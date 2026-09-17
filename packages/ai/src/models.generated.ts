@@ -10285,6 +10285,23 @@ export const MODELS = {
 			contextWindow: 262144,
 			maxTokens: 65536,
 		} satisfies Model<"anthropic-messages">,
+		"union-alpha": {
+			id: "union-alpha",
+			name: "Union Alpha Free",
+			api: "anthropic-messages",
+			provider: "opencode",
+			baseUrl: "https://opencode.ai/zen",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 262144,
+			maxTokens: 131072,
+		} satisfies Model<"anthropic-messages">,
 	},
 	"opencode-go": {
 		"deepseek-v4-flash": {

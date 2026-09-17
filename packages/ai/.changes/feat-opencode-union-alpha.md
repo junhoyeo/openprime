@@ -1,0 +1,1 @@
+- Added the OpenCode Zen `union-alpha` (Union Alpha Free) stealth coding model: free, 262K context, 131K max output, text and image input, routed through the Anthropic Messages API.
