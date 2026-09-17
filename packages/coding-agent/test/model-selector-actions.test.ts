@@ -208,7 +208,15 @@ describe("ModelSelectorComponent", () => {
 
 		const base = harness.getModel("base")!;
 		const signedInExact = { ...base, provider: "prime-inference", id: "z-ai/glm-5.2", name: "GLM 5.2" };
-		const signedOutExact = { ...base, provider: "opencode", id: "glm-5.2", name: "GLM 5.2" };
+		// Non-zero cost: zero-cost `opencode` models are the free Zen tier and count
+		// as authenticated (isOpencodePublicModel), which would make this row signed-in.
+		const signedOutExact = {
+			...base,
+			provider: "opencode",
+			id: "glm-5.2",
+			name: "GLM 5.2",
+			cost: { ...base.cost, input: 1 },
+		};
 		const signedInFuzzy = {
 			...base,
 			provider: "prime-inference",

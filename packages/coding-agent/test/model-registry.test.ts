@@ -1680,4 +1680,18 @@ describe("ModelRegistry", () => {
 			});
 		});
 	});
+
+	test("zero-cost OpenCode models are selectable without credentials", async () => {
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const model = registry.find("opencode", "union-alpha");
+		expect(model).toBeDefined();
+		expect(registry.hasConfiguredAuth(model!)).toBe(true);
+		expect(
+			registry
+				.getAvailable()
+				.some((candidate) => candidate.provider === "opencode" && candidate.id === "union-alpha"),
+		).toBe(true);
+		const auth = await registry.getApiKeyAndHeaders(model!);
+		expect(auth).toMatchObject({ ok: true, apiKey: "public" });
+	});
 });

@@ -1,6 +1,8 @@
 import { MODELS } from "./models.generated.js";
 import type { Api, KnownProvider, Model, ModelThinkingLevel, OpenAIResponsesCompat, Usage } from "./types.js";
 
+export { isOpencodePublicModel, opencodePublicApiKey } from "./utils/opencode-headers.js";
+
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 
 for (const [provider, models] of Object.entries(MODELS)) {

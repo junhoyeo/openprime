@@ -11,11 +11,13 @@ import {
 	type Context,
 	getModels,
 	getProviders,
+	isOpencodePublicModel,
 	type KnownProvider,
 	type Model,
 	type OAuthProviderInterface,
 	type OpenAICompletionsCompat,
 	type OpenAIResponsesCompat,
+	opencodePublicApiKey,
 	registerApiProvider,
 	resetApiProviders,
 	type SimpleStreamOptions,
@@ -1020,6 +1022,9 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		if (isOpencodePublicModel(model)) {
+			return true;
+		}
 		return this.authStorage.hasAuth(model.provider) || this.hasConfiguredProviderRequestAuth(model.provider);
 	}
 
@@ -1312,6 +1317,9 @@ export class ModelRegistry {
 					apiKey = resolvedApiKey;
 					authSourceToken = this.getProviderRequestAuthSourceToken(model.provider, providerRequestAuthSource);
 				}
+			}
+			if (apiKey === undefined) {
+				apiKey = opencodePublicApiKey(model);
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
 

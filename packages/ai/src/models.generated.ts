@@ -10291,6 +10291,7 @@ export const MODELS = {
 			api: "anthropic-messages",
 			provider: "opencode",
 			baseUrl: "https://opencode.ai/zen",
+			headers: {"User-Agent":"opencode/1.18.31","x-opencode-client":"cli"},
 			reasoning: true,
 			input: ["text", "image"],
 			cost: {
