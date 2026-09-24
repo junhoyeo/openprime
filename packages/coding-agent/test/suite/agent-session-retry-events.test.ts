@@ -116,18 +116,13 @@ describe("AgentSession retry and event characterization", () => {
 			new AgentContinueError("nothing-to-continue", "Nothing to continue"),
 		);
 
-		const markStale = vi.spyOn(
-			harness.session as unknown as { _markProviderAuthStaleForRetryFailure: () => void },
-			"_markProviderAuthStaleForRetryFailure",
-		);
-
 		// Pre-fix this hangs: the swallowed rejection leaves the retry unresolved forever.
 		await harness.session.prompt("test");
 
 		expect(harness.session.isRetrying).toBe(false);
 		expect(retryEvents).toEqual(["start:1", "end:false:Nothing to continue"]);
-		// Terminal like every other retry end: a captured auth failure goes stale.
-		expect(markStale).toHaveBeenCalled();
+		// This fork never marks provider auth stale on a terminal retry (#24).
+		expect(harness.eventsOfType("auth_stale")).toHaveLength(0);
 	});
 
 	it("ignores a stale continue rejection after the retry was aborted and a newer one runs", async () => {
@@ -207,6 +202,8 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("caps exponential backoff at maxBackoffMs", async () => {
+		// Pin the backoff jitter to its midpoint so the sequence is deterministic.
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 5, baseDelayMs: 1, maxBackoffMs: 4 } },
 		});
@@ -232,6 +229,8 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("grows backoff without a ceiling when maxBackoffMs is 0", async () => {
+		// Pin the backoff jitter to its midpoint so the sequence is deterministic.
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 4, baseDelayMs: 1, maxBackoffMs: 0 } },
 		});

@@ -35,7 +35,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
-import { applyOpencodeZenHeaders, opencodePublicApiKey } from "../utils/opencode-headers.js";
+import { opencodePublicApiKey } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	classifyStreamFailure,
@@ -953,11 +953,6 @@ function createClient(
 		return { client, isOAuthToken: true };
 	}
 
-	const defaultHeaders =
-		model.provider === "opencode" || model.provider === "opencode-go"
-			? applyOpencodeZenHeaders({ ...model.headers, ...optionsHeaders })
-			: undefined;
-
 	const client = new Anthropic({
 		maxRetries: 0,
 		apiKey,
@@ -972,11 +967,10 @@ function createClient(
 					"anthropic-dangerous-direct-browser-access": "true",
 					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
 				},
+				// Zen's zero-cost tier gates on the OpenCode CLI identity, which the
+				// catalog entry carries in model.headers; withOpenCodeHeaders keeps it.
 				model.headers,
 				optionsHeaders,
-				// Zen's zero-cost tier gates on the OpenCode CLI identity; it must win over
-				// the "prime-agent" User-Agent withOpenCodeHeaders defaults to.
-				defaultHeaders,
 			),
 		),
 	});

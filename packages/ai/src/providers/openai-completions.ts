@@ -34,7 +34,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
-import { applyOpencodeZenHeaders, opencodePublicApiKey } from "../utils/opencode-headers.js";
+import { opencodePublicApiKey } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
@@ -553,10 +553,7 @@ function createClient(
 		}
 	}
 
-	const headers =
-		model.provider === "opencode" || model.provider === "opencode-go"
-			? applyOpencodeZenHeaders({ ...model.headers })
-			: { ...model.headers };
+	const headers = { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({

@@ -13341,6 +13341,10 @@ export class AgentSession {
 			return false;
 		}
 
+		// Exponential backoff, capped by retry.maxBackoffMs (0 disables): without a
+		// ceiling a large maxRetries stops being a retry policy (attempt 30 at a 1s
+		// base waits ~6000 days). Server-requested waits are already bounded above.
+		const delayMs = settings.maxBackoffMs > 0 ? Math.min(delay.delayMs, settings.maxBackoffMs) : delay.delayMs;
 		return this._retryAfterDelay(
 			message,
 			options,
@@ -13348,10 +13352,10 @@ export class AgentSession {
 				type: "auto_retry_start",
 				attempt: this._retryAttempt,
 				maxAttempts: settings.maxRetries,
-				delayMs: delay.delayMs,
+				delayMs,
 				errorMessage: message.errorMessage || "Unknown error",
 			},
-			delay.delayMs,
+			delayMs,
 		);
 	}
 
