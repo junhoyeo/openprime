@@ -518,7 +518,15 @@ export async function generateSummary(
 	requestOptions?: Pick<
 		SimpleStreamOptions,
 		"onPayload" | "onResponse" | "serviceTier" | "sessionId" | "maxRetryDelayMs"
-	>,
+	> & {
+		/**
+		 * Opt-in hook receiving the summarization completion itself. Summaries are
+		 * returned as plain strings, so without this the tokens they spend are
+		 * invisible to callers that account for a run's cost. Not forwarded to the
+		 * provider call.
+		 */
+		onCompletion?: (message: AssistantMessage) => void;
+	},
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -540,16 +548,22 @@ export async function generateSummary(
 		},
 	];
 
+	// onCompletion is ours, not the provider's; keep it out of the request.
+	const { onCompletion, ...providerOptions } = requestOptions ?? {};
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { ...requestOptions, maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { ...requestOptions, maxTokens, signal, apiKey, headers };
+			? { ...providerOptions, maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+			: { ...providerOptions, maxTokens, signal, apiKey, headers };
 
 	const response = await completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
 	);
+
+	// Reported before the error check: a failed summarization can still have spent
+	// tokens, and dropping that makes the spend unrecoverable.
+	onCompletion?.(response);
 
 	if (response.stopReason === "error") {
 		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);

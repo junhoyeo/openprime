@@ -4087,6 +4087,64 @@ describe("DaemonAgentConnection", () => {
 		expect(sent?.previousTurns).toEqual([{ question: "What changed?", answer: "The parser." }]);
 	});
 
+	it("gates side-question pane ids on the daemon capability", async () => {
+		// New client, old daemon: the pane id must be dropped rather than sent to a
+		// daemon that would accept and ignore it. Unlike follow-up transcripts this
+		// degrades instead of failing, because losing pane grouping does not make
+		// the answer wrong.
+		const oldDaemonClient = new FakeDaemonClient();
+		const oldConnection = new DaemonAgentConnection(asDaemonClient(oldDaemonClient), "active-original");
+
+		await oldConnection.startSideQuestion("turn-1", "What changed?", undefined, "pane-1");
+		const oldSent = oldDaemonClient.requests.find(
+			(command): command is Extract<DaemonCommand, { type: "start_side_question" }> =>
+				command.type === "start_side_question",
+		);
+		expect(oldSent).toBeDefined();
+		expect(oldSent && "paneId" in oldSent).toBe(false);
+
+		// side_question_transcript predates pane ids, so it must not be read as
+		// implying them.
+		const transcriptOnlyClient = new FakeDaemonClient();
+		transcriptOnlyClient.serverCapabilities.add("side_question_transcript");
+		const transcriptOnlyConnection = new DaemonAgentConnection(
+			asDaemonClient(transcriptOnlyClient),
+			"active-original",
+		);
+
+		await transcriptOnlyConnection.startSideQuestion("turn-1", "What changed?", undefined, "pane-1");
+		const transcriptOnlySent = transcriptOnlyClient.requests.find(
+			(command): command is Extract<DaemonCommand, { type: "start_side_question" }> =>
+				command.type === "start_side_question",
+		);
+		expect(transcriptOnlySent && "paneId" in transcriptOnlySent).toBe(false);
+
+		// New client, new daemon: the pane id goes over the wire.
+		const newDaemonClient = new FakeDaemonClient();
+		newDaemonClient.serverCapabilities.add("side_question_pane_id");
+		const newConnection = new DaemonAgentConnection(asDaemonClient(newDaemonClient), "active-original");
+
+		await newConnection.startSideQuestion("turn-1", "What changed?", undefined, "pane-1");
+		const newSent = newDaemonClient.requests.find(
+			(command): command is Extract<DaemonCommand, { type: "start_side_question" }> =>
+				command.type === "start_side_question",
+		);
+		expect(newSent?.paneId).toBe("pane-1");
+
+		// Old client, new daemon: a capable daemon still accepts a command that
+		// carries no pane id at all.
+		const capableDaemonClient = new FakeDaemonClient();
+		capableDaemonClient.serverCapabilities.add("side_question_pane_id");
+		const legacyCallerConnection = new DaemonAgentConnection(asDaemonClient(capableDaemonClient), "active-original");
+
+		await legacyCallerConnection.startSideQuestion("turn-1", "What changed?");
+		const legacySent = capableDaemonClient.requests.find(
+			(command): command is Extract<DaemonCommand, { type: "start_side_question" }> =>
+				command.type === "start_side_question",
+		);
+		expect(legacySent && "paneId" in legacySent).toBe(false);
+	});
+
 	it("gates transient bash on the daemon capability", async () => {
 		const oldDaemonClient = new FakeDaemonClient();
 		const oldConnection = new DaemonAgentConnection(asDaemonClient(oldDaemonClient), "active-original");

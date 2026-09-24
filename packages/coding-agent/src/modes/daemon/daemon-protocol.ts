@@ -71,8 +71,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
 // Revision 26 reports attach ownership so shared-client cleanup cannot detach a sibling's entry.
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-585ef1102921";
+// Revision 27 carries the client's side-question pane id on start_side_question so
+// side-conversation storage keeps one pane in one transcript across a reconnect.
+export const DAEMON_SCHEMA_REVISION = 27;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-bd7f013b67b4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -123,7 +125,14 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	// The daemon honors paneId on start_side_question and groups a pane's turns
+	// into one stored transcript by it. Predates side_question_transcript, which
+	// only covers previousTurns, so it needs its own gate: an older daemon accepts
+	// the command and silently ignores the identity, which would split one visible
+	// conversation across transcripts on reconnect. Clients must check before
+	// sending; without it storage falls back to the previousTurns heuristic.
+	| "side_question_pane_id";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -168,6 +177,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"side_question_pane_id",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -544,6 +554,13 @@ export type DaemonCommand =
 			sideQuestionId: string;
 			question: string;
 			previousTurns?: AgentConnectionSideQuestionTurn[];
+			/**
+			 * Stable identity of the client's side-question pane, constant across
+			 * every turn in one pane. Storage groups turns by it, so a reconnect
+			 * cannot split one visible conversation into two transcripts. Optional
+			 * for older clients, which fall back to a previousTurns heuristic.
+			 */
+			paneId?: string;
 	  }
 	| { id?: string; type: "abort_side_question"; activeSessionId: string; sideQuestionId: string }
 	| {

@@ -21,6 +21,12 @@ import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/sess
 import { SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import {
+	createSideQuestionPaneId,
+	createSideQuestionStore,
+	SideQuestionPaneRegistry,
+	type SideQuestionRecorder,
+} from "../../core/side-question-store.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import {
 	createAgentConnectionCommands,
@@ -80,6 +86,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly beforeSessionInvalidateListeners = new Set<AgentConnectionBeforeSessionInvalidateListener>();
 	private readonly sideQuestionRuns = new Map<string, SideQuestionRun>();
+	private readonly sideQuestionPanes = new SideQuestionPaneRegistry();
 	private readonly sessionInputPauses = new Map<string, AgentConnectionSessionInputPause>();
 	private headlessExtensionOptions: InProcessHeadlessExtensionOptions | undefined;
 	private unsubscribeSessionEvents: (() => void) | undefined;
@@ -383,6 +390,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		id: string,
 		question: string,
 		previousTurns?: AgentConnectionSideQuestionTurn[],
+		paneId?: string,
 	): Promise<void> {
 		if (this.sideQuestionRuns.has(id)) {
 			throw new Error(`Side question already exists: ${id}`);
@@ -396,6 +404,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			{
 				getCompactionSettings: () => this.session.settingsManager.getCompactionSettings(),
 				getRequestAuth: (model) => this.session.getRequestAuth(model),
+				recorder: this.resolveSideQuestionRecorder(previousTurns, paneId),
 			},
 		);
 		this.sideQuestionRuns.set(id, run);
@@ -403,6 +412,30 @@ export class InProcessAgentConnection implements AgentConnection {
 			this.sideQuestionRuns.delete(id);
 		};
 		void run.done.then(removeRun, removeRun);
+	}
+
+	/**
+	 * One pane, one transcript. A caller-supplied paneId is authoritative; older
+	 * callers fall back to "a question with no prior turns opens a new pane".
+	 */
+	private resolveSideQuestionRecorder(
+		previousTurns: AgentConnectionSideQuestionTurn[] | undefined,
+		paneId: string | undefined,
+	): SideQuestionRecorder | undefined {
+		const model = this.session.agent.state.model;
+		if (!model) {
+			return undefined;
+		}
+		return this.sideQuestionPanes.resolve(
+			paneId ?? "session",
+			paneId !== undefined || (previousTurns?.length ?? 0) > 0,
+			() =>
+				createSideQuestionStore({
+					parent: this.session.sessionManager,
+					model,
+					btwId: createSideQuestionPaneId(),
+				}),
+		);
 	}
 
 	async abortSideQuestion(id: string): Promise<boolean> {
@@ -687,6 +720,9 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	private abortAllSideQuestions(): void {
+		// Recorders are bound to the session that was just replaced; keeping them
+		// would append a follow-up to the previous session's transcript.
+		this.sideQuestionPanes.clear();
 		for (const run of this.sideQuestionRuns.values()) {
 			run.abort();
 		}
