@@ -33,6 +33,7 @@ type FakeInteractiveMode = {
 	};
 	agentConnection: {
 		abort: Mock;
+		abortAndSendQueued: Mock;
 		clearQueue: Mock;
 		abortAndClearQueue: Mock;
 		abortRetry: Mock;
@@ -41,7 +42,7 @@ type FakeInteractiveMode = {
 		abortBash: Mock;
 	};
 	subagentSummaryLine: { invalidate: Mock };
-	ui: { requestRender: Mock; onDebug?: () => void };
+	ui: { requestRender: Mock; onDebug?: () => void; hasOverlay?: () => boolean };
 	updatePendingMessagesDisplay: Mock;
 	showError: Mock;
 	showTreeSelector: Mock;

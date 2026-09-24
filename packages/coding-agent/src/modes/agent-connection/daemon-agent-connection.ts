@@ -154,6 +154,16 @@ interface ReplacementSnapshotExpectation {
  */
 class SnapshotTransferAbandonedError extends Error {}
 
+/**
+ * A concurrent lifecycle transition (session_replaced, switch, reconnect,
+ * update recovery) rebound the connection while this attach was in flight, so
+ * its response can no longer publish. The newer binding owns the connection and
+ * is already coherent, so a plain `attach()` releases the abandoned attempt and
+ * returns instead of failing the caller; a transition that must own the binding
+ * it asked for (revival, switch) still catches and handles this.
+ */
+class SessionAttachSupersededError extends Error {}
+
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const REVIVAL_RESYNC_RETRY_MS = 250;
@@ -500,6 +510,20 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly pendingBindingCatchupSnapshots = new Map<string, DaemonSessionSnapshot>();
 	private readonly pendingBindingCatchupFailures = new Set<string>();
 	private readonly pendingBindingActiveSessionIds = new Set<string>();
+	/**
+	 * Live session_events addressed to a binding-transition target that arrived
+	 * before its binding published. The daemon starts streaming a session's
+	 * events as soon as the attach registers, so an event can cross the wire
+	 * ahead of the attach response's continuation; dropping it would lose a
+	 * transcript update the attach snapshot does not contain. They are held per
+	 * target and replayed through the normal path once the binding publishes -
+	 * where the applied snapshot's cursor discards the ones it already covers -
+	 * and discarded with the admission if the transition fails or is superseded.
+	 */
+	private readonly pendingBindingSessionEvents = new Map<
+		string,
+		Extract<DaemonOutbound, { type: "session_event" }>[]
+	>();
 	private readonly snapshotRecoveryPromises = new Map<string, Promise<void>>();
 	/** Latest switch's not-yet-settled replacement snapshot wait; newer switches replace it. */
 	private pendingReplacementSnapshot: ReplacementSnapshotExpectation | undefined;
@@ -663,7 +687,18 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async attach(options?: { recoverable?: boolean }): Promise<void> {
-		await this.attachSessionBinding(this.activeSessionId, false, options);
+		try {
+			await this.attachSessionBinding(this.activeSessionId, false, options);
+		} catch (error) {
+			// A plain re-attach asks for the session this connection is currently
+			// on. If a concurrent transition (session_replaced, switch, reconnect)
+			// rebound it meanwhile, that newer binding is already coherent and owns
+			// the connection: the superseded attempt has released its attachment and
+			// discarded its snapshot, so there is nothing left to report. Transitions
+			// that must own the binding they asked for call attachSessionBinding
+			// directly and still see the error.
+			if (!(error instanceof SessionAttachSupersededError)) throw error;
+		}
 	}
 
 	/**
@@ -732,6 +767,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.pendingBindingCatchupSnapshots.delete(this.activeSessionId);
 				this.pendingBindingCatchupFailures.delete(this.activeSessionId);
 				this.applySessionSnapshot(catchup);
+				await this.replayPendingBindingSessionEvents(this.activeSessionId);
 			} else if (this.pendingBindingCatchupFailures.delete(this.activeSessionId)) {
 				// A catch-up FAILED while the target was pending and no later one
 				// succeeded: the cached attach snapshot predates the events that
@@ -739,6 +775,9 @@ export class DaemonAgentConnection implements AgentConnection {
 				// read actually re-reads from the daemon instead of serving the
 				// stale cache.
 				this.latestSnapshotIsFresh = false;
+				await this.replayPendingBindingSessionEvents(this.activeSessionId);
+			} else {
+				await this.replayPendingBindingSessionEvents(this.activeSessionId);
 			}
 			// The roster bar is an accessory: its subscribe failure must never fail an
 			// otherwise-recovered session. The bar degrades; the next reconnect or rebind
@@ -754,7 +793,24 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.pendingBindingActiveSessionIds.delete(targetActiveSessionId);
 				this.pendingBindingCatchupSnapshots.delete(targetActiveSessionId);
 				this.pendingBindingCatchupFailures.delete(targetActiveSessionId);
+				this.pendingBindingSessionEvents.delete(targetActiveSessionId);
 			}
+		}
+	}
+
+	/**
+	 * Deliver the live events that crossed the wire for a transition target
+	 * before its binding published. They run through the normal message path, so
+	 * the applied snapshot's cursor drops the ones it already covers and deferral
+	 * buffers the rest exactly as if they had arrived after publication.
+	 */
+	private async replayPendingBindingSessionEvents(activeSessionId: string): Promise<void> {
+		const held = this.pendingBindingSessionEvents.get(activeSessionId);
+		if (!held) return;
+		this.pendingBindingSessionEvents.delete(activeSessionId);
+		for (const message of held) {
+			if (this.disposed || this.terminalCloseEmitted || message.activeSessionId !== this.activeSessionId) return;
+			await this.handleDaemonMessage(message);
 		}
 	}
 
@@ -772,6 +828,14 @@ export class DaemonAgentConnection implements AgentConnection {
 	): Promise<string | undefined> {
 		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
 		const attachmentAttempt = targetAttachments.begin(targetActiveSessionId);
+		// A streamed attach snapshot can be parsed in the SAME socket read as the
+		// attach response, ahead of this request's promise continuation. The apply
+		// hook installs it from inside that read so a live event coalesced behind
+		// it (message_update/message_end) refines the snapshot instead of being
+		// overwritten by it when the continuation resumes. It is armed only for a
+		// same-binding attach: a cross-worker target must not touch shared state
+		// before its binding publishes.
+		let streamedSnapshotApplied = false;
 		let result: SessionSummary | DaemonAttachResult;
 		try {
 			result = await this.requestDataWithClient<SessionSummary | DaemonAttachResult>(
@@ -807,7 +871,30 @@ export class DaemonAgentConnection implements AgentConnection {
 								},
 				},
 				undefined,
-				requestOptions,
+				{
+					...requestOptions,
+					onResponse: (response) => {
+						if (
+							!response.success ||
+							this.disposed ||
+							this.terminalCloseEmitted ||
+							sessionRevision !== this.sessionRevision
+						)
+							return;
+						const responseResult = response.data as SessionSummary | DaemonAttachResult;
+						if ("snapshot" in responseResult && responseResult.snapshotStream) {
+							this.getSnapshotAssembly(responseResult.snapshotStream.id).apply = (snapshot) => {
+								// completeSnapshotAssembly only invokes this for the PUBLISHED
+								// binding; the revision guard covers a replacement that rebound
+								// the connection without moving activeSessionId.
+								if (this.disposed || this.terminalCloseEmitted || sessionRevision !== this.sessionRevision)
+									return;
+								this.applySessionSnapshot(snapshot, responseResult.replay);
+								streamedSnapshotApplied = true;
+							};
+						}
+					},
+				},
 				wrapControlPlaneError,
 			);
 		} catch (error) {
@@ -817,11 +904,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		const attachCreatedAttachment = "wasAttached" in result && result.wasAttached === false;
 		// A session_replaced (or restart restore) can rebind the connection without
 		// moving activeSessionId, so the revision is checked alongside the binding.
+		const closedDuringAttach = this.disposed || this.terminalCloseEmitted;
 		if (
 			this.activeSessionId !== entryActiveSessionId ||
 			sessionRevision !== this.sessionRevision ||
-			this.disposed ||
-			this.terminalCloseEmitted
+			closedDuringAttach
 		) {
 			// The response registered the socket attachment, but the binding can no
 			// longer publish. End the successful attempt and request its cleanup as
@@ -847,7 +934,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				}
 				this.ignoreSnapshotId(snapshotId);
 			}
-			throw new Error(`Session attach superseded: binding moved from ${entryActiveSessionId}`);
+			// A closed/disposed connection is terminal, not a supersession: the
+			// caller must see the failure rather than a quietly released attach.
+			throw closedDuringAttach
+				? new Error("Daemon session closed during attach")
+				: new SessionAttachSupersededError(`Session attach superseded: binding moved from ${entryActiveSessionId}`);
 		}
 		if (resetCursors) {
 			this.lastEventSequence = undefined;
@@ -885,11 +976,18 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.shutdownReconnectFailed = false;
 			this.terminalCloseEmitted = false;
 			this.daemonClosingNotice = undefined;
-			const attachCursor = getAttachLastEventCursor(result);
-			if (attachCursor) {
-				this.observeEventCursor(attachCursor);
+			const streamsSnapshot = "snapshot" in result && result.snapshotStream !== undefined;
+			if (!streamsSnapshot) {
+				// A streamed attach takes its cursors from the snapshot it applies.
+				// Advancing them from the response instead would retire the events
+				// an abandoned (superseded) stream never delivered, and the session
+				// they belong to would never replay them.
+				const attachCursor = getAttachLastEventCursor(result);
+				if (attachCursor) {
+					this.observeEventCursor(attachCursor);
+				}
+				this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
 			}
-			this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
 			if ("snapshot" in result) {
 				const appliedActiveSessionId = this.activeSessionId;
 				const preAwaitSnapshot = this.latestSnapshot;
@@ -905,7 +1003,19 @@ export class DaemonAgentConnection implements AgentConnection {
 					// A concurrent transition rebound the connection while the
 					// streamed snapshot was in flight; applying the late snapshot
 					// would describe a session this connection no longer shows.
-					throw new Error(`Session attach superseded: binding moved from ${appliedActiveSessionId}`);
+					throw this.disposed || this.terminalCloseEmitted
+						? new Error("Daemon session closed during attach")
+						: new SessionAttachSupersededError(
+								`Session attach superseded: binding moved from ${appliedActiveSessionId}`,
+							);
+				}
+				if (streamedSnapshotApplied) {
+					// The apply hook installed this snapshot from inside the socket
+					// read that carried its end frame, so every record coalesced behind
+					// it - a live event refining the streaming message and clearing
+					// freshness, a newer catch-up resync - already ran against it in
+					// wire order. Re-installing it here would undo them.
+					return displacedActiveSessionId;
 				}
 				// The daemon can deliver the attach snapshot's end frame and a queued
 				// catch-up resync in one socket read; the resync then lands on the
@@ -928,16 +1038,20 @@ export class DaemonAgentConnection implements AgentConnection {
 					(snapshot.lastEventSequence === undefined || concurrentSeq > snapshot.lastEventSequence);
 				if (!keepConcurrentlyAppliedSnapshot) {
 					this.applySessionSnapshot(snapshot, result.replay);
-					// A live event parsed between the snapshot's end frame and this
-					// continuation advanced the connection cursor past the snapshot's
-					// content; marking such a cache fresh would serve state whose
-					// stamped cursor claims it includes an event it does not. The
-					// invalidation is preserved so the next read re-reads.
-					this.latestSnapshotIsFresh =
-						this.lastEventSequence === undefined ||
-						snapshot.lastEventSequence === undefined ||
-						this.lastEventSequence <= snapshot.lastEventSequence;
-					this.latestSnapshotStateIsFresh = this.latestSnapshotIsFresh;
+					if (streamsSnapshot) {
+						// A live event parsed between the snapshot's end frame and this
+						// continuation advanced the connection cursor past the snapshot's
+						// content; marking such a cache fresh would serve state whose
+						// stamped cursor claims it includes an event it does not. The
+						// invalidation is preserved so the next read re-reads. An inline
+						// snapshot has no such window: it arrives with the response, so
+						// it stays fresh like any applied snapshot.
+						this.latestSnapshotIsFresh =
+							this.lastEventSequence === undefined ||
+							snapshot.lastEventSequence === undefined ||
+							this.lastEventSequence <= snapshot.lastEventSequence;
+						this.latestSnapshotStateIsFresh = this.latestSnapshotIsFresh;
+					}
 				}
 			} else {
 				this.latestSnapshot = undefined;
@@ -2787,6 +2901,21 @@ export class DaemonAgentConnection implements AgentConnection {
 			});
 			return;
 		}
+		if (
+			message.type === "session_event" &&
+			message.activeSessionId !== this.activeSessionId &&
+			message.activeSessionId !== undefined
+		) {
+			// A live event for a still-pending binding target: hold it until that
+			// binding publishes. It must not run against the published binding -
+			// its sequence belongs to a different session's event stream.
+			const held = this.pendingBindingSessionEvents.get(message.activeSessionId) ?? [];
+			if (held.length < MAX_DEFERRED_SESSION_EVENTS) {
+				held.push(message);
+				this.pendingBindingSessionEvents.set(message.activeSessionId, held);
+			}
+			return;
+		}
 		if ("snapshotId" in message && this.ignoredSnapshotIds.has(message.snapshotId)) {
 			if (message.type === "session_snapshot_end" || message.type === "session_snapshot_failed") {
 				this.ignoredSnapshotIds.delete(message.snapshotId);
@@ -3540,14 +3669,20 @@ export class DaemonAgentConnection implements AgentConnection {
 		// waiter gets the resolved snapshot below, but the shared identity and
 		// snapshot cache must only describe the published binding.
 		const isForPublishedBinding = message.activeSessionId === this.activeSessionId;
+		const purpose = assembly.begin.purpose ?? "attach";
 		let mappedSnapshot: AgentConnectionSnapshot | undefined;
 		if (isForPublishedBinding) {
-			this.applySessionSnapshot(snapshot);
-			mappedSnapshot = this.latestSnapshot;
+			// An attach snapshot for the published binding is installed through the
+			// attach's own apply hook, which carries its replay info and its revision
+			// guard; installing it here too would drop the replay and overwrite a
+			// newer record from the same socket read. Its waiter still resolves below.
+			if (purpose === "attach") {
+				assembly.apply?.(snapshot);
+			} else {
+				this.applySessionSnapshot(snapshot);
+				mappedSnapshot = this.latestSnapshot;
+			}
 		}
-		const purpose = assembly.begin.purpose ?? "attach";
-		// Attach owns the revision guard, but its snapshot must precede the next record in this socket read.
-		if (purpose === "attach") assembly.apply?.(snapshot);
 		assembly.resolve(snapshot);
 		clearTimeout(assembly.timeout);
 		if (purpose !== "attach") {
@@ -3626,7 +3761,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		return (
 			message.activeSessionId !== undefined &&
 			this.pendingBindingActiveSessionIds.has(message.activeSessionId) &&
-			isSnapshotTransferMessage(message)
+			(isSnapshotTransferMessage(message) || message.type === "session_event")
 		);
 	}
 
