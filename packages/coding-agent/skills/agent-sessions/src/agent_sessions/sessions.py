@@ -434,7 +434,8 @@ def _parse_kimi(path: Path, records: Iterable[dict[str, Any]], session: Session)
 # Kiro inlines image bytes and redacted-thinking payloads as raw JSON integer
 # arrays, which pushes single lines past 16 MB. Eliding them before json.loads
 # keeps a transcript costing its text rather than its pixels.
-_KIRO_BYTE_ARRAY = re.compile(r'"data":\s*\[[\d,\s]{256,}\]')
+# `data` carries inline image bytes; `redactedContent` carries encrypted thinking.
+_KIRO_BYTE_ARRAY = re.compile(r'"(data|redactedContent)":\s*\[[\d,\s]{256,}\]')
 _KIRO_WIDE_LINE = 1 << 18
 
 # The sidecar's scalars are followed by a `session_state` blob that reaches
@@ -448,7 +449,7 @@ def _kiro_records(path: Path) -> Iterator[dict[str, Any]]:
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if len(line) > _KIRO_WIDE_LINE:
-                line = _KIRO_BYTE_ARRAY.sub('"data":[]', line)
+                line = _KIRO_BYTE_ARRAY.sub(r'"\1":[]', line)
             line = line.strip()
             if not line:
                 continue
@@ -1125,7 +1126,114 @@ def _render_session(
 # grep
 # --------------------------------------------------------------------------
 
-_LITERAL_RUN = re.compile(r"[^\\\\^$.|?*+()\[\]{}]{3,}")
+# Characters that end a literal run: regex metacharacters and the escape prefix.
+_RUN_BREAKERS = "\\^$.|?*+()[]{}"
+
+# `{n}` / `{n,}` / `{n,m}`; anything else after `{` is a literal brace in Python.
+_BRACE_QUANTIFIER = re.compile(r"\{(\d*)(,(\d*))?\}")
+
+
+def _skip_group(pattern: str, start: int) -> int:
+    """Index just past the `(`-group or `[`-class opened at `start`."""
+    closers = {"(": ")", "[": "]"}
+    opener = pattern[start]
+    closer = closers[opener]
+    depth = 0
+    index = start
+    in_class = opener == "["
+    if in_class:
+        # `[]a]` and `[^]a]` open with a literal `]`, which does not close them.
+        index += 1
+        if index < len(pattern) and pattern[index] == "^":
+            index += 1
+        if index < len(pattern) and pattern[index] == "]":
+            index += 1
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if in_class:
+            if char == "]":
+                return index + 1
+            index += 1
+            continue
+        if char == "[":
+            index = _skip_group(pattern, index)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return len(pattern)
+
+
+def _mandatory_literals(pattern: str) -> list[str]:
+    """Literal runs that must appear verbatim in every match of `pattern`.
+
+    A literal-run prefilter is only sound for runs no quantifier can erase:
+    `errors?` must probe `error`, never `errors`, or a transcript holding only
+    `error` is skipped and the match is silently lost. Groups, classes, escapes
+    and alternations end the current run, so what survives is a conservative
+    subset — which is exactly what a skip-the-file probe needs.
+    """
+    runs: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            runs.append("".join(current))
+            current.clear()
+
+    index = 0
+    length = len(pattern)
+    while index < length:
+        char = pattern[index]
+        if char in "([":
+            flush()
+            index = _skip_group(pattern, index)
+            continue
+        if char == "\\":
+            # \d, \b, \n ... — never probed as a literal.
+            flush()
+            index += 2
+            continue
+        if char in "?*":
+            # Erases the character it follows, so drop it and end the run.
+            if current:
+                current.pop()
+            flush()
+            index += 1
+            continue
+        if char == "+":
+            # One occurrence is still guaranteed; only the run's contiguity ends.
+            flush()
+            index += 1
+            continue
+        if char == "{":
+            match = _BRACE_QUANTIFIER.match(pattern, index)
+            if match is None:  # a literal brace
+                current.append(char)
+                index += 1
+                continue
+            low = match.group(1)
+            optional = low in {"", "0"}
+            if optional and current:
+                current.pop()
+            flush()
+            index = match.end()
+            continue
+        if char in _RUN_BREAKERS:  # . ^ $ | ) ] }
+            flush()
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    flush()
+    return runs
 
 
 def compile_pattern(pattern: str, fixed: bool = False, ignore_case: bool | None = None) -> re.Pattern[str]:
@@ -1189,7 +1297,7 @@ def _prefilter_terms(pattern: str, fixed: bool) -> list[str]:
         return _probe_terms(pattern)
     terms: list[str] = []
     for branch in _split_alternation(pattern):
-        runs = _LITERAL_RUN.findall(branch)
+        runs = _mandatory_literals(branch)
         if not runs:
             return []  # one un-probeable branch makes the whole filter unsafe
         probes = _probe_terms(max(runs, key=len))
@@ -1268,9 +1376,15 @@ def grep_sessions(
             continue
         events = filter_events(parsed, kinds)
         hits: list[dict[str, Any]] = []
+        matched_events = 0
         for position, event in enumerate(events):
             match = regex.search(event.text)
             if not match:
+                continue
+            matched_events += 1
+            if max_per_session and len(hits) >= max_per_session:
+                # Keep counting (`matched_events` is the `rg -c` figure) but stop
+                # rendering hits once the per-session window is full.
                 continue
             hit = {
                 "index": event.index,
@@ -1293,11 +1407,9 @@ def grep_sessions(
                     if item is not event
                 ]
             hits.append(hit)
-            if max_per_session and len(hits) >= max_per_session:
-                break
         if not hits:
             continue
-        results.append({**parsed.as_dict(), "matched_events": len(hits), "hits": hits})
+        results.append({**parsed.as_dict(), "matched_events": matched_events, "hits": hits})
         hit_budget -= len(hits)
         if hit_budget <= 0 or (max_reported and len(results) >= max_reported):
             break
