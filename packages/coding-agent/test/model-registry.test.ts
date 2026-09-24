@@ -1681,16 +1681,18 @@ describe("ModelRegistry", () => {
 		});
 	});
 
-	test("zero-cost OpenCode models are selectable without credentials", async () => {
+	test("zero-cost OpenCode models resolve the public key without polluting the available list", async () => {
 		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 		const model = registry.find("opencode", "union-alpha");
 		expect(model).toBeDefined();
-		expect(registry.hasConfiguredAuth(model!)).toBe(true);
+		// No credential: not advertised (keeps /model cycling and subagent discovery clean)...
+		expect(registry.hasConfiguredAuth(model!)).toBe(false);
 		expect(
 			registry
 				.getAvailable()
 				.some((candidate) => candidate.provider === "opencode" && candidate.id === "union-alpha"),
-		).toBe(true);
+		).toBe(false);
+		// ...but an explicit selection still authenticates with OpenCode's public key.
 		const auth = await registry.getApiKeyAndHeaders(model!);
 		expect(auth).toMatchObject({ ok: true, apiKey: "public" });
 	});

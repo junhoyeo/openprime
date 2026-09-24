@@ -11,7 +11,6 @@ import {
 	type Context,
 	getModels,
 	getProviders,
-	isOpencodePublicModel,
 	type KnownProvider,
 	type Model,
 	type OAuthProviderInterface,
@@ -1022,9 +1021,6 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
-		if (isOpencodePublicModel(model)) {
-			return true;
-		}
 		return this.authStorage.hasAuth(model.provider) || this.hasConfiguredProviderRequestAuth(model.provider);
 	}
 
@@ -1319,6 +1315,11 @@ export class ModelRegistry {
 				}
 			}
 			if (apiKey === undefined) {
+				// Zero-cost OpenCode Zen models accept OpenCode's own `public` key, so an
+				// explicit `--model opencode/<id>` works without a stored credential. They are
+				// deliberately NOT reported as configured by hasConfiguredAuth(): that would
+				// push every free Zen model into /model cycling and subagent discovery for
+				// users who never set up OpenCode.
 				apiKey = opencodePublicApiKey(model);
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
