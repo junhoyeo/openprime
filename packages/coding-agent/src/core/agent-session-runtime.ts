@@ -7,7 +7,7 @@ import type {
 	AgentSessionRuntimeDiagnostic,
 	AgentSessionServices,
 } from "./agent-session-services.js";
-import { flushAgentTraceUpload } from "./agent-traces.js";
+import { flushAgentTraceUpload, logDetachedAgentTraceFlushFailure } from "./agent-traces.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
@@ -20,24 +20,11 @@ import { SessionManager } from "./session-manager.js";
 
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
 
-/**
- * Result returned by runtime creation.
- *
- * The caller gets the created session, its cwd-bound services, and all
- * diagnostics collected during setup.
- */
 export interface CreateAgentSessionRuntimeResult extends CreateAgentSessionResult {
 	services: AgentSessionServices;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
-/**
- * Creates a full runtime for a target cwd and session manager.
- *
- * The factory closes over process-global fixed inputs, recreates cwd-bound
- * services for the effective cwd, resolves session options against those
- * services, and finally creates the AgentSession.
- */
 export type CreateAgentSessionRuntimeFactory = (options: {
 	cwd: string;
 	agentDir: string;
@@ -57,10 +44,8 @@ export interface AgentSessionRuntimeMetadata {
 	parentSessionFile?: string;
 	rlmChildId?: string;
 	rlmParentNodeId?: string;
-	/** Runtime restored from an already-persisted completed registry entry. */
 	rehydratedCompleted?: boolean;
 	prompt?: string;
-	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;
 	sessionDir?: string;
 }
@@ -76,13 +61,11 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 		.join("");
 }
 
-/**
- * Owns the current AgentSession plus its cwd-bound services.
- *
- * Session replacement methods tear down the current runtime first, then create
- * and apply the next runtime. If creation fails, the error is propagated to the
- * caller. The caller is responsible for user-facing error handling.
- */
+export interface AgentSessionRuntimeDisposeOptions {
+	/** Set false when the session's artifact dir is deleted right after disposal (default true). */
+	kernelSnapshot?: boolean;
+}
+
 export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
 	private readonly sessionReplacedListeners = new Set<(session: AgentSession) => void | Promise<void>>();
@@ -221,7 +204,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			reason,
 			targetSessionFile,
 		});
-		await flushAgentTraceUpload(this.session.sessionManager).catch(() => undefined);
+		this.detachTraceFlush();
 		this.beforeSessionInvalidate?.();
 		// Await the kernel's final snapshot flush before invalidating the session.
 		await this.session.disposeAsync();
@@ -703,7 +686,14 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return { cancelled: false };
 	}
 
-	private async disposeOnce(): Promise<void> {
+	private detachTraceFlush(): void {
+		const sessionManager = this.session.sessionManager;
+		void flushAgentTraceUpload(sessionManager).catch((error) =>
+			logDetachedAgentTraceFlushFailure(sessionManager.getSessionFile(), error),
+		);
+	}
+
+	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {
 		let disposeError: unknown;
 		try {
 			await emitSessionShutdownEvent(this.session.extensionRunner, {
@@ -713,11 +703,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		} catch (error) {
 			disposeError ??= error;
 		}
-		try {
-			await flushAgentTraceUpload(this.session.sessionManager);
-		} catch (error) {
-			disposeError ??= error;
-		}
+		this.detachTraceFlush();
 		try {
 			this.beforeSessionInvalidate?.();
 		} catch (error) {
@@ -725,7 +711,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		try {
 			// Await the kernel's final snapshot flush before tearing the session down.
-			await this.session.disposeAsync();
+			await this.session.disposeAsync({ kernelSnapshot: options.kernelSnapshot ?? true });
 		} catch (error) {
 			disposeError ??= error;
 		}
@@ -743,20 +729,14 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 	}
 
-	async dispose(): Promise<void> {
+	async dispose(options?: AgentSessionRuntimeDisposeOptions): Promise<void> {
 		if (!this.disposePromise) {
-			this.disposePromise = this.disposeOnce();
+			this.disposePromise = this.disposeOnce(options ?? {});
 		}
 		await this.disposePromise;
 	}
 }
 
-/**
- * Create the initial runtime from a runtime factory and initial session target.
- *
- * The same factory is stored on the returned AgentSessionRuntime and reused for
- * later /new, resume, /fork, and import flows.
- */
 export async function createAgentSessionRuntime(
 	createRuntime: CreateAgentSessionRuntimeFactory,
 	options: {

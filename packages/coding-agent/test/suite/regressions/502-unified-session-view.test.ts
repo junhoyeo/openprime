@@ -2,6 +2,7 @@ import stripAnsi from "strip-ansi";
 import { describe, expect, test, vi } from "vitest";
 import { AgentsViewMode } from "../../../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 import { createDeferred as deferred } from "../scheduling.js";
 
 function summary(id: string): SessionSummary {
@@ -50,18 +51,18 @@ function refreshHarness() {
 		reconnectPromise: undefined,
 		daemonShutdownReceived: false,
 		options: {},
-		liveCatalogGeneration: 0,
 		savedCatalogGeneration: 0,
 		heartbeatCatalogGeneration: 0,
-		liveCatalogRefreshPending: false,
 		savedCatalogRefreshPending: false,
 		heartbeats: [] as unknown[],
+		savedSearchFetchStarted: false,
 		persistentState,
 		applySessionList,
 		reconcileCatalogs,
 		resolveMissingSelectionAnchor: vi.fn(),
 		setStatusMessage: vi.fn(),
 		startClientReconnect: vi.fn(),
+		rearmSavedSearchFetch: privateMethod<(this: unknown) => void>("rearmSavedSearchFetch"),
 	};
 }
 
@@ -74,41 +75,29 @@ function privateMethod<T>(name: string): T {
 }
 
 describe("#502 unified session view regressions", () => {
-	test.each(["live", "heartbeat"] as const)(
-		"an older overlapping %s poll cannot overwrite the newer response",
-		async (kind) => {
-			const old = deferred<unknown>();
-			const newer = kind === "live" ? summary("new") : { job: { id: "new" } };
-			const client = {
-				isConnected: true,
-				hello: { protocol: { version: 3 } },
-				supportsServerCapability: () => true,
-				request: vi
-					.fn()
-					.mockReturnValueOnce(old.promise)
-					.mockResolvedValueOnce({
-						success: true,
-						data: kind === "live" ? { sessions: [newer] } : { heartbeats: [newer] },
-					}),
-			};
-			const harness = { ...refreshHarness(), requireClient: () => client };
-			const refresh = privateMethod<(this: typeof harness) => Promise<unknown>>(
-				kind === "live" ? "refreshSessions" : "refreshHeartbeats",
-			);
+	test("an older overlapping heartbeat poll cannot overwrite the newer response", async () => {
+		const old = deferred<unknown>();
+		const newer = { job: { id: "new" } };
+		const client = {
+			isConnected: true,
+			hello: { protocol: { version: 3 } },
+			supportsServerCapability: () => true,
+			request: vi
+				.fn()
+				.mockReturnValueOnce(old.promise)
+				.mockResolvedValueOnce({ success: true, data: { heartbeats: [newer] } }),
+		};
+		const harness = { ...refreshHarness(), requireClient: () => client };
+		const refresh = privateMethod<(this: typeof harness) => Promise<unknown>>("refreshHeartbeats");
 
-			const oldPoll = refresh.call(harness);
-			await refresh.call(harness);
-			old.resolve({
-				success: true,
-				data: kind === "live" ? { sessions: [summary("old")] } : { heartbeats: [{ job: { id: "old" } }] },
-			});
-			await oldPoll;
+		const oldPoll = refresh.call(harness);
+		await refresh.call(harness);
+		old.resolve({ success: true, data: { heartbeats: [{ job: { id: "old" } }] } });
+		await oldPoll;
 
-			if (kind === "live") expect(harness.applySessionList).toHaveBeenCalledWith([newer], true);
-			else expect(harness.heartbeats).toEqual([newer]);
-			expect(kind === "live" ? harness.applySessionList : harness.reconcileCatalogs).toHaveBeenCalledOnce();
-		},
-	);
+		expect(harness.heartbeats).toEqual([newer]);
+		expect(harness.reconcileCatalogs).toHaveBeenCalledOnce();
+	});
 
 	test("overlapping saved scans retain the last complete catalog after the newest scan fails", async () => {
 		const previous = [savedSession("previous")];
@@ -248,8 +237,10 @@ describe("#502 unified session view regressions", () => {
 				client,
 				options: { reconnectTimeoutMs: 10_000 },
 				requireClient: () => client,
+				rosterStore: { attach: vi.fn(async () => true), summaries: () => [summary("live")] },
 				refreshSavedSessions: vi.fn(async () => true),
 				refreshHeartbeats: vi.fn(async (_options?: { duringReconnect?: boolean }) => false),
+				armSavedSearchFetch: vi.fn(),
 				reconnectClient: vi.fn(async (_reconnectingClient: typeof client, _error: unknown) => {}),
 			};
 			const refreshHeartbeats =
@@ -282,6 +273,8 @@ describe("#502 unified session view regressions", () => {
 			expect(client.reconnect).toHaveBeenCalledTimes(2);
 			expect(harness.applySessionList).toHaveBeenCalledWith([summary("live")], true);
 			expect(harness.heartbeats).toEqual([{ job: { id: "healthy" } }]);
+			// A query that outlived the outage re-fetches the saved catalog through the one arm predicate.
+			expect(harness.armSavedSearchFetch).toHaveBeenCalledWith({ duringReconnect: true });
 			expect(harness.reconnectPromise).toBeUndefined();
 		} finally {
 			vi.useRealTimers();
@@ -316,7 +309,6 @@ describe("#502 unified session view regressions", () => {
 		const fallback = summary("fallback");
 		const harness = {
 			selectionAnchorPending: true,
-			liveCatalogRefreshPending: false,
 			savedCatalogRefreshPending: true,
 			selectedIndex: 0,
 			selectedActiveSessionId: undefined as string | undefined,
@@ -347,7 +339,7 @@ describe("#502 unified session view regressions", () => {
 			rows: [],
 			exitRenameMode: vi.fn(),
 			setStatusMessage: vi.fn(),
-			refreshBothCatalogs: vi.fn(async () => true),
+			refreshSessions: vi.fn(async () => true),
 			requireClient: () => ({ request }),
 			renameSession: Reflect.get(AgentsViewMode.prototype, "renameSession"),
 		};
@@ -376,22 +368,6 @@ describe("#502 unified session view regressions", () => {
 				"withPendingDeleteSession",
 			).call(harness, []),
 		).toEqual([]);
-	});
-
-	test("slow live polls are coalesced instead of repeatedly superseded", async () => {
-		const slow = deferred<boolean>();
-		const refreshSessions = vi.fn(() => slow.promise);
-		const harness = { liveCatalogPollPromise: undefined, refreshSessions };
-		const poll = privateMethod<(this: typeof harness) => void>("pollSessions");
-
-		poll.call(harness);
-		poll.call(harness);
-		expect(refreshSessions).toHaveBeenCalledOnce();
-		slow.resolve(true);
-		await slow.promise;
-		await Promise.resolve();
-		poll.call(harness);
-		expect(refreshSessions).toHaveBeenCalledTimes(2);
 	});
 
 	test.each([
@@ -469,5 +445,69 @@ describe("#502 unified session view regressions", () => {
 			),
 		);
 		expect(rendered).toMatch(/123456 · 2h\s*$/);
+	});
+
+	test("scoped subagent rows keep model and effort ahead of summaries", () => {
+		initTheme("dark");
+		const subagent = {
+			// Direct children in a scoped Agents View render as agent rows while
+			// retaining their persisted subagent runtime kind.
+			kind: "agent" as const,
+			section: "idle" as const,
+			summary: {
+				...summary("effort-child"),
+				runtimeKind: "subagent" as const,
+				summary: "Investigate a variable background status that can be truncated",
+				model: { provider: "prime-inference", id: "gpt-5.6-terra" } as SessionSummary["model"],
+				thinkingLevel: "high" as SessionSummary["thinkingLevel"],
+			} as SessionSummary,
+			title: "Inspect agents view",
+			subtitle: "",
+			statusLabel: "idle",
+			depth: 1,
+			selectable: true,
+			runningSubagentCount: 0,
+			identity: "effort-child",
+			parentIdentity: "parent",
+		};
+		const harness = {
+			rows: [subagent],
+			selectedIndex: -1,
+			isPendingDeleteRow: () => false,
+			isPendingKillSubagentRow: () => false,
+			getRowIcon: () => "·",
+			formatRowIcon: (_section: string, icon: string) => icon,
+		};
+		const render = (width: number) =>
+			stripAnsi(
+				privateMethod<(this: typeof harness, row: typeof subagent, width: number) => string>("renderRow").call(
+					harness,
+					subagent,
+					width,
+				),
+			);
+
+		const full = render(120);
+		expect(full).toContain(
+			"Inspect agents view · prime-inference/gpt-5.6-terra:high · Investigate a variable background status",
+		);
+		const narrow = render(75);
+		expect(narrow).toContain("prime-inference/gpt-5.6-terra:high");
+		expect(narrow).not.toContain("Investigate a variable background status");
+
+		subagent.summary.summary = "";
+		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra:high");
+
+		// Older daemons identify subagents through persisted linkage instead of runtimeKind.
+		subagent.summary.runtimeKind = undefined;
+		subagent.summary.rlmChildId = "effort-child";
+		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra:high");
+
+		subagent.summary.thinkingLevel = "off";
+		subagent.summary.summary = "A later summary";
+		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra · A later summary");
+		expect(render(100)).not.toContain(":off");
+
+		expect(render(20)).toHaveLength(20);
 	});
 });

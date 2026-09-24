@@ -11,7 +11,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../core/session-lease.js";
-import { defaultDaemonSocketDir, defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
+import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -100,8 +100,7 @@ export interface AcquireDaemonUpdateRestartCoordinatorOptions {
 }
 
 export function resolveDaemonUpdateRestartSocketPath(socketPath?: string): string {
-	const selectedSocketPath = socketPath ?? defaultDaemonSocketPath();
-	return process.platform === "win32" ? selectedSocketPath : resolve(selectedSocketPath);
+	return normalizeSocketPath(socketPath ?? defaultDaemonSocketPath());
 }
 
 const TERMINAL_PHASES: ReadonlySet<DaemonUpdateRestartPhase> = new Set(["complete", "skipped", "failed"]);
@@ -158,8 +157,7 @@ function statusLivenessId(status: DaemonUpdateRestartStatus): string {
 }
 
 function socketKey(socketPath: string): string {
-	const normalized = process.platform === "win32" ? socketPath.toLowerCase() : resolve(socketPath);
-	return createHash("sha256").update(normalized).digest("hex");
+	return createHash("sha256").update(normalizeSocketPath(socketPath)).digest("hex");
 }
 
 function writeJsonAtomically(path: string, value: unknown): void {
@@ -331,11 +329,18 @@ function coordinatorRecordPath(registryDir: string, socketPath: string): string 
 
 async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () => T | Promise<T>): Promise<T> {
 	mkdirSync(registryDir, { recursive: true, mode: 0o700 });
+	let compromisedError: Error | undefined;
+	const assertGuardHeld = () => {
+		if (compromisedError) throw new Error(`Coordinator registry guard was compromised: ${compromisedError.message}`);
+	};
 	const release = await lockfile.lock(registryDir, {
 		realpath: false,
 		lockfilePath: resolve(registryDir, ".guard"),
 		stale: COORDINATOR_REGISTRY_LOCK_STALE_MS,
 		update: COORDINATOR_REGISTRY_LOCK_UPDATE_MS,
+		onCompromised: (error) => {
+			compromisedError ??= error;
+		},
 		retries: {
 			retries: COORDINATOR_REGISTRY_LOCK_RETRIES,
 			factor: 1,
@@ -344,9 +349,13 @@ async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () =
 		},
 	});
 	try {
-		return await action();
+		assertGuardHeld();
+		const result = await action();
+		assertGuardHeld();
+		return result;
 	} finally {
-		await release();
+		if (compromisedError) await release().catch(() => undefined);
+		else await release();
 	}
 }
 

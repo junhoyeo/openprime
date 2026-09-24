@@ -1,6 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - 2026-09-01
+
+- Add an optional `transform` hook to `Markdown` so callers can rewrite markdown with the exact content width before rendering.
+
+## [0.8.0] - 2026-08-21
+
+## [0.7.4] - 2026-08-19
+
+## [0.7.3] - 2026-08-17
+
+- Fixed hyperlinks not being clickable in fullscreen mode on terminals that gate native link handling while mouse reporting is active (e.g. Ghostty); left-clicking a link now opens it directly.
 
 ## [0.7.2] - 2026-08-11
 

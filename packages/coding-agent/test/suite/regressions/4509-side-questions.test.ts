@@ -1587,6 +1587,7 @@ describe("ENG-4509 side questions", () => {
 			isAgentCompacting: () => false,
 			isBashRunning: () => true,
 			applyConnectionStateSnapshot: vi.fn(),
+			refreshQueueSelectionFromState: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
@@ -1595,7 +1596,7 @@ describe("ENG-4509 side questions", () => {
 			})),
 			renderSessionContext: vi.fn(async () => {}),
 			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
-			refreshConnectionQueue: vi.fn(async () => {}),
+			updatePendingMessagesDisplay: vi.fn(),
 			flushCompactionQueue: vi.fn(async () => {}),
 			flushPendingBashComponents: vi.fn(),
 			updateTerminalTitle: vi.fn(),
@@ -1621,6 +1622,7 @@ describe("ENG-4509 side questions", () => {
 			messages: [],
 		});
 
+		expect(fakeThis.updatePendingMessagesDisplay).toHaveBeenCalledOnce();
 		expect(bashComponent.setComplete).toHaveBeenCalledWith(undefined, false);
 		expect(finishBash).toHaveBeenCalledOnce();
 		expect(fakeThis.activeBashComponent).toBeUndefined();
