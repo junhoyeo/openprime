@@ -15,6 +15,17 @@ import { PRIME_INFERENCE_BASE_URL } from "./prime-inference-model-catalog.js";
 import { parseProviderModelCatalog } from "./provider-model-catalog.js";
 
 const installedModels = getProviders().flatMap((provider) => getModels(provider) as Model<Api>[]);
+
+/** Compiled models this fork ships that upstream's catalogs omit; kept alongside them, catalog entry wins. */
+export const FORK_BUNDLED_EXTRA_MODELS: ReadonlySet<string> = new Set(["opencode/union-alpha"]);
+
+export function forkExtraInstalledModels(listed: readonly Model<Api>[]): Model<Api>[] {
+	const present = new Set(listed.map((model) => `${model.provider}/${model.id}`));
+	return installedModels.filter((model) => {
+		const key = `${model.provider}/${model.id}`;
+		return FORK_BUNDLED_EXTRA_MODELS.has(key) && !present.has(key);
+	});
+}
 const PACKAGED_MODEL_CATALOG_FILE = "models.bundled.json";
 const bundledModelsByAsset = new Map<string, Model<Api>[]>();
 
@@ -47,6 +58,9 @@ function loadBundledModels(_source: boolean, assetPath: string): Model<Api>[] {
 		const catalog = createBundledModelCatalog(JSON.parse(readFileSync(assetPath, "utf8")));
 		return [
 			...parseProviderModelCatalog(catalog, installedModels),
+			// Fork-only compiled entries the packaged/remote catalogs do not list
+			// (e.g. OpenCode Zen stealth models) stay available.
+			...forkExtraInstalledModels(catalog.models),
 			...catalog.models.filter(
 				(model) =>
 					model.provider === "prime-inference" &&

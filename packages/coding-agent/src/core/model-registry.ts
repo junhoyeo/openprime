@@ -32,7 +32,7 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
-import { getBundledModels } from "./bundled-model-catalog.js";
+import { forkExtraInstalledModels, getBundledModels } from "./bundled-model-catalog.js";
 import { refreshDefaultModelCatalog } from "./default-model-catalog.js";
 import { CATALOG_REFRESH_INTERVAL_MS, CatalogCache, isCatalogOffline } from "./model-catalog-cache.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
@@ -49,9 +49,6 @@ import {
 } from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
 import { PROVIDER_MODEL_CATALOG_URL, parseProviderModelCatalog } from "./provider-model-catalog.js";
-
-/** Fork-bundled models kept even when the remote provider catalog omits them. */
-const FORK_BUNDLED_EXTRA_MODELS = new Set(["opencode/union-alpha"]);
 
 import {
 	resolveConfigValueOrThrow,
@@ -584,12 +581,7 @@ export class ModelRegistry {
 	 * provider/id wins.
 	 */
 	private bundledForkExtraModels(remote: readonly Model<Api>[]): Model<Api>[] {
-		const listed = new Set(remote.map((model) => `${model.provider}/${model.id}`));
-		return this.bundledCatalogModels.filter(
-			(model) =>
-				FORK_BUNDLED_EXTRA_MODELS.has(`${model.provider}/${model.id}`) &&
-				!listed.has(`${model.provider}/${model.id}`),
-		);
+		return forkExtraInstalledModels(remote);
 	}
 
 	/**
