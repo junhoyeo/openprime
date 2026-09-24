@@ -31,6 +31,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
+import { applyOpencodeZenHeaders, opencodePublicApiKey } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	classifyStreamFailure,
@@ -485,7 +486,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				client = options.client;
 				isOAuth = false;
 			} else {
-				const apiKey = options?.apiKey ?? getEnvApiKey(model.provider) ?? "";
+				const apiKey = opencodePublicApiKey(model, options?.apiKey ?? getEnvApiKey(model.provider)) ?? "";
 
 				let copilotDynamicHeaders: Record<string, string> | undefined;
 				if (model.provider === "github-copilot") {
@@ -800,7 +801,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = opencodePublicApiKey(model, options?.apiKey || getEnvApiKey(model.provider));
 	if (!apiKey) {
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
@@ -925,6 +926,11 @@ function createClient(
 		return { client, isOAuthToken: true };
 	}
 
+	const defaultHeaders =
+		model.provider === "opencode" || model.provider === "opencode-go"
+			? applyOpencodeZenHeaders({ ...model.headers, ...optionsHeaders })
+			: undefined;
+
 	const client = new Anthropic({
 		apiKey,
 		baseURL: model.baseUrl,
@@ -937,6 +943,7 @@ function createClient(
 			},
 			model.headers,
 			optionsHeaders,
+			defaultHeaders,
 		),
 	});
 

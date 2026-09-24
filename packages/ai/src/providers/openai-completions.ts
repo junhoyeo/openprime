@@ -34,6 +34,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
+import { applyOpencodeZenHeaders, opencodePublicApiKey } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -163,7 +164,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 		};
 
 		try {
-			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
+			const apiKey = opencodePublicApiKey(model, options?.apiKey || getEnvApiKey(model.provider)) || "";
 			const compat = getCompat(model);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 			const cacheControl = getCompatCacheControl(compat, cacheRetention);
@@ -489,7 +490,7 @@ export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions",
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = opencodePublicApiKey(model, options?.apiKey || getEnvApiKey(model.provider));
 	if (!apiKey) {
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
@@ -518,15 +519,22 @@ function createClient(
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
 ) {
 	if (!apiKey) {
-		if (!process.env.OPENAI_API_KEY) {
+		const publicKey = opencodePublicApiKey(model);
+		if (publicKey) {
+			apiKey = publicKey;
+		} else if (!process.env.OPENAI_API_KEY) {
 			throw new Error(
 				"OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it as an argument.",
 			);
+		} else {
+			apiKey = process.env.OPENAI_API_KEY;
 		}
-		apiKey = process.env.OPENAI_API_KEY;
 	}
 
-	const headers = { ...model.headers };
+	const headers =
+		model.provider === "opencode" || model.provider === "opencode-go"
+			? applyOpencodeZenHeaders({ ...model.headers })
+			: { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
