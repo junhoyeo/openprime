@@ -269,6 +269,24 @@ describe("builtin skills", () => {
 			expect(edit?.kind === "python" && edit.python.importName).toBe("edit");
 		});
 
+		it("ships the agent-sessions skill as a python skill importable as `agent_sessions`", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const agentSessions = skills.find((s) => s.name === "agent-sessions");
+			expect(agentSessions).toBeDefined();
+			expect(agentSessions?.kind).toBe("python");
+			expect(agentSessions?.kind === "python" && agentSessions.python.importName).toBe("agent_sessions");
+		});
+
+		it("ships the aside skill as a python skill importable as `aside`", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const aside = skills.find((s) => s.name === "aside");
+			expect(aside).toBeDefined();
+			expect(aside?.kind).toBe("python");
+			expect(aside?.kind === "python" && aside.python.importName).toBe("aside");
+		});
+
 		it("loads the skill-creator python template as a valid python skill", () => {
 			const referencePath = join(getBundledSkillsDir(), "skill-creator", "references", "python-skills.md");
 			const reference = readFileSync(referencePath, "utf-8");
