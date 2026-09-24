@@ -1,0 +1,1 @@
+- Bundled `aside` (Aside Browser automation) and `agent-sessions` (cross-harness coding-agent transcript search) as built-in Python skills, loaded by default with no registry changes.
