@@ -74,6 +74,11 @@ const KIMI_STATIC_HEADERS = {
 	"User-Agent": "KimiCLI/1.5",
 } as const;
 
+const OPENCODE_STATIC_HEADERS = {
+	"User-Agent": "opencode/1.18.31",
+	"x-opencode-client": "cli",
+} as const;
+
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
@@ -1346,6 +1351,12 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					}
 				}
 
+				const cost = {
+					input: m.cost?.input || 0,
+					output: m.cost?.output || 0,
+					cacheRead: m.cost?.cache_read || 0,
+					cacheWrite: m.cost?.cache_write || 0,
+				};
 				models.push({
 					id: modelId,
 					name: m.name || modelId,
@@ -1354,12 +1365,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl,
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost,
+					...(cost.input === 0 ? { headers: { ...OPENCODE_STATIC_HEADERS } } : {}),
 					...(compat ? { compat } : {}),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -1893,6 +1900,27 @@ async function generateModels() {
 			},
 			contextWindow: 1050000,
 			maxTokens: 128000,
+		});
+	}
+
+	if (!allModels.some((m) => m.provider === "opencode" && m.id === "union-alpha")) {
+		allModels.push({
+			id: "union-alpha",
+			name: "Union Alpha Free",
+			api: "anthropic-messages",
+			provider: "opencode",
+			baseUrl: "https://opencode.ai/zen",
+			headers: { ...OPENCODE_STATIC_HEADERS },
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 262144,
+			maxTokens: 131072,
 		});
 	}
 

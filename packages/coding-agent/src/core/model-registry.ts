@@ -16,6 +16,7 @@ import {
 	type OAuthProviderInterface,
 	type OpenAICompletionsCompat,
 	type OpenAIResponsesCompat,
+	opencodePublicApiKey,
 	registerApiProvider,
 	resetApiProviders,
 	type SimpleStreamOptions,
@@ -1312,6 +1313,14 @@ export class ModelRegistry {
 					apiKey = resolvedApiKey;
 					authSourceToken = this.getProviderRequestAuthSourceToken(model.provider, providerRequestAuthSource);
 				}
+			}
+			if (apiKey === undefined) {
+				// Zero-cost OpenCode Zen models accept OpenCode's own `public` key, so an
+				// explicit `--model opencode/<id>` works without a stored credential. They are
+				// deliberately NOT reported as configured by hasConfiguredAuth(): that would
+				// push every free Zen model into /model cycling and subagent discovery for
+				// users who never set up OpenCode.
+				apiKey = opencodePublicApiKey(model);
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
 

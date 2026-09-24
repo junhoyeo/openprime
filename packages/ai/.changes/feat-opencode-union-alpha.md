@@ -1,0 +1,1 @@
+- Added the OpenCode Zen `union-alpha` (Union Alpha Free) stealth coding model: free, 262K context, 131K max output, text and image input, routed through the Anthropic Messages API. Zero-cost Zen models are selectable without `OPENCODE_API_KEY` and send the OpenCode CLI client headers (`User-Agent: opencode/1.18.31`, `x-opencode-client: cli`) plus `apiKey: "public"`.
