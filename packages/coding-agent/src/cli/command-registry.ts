@@ -1,4 +1,5 @@
 import { APP_NAME } from "../config.js";
+import { findSlashCommandSuggestion } from "../core/slash-commands.js";
 
 export interface CommandSpec {
 	path: readonly string[];
@@ -24,6 +25,12 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		path: ["list"],
 		usage: "list [--all] [--json]",
 		summary: "List agents",
+		options: ["-a, --all  Include saved agents", "--json      Print JSON"],
+	},
+	{
+		path: ["sessions"],
+		usage: "sessions [--all] [--json]",
+		summary: "Show agent status, activity, and usage",
 		options: ["-a, --all  Include saved agents", "--json      Print JSON"],
 	},
 	{
@@ -84,6 +91,19 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		usage: "doctor [--fix] [--json]",
 		summary: "Inspect and safely clean up background services",
 		options: ["--fix   Remove stale sockets and stop idle orphaned services", "--json  Print JSON"],
+	},
+	{
+		path: ["incident"],
+		usage: "incident [--since <time>] [--until <time>] [--session <id>]",
+		summary: "Reconstruct a daemon incident from its logs",
+		description:
+			"Summarizes the daemon logs for a time window into an operator timeline: supervisor and worker events, session anomalies, and recovery actions. Times without a timezone are read as UTC, matching the log; the default window is the last 24 hours.",
+		options: [
+			"--since <time>  Window start (ISO date/time, date, or HH:MM today; default: 24h ago)",
+			"--until <time>  Window end (default: now)",
+			"--session <id>  Only events naming this session id, worker id, or session name (prefix match)",
+		],
+		examples: ['incident --since "2026-09-16T20:02" --until "2026-09-16T20:21"', "incident --session 2339fb7da605"],
 	},
 	{
 		path: ["shutdown"],
@@ -148,8 +168,14 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["update"],
-		usage: "update [--force]",
+		usage: "update [--force] [--rollback] [--nightly|--stable]",
 		summary: "Update Prime Agent",
+		options: [
+			"--force     Reinstall even if the current version is the latest on the channel",
+			"--rollback  Restore the previous compiled release",
+			"--nightly   Switch updates to the nightly channel (unreleased builds, may be broken)",
+			"--stable    Return updates to the stable channel",
+		],
 	},
 	{
 		path: ["model"],
@@ -295,17 +321,7 @@ export function isHelpCommandRequest(path: readonly string[]): boolean {
 }
 
 export function findCommandSuggestion(input: string, candidates: readonly string[]): string | undefined {
-	let closest: { candidate: string; distance: number } | undefined;
-	for (const candidate of candidates) {
-		const distance = editDistance(input, candidate);
-		if (!closest || distance < closest.distance) {
-			closest = { candidate, distance };
-		}
-	}
-	if (!closest || closest.distance > Math.max(2, Math.floor(input.length / 3))) {
-		return undefined;
-	}
-	return closest.candidate;
+	return findSlashCommandSuggestion(input, candidates);
 }
 
 export function formatTopLevelHelp(): string {
@@ -357,22 +373,4 @@ export function formatCommandHelp(path: readonly string[]): string | undefined {
 		sections.push("", "Examples:", ...spec.examples.map((example) => `  ${APP_NAME} ${example}`));
 	}
 	return sections.join("\n");
-}
-
-function editDistance(left: string, right: string): number {
-	const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-	for (let leftIndex = 1; leftIndex <= left.length; leftIndex++) {
-		let diagonal = previous[0]!;
-		previous[0] = leftIndex;
-		for (let rightIndex = 1; rightIndex <= right.length; rightIndex++) {
-			const above = previous[rightIndex]!;
-			previous[rightIndex] = Math.min(
-				previous[rightIndex]! + 1,
-				previous[rightIndex - 1]! + 1,
-				diagonal + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1),
-			);
-			diagonal = above;
-		}
-	}
-	return previous[right.length]!;
 }

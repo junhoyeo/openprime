@@ -1,7 +1,6 @@
-import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { constants, type Dirent, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { access, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
+import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -9,8 +8,8 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
-import { isOrphanProcessIdentityCurrent } from "../orphan-process-journal.js";
-import { compareProcessStartIds, getProcessStartId } from "../session-lease.js";
+import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
+import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
 const BOOTSTRAP_SCHEMA = 9;
@@ -36,7 +35,51 @@ const DEFAULT_RLM_EXTRA_PACKAGES = [
 export const DEFAULT_RLM_EXTRA_UV_ARGS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.uvArg);
 export const DEFAULT_RLM_EXTRA_IMPORT_NAMES = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.importName);
 export const DEFAULT_RLM_EXTRA_IMPORT_LABELS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.promptLabel);
+const WINDOWS_PATHEXT_DEFAULT = [".COM", ".EXE", ".BAT", ".CMD"];
+const WINDOWS_SUPPORTED_EXECUTABLE_EXTENSIONS = new Set(
+	WINDOWS_PATHEXT_DEFAULT.map((extension) => extension.toLowerCase()),
+);
+
+export interface BatchShimInvocation {
+	args: string[];
+	env: NodeJS.ProcessEnv;
+}
+
+/** Build a cmd.exe invocation without embedding user-controlled values in its command string. */
+export function buildBatchShimInvocation(
+	command: string,
+	args: readonly string[],
+	baseEnv: NodeJS.ProcessEnv,
+	token = randomUUID().replaceAll("-", ""),
+): BatchShimInvocation {
+	if (!/^[A-Za-z0-9_]+$/.test(token)) {
+		throw new Error("Windows batch shim token contains unsupported characters");
+	}
+	const values = [command, ...args];
+	if (values.some((value) => /["\0\r\n]/.test(value))) {
+		throw new Error("Windows batch shim paths and arguments cannot contain quotes, NUL, or line breaks");
+	}
+	const env = { ...baseEnv };
+	const variables = values.map((value, index) => {
+		const name = `PRIME_AGENT_BATCH_${token}_${index}`;
+		env[name] = value;
+		return `"%${name}%"`;
+	});
+	return {
+		args: ["/d", "/v:off", "/s", "/c", `"${variables.join(" ")}"`],
+		env,
+	};
+}
+
 const UV_INSTALL_COMMAND = "curl -LsSf https://astral.sh/uv/install.sh | sh";
+/** MCP discovery surface the kernel runtime must expose for /plugins work. */
+const REQUIRED_MCP_DISCOVERY_METHODS = [
+	"list_plugins",
+	"search_plugins",
+	"list_connections",
+	"search_tools",
+	"describe_tool",
+];
 const REQUIRED_HARNESS_METHODS = [
 	"create_memory",
 	"update_memory",
@@ -52,23 +95,18 @@ const REQUIRED_HARNESS_METHODS = [
 	"delete_prompt_note",
 	"record_refinement",
 ];
-const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
+export const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert all(callable(getattr(mcp, _m, None)) for _m in ${JSON.stringify(REQUIRED_MCP_DISCOVERY_METHODS)}), "rlm.mcp is missing MCP discovery methods (list_plugins, search_plugins, list_connections, search_tools, describe_tool); the kernel venv needs a current prime-agent-runtime"; assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
+const BOOTSTRAP_VERSION_TMP_FILE = `${BOOTSTRAP_VERSION_FILE}.tmp`;
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
+// Bounded retry for the atomic marker swap: replacing an existing marker can
+// fail while a scanner or editor holds the file open.
+const BOOTSTRAP_MARKER_SWAP_ATTEMPTS = 3;
+const BOOTSTRAP_MARKER_SWAP_RETRY_MS = 50;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
-const BOOTSTRAP_STDERR_MAX_CHARS = 2_000;
-const BOOTSTRAP_STDERR_MAX_LINES = 20;
-const BOOTSTRAP_STDERR_BUFFER_CHARS = 8_000;
-const KERNEL_VENV_IDENTITY_CHARS = 20;
-const KERNEL_VENV_GENERATION_PREFIX = "generation-";
-const MAX_RETAINED_INACTIVE_KERNEL_GENERATIONS = 1;
-const KERNEL_GENERATION_LEASE_DIR = ".leases";
-const KERNEL_GENERATION_PUBLISHED_FILE = ".generation-published";
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
-const hostGenerationLeasePaths = new Set<string>();
-let hostGenerationLeaseCleanupInstalled = false;
 
 export type KernelPythonSkill = PythonSkillRuntimeInfo;
 export type KernelBootstrapProgressHandler = (message: string) => void;
@@ -91,22 +129,10 @@ interface BootstrapVersion {
 	snapshot?: string;
 	extraUvArgs?: string[];
 	pythonSkills?: BootstrapPythonSkill[];
-	requestedPythonSkills?: BootstrapPythonSkill[];
-}
-
-interface KernelGenerationLease {
-	version: 1;
-	pid: number;
-	processStartId: string;
-	updatedAt: string;
 }
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function isNodeError(error: unknown, code: string): boolean {
-	return error instanceof Error && "code" in error && error.code === code;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -145,12 +171,16 @@ function fileContentHash(filePath: string): string {
 	}
 }
 
+function pythonSkillKey(skill: Pick<BootstrapPythonSkill, "importName" | "packagePath">): string {
+	return `${skill.importName}\0${skill.packagePath}`;
+}
+
 function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | undefined): BootstrapPythonSkill[] {
 	const byKey = new Map<string, BootstrapPythonSkill>();
 	const addSkill = (skill: Pick<KernelPythonSkill, "importName" | "packagePath" | "pyprojectPath">): void => {
 		const packagePath = path.resolve(skill.packagePath);
 		const pyprojectPath = path.resolve(skill.pyprojectPath);
-		const key = `${skill.importName}\0${packagePath}`;
+		const key = pythonSkillKey({ importName: skill.importName, packagePath });
 		if (byKey.has(key)) {
 			return;
 		}
@@ -348,7 +378,6 @@ function ensureKernelPythonKey(pythonSkills: readonly BootstrapPythonSkill[]): s
 	return [
 		process.env.PRIME_AGENT_KERNEL_PYTHON ?? "",
 		process.env.PRIME_AGENT_KERNEL_VENV ?? "",
-		process.env.PRIME_AGENT_KERNEL_VENV_ROOT ?? "",
 		process.env.HOME ?? "",
 		process.env.XDG_DATA_HOME ?? "",
 		JSON.stringify(pythonSkills),
@@ -390,63 +419,28 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 	}
 }
 
-function sanitizeBootstrapDiagnostic(value: string): string {
-	return value
-		.replace(/\b(Authorization\s*:\s*)(Basic|Bearer|Token)\s+\S+/gi, "$1$2 [redacted]")
-		.replace(/\b(Bearer|Token)[ \t]+\S+/gi, "$1 [redacted]")
-		.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@")
-		.replace(
-			/([?&](?:(?:access|refresh|id)[_-]?token|client[_-]?secret|api[_-]?key|password|secret|token)=)[^&\s]+/gi,
-			"$1[redacted]",
-		)
-		.replace(
-			/\b((?:(?:access|refresh|id)[_-]?token|client[_-]?secret|api[_-]?key|password|secret|token)\s*[=:]\s*)\S+/gi,
-			"$1[redacted]",
-		);
-}
-
-function boundedStderrTail(value: string, leadingTokenMayBeTruncated = false): string {
-	// Sanitize while the authorization marker and URL userinfo are still present;
-	// truncating the raw tail first can retain a token after discarding its marker.
-	let sanitized = sanitizeBootstrapDiagnostic(value);
-	if (leadingTokenMayBeTruncated) sanitized = sanitized.replace(/^\S+/, "[redacted]");
-	const lines = sanitized.trimEnd().split(/\r?\n/).slice(-BOOTSTRAP_STDERR_MAX_LINES);
-	return lines.join("\n").slice(-BOOTSTRAP_STDERR_MAX_CHARS);
+function isBatchShim(command: string): boolean {
+	return process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
 }
 
 function run(command: string, args: string[], options: { stdio?: "ignore" | "inherit" } = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const stdio = options.stdio ?? "pipe";
-		const child = spawn(command, args, {
-			env: process.env,
-			stdio,
+		// CPython must read UTF-8 .pth files even under a Windows legacy code page.
+		const env = { ...process.env, ...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}) };
+		const batch = isBatchShim(command) ? buildBatchShimInvocation(command, args, env) : undefined;
+		const child = spawnHidden(batch ? (process.env.ComSpec ?? "cmd.exe") : command, batch?.args ?? args, {
+			env: batch?.env ?? env,
+			stdio: options.stdio ?? "ignore",
+			...(batch ? { windowsVerbatimArguments: true } : {}),
 		});
-		let stderrBuffer = "";
-		let stderrLeadingTokenMayBeTruncated = false;
-		if (stdio === "pipe") {
-			child.stdout?.resume();
-			child.stderr?.setEncoding("utf8");
-			child.stderr?.on("data", (chunk: string) => {
-				const combined = `${stderrBuffer}${chunk}`;
-				if (combined.length > BOOTSTRAP_STDERR_BUFFER_CHARS) stderrLeadingTokenMayBeTruncated = true;
-				stderrBuffer = combined.slice(-BOOTSTRAP_STDERR_BUFFER_CHARS);
-			});
-		}
 		child.on("error", reject);
-		child.on("close", (code, signal) => {
+		child.on("exit", (code, signal) => {
 			if (code === 0) {
 				resolve();
 				return;
 			}
 			const reason = signal ? `signal ${signal}` : `exit code ${code}`;
-			const stderrTail = boundedStderrTail(stderrBuffer, stderrLeadingTokenMayBeTruncated);
-			const diagnostic = stderrTail
-				? `
-stderr (tail):
-${stderrTail}`
-				: "";
-			const renderedCommand = sanitizeBootstrapDiagnostic(`${command} ${args.join(" ")}`);
-			reject(new Error(`${renderedCommand} failed with ${reason}${diagnostic}`));
+			reject(new Error(`${command} ${args.join(" ")} failed with ${reason}`));
 		});
 	});
 }
@@ -504,25 +498,6 @@ function bootstrapLockDir(venv: string): string {
 	return path.join(path.dirname(venv), `${path.basename(venv)}${BOOTSTRAP_LOCK_NAME}`);
 }
 
-function processIsRunning(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return isNodeError(error, "EPERM");
-	}
-}
-
-async function readLockPid(lockDir: string): Promise<number | null> {
-	try {
-		const raw = await readFile(path.join(lockDir, "pid"), "utf8");
-		const pid = Number.parseInt(raw.trim(), 10);
-		return Number.isInteger(pid) && pid > 0 ? pid : null;
-	} catch {
-		return null;
-	}
-}
-
 async function lockMissingPidIsStale(lockDir: string): Promise<boolean> {
 	try {
 		const lockStat = await stat(lockDir);
@@ -537,31 +512,43 @@ async function acquireBootstrapLock(venv: string): Promise<() => Promise<void>> 
 	await mkdir(path.dirname(lockDir), { recursive: true });
 
 	for (;;) {
-		try {
-			await mkdir(lockDir);
-			await writeFile(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
+		const attempt = await tryAcquireDirLock(lockDir, async (ownerPid) =>
+			ownerPid === undefined ? !(await lockMissingPidIsStale(lockDir)) : isProcessAlive(ownerPid),
+		);
+		if (attempt === "acquired") {
 			return () => rm(lockDir, { recursive: true, force: true });
-		} catch (error) {
-			if (!isNodeError(error, "EEXIST")) throw error;
-
-			// Besides making lock contention inspectable, this marker gives process
-			// tests a deterministic rendezvous at the filesystem-lock boundary.
-			await writeFile(path.join(lockDir, `waiter-${process.pid}`), "", "utf8").catch(() => undefined);
-			const pid = await readLockPid(lockDir);
-			if (pid === null ? await lockMissingPidIsStale(lockDir) : !processIsRunning(pid)) {
-				await rm(lockDir, { recursive: true, force: true });
-				continue;
-			}
-
+		}
+		if (attempt === "held") {
 			await sleep(BOOTSTRAP_LOCK_RETRY_MS);
 		}
 	}
 }
 
+/** Try a bare command followed by supported PATHEXT extensions in the configured order. */
+export function windowsExecutableCandidates(name: string, pathext: string | undefined): string[] {
+	const extensions = (pathext ?? "")
+		.split(";")
+		.map((ext) => ext.trim().toLowerCase())
+		.filter((ext) => WINDOWS_SUPPORTED_EXECUTABLE_EXTENSIONS.has(ext));
+	const lowerName = name.toLowerCase();
+	if (WINDOWS_PATHEXT_DEFAULT.some((ext) => lowerName.endsWith(ext.toLowerCase()))) {
+		return [name];
+	}
+	const seen = new Set<string>([name.toLowerCase()]);
+	const candidates = [name];
+	for (const ext of extensions.length > 0 ? extensions : WINDOWS_PATHEXT_DEFAULT) {
+		const candidate = `${name}${ext}`;
+		if (seen.has(candidate.toLowerCase())) continue;
+		seen.add(candidate.toLowerCase());
+		candidates.push(candidate);
+	}
+	return candidates;
+}
+
 async function findExecutable(name: string): Promise<string | null> {
 	const pathValue = process.env.PATH;
 	if (!pathValue) return null;
-	const candidates = process.platform === "win32" ? [name, `${name}.exe`] : [name];
+	const candidates = process.platform === "win32" ? windowsExecutableCandidates(name, process.env.PATHEXT) : [name];
 	for (const dir of pathValue.split(path.delimiter)) {
 		if (!dir) continue;
 		for (const candidate of candidates) {
@@ -628,11 +615,10 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 			parsed.extraUvArgs.every((v: unknown): v is string => typeof v === "string")
 				? (parsed.extraUvArgs as string[])
 				: undefined;
-		const parsePythonSkills = (value: unknown): BootstrapPythonSkill[] | null | undefined => {
-			if (value === undefined) return undefined;
-			if (!Array.isArray(value)) return null;
+		let pythonSkills: BootstrapPythonSkill[] | undefined;
+		if (Array.isArray(parsed.pythonSkills)) {
 			if (
-				!value.every((v: unknown): v is BootstrapPythonSkill => {
+				!parsed.pythonSkills.every((v: unknown): v is BootstrapPythonSkill => {
 					if (!isRecord(v)) return false;
 					return (
 						typeof v.importName === "string" &&
@@ -644,18 +630,14 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 			) {
 				return null;
 			}
-			return value;
-		};
-		const pythonSkills = parsePythonSkills(parsed.pythonSkills);
-		const requestedPythonSkills = parsePythonSkills(parsed.requestedPythonSkills);
-		if (pythonSkills === null || requestedPythonSkills === null) return null;
+			pythonSkills = parsed.pythonSkills as BootstrapPythonSkill[];
+		}
 		return {
 			schema: parsed.schema,
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
 			snapshot: typeof parsed.snapshot === "string" ? parsed.snapshot : undefined,
 			extraUvArgs,
 			pythonSkills,
-			requestedPythonSkills,
 		};
 	} catch {
 		return null;
@@ -669,18 +651,16 @@ function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boo
 	return a.every((v, i) => v === b[i]);
 }
 
+// The marker lists skills in install order and the caller in path order, so compare by key, not index.
 function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly BootstrapPythonSkill[]): boolean {
-	const left = a ?? [];
-	if (left.length !== b.length) return false;
-	return left.every((skill, index) => {
-		const expected = b[index];
-		return (
-			skill.importName === expected.importName &&
-			skill.packagePath === expected.packagePath &&
-			skill.pyprojectPath === expected.pyprojectPath &&
-			skill.pyprojectHash === expected.pyprojectHash
-		);
-	});
+	const recorded = new Map((a ?? []).map((skill) => [pythonSkillKey(skill), skill]));
+	return (
+		recorded.size === b.length &&
+		b.every((skill) => {
+			const match = recorded.get(pythonSkillKey(skill));
+			return match?.pyprojectPath === skill.pyprojectPath && match.pyprojectHash === skill.pyprojectHash;
+		})
+	);
 }
 
 function bootstrapVersionCurrent(
@@ -691,7 +671,7 @@ function bootstrapVersionCurrent(
 	return (
 		version !== null &&
 		bootstrapBaseVersionCurrent(version, runtimeIdentity) &&
-		pythonSkillsMatch(version.requestedPythonSkills ?? version.pythonSkills, pythonSkills)
+		pythonSkillsMatch(version.pythonSkills, pythonSkills)
 	);
 }
 
@@ -707,28 +687,66 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeId
 async function writeBootstrapVersion(
 	venv: string,
 	runtimeIdentity: string,
-	installedPythonSkills: readonly BootstrapPythonSkill[],
-	requestedPythonSkills: readonly BootstrapPythonSkill[],
+	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<void> {
 	const version: BootstrapVersion = {
 		schema: BOOTSTRAP_SCHEMA,
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
-		pythonSkills: [...installedPythonSkills],
-		requestedPythonSkills: [...requestedPythonSkills],
+		pythonSkills: [...pythonSkills],
 	};
-	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
+	const filePath = path.join(venv, BOOTSTRAP_VERSION_FILE);
+	const tmpPath = path.join(venv, BOOTSTRAP_VERSION_TMP_FILE);
+	const serialized = `${JSON.stringify(version)}\n`;
+	// Write-then-rename is atomic: a kill mid-write can never leave a partial
+	// marker, which would read as absent and force a rebuild. Replacing an
+	// existing marker can fail transiently while another process holds it, so
+	// retry the swap. A marker that stays unwritten is only stale: the next
+	// startup re-syncs skills, whereas an in-place overwrite truncated by a
+	// failure or a kill would read as absent and rebuild the whole venv.
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= BOOTSTRAP_MARKER_SWAP_ATTEMPTS; attempt += 1) {
+		try {
+			await writeFile(tmpPath, serialized, "utf8");
+			await rename(tmpPath, filePath);
+			return;
+		} catch (error) {
+			lastError = error;
+			// Retry below; the previous marker is still intact.
+		}
+		if (attempt < BOOTSTRAP_MARKER_SWAP_ATTEMPTS) await sleep(BOOTSTRAP_MARKER_SWAP_RETRY_MS);
+	}
+	// Give up without overwriting the marker in place: a write truncated there
+	// by a failure or a kill reads as absent and forces a full venv rebuild,
+	// while the untouched previous marker stays valid. The failure still
+	// surfaces: a marker this process cannot write is one the next startup
+	// cannot trust.
+	await rm(tmpPath, { force: true }).catch(() => undefined);
+	throw lastError;
+}
+
+// Incremental marker write that merges fresh entries into the skills already
+// recorded on disk. A missing or corrupt marker contributes no base entries.
+async function writeMergedBootstrapVersion(
+	venv: string,
+	runtimeIdentity: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): Promise<void> {
+	const version = await readBootstrapVersion(venv);
+	const merged = new Map((version?.pythonSkills ?? []).map((skill) => [pythonSkillKey(skill), skill]));
+	for (const skill of pythonSkills) {
+		merged.set(pythonSkillKey(skill), skill);
+	}
+	await writeBootstrapVersion(venv, runtimeIdentity, [...merged.values()]);
 }
 
 function runtimeCandidateDirs(): string[] {
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-	// dist/prime-agent-runtime is listed first deliberately: it is the only path stable
-	// across every shipped layout (dist/, dist/bundle/, bun), where import.meta.url-relative
-	// resolution breaks. `npm run build` rebuilds it from live source (copy-assets does
-	// rm -rf + cp), so the staleness hash still refreshes on every build. The relative
-	// paths below cover running from source (tsx) where dist/ hasn't been built.
+	// Compiled executables use a flat sidecar layout; Node packages keep sources in dist/.
+	// Resolve both from the physical package directory, outside Bun's virtual filesystem.
 	return [
+		path.join(getPackageDir(), "prime-agent-runtime"),
 		path.join(getPackageDir(), "dist", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
@@ -783,204 +801,8 @@ async function hashRuntimeSource(sourceDir: string): Promise<string> {
 	return `sha256:${hash.digest("hex")}`;
 }
 
-function kernelEnvironmentIdentity(runtimeIdentity: string, pythonSkills: readonly BootstrapPythonSkill[]): string {
-	const identity = JSON.stringify({
-		schema: BOOTSTRAP_SCHEMA,
-		python: PYTHON_VERSION,
-		runtime: runtimeIdentity,
-		snapshot: STATE_SNAPSHOT_REQUIREMENT,
-		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
-		pythonSkills,
-	});
-	return createHash("sha256").update(identity).digest("hex").slice(0, KERNEL_VENV_IDENTITY_CHARS);
-}
-
-function kernelGenerationRoot(baseVenv: string): string {
-	const override = process.env.PRIME_AGENT_KERNEL_VENV_ROOT;
-	if (override) return path.resolve(expandHome(override));
-	return `${baseVenv}.generations`;
-}
-
-export async function resolveKernelVenvDir(): Promise<string> {
-	const baseVenv = await resolveWritableKernelVenvDir();
-	return process.env.PRIME_AGENT_KERNEL_VENV ? baseVenv : kernelGenerationRoot(baseVenv);
-}
-
-function kernelGenerationTimestamp(name: string): number {
-	const match = name.match(/^generation-[a-f0-9]{20}-(\d+)-/);
-	return match ? Number.parseInt(match[1], 10) : 0;
-}
-
-async function findReadyKernelVenv(
-	generationRoot: string,
-	runtimeIdentity: string,
-	pythonSkills: readonly BootstrapPythonSkill[],
-): Promise<string | null> {
-	let entries: Dirent[];
-	try {
-		entries = await readdir(generationRoot, { withFileTypes: true });
-	} catch (error) {
-		if (isNodeError(error, "ENOENT")) return null;
-		throw error;
-	}
-	const generationNames = entries
-		.filter((entry) => entry.isDirectory() && entry.name.startsWith(KERNEL_VENV_GENERATION_PREFIX))
-		.map((entry) => entry.name)
-		.sort((a, b) => kernelGenerationTimestamp(b) - kernelGenerationTimestamp(a));
-	for (const generationName of generationNames) {
-		const venv = path.join(generationRoot, generationName);
-		const leaseDirExists = await exists(path.join(venv, KERNEL_GENERATION_LEASE_DIR));
-		if (leaseDirExists && !(await exists(path.join(venv, KERNEL_GENERATION_PUBLISHED_FILE)))) continue;
-		const python = path.join(venv, "bin", "python");
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return venv;
-	}
-	return null;
-}
-
-function parseKernelGenerationLease(value: unknown): KernelGenerationLease | null {
-	if (!isRecord(value)) return null;
-	if (
-		value.version !== 1 ||
-		!Number.isInteger(value.pid) ||
-		(value.pid as number) <= 0 ||
-		typeof value.processStartId !== "string" ||
-		value.processStartId.length === 0 ||
-		typeof value.updatedAt !== "string"
-	) {
-		return null;
-	}
-	return value as unknown as KernelGenerationLease;
-}
-
-async function writeKernelGenerationLease(venv: string, pid: number): Promise<string> {
-	const leaseDir = path.join(venv, KERNEL_GENERATION_LEASE_DIR);
-	await mkdir(leaseDir, { recursive: true });
-	const lease: KernelGenerationLease = {
-		version: 1,
-		pid,
-		// An unavailable start id is intentionally unverifiable. The GC still knows
-		// the lease is dead when the PID no longer exists, but cannot mistake PID
-		// reuse for death while that PID is running.
-		processStartId: getProcessStartId(pid) ?? `unverifiable:${pid}`,
-		updatedAt: new Date().toISOString(),
-	};
-	const destination = path.join(leaseDir, `${pid}.json`);
-	const temporary = path.join(leaseDir, `.${pid}-${process.pid}-${Date.now()}.tmp`);
-	await writeFile(
-		temporary,
-		`${JSON.stringify(lease)}
-`,
-		{ encoding: "utf8", mode: 0o600 },
-	);
-	await rename(temporary, destination);
-	return destination;
-}
-
-function registerHostGenerationLeasePath(leasePath: string): void {
-	hostGenerationLeasePaths.add(leasePath);
-	if (hostGenerationLeaseCleanupInstalled) return;
-	hostGenerationLeaseCleanupInstalled = true;
-	process.once("exit", () => {
-		for (const registeredPath of hostGenerationLeasePaths) {
-			rmSync(registeredPath, { force: true });
-		}
-		hostGenerationLeasePaths.clear();
-	});
-}
-
-export async function registerKernelPythonLease(python: string, pid: number): Promise<() => void> {
-	if (!Number.isInteger(pid) || pid <= 0) throw new Error(`invalid kernel pid for environment lease: ${pid}`);
-	const venv = path.dirname(path.dirname(python));
-	if (!path.basename(venv).startsWith(KERNEL_VENV_GENERATION_PREFIX)) return () => undefined;
-	if (!(await exists(path.join(venv, BOOTSTRAP_VERSION_FILE)))) return () => undefined;
-	const leasePath = await writeKernelGenerationLease(venv, pid);
-	return () => rmSync(leasePath, { force: true });
-}
-
-function generationHasRunningInterpreter(generation: string): boolean | null {
-	const interpreter = path.join(generation, "bin", "python");
-	const result = spawnSync("ps", ["-axo", "command="], { encoding: "utf8" });
-	if (result.error || result.status !== 0 || typeof result.stdout !== "string") return null;
-	return result.stdout.split(/\r?\n/).some((command) => command.includes(interpreter));
-}
-
-async function generationHasOnlyDeadLeases(generation: string): Promise<boolean> {
-	// The process-table check closes the spawn-to-lease window: a freshly exec'd
-	// interpreter protects its generation even if the host dies before recording
-	// the child PID. Failure to inspect the process table is conservative.
-	if (generationHasRunningInterpreter(generation) !== false) return false;
-	const leaseDir = path.join(generation, KERNEL_GENERATION_LEASE_DIR);
-	let entries: Dirent[];
-	try {
-		entries = await readdir(leaseDir, { withFileTypes: true });
-	} catch {
-		// Generations published by older binaries, unreadable lease directories,
-		// and other unverifiable states are conservatively protected.
-		return false;
-	}
-	for (const entry of entries) {
-		if (entry.name.startsWith(".") && entry.name.endsWith(".tmp")) continue;
-		if (!entry.isFile()) return false;
-		let lease: KernelGenerationLease | null = null;
-		try {
-			lease = parseKernelGenerationLease(JSON.parse(await readFile(path.join(leaseDir, entry.name), "utf8")));
-		} catch {
-			return false;
-		}
-		if (!lease) return false;
-		if (!processIsRunning(lease.pid)) continue;
-		if (isOrphanProcessIdentityCurrent({ pid: lease.pid, processStartId: lease.processStartId })) return false;
-		const comparison = compareProcessStartIds(lease.processStartId, getProcessStartId(lease.pid));
-		if (comparison !== "mismatch") return false;
-	}
-	return true;
-}
-
-async function prepareGenerationSlot(generationRoot: string): Promise<void> {
-	await mkdir(generationRoot, { recursive: true });
-	const entries = (await readdir(generationRoot, { withFileTypes: true }))
-		.filter((entry) => entry.isDirectory() && entry.name.startsWith(KERNEL_VENV_GENERATION_PREFIX))
-		.sort((a, b) => kernelGenerationTimestamp(a.name) - kernelGenerationTimestamp(b.name));
-	const reclaimable: string[] = [];
-	for (const entry of entries) {
-		const generation = path.join(generationRoot, entry.name);
-		if (!(await exists(path.join(generation, BOOTSTRAP_VERSION_FILE)))) {
-			// The global generation-root lock proves that no same-host builder is
-			// active. A directory without the bootstrap marker was never selectable.
-			await rm(generation, { recursive: true, force: true });
-		} else if (
-			(await exists(path.join(generation, KERNEL_GENERATION_LEASE_DIR))) &&
-			!(await exists(path.join(generation, KERNEL_GENERATION_PUBLISHED_FILE)))
-		) {
-			// New-format builders create the lease directory before bootstrap and
-			// write the publication marker only after the resolver lease is durable.
-			await rm(generation, { recursive: true, force: true });
-		} else if (await generationHasOnlyDeadLeases(generation)) {
-			reclaimable.push(generation);
-		}
-	}
-
-	const deleteCount = Math.max(0, reclaimable.length - MAX_RETAINED_INACTIVE_KERNEL_GENERATIONS);
-	for (const generation of reclaimable.slice(0, deleteCount)) {
-		await rm(generation, { recursive: true, force: true });
-	}
-	// Live and unverifiable generations are exempt from inactive retention so
-	// publication never blocks. Once their leases die, a later resolution pass
-	// reclaims all but the newest inactive rollback generation.
-}
-
-async function createKernelVenvGeneration(
-	generationRoot: string,
-	runtimeIdentity: string,
-	pythonSkills: readonly BootstrapPythonSkill[],
-): Promise<string> {
-	await prepareGenerationSlot(generationRoot);
-	const identity = kernelEnvironmentIdentity(runtimeIdentity, pythonSkills);
-	const generation = await mkdtemp(
-		path.join(generationRoot, `${KERNEL_VENV_GENERATION_PREFIX}${identity}-${Date.now()}-${process.pid}-`),
-	);
-	await mkdir(path.join(generation, KERNEL_GENERATION_LEASE_DIR));
-	return generation;
+export function kernelVenvPython(venv: string, platform: NodeJS.Platform = process.platform): string {
+	return platform === "win32" ? path.join(venv, "Scripts", "python.exe") : path.join(venv, "bin", "python");
 }
 
 async function bootstrapVenv(
@@ -990,27 +812,15 @@ async function bootstrapVenv(
 ): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
 	const uv = await ensureUv(options);
-	const python = path.join(venv, "bin", "python");
+	const python = kernelVenvPython(venv);
 	const sourceDir = await resolveRuntimeSourceDir();
 	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
 	await run(uv, ["python", "install", PYTHON_VERSION]);
-	// bootstrapVenv is always handed a directory that already exists: the base
-	// path is an mkdtemp .building- directory, and a generation path also holds
-	// the .leases subdirectory. uv will not initialise a non-empty directory that
-	// is not already a virtualenv, so the target has to be emptied first.
-	//
-	// Emptying it here rather than delegating to uv is what keeps this working
-	// across uv versions: --clear stopped accepting non-virtualenv directories in
-	// uv 0.12, and the --force it suggests instead does not exist before it, so
-	// either flag breaks half the installed base. An empty target needs neither.
-	// The directory itself is recreated immediately so mkdtemp keeps owning the
-	// collision-free name, and .leases is restored by writeKernelGenerationLease's
-	// recursive mkdir exactly as it was when uv did the clearing.
-	await rm(venv, { recursive: true, force: true });
-	await mkdir(venv, { recursive: true });
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	// Nothing invokes the venv's own pip; every kernel-venv package is installed
+	// through `uv pip install --python`, so the venv is created unseeded.
+	await run(uv, ["venv", venv, "--python", PYTHON_VERSION]);
 	await run(uv, [
 		"pip",
 		"install",
@@ -1020,6 +830,10 @@ async function bootstrapVenv(
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
+	// Land the base marker before the skill sync: a session killed mid-sync
+	// must leave the next one on the skills-only path instead of wiping the
+	// venv and re-paying the runtime install.
+	await writeBootstrapVersion(venv, runtimeIdentity, []);
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -1033,9 +847,7 @@ async function syncPythonSkills(
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
 	const installedPythonSkills: BootstrapPythonSkill[] = [];
-	const currentPythonSkills = new Map(
-		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
-	);
+	const currentPythonSkills = new Map((version?.pythonSkills ?? []).map((skill) => [pythonSkillKey(skill), skill]));
 	const pythonSkillsByProjectName = new Map(
 		pythonSkills.map((skill) => [readPythonSkillProjectName(skill).replaceAll("_", "-").toLowerCase(), skill]),
 	);
@@ -1053,7 +865,7 @@ async function syncPythonSkills(
 	);
 
 	for (const skill of sortPythonSkillsForInstall(pythonSkills)) {
-		const existingSkill = currentPythonSkills.get(`${skill.importName}\0${skill.packagePath}`);
+		const existingSkill = currentPythonSkills.get(pythonSkillKey(skill));
 		if (existingSkill?.pyprojectPath === skill.pyprojectPath && existingSkill.pyprojectHash === skill.pyprojectHash) {
 			installedPythonSkills.push(skill);
 			continue;
@@ -1062,7 +874,7 @@ async function syncPythonSkills(
 		const localDependencies = dependenciesBySkill.get(skill) ?? [];
 		const localDependencyArgs = localDependencies
 			.filter((dependency) => {
-				const installedDependency = currentPythonSkills.get(`${dependency.importName}\0${dependency.packagePath}`);
+				const installedDependency = currentPythonSkills.get(pythonSkillKey(dependency));
 				const installedThisSync = installedPythonSkills.some(
 					(installed) =>
 						installed.importName === dependency.importName &&
@@ -1087,18 +899,32 @@ async function syncPythonSkills(
 				...formatPythonSkillInstallArgs(skill),
 				...localDependencyArgs,
 			]);
-			installedPythonSkills.push(
-				skill,
-				...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
-			);
 		} catch (error) {
 			reportProgress(
 				options,
 				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}`,
 			);
+			continue;
 		}
+		installedPythonSkills.push(
+			skill,
+			...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
+		);
+		// Persist progress after every completed install so a killed session
+		// resumes at the first missing skill instead of re-syncing from scratch.
+		// Merge with the on-disk marker so skills already recorded but not yet
+		// visited this sync (they sit later in install order) survive this
+		// incremental write; the final write below stays an authoritative replace.
+		await writeMergedBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 	}
-	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills, pythonSkills);
+	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
+}
+
+async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
+	return (
+		(await hasPrimeAgentRuntime(python)) &&
+		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
+	);
 }
 
 async function kernelReady(
@@ -1117,25 +943,9 @@ function formatBootstrapFailure(error: unknown): Error {
 	return new Error(
 		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
 			"First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
+			"An interrupted runtime upgrade needs network once more, so re-run this while online. " +
 			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap.",
 	);
-}
-
-async function cleanupAbandonedExactVenvBuilds(baseVenv: string): Promise<void> {
-	const parent = path.dirname(baseVenv);
-	const prefix = `${path.basename(baseVenv)}.building-`;
-	let entries: Dirent[];
-	try {
-		entries = await readdir(parent, { withFileTypes: true });
-	} catch (error) {
-		if (isNodeError(error, "ENOENT")) return;
-		throw error;
-	}
-	for (const entry of entries) {
-		if (entry.isDirectory() && entry.name.startsWith(prefix)) {
-			await rm(path.join(parent, entry.name), { recursive: true, force: true });
-		}
-	}
 }
 
 async function ensureKernelPythonUncached(
@@ -1145,10 +955,15 @@ async function ensureKernelPythonUncached(
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
 		const python = path.resolve(expandHome(override));
+		if (isBatchShim(python)) {
+			throw new Error(
+				`PRIME_AGENT_KERNEL_PYTHON must point directly to a Python executable, not a Windows batch shim: ${python}`,
+			);
+		}
 		const missing: string[] = [];
 		if (!(await hasPrimeAgentRuntime(python))) {
 			missing.push(
-				"a current prime-agent-runtime with callable rlm.run, rlm.host_request, and explicit harness CRUD methods",
+				"a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, and explicit harness CRUD methods",
 			);
 		}
 		if (missing.length === 0) {
@@ -1170,80 +985,43 @@ async function ensureKernelPythonUncached(
 		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}
 
-	const baseVenv = await resolveWritableKernelVenvDir();
+	const venv = await resolveWritableKernelVenvDir();
+	const python = kernelVenvPython(venv);
 	const runtimeIdentity = await resolveRuntimeIdentity();
-	const exactPython = path.join(baseVenv, "bin", "python");
+	// No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills;
+	// letting them reach syncPythonSkills would rewrite the marker with an empty list,
+	// wiping the recorded skills and forcing the next real session to re-sync every
+	// skill. They only need the base kernel to be ready.
+	const readyForCaller = async (): Promise<boolean> =>
+		pythonSkills.length === 0
+			? kernelBaseReady(python, venv, runtimeIdentity)
+			: kernelReady(python, venv, runtimeIdentity, pythonSkills);
+	if (await readyForCaller()) return python;
 
-	// PRIME_AGENT_KERNEL_VENV remains an exact-path contract. Never silently
-	// reinterpret it as a prefix, and never replace a non-current directory that
-	// a live process may still be using.
-	if (process.env.PRIME_AGENT_KERNEL_VENV) {
-		if (await kernelReady(exactPython, baseVenv, runtimeIdentity, pythonSkills)) return exactPython;
-		const releaseLock = await acquireBootstrapLock(baseVenv);
-		let buildingVenv: string | null = null;
-		try {
-			await cleanupAbandonedExactVenvBuilds(baseVenv);
-			if (await kernelReady(exactPython, baseVenv, runtimeIdentity, pythonSkills)) return exactPython;
-			if (await exists(baseVenv)) {
-				throw new Error(
-					`PRIME_AGENT_KERNEL_VENV points to a non-current environment at ${baseVenv}. ` +
-						"Prime Agent will not replace it while another kernel may use it. Stop dependent sessions and remove or move that directory manually, choose a new PRIME_AGENT_KERNEL_VENV, or set PRIME_AGENT_KERNEL_PYTHON.",
-				);
-			}
-			reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-			await mkdir(path.dirname(baseVenv), { recursive: true });
-			buildingVenv = await mkdtemp(path.join(path.dirname(baseVenv), `${path.basename(baseVenv)}.building-`));
-			await bootstrapVenv(buildingVenv, pythonSkills, options);
-			await rename(buildingVenv, baseVenv);
-			buildingVenv = null;
-			reportProgress(options, "✓ ready");
-			return exactPython;
-		} catch (error) {
-			if (buildingVenv) await rm(buildingVenv, { recursive: true, force: true }).catch(() => undefined);
-			throw formatBootstrapFailure(error);
-		} finally {
-			await releaseLock().catch(() => undefined);
-		}
-	}
-
-	// Compatibility discovery: a current legacy ~/.prime/agent/kernel-venv is
-	// returned in place rather than stranded by the generational layout.
-	if (await kernelReady(exactPython, baseVenv, runtimeIdentity, pythonSkills)) return exactPython;
-
-	const generationRoot = kernelGenerationRoot(baseVenv);
-
-	// One root-wide lock serializes resolution leases, same-identity publication,
-	// and reclamation so a generation cannot disappear between lookup and lease.
-	// Reclamation removes only generations whose recorded process identities are
-	// all provably dead.
-	const releaseLock = await acquireBootstrapLock(generationRoot);
-	let buildingVenv: string | null = null;
+	const releaseLock = await acquireBootstrapLock(venv);
 	try {
-		const concurrentlyBuiltVenv = await findReadyKernelVenv(generationRoot, runtimeIdentity, pythonSkills);
-		if (concurrentlyBuiltVenv) {
-			await writeFile(path.join(concurrentlyBuiltVenv, KERNEL_GENERATION_PUBLISHED_FILE), "1\n", "utf8");
-			const hostLeasePath = await writeKernelGenerationLease(concurrentlyBuiltVenv, process.pid);
-			registerHostGenerationLeasePath(hostLeasePath);
-			await prepareGenerationSlot(generationRoot);
-			return path.join(concurrentlyBuiltVenv, "bin", "python");
+		if (await readyForCaller()) return python;
+		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
+			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
+			return python;
 		}
 
+		const hadVenv = existsSync(venv);
 		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-		buildingVenv = await createKernelVenvGeneration(generationRoot, runtimeIdentity, pythonSkills);
-		await bootstrapVenv(buildingVenv, pythonSkills, options);
-		const hostLeasePath = await writeKernelGenerationLease(buildingVenv, process.pid);
-		registerHostGenerationLeasePath(hostLeasePath);
-		await writeFile(path.join(buildingVenv, KERNEL_GENERATION_PUBLISHED_FILE), "1\n", "utf8");
-		const python = path.join(buildingVenv, "bin", "python");
-		buildingVenv = null;
-		reportProgress(options, "✓ ready");
-		return python;
+		if (hadVenv) {
+			reportProgress(options, "rebuilding kernel venv");
+			await rm(venv, { recursive: true, force: true });
+		}
+
+		await bootstrapVenv(venv, pythonSkills, options);
 	} catch (error) {
-		if (buildingVenv) await rm(buildingVenv, { recursive: true, force: true }).catch(() => undefined);
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
 	}
+
+	reportProgress(options, "✓ ready");
+	return python;
 }
 
 export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {

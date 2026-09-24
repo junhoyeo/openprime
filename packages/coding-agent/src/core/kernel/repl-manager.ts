@@ -1,14 +1,29 @@
 // Kernel client for the REPL runtime: the kernel is a JSON-lines subprocess
 // (`python -m rlm.repl`) — requests on stdin, events on stdout, stderr kept as
 // a diagnostics tail. The protocol is documented in prime-agent-runtime/src/rlm/repl.md.
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import {
+	chmodSync,
+	closeSync,
+	existsSync,
+	fchmodSync,
+	mkdirSync,
+	openSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeSync,
+} from "node:fs";
+import { dirname } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { v4 as uuid } from "uuid";
+import { spawnHidden } from "../../utils/child-process.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
-import { ensureKernelPython, registerKernelPythonLease } from "./bootstrap.js";
+import { ensureKernelPython } from "./bootstrap.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
+	BASH_ACTIVITY_DISPLAY_MIME,
 	createDeferred,
 	createKernelStartupAbortError,
 	DEFAULT_MAX_OUTPUT_CHARS,
@@ -37,6 +52,7 @@ import {
 	parseAttachmentDisplay,
 	parseDiffDisplay,
 	parseSentAgentMessage,
+	RESTORE_EXECUTION_TIMEOUT_MS,
 	raceStartupWithAbort,
 	SNAPSHOT_EXECUTION_TIMEOUT_MS,
 } from "./shared.js";
@@ -55,6 +71,45 @@ const REPAIR_STEP_TIMEOUT_MS = 30_000;
 const MAX_HANDLED_HOST_REQUEST_IDS = 1024;
 // Cap for unattributed background output buffered between and during cells.
 const MAX_BACKGROUND_OUTPUT_CHARS = 64 * 1024;
+// Largest legit frame is an attachment display event, base64 capped at
+// MAX_ATTACHMENT_DATA_CHARS; a line that cannot complete within this ceiling is
+// corruption the protocol repair owns, not output worth buffering until OOM.
+const MAX_PROTOCOL_LINE_CHARS = 32 * 1024 * 1024;
+// The spawning cell's source rides every host-request round trip and persists per child
+// as runtimeMetadata.spawnCode, so cap it once at this boundary.
+// Keep below SPAWN_CODE_MAX_CHARS in daemon-session-list.ts so its 4000-char display slice stays a no-op.
+const MAX_CELL_SOURCE_CHARS = 2 * 1024;
+const CELL_SOURCE_TRUNCATION_MARKER = ` [... cell source truncated at ${MAX_CELL_SOURCE_CHARS} chars ...]`;
+
+const MAX_KERNEL_STDERR_CHARS = 8 * 1024;
+const MAX_KERNEL_STDERR_LOG_BYTES = 5 * 1024 * 1024;
+const KERNEL_STDERR_LOG_BUDGET_MARKER = "[stderr log budget exhausted]\n";
+// Owner-only directory for the kernel stderr log, matching the other private session artifacts.
+const KERNEL_STDERR_LOG_DIR_MODE = 0o700;
+// Owner-only file bits; kernel stderr can carry exception payloads.
+const KERNEL_STDERR_LOG_MODE = 0o600;
+
+function manifestStatOf(path: string): { mtimeMs: number; size: number } | null {
+	try {
+		const stat = statSync(path);
+		return { mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch {
+		return null;
+	}
+}
+
+/** fs.writeSync may write fewer bytes than asked (partial ENOSPC, signals); loop until done. */
+function writeFullySync(fd: number, data: Buffer): void {
+	let offset = 0;
+	while (offset < data.length) {
+		offset += writeSync(fd, data, offset);
+	}
+}
+
+function capCellSourceCode(code: string | undefined): string | undefined {
+	if (code === undefined || code.length <= MAX_CELL_SOURCE_CHARS) return code;
+	return `${code.slice(0, MAX_CELL_SOURCE_CHARS)}${CELL_SOURCE_TRUNCATION_MARKER}`;
+}
 
 /** ExecuteResult plus the raw fields of the request's `done` event (state ops). */
 interface InternalExecuteResult extends ExecuteResult {
@@ -136,11 +191,19 @@ function asReasonArray(value: unknown): { name: string; reason: string }[] {
 export class ReplKernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
-		"python" | "cwd" | "env" | "sessionId" | "hostHandlers" | "pythonSkills" | "snapshot" | "bootstrapCode"
+		| "python"
+		| "cwd"
+		| "env"
+		| "sessionId"
+		| "hostHandlers"
+		| "onBackgroundWorkSettled"
+		| "pythonSkills"
+		| "snapshot"
+		| "bootstrapCode"
+		| "stderrLogPath"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
-	private readonly kernelEnvironmentLeaseReleases = new Map<number, () => void>();
 	private readyDeferred?: ReturnType<typeof createDeferred<number>>;
 	private kernelStderr = "";
 	/** Serializes execute() calls — the runtime runs one request at a time. */
@@ -158,6 +221,7 @@ export class ReplKernelManager {
 	private pendingBackgroundOutput = "";
 	private pendingBackgroundOutputTruncated = false;
 	private readonly inFlightHostRequests = new Set<Promise<void>>();
+	private readonly backgroundBashHandles = new Map<string, number>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Bumped by every teardown so a stale in-flight doStart can never touch a newer kernel. */
 	private startGeneration = 0;
@@ -181,6 +245,13 @@ export class ReplKernelManager {
 	private pendingRebootstrap = false;
 	/** Restore the saved namespace on that fresh start too (false when the snapshot itself is the declared culprit). */
 	private pendingRestore = false;
+	private completedExecutions = 0;
+	/** Tri-state: undefined = no non-repair restore attempted yet, null = manifest was missing at that attempt. */
+	private restoredManifestStat?: { mtimeMs: number; size: number } | null;
+	private restoredNamespaceSkip?: {
+		manifestStat: { mtimeMs: number; size: number } | null;
+		completedExecutions: number;
+	};
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
 
@@ -191,9 +262,11 @@ export class ReplKernelManager {
 			env: options.env,
 			sessionId: options.sessionId,
 			hostHandlers: options.hostHandlers,
+			onBackgroundWorkSettled: options.onBackgroundWorkSettled,
 			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
 			bootstrapCode: options.bootstrapCode,
+			stderrLogPath: options.stderrLogPath,
 		};
 	}
 
@@ -201,8 +274,56 @@ export class ReplKernelManager {
 		return this.options.sessionId;
 	}
 
+	get hasBackgroundWork(): boolean {
+		return this.backgroundBashHandles.size > 0;
+	}
+
 	private appendKernelDiagnostic(message: string): void {
-		this.kernelStderr += `[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`;
+		this.appendKernelStderrText(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
+	}
+
+	private appendKernelStderrText(text: string): void {
+		this.kernelStderr = (this.kernelStderr + text).slice(-MAX_KERNEL_STDERR_CHARS);
+	}
+
+	/**
+	 * The write budget is the file's remaining capacity, not a fresh allowance,
+	 * so current file and `.old` each stay near MAX_KERNEL_STDERR_LOG_BYTES and
+	 * per-session disk near 2x — even when rotation fails and the file is kept.
+	 */
+	private openStderrLog(): { fd: number; budget: number } | undefined {
+		const path = this.options.stderrLogPath;
+		if (!path) return undefined;
+		try {
+			mkdirSync(dirname(path), { recursive: true, mode: KERNEL_STDERR_LOG_DIR_MODE });
+			let size = existsSync(path) ? statSync(path).size : 0;
+			if (size > MAX_KERNEL_STDERR_LOG_BYTES) {
+				try {
+					// Tighten before the move: a renamed log keeps its mode, and the
+					// rotated file holds the exception payloads worth protecting.
+					chmodSync(path, KERNEL_STDERR_LOG_MODE);
+					// Drop any prior .old first: rename fails on Windows if it exists.
+					rmSync(`${path}.old`, { force: true });
+					renameSync(path, `${path}.old`);
+					size = 0;
+				} catch (error) {
+					// A failed rotation must not cost the log: keep appending instead.
+					this.appendKernelDiagnostic(`cannot rotate kernel stderr log: ${errorMessage(error)}`);
+				}
+			}
+			const fd = openSync(path, "a", KERNEL_STDERR_LOG_MODE);
+			// Exact bits despite the umask; tightens a pre-existing loose log.
+			try {
+				fchmodSync(fd, KERNEL_STDERR_LOG_MODE);
+			} catch (error) {
+				closeSync(fd);
+				throw error;
+			}
+			return { fd, budget: Math.max(0, MAX_KERNEL_STDERR_LOG_BYTES - size) };
+		} catch (error) {
+			this.appendKernelDiagnostic(`cannot open kernel stderr log: ${errorMessage(error)}`);
+			return undefined;
+		}
 	}
 
 	async start(options: KernelStartOptions = {}): Promise<void> {
@@ -250,13 +371,14 @@ export class ReplKernelManager {
 			throw new Error("Kernel was disposed during startup");
 		}
 
-		const child = spawn(python, ["-m", "rlm.repl"], {
+		const child = spawnHidden(python, ["-m", "rlm.repl"], {
 			cwd: this.options.cwd,
 			// bash.py journals its process groups under this pid so the host can
 			// reap them if the runtime dies without running its shutdown hook.
 			env: {
 				...process.env,
 				...this.options.env,
+				...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}),
 				PRIME_AGENT_KERNEL_OWNER_PID: String(process.pid),
 			},
 			stdio: ["pipe", "pipe", "pipe"],
@@ -268,21 +390,6 @@ export class ReplKernelManager {
 		this.wireChild(child);
 
 		try {
-			const childPid = child.pid;
-			if (childPid !== undefined) {
-				try {
-					const releaseLease = await registerKernelPythonLease(python, childPid);
-					this.kernelEnvironmentLeaseReleases.set(childPid, releaseLease);
-					if (child.exitCode !== null || child.signalCode !== null) {
-						releaseLease();
-						this.kernelEnvironmentLeaseReleases.delete(childPid);
-					}
-				} catch (error) {
-					this.appendKernelDiagnostic(`environment lease failed: ${errorMessage(error)}`);
-					throw error;
-				}
-			}
-
 			const protocol = await this.waitForReady(child);
 			if (this.startStale(generation)) throw new Error("Kernel start superseded");
 			// Ready and a corrupt frame can share one stdout chunk: ready resolved the
@@ -315,11 +422,21 @@ export class ReplKernelManager {
 	private wireChild(child: ChildProcess): void {
 		const decoder = new StringDecoder("utf8");
 		let buffered = "";
+		// A poisoned child's residue must not grow the buffer again before the
+		// protocol repair kills it.
+		let poisoned = false;
 		child.stdout?.on("data", (buf: Buffer) => {
-			if (this.child !== child) return;
+			if (this.child !== child || poisoned) return;
 			buffered += decoder.write(buf);
+			if (buffered.length > MAX_PROTOCOL_LINE_CHARS) {
+				poisoned = true;
+				buffered = "";
+				this.failProtocolFrame(child, `oversized protocol line: exceeds ${MAX_PROTOCOL_LINE_CHARS} chars`);
+				return;
+			}
 			let newline = buffered.indexOf("\n");
 			while (newline !== -1) {
+				if (this.child !== child) return;
 				const line = buffered.slice(0, newline);
 				buffered = buffered.slice(newline + 1);
 				newline = buffered.indexOf("\n");
@@ -344,8 +461,69 @@ export class ReplKernelManager {
 			}
 		});
 
+		// The runtime dup2's fd 2 into its protocol pump before ready (repl.py
+		// _setup_fds), so this pipe only ever carries pre-ready bytes; the write
+		// budget caps what lands on disk, and once it is spent the handler keeps
+		// draining but discards (a blocked pipe would wedge a pre-ready kernel).
+		const stderrLog = this.openStderrLog();
+		const stderrDecoder = new StringDecoder("utf8");
+		let stderrLogBudget = stderrLog?.budget ?? 0;
+		let stderrLogWritable = stderrLog !== undefined;
 		child.stderr?.on("data", (buf: Buffer) => {
-			this.kernelStderr += buf.toString();
+			this.appendKernelStderrText(stderrDecoder.write(buf));
+			if (!stderrLogWritable || stderrLog === undefined) return;
+			try {
+				if (buf.length <= stderrLogBudget) {
+					writeFullySync(stderrLog.fd, buf);
+					stderrLogBudget -= buf.length;
+				} else {
+					writeFullySync(stderrLog.fd, Buffer.from(KERNEL_STDERR_LOG_BUDGET_MARKER));
+					stderrLogWritable = false;
+				}
+			} catch (error) {
+				stderrLogWritable = false;
+				this.appendKernelDiagnostic(`kernel stderr log write failed: ${errorMessage(error)}`);
+			}
+		});
+		// A kernel that dies mid-character leaves bytes buffered in the decoder;
+		// flush them so the tail keeps the truncated final character. Both events,
+		// because each can be the only one to precede the tail build: 'end' beats
+		// 'exit' on natural EOF (whose 'close' emission can land after it), while
+		// a drain-destroyed stream skips 'end'. The second end() returns "".
+		child.stderr?.once("end", () => this.appendKernelStderrText(stderrDecoder.end()));
+		child.stderr?.once("close", () => {
+			this.appendKernelStderrText(stderrDecoder.end());
+			if (stderrLog === undefined) return;
+			try {
+				closeSync(stderrLog.fd);
+			} catch (error) {
+				this.appendKernelDiagnostic(`kernel stderr log close failed: ${errorMessage(error)}`);
+			}
+		});
+		// A pipe write into a dead kernel surfaces as an 'error' event on the
+		// stream (write EPIPE); without a listener Node rethrows it and takes
+		// down the whole worker. The pending writeLine rejection and the child
+		// 'exit' handler below own the fallout, so this only records the
+		// diagnosis. Read-side pipe errors on stdout/stderr land the same way
+		// and need the same guard.
+		child.stdin?.on("error", (error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`kernel stdin error: ${errorMessage(error)}`);
+		});
+		child.stdout?.on("error", (error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`kernel stdout error: ${errorMessage(error)}`);
+		});
+		child.stderr?.on("error", (error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`kernel stderr error: ${errorMessage(error)}`);
+		});
+		child.once("exit", () => {
+			// One turn for the poll phase to deliver the bytes the kernel wrote
+			// before dying (the pipe buffer bounds them), then destroy: EOF may
+			// never come, and anything later is a surviving grandchild's
+			// post-mortem noise, not the kernel's last words.
+			globalThis.setImmediate(() => child.stderr?.destroy());
 		});
 
 		child.on("error", (err) => {
@@ -361,10 +539,6 @@ export class ReplKernelManager {
 		});
 
 		child.on("exit", (code, signal) => {
-			if (child.pid !== undefined) {
-				this.kernelEnvironmentLeaseReleases.get(child.pid)?.();
-				this.kernelEnvironmentLeaseReleases.delete(child.pid);
-			}
 			if (this.child !== child) return;
 			if (this.state !== "shutdown") {
 				this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
@@ -608,8 +782,16 @@ export class ReplKernelManager {
 			return await new Promise<number>((resolve, reject) => {
 				ready.promise.then(resolve, reject);
 				onExit = () => {
-					const tail = this.kernelStderr.slice(-1024);
-					reject(new Error(`Kernel exited before ready. stderr:\n${tail || "(empty)"}`));
+					const finish = () => {
+						const tail = this.kernelStderr.slice(-1024);
+						reject(new Error(`Kernel exited before ready. stderr:\n${tail || "(empty)"}`));
+					};
+					// The final stderr chunks can still be in flight at 'exit'; wait for
+					// the drained pipe so the tail includes the kernel's last words (the
+					// ready timeout stays armed, bounding the wait).
+					const stderr = child.stderr;
+					if (!stderr || stderr.closed) finish();
+					else stderr.once("close", finish);
 				};
 				if (child.exitCode !== null || child.signalCode !== null) {
 					onExit();
@@ -648,6 +830,38 @@ export class ReplKernelManager {
 
 	private handleEvent(event: Record<string, unknown>): void {
 		const type = event.event;
+		if (type === "display" && isRecord(event.data) && BASH_ACTIVITY_DISPLAY_MIME in event.data) {
+			const activity = event.data[BASH_ACTIVITY_DISPLAY_MIME];
+			if (
+				isRecord(activity) &&
+				typeof activity.id === "string" &&
+				/^[a-f0-9]{32}$/.test(activity.id) &&
+				typeof activity.pid === "number" &&
+				Number.isSafeInteger(activity.pid) &&
+				activity.pid > 0 &&
+				typeof activity.active === "boolean"
+			) {
+				if (activity.active) {
+					if (!this.backgroundBashHandles.has(activity.id)) {
+						this.backgroundBashHandles.set(activity.id, activity.pid);
+					}
+				} else if (this.backgroundBashHandles.get(activity.id) === activity.pid) {
+					this.backgroundBashHandles.delete(activity.id);
+					if (this.backgroundBashHandles.size === 0) {
+						// The last live handle settled: the completion notice for it
+						// is already admitted, so owed continuations may resume. A
+						// host callback failure must not break the event path.
+						try {
+							this.options.onBackgroundWorkSettled?.();
+						} catch (error) {
+							// The settlement already happened on the map.
+							this.appendKernelDiagnostic(`background work settled callback failed: ${errorMessage(error)}`);
+						}
+					}
+				}
+			}
+			return;
+		}
 		if (type === "ready") {
 			this.readyDeferred?.resolve(typeof event.protocol === "number" ? event.protocol : -1);
 			return;
@@ -690,6 +904,9 @@ export class ReplKernelManager {
 						execution.stdout = execution.stdout.slice(0, execution.maxChars);
 						execution.stdoutTruncated = true;
 					}
+				} else if (text.length > 0) {
+					// The buffer filled exactly on an earlier frame; the dropped remainder still counts as truncation.
+					execution.stdoutTruncated = true;
 				}
 			} else {
 				if (execution.stderr.length < execution.maxChars) {
@@ -698,6 +915,8 @@ export class ReplKernelManager {
 						execution.stderr = execution.stderr.slice(0, execution.maxChars);
 						execution.stderrTruncated = true;
 					}
+				} else if (text.length > 0) {
+					execution.stderrTruncated = true;
 				}
 			}
 			execution.opts.onStream?.(text, type);
@@ -958,6 +1177,7 @@ export class ReplKernelManager {
 		}
 		if (!execution.settled) {
 			execution.settled = true;
+			this.completedExecutions += 1;
 			if (execution.opts.onLateSentAgentMessage) {
 				this.registerLateSentAgentMessageHandler(execution.requestId, execution.opts.onLateSentAgentMessage);
 			}
@@ -1152,7 +1372,7 @@ export class ReplKernelManager {
 		// Tag the request with the cell that triggered it. A blocking call is still
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
-		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
+		const cellSourceCode = capCellSourceCode(this.activeExecution?.code ?? this.lastCellCode);
 		return handler({ ...data, cellSourceCode });
 	}
 
@@ -1167,6 +1387,18 @@ export class ReplKernelManager {
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();
+		// Teardown kills the handles with the kernel, so owed continuations
+		// waiting on them must hear the settlement once before it is lost. A
+		// host callback failure must not abort the kernel teardown.
+		if (this.backgroundBashHandles.size > 0) {
+			this.backgroundBashHandles.clear();
+			try {
+				this.options.onBackgroundWorkSettled?.();
+			} catch (error) {
+				// The settlement already happened on the map; teardown continues.
+				this.appendKernelDiagnostic(`background work settled callback failed: ${errorMessage(error)}`);
+			}
+		}
 		// Stale pre-teardown background output must not surface after a restart.
 		this.pendingBackgroundOutput = "";
 		this.pendingBackgroundOutputTruncated = false;
@@ -1177,7 +1409,13 @@ export class ReplKernelManager {
 		if (child) {
 			child.stdin?.destroy();
 			child.stdout?.destroy();
-			child.stderr?.destroy();
+			// An exited child keeps its stderr: the post-exit drain owns it, and
+			// destroying here would drop its buffered last words. A still-alive
+			// child may ignore the kill signal and never emit 'exit', so that
+			// drain would never run — destroy now to bound the pipe's lifetime.
+			if (child.exitCode === null && child.signalCode === null) {
+				child.stderr?.destroy();
+			}
 			const pid = child.pid;
 			let signaled = false;
 			try {
@@ -1410,17 +1648,22 @@ export class ReplKernelManager {
 	private async performRestore(protocolRepair: boolean): Promise<RestoreResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg) return null;
+		// Before the attempt, so a failed or timed-out restore still arms the skip;
+		// repair retries (reprovision after a failed first restore) keep the non-repair stat.
+		if (!protocolRepair) this.restoredManifestStat = manifestStatOf(cfg.manifestPath);
 		try {
 			const r = await this.enqueueRequest(
 				{ type: "restore", path: cfg.path },
 				"",
 				{ internal: true, protocolRepair },
-				protocolRepair ? REPAIR_STEP_TIMEOUT_MS : undefined,
+				protocolRepair ? REPAIR_STEP_TIMEOUT_MS : RESTORE_EXECUTION_TIMEOUT_MS,
 			);
 			if (r.status !== "ok" || !r.doneFields) {
 				this.appendKernelDiagnostic(
 					`state restore ${r.status === "aborted" ? "timed out" : "failed"}: ${r.error?.evalue ?? r.stderr}`,
 				);
+				// The namespace never got the saved state, so the on-disk payload must stay the fresher copy.
+				if (!protocolRepair) this.pendingRestore = true;
 				return null;
 			}
 			this.pendingRestore = false;
@@ -1431,8 +1674,24 @@ export class ReplKernelManager {
 			};
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
+			if (!protocolRepair) this.pendingRestore = true;
 			return null;
 		}
+	}
+
+	/**
+	 * Arm the one-shot post-restore snapshot skip: the bootstrap-scheduled snapshot would
+	 * rewrite identical content, or after a failed restore clobber the healthy on-disk
+	 * copy with a skills-only payload. Call after the bootstrap succeeds — its own
+	 * settled execution must not defeat the arm.
+	 */
+	markRestoredNamespaceFresh(): void {
+		if (this.restoredManifestStat === undefined) return; // no attempted non-repair restore to match
+		this.restoredNamespaceSkip = {
+			manifestStat: this.restoredManifestStat,
+			completedExecutions: this.completedExecutions,
+		};
+		this.restoredManifestStat = undefined;
 	}
 
 	/** Live user-defined top-level names, or null if the kernel isn't running. Never throws. */
@@ -1457,11 +1716,22 @@ export class ReplKernelManager {
 		if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
 		this.snapshotTimer = globalThis.setTimeout(() => {
 			this.snapshotTimer = undefined;
+			if (this.consumeRestoredSnapshotSkip()) return;
 			void this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS });
 		}, cfg.debounceMs ?? DEFAULT_SNAPSHOT_DEBOUNCE_MS);
 		if (this.snapshotTimer && typeof this.snapshotTimer === "object" && "unref" in this.snapshotTimer) {
 			this.snapshotTimer.unref();
 		}
+	}
+
+	private consumeRestoredSnapshotSkip(): boolean {
+		const skip = this.restoredNamespaceSkip;
+		this.restoredNamespaceSkip = undefined; // one-shot: consumed whether or not it fires
+		if (!skip || !this.options.snapshot) return false;
+		if (this.completedExecutions !== skip.completedExecutions) return false;
+		const stat = manifestStatOf(this.options.snapshot.manifestPath);
+		if (stat === null || skip.manifestStat === null) return stat === skip.manifestStat;
+		return stat.mtimeMs === skip.manifestStat.mtimeMs && stat.size === skip.manifestStat.size;
 	}
 
 	private clearSnapshotTimer(): void {
@@ -1518,5 +1788,9 @@ export class ReplKernelManager {
 
 	get isRunning(): boolean {
 		return this.state === "running";
+	}
+
+	get isDefunct(): boolean {
+		return this.state === "shutdown";
 	}
 }

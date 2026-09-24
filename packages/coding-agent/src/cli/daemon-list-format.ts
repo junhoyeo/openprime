@@ -1,3 +1,4 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { formatSessionDisplayId } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
@@ -34,7 +35,7 @@ export function formatSessionListTable(sessions: readonly SessionSummary[], nowM
 		id: formatSessionDisplayId(session.id),
 		status: listStatusForSummary(session),
 		age: formatSessionAge(session.modified, nowMs),
-		model: formatSessionModel(session.model),
+		model: formatModelSelector(session.model),
 		messages: String(session.messageCount),
 		clients: String(session.attachedClients),
 	}));
@@ -68,7 +69,7 @@ function formatListCell(row: ListRow, column: keyof ListRow, value: string): str
 	}
 }
 
-function formatSessionAge(modified: string | undefined, nowMs: number): string {
+export function formatSessionAge(modified: string | undefined, nowMs: number): string {
 	if (!modified) {
 		return "";
 	}
@@ -99,23 +100,28 @@ function formatSessionAge(modified: string | undefined, nowMs: number): string {
 	return `${Math.floor(ageWeeks / 52)}y`;
 }
 
-function formatSessionModel(model: SessionSummary["model"]): string {
+function formatModelSelector(model: SessionSummary["model"]): string {
 	return model ? `${model.provider}/${model.id}` : "";
 }
 
-function formatTable<T extends Record<string, string>>(
+// Column widths are terminal display widths: UTF-16 `.length` under-counts CJK
+// and emoji cells, which drifts the following columns (the agents view measures
+// with `visibleWidth` for the same reason).
+export function formatTable<T extends Record<string, string>>(
 	columns: Array<keyof T>,
 	rows: T[],
 	formatCell?: (row: T, column: keyof T, value: string) => string,
 ): string {
 	const widths = columns.map((column) =>
-		Math.max(String(column).length, ...rows.map((row) => String(row[column]).length)),
+		Math.max(visibleWidth(String(column)), ...rows.map((row) => visibleWidth(String(row[column])))),
 	);
-	const lines = [columns.map((column, index) => String(column).padEnd(widths[index])).join("  ")];
+	const padCell = (value: string, width: number): string =>
+		value + " ".repeat(Math.max(0, width - visibleWidth(value)));
+	const lines = [columns.map((column, index) => padCell(String(column), widths[index])).join("  ")];
 	for (const row of rows) {
 		const line = columns
 			.map((column, index) => {
-				const value = String(row[column]).padEnd(widths[index]);
+				const value = padCell(String(row[column]), widths[index]);
 				return formatCell ? formatCell(row, column, value) : value;
 			})
 			.join("  ");

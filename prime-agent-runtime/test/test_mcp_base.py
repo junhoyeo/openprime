@@ -201,6 +201,29 @@ class McpIntegrationTest(unittest.TestCase):
             tools = _run(_Integration().list_tools())
         self.assertEqual(tools[0]["inputSchema"], schema)
 
+    def test_snake_case_input_schema_surfaces(self):
+        # mcp>=2 Tool objects expose input_schema (pydantic field name), not inputSchema.
+        Tool = type("Tool", (), {})
+        tool = Tool()
+        tool.name = "list_issues"
+        tool.description = "List issues"
+        tool.input_schema = {"type": "object", "properties": {"team": {"type": "string"}}}
+        session = _FakeSession(tools=[], result=None)
+
+        async def list_tools():
+            resp = type("Resp", (), {})()
+            resp.tools = [tool]
+            return resp
+
+        session.list_tools = list_tools
+        self._write_auth(
+            {"type": "oauth", "access": "t", "refresh": "r", "expires": (time.time() + 3600) * 1000}
+        )
+        with self._patch_session(session):
+            integration = _Integration()
+            tools = _run(integration.list_tools())
+        self.assertEqual(tools[0]["inputSchema"], tool.input_schema)
+
     def test_bound_tool_docstring_carries_schema(self):
         """help(tool) must render real arguments, not an empty schema."""
         schema = {"type": "object", "properties": {"componentName": {"type": "string"}}}

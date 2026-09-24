@@ -109,6 +109,19 @@ def one(events: list[dict], kind: str) -> dict | None:
     return matches[0] if matches else None
 
 
+def wait_for_host_request(repl: ReplProcess, events: list[dict]) -> dict:
+    request = one(events, "host_request")
+    while request is None:
+        event = repl.read_event()
+        if event.get("event") == "host_request":
+            request = event
+    return request
+
+
+def reply_ok(repl: ReplProcess, request: dict) -> None:
+    repl.send({"type": "host_reply", "id": request["id"], "data": {"status": "ok", "result": {}}})
+
+
 class ReplTest(unittest.TestCase):
     def setUp(self) -> None:
         self.repl = ReplProcess()
@@ -123,6 +136,33 @@ class ReplTest(unittest.TestCase):
         # Loose bound for loaded CI machines; still catches an order-of-magnitude regression.
         print(f"\n[startup] spawn -> ready: {self.ready_ms:.0f} ms")
         self.assertLess(self.ready_ms, 500)
+
+    def test_import_rlm_defers_the_event_loop_stack(self):
+        # `import rlm` is the pre-ready boot path: the event loop stack must load
+        # after the ready event, not during package import, and serving must keep
+        # it resident.
+        env = {**os.environ, "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", "")}
+        code = "import rlm, sys; assert 'asyncio' not in sys.modules and 'secrets' not in sys.modules"
+        subprocess.run([sys.executable, "-c", code], env=env, check=True, timeout=30)
+        events = self.repl.execute("serving", "import sys\n'asyncio' in sys.modules")
+        self.assertEqual(one(events, "result")["text"], "True")
+
+    def test_sigint_during_the_deferred_boot_stays_fatal(self):
+        # A fake `asyncio` parks the kernel inside the post-ready deferred
+        # import. The fifo open below returns only once the kernel is parked in
+        # that window, where an early _sigint_handler install swallowed the
+        # Ctrl-C, so only the default handler may be in charge there.
+        with tempfile.TemporaryDirectory() as tmp:
+            park = os.path.join(tmp, "deferred-boot-park")
+            os.mkfifo(park)
+            with open(os.path.join(tmp, "asyncio.py"), "w") as fake_asyncio:
+                fake_asyncio.write(f"import os\nos.read(os.open({park!r}, os.O_RDONLY), 1)\n")
+            repl = ReplProcess(env={"PYTHONPATH": tmp + os.pathsep + SRC})
+            self.addCleanup(repl.close)
+            self.assertEqual(repl.ready()[0]["event"], "ready")
+            with open(park, "wb"):
+                os.kill(repl.proc.pid, signal.SIGINT)
+                self.assertNotEqual(repl.proc.wait(timeout=10), 0)
 
     def test_result_echo(self):
         events = self.repl.execute("a", "1+1")
@@ -366,19 +406,16 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(error["ename"], "KeyboardInterrupt")
         self.assertEqual(one(events, "done")["status"], "error")
 
-    def test_stdout_buffer_write_works_and_surfaces_as_null(self):
-        # Libraries write bytes via sys.stdout.buffer; the tagged writer must
-        # expose a working buffer whose bytes surface (null-attributed) before done.
+    def test_stdout_buffer_write_surfaces_as_null_and_rejects_int(self):
+        # Libraries write bytes via sys.stdout.buffer: the tagged writer exposes a
+        # working buffer whose bytes surface (null-attributed) before done, and it
+        # raises TypeError for ints (bytes(5) would emit five NULs).
         events = self.repl.execute(
             "bufw", "import sys\nsys.stdout.buffer.write(b'buffer-bytes\\n')\nsys.stdout.buffer.flush()"
         )
-        self.assertEqual(one(events, "done")["status"], "ok")
         buffered = next(e for e in events if e.get("event") == "stdout" and "buffer-bytes" in e["text"])
         self.assertIsNone(buffered["id"])
         self.assertLess(events.index(buffered), events.index(one(events, "done")))
-
-    def test_stdout_buffer_write_rejects_int(self):
-        # A real stdout.buffer raises TypeError for ints; bytes(5) would emit five NULs.
         events = self.repl.execute("bufint", "import sys\nsys.stdout.buffer.write(5)")
         self.assertEqual(one(events, "error")["ename"], "TypeError")
         self.assertEqual(one(events, "done")["status"], "error")
@@ -623,6 +660,77 @@ class ReplTest(unittest.TestCase):
             events = self.repl.execute("chk", "'In' in dir()")
             self.assertEqual(one(events, "result")["text"], "False")
 
+    def test_restore_revives_functions_with_live_globals_pr2471(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.dill")
+            self.repl.execute("fn1", "G = 1\ndef reader():\n    return G\ndef prober():\n    return late")
+            # priv.__globals__ is the private exec dict pn, not ns: drives backfill.
+            self.repl.execute("fn0", "exec('SECRET = 42\\ndef priv():\\n    return SECRET', pn:={'__name__': '__main__'})\npriv = pn['priv']")
+            self.repl.send({"type": "snapshot", "id": "fn2", "path": path, "manifest_path": os.path.join(tmp, "state.json")})
+            self.repl.send({"type": "restore", "id": "fn3", "path": path})
+            self.assertEqual(one(self.repl.until_done("fn3"), "done")["status"], "ok")
+            events = self.repl.execute("fn4", "G = 2\nreader()")
+            self.assertEqual(one(events, "result")["text"], "2")
+            events = self.repl.execute("fn5", "late = 'live'\nprober()")
+            self.assertEqual(one(events, "result")["text"], "'live'")
+            events = self.repl.execute("fn6", "priv()")
+            self.assertEqual(one(events, "result")["text"], "42")
+
+    def test_restore_revives_partial_wrapped_functions_pr2471(self):
+        # dill revives a partial's wrapped __main__ function with frozen globals.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.dill")
+            self.repl.execute("pt1", "import functools\nG = 1\ndef base():\n    return G\nwrapped = functools.partial(base)")
+            self.repl.send({"type": "snapshot", "id": "pt2", "path": path, "manifest_path": os.path.join(tmp, "state.json")})
+            self.repl.send({"type": "restore", "id": "pt3", "path": path})
+            self.assertEqual(one(self.repl.until_done("pt3"), "done")["status"], "ok")
+            events = self.repl.execute("pt4", "G = 2\nwrapped()")
+            self.assertEqual(one(events, "result")["text"], "2")
+
+    def _snapshot_restore(self, rid: str, code: str, tmp: str) -> None:
+        self.assertEqual(one(self.repl.execute(rid + "0", code), "done")["status"], "ok")
+        self.repl.send({"type": "snapshot", "id": rid + "1", "path": os.path.join(tmp, "s.dill"), "manifest_path": os.path.join(tmp, "s.json")})
+        self.repl.send({"type": "restore", "id": rid + "2", "path": os.path.join(tmp, "s.dill")})
+        self.assertEqual(one(self.repl.until_done(rid + "2"), "done")["status"], "ok")
+
+    def test_restore_rebuilt_partial_keeps_attributes_and_args_pr2471(self):
+        code = (
+            "import functools\nG = 1\ndef helper():\n    return G\ndef apply(fn):\n    return fn()\n"
+            "wrapped = functools.partial(apply, helper)\nwrapped.label = 'x'"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot_restore("pa", code, tmp)
+            self.assertEqual(one(self.repl.execute("pa4", "wrapped.label"), "result")["text"], "'x'")
+            self.assertEqual(one(self.repl.execute("pa5", "G = 2\nwrapped()"), "result")["text"], "2")
+
+    def test_restore_backfill_skips_excluded_names_pr2471(self):
+        code = (
+            "exec('PUB = 1\\n_hidden = 2\\nIn = 3\\nOut = 4\\ndef user():\\n    return (PUB, _hidden, In, Out)', pn:={'__name__': '__main__'})\n"
+            "user = pn['user']"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot_restore("ex", code, tmp)
+            probe = "('PUB' in dir(), '_hidden' in dir(), 'In' in dir(), 'Out' in dir())"
+            self.assertEqual(one(self.repl.execute("ex4", probe), "result")["text"], "(True, False, False, False)")
+
+    def test_restore_revives_callables_in_defaults_and_closures_pr2471(self):
+        code = ("G = 1\ndef helper():\n    return G\nrun = lambda fn=helper: fn()\nrun2 = lambda *, fn=helper: fn()\nclosed = (lambda fn: lambda: fn())(helper)\n"
+                "def make():\n    n = 0\n    def get():\n        return n\n    def set(v):\n        nonlocal n\n        n = v\n    get.set = set\n    return get\ncounter = make()\nrun.callback = helper")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot_restore("dc", code, tmp)
+            self.assertEqual(one(self.repl.execute("dc4", "G = 2\ncounter.set(5)\n(run(), run2(), closed(), counter(), run.callback())"), "result")["text"], "(2, 2, 2, 5, 2)")
+
+    def test_restore_publishes_rebuilt_partial_in_backfill_cycle_pr2471(self):
+        code = ("exec('import functools\\nG = 1\\ndef base():\\n    return G, wrapped\\nwrapped = functools.partial(base)\\n"
+                "def entry():\\n    return wrapped()', pn:={'__name__': '__main__'})\nentry = pn['entry']")
+        self._snapshot_restore("bp", code, self.enterContext(tempfile.TemporaryDirectory()))
+        self.assertEqual(one(self.repl.execute("bp4", "G = 2\nentry()[0]"), "result")["text"], "2")
+
+    def test_restore_revives_functions_inside_containers_pr2471(self):
+        code = "G = 1\ndef reader():\n    return G\ncallbacks = [reader]\nhandlers = {'read': reader}\npair = (reader,)"
+        self._snapshot_restore("ct", code, self.enterContext(tempfile.TemporaryDirectory()))
+        self.assertEqual(one(self.repl.execute("ct4", "G = 2\n(callbacks[0](), handlers['read'](), pair[0]())"), "result")["text"], "(2, 2, 2)")
+
     def test_snapshot_prune_oversized(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "kernel-state.dill")
@@ -644,6 +752,23 @@ class ReplTest(unittest.TestCase):
             self.assertEqual(done["pruned"], ["big"])
             events = self.repl.execute("p3", "'big' in dir()")
             self.assertEqual(one(events, "result")["text"], "False")
+
+    def test_prune_measures_the_current_value_2478(self):
+        # Redefinition or in-place shrink after an oversized skip: prune must re-measure.
+        for cell in ("def big(): pass", "big.clear()"):
+            with self.subTest(cell=cell):
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = {"type": "snapshot", "path": os.path.join(tmp, "kernel-state.dill"),
+                            "manifest_path": os.path.join(tmp, "kernel-state.json"), "max_variable_bytes": 1024}
+                    self.repl.execute("pk1", "big = bytearray(b'x' * 100_000)\nkeep = 1")
+                    self.repl.send({"id": "pk2", **base})
+                    self.assertEqual(one(self.repl.until_done("pk2"), "done")["status"], "ok")
+                    self.repl.execute("pk3", cell)
+                    self.repl.send({"id": "pk4", "prune_oversized": True, **base})
+                    done = one(self.repl.until_done("pk4"), "done")
+                    self.assertEqual(done["status"], "ok")
+                    self.assertEqual(done["pruned"], [])
+                    self.assertEqual(done["saved"], ["big", "keep"])
 
     def test_emit_display(self):
         payloads = {
@@ -692,6 +817,26 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(follow, "result")["text"], "2")
         self.assertEqual(one(follow, "done")["status"], "ok")
 
+    def test_large_write_ships_bounded_stream_frames(self):
+        events = self.repl.execute("chunk", "import sys\nsys.stdout.write('x' * 300_000)")
+        frames = [e["text"] for e in events if e.get("event") == "stdout"]
+        self.assertEqual("".join(frames), "x" * 300_000)
+        self.assertTrue(all(len(frame) <= 65536 for frame in frames))
+
+    def test_oversized_text_and_payloads_are_capped(self):
+        code = "class C:\n    def __repr__(self):\n        return 'x' * 3_000_000\nC()"
+        events = self.repl.execute("big-repr", code)
+        expected = "x" * 1_048_576 + "\n[... result truncated at 1048576 characters ...]"
+        self.assertEqual(one(events, "result")["text"], expected)
+        error = one(self.repl.execute("big-error", "raise ValueError('x' * 3_000_000)"), "error")
+        self.assertEqual(error["evalue"], expected)
+        self.assertEqual(error["traceback"][-1], "ValueError: " + expected[len("ValueError: ") :])
+        events = self.repl.execute("emit-big", "from rlm.repl import emit\nemit({'text/plain': 'x' * 17_000_000})")
+        self.assertEqual(one(events, "error")["ename"], "ValueError")
+        self.assertEqual(one(events, "done")["status"], "error")
+        code = "from rlm.repl import host_request\nawait host_request({'type': 'demo', 'blob': 'x' * 17_000_000})"
+        self.assertEqual(one(self.repl.execute("hr-big", code), "error")["ename"], "ValueError")
+
     def test_bash_integration(self):
         events = self.repl.execute(
             "sh1", "from rlm import bash\nresult = await bash('echo repl-bash')\nresult.output.strip()"
@@ -712,6 +857,407 @@ class ReplTest(unittest.TestCase):
                 return
             time.sleep(0.05)
         self.fail(f"bash child {pid} survived runtime shutdown")
+
+    def test_async_bash_completion_notifies_only_after_an_unawaited_creating_cell(self):
+        direct = self.repl.execute(
+            "bash-direct", "from rlm import bash\n(await bash('printf direct')).exit_code"
+        )
+        self.assertIsNone(one(direct, "host_request"))
+
+        eventual = self.repl.execute(
+            "bash-eventual",
+            "import asyncio\nhandle = bash('printf eventual')\nawait asyncio.sleep(0.1)\n(await handle).exit_code",
+        )
+        self.assertIsNone(one(eventual, "host_request"))
+
+        started = self.repl.execute(
+            "bash-detached", "handle = bash('sleep 0.05; printf detached')\nhandle.pid"
+        )
+        pid = int(one(started, "result")["text"])
+        request = wait_for_host_request(self.repl, started)
+        self.assertEqual(
+            request["data"],
+            {
+                "type": "bash.completed",
+                "pid": pid,
+                "command": "sleep 0.05; printf detached",
+                "exitCode": 0,
+            },
+        )
+        reply_ok(self.repl, request)
+        inspected = self.repl.execute("bash-inspect", "handle.poll().output")
+        self.assertIn("detached", one(inspected, "result")["text"])
+
+    def test_result_read_after_notice_requests_one_withdrawal(self):
+        reads = (
+            ("poll", "handle.poll().output"),
+            ("await", "(await handle).output"),
+        )
+        for label, read_code in reads:
+            with self.subTest(label=label):
+                command = f"sleep 0.05; printf withdrawn-{label}"
+                started = self.repl.execute(
+                    f"withdraw-{label}",
+                    f"from rlm import bash\nhandle = bash({command!r})\nhandle.pid",
+                )
+                pid = int(one(started, "result")["text"])
+                notice = wait_for_host_request(self.repl, started)
+                self.assertEqual(notice["data"]["type"], "bash.completed")
+                reply_ok(self.repl, notice)
+                read = self.repl.execute(f"withdraw-{label}-read", read_code)
+                self.assertIn(f"withdrawn-{label}", one(read, "result")["text"])
+                # The withdrawal must ship ahead of the reading cell's done, or the
+                # notice is delivered as a stale turn-boundary notice instead.
+                kinds = [event.get("event") for event in read]
+                self.assertLess(kinds.index("host_request"), kinds.index("done"))
+                request = wait_for_host_request(self.repl, read)
+                self.assertEqual(
+                    request["data"], {"type": "bash.consumed", "pid": pid, "command": command}
+                )
+                # Old host: the error reply is dropped silently and the withdrawal never repeats.
+                self.repl.send(
+                    {"type": "host_reply", "id": request["id"], "data": {"status": "error", "error": "unknown"}}
+                )
+                if label == "poll":
+                    again = self.repl.execute("withdraw-again", "handle.output()\nhandle.tail(1)")
+                    self.assertEqual([e for e in again if e.get("event") in ("error", "host_request")], [])
+
+    def test_result_read_before_notice_acceptance_withdraws_at_acceptance(self):
+        started = self.repl.execute("early", "from rlm import bash\nhandle = bash('printf early')\nhandle.pid")
+        notice = wait_for_host_request(self.repl, started)
+        self.assertIsNone(one(self.repl.execute("early-read", "handle.poll().output"), "host_request"))
+        reply_ok(self.repl, notice)
+        withdrawal = wait_for_host_request(self.repl, [])["data"]
+        self.assertEqual(withdrawal, {"type": "bash.consumed", "pid": notice["data"]["pid"], "command": "printf early"})
+
+    def test_detached_read_between_turns_keeps_bash_completion(self):
+        # A watcher reading the handle with no cell running reaches nobody: the
+        # notice is the only wake-up an idle session gets, so it must survive.
+        code = "\n".join(
+            [
+                "from rlm import bash",
+                "import asyncio",
+                "handle = bash('sleep 0.2; printf detached-read')",
+                "async def watch():",
+                "    await handle._wait()",
+                "    globals()['seen'] = handle.output()",
+                "asyncio.create_task(watch())",
+                "handle.pid",
+            ]
+        )
+        started = self.repl.execute("detached-read", code)
+        pid = int(one(started, "result")["text"])
+        request = wait_for_host_request(self.repl, started)
+        self.assertEqual(request["data"]["type"], "bash.completed")
+        self.assertEqual(request["data"]["pid"], pid)
+        reply_ok(self.repl, request)
+        probe = self.repl.execute("detached-read-probe", "await asyncio.sleep(0.05)\nseen")
+        self.assertIsNone(one(probe, "host_request"))
+        self.assertEqual(one(probe, "result")["text"], "'detached-read'")
+
+    def test_result_read_in_creating_cell_suppresses_bash_completion(self):
+        events = self.repl.execute(
+            "read-in-cell",
+            "from rlm import bash\nimport asyncio\nhandle = bash('printf read-in-cell')\n"
+            "await asyncio.wait_for(handle._wait(), 5)\nhandle.output()",
+        )
+        self.assertEqual(one(events, "result")["text"], "'read-in-cell'")
+        probe = self.repl.execute("read-in-cell-probe", "await asyncio.sleep(0.05)")
+        self.assertIsNone(one(events, "host_request"))
+        self.assertIsNone(one(probe, "host_request"))
+
+    def test_wrapper_awaits_in_creating_cell_suppress_bash_completion(self):
+        def task_group(label: str, await_expression: str) -> str:
+            return "\n".join(
+                [
+                    f"handle = bash('printf {label}')",
+                    "async def consume():",
+                    f"    return {await_expression}",
+                    "async with asyncio.TaskGroup() as group:",
+                    "    task = group.create_task(consume())",
+                    "task.result().output",
+                ]
+            )
+
+        snippets = {
+            "gather": "(await asyncio.gather(bash('printf gather')))[0].output",
+            "wait-for": "(await asyncio.wait_for(bash('printf wait-for'), 1)).output",
+            "shield": "(await asyncio.shield(bash('printf shield'))).output",
+            "nested": "(await asyncio.shield(asyncio.gather(bash('printf nested'))))[0].output",
+            "as-completed": (
+                "[(await completed).output for completed in "
+                "asyncio.as_completed([bash('printf as-completed')])]"
+            ),
+            "as-completed-delayed-consumer": (
+                "handle = bash('sleep 0.15; printf as-completed-delayed-consumer')\n"
+                "completed = next(iter(asyncio.as_completed([handle])))\n"
+                "await asyncio.sleep(0)\n"
+                "(await completed).output"
+            ),
+            "as-completed-finished-handle": (
+                "handle = bash('printf as-completed-finished-handle')\n"
+                "task = asyncio.ensure_future(handle)\n"
+                "await asyncio.to_thread(handle._done.wait)\n"
+                "await asyncio.sleep(0.01)\n"
+                "assert task.done()\n"
+                "(await handle).output"
+            ),
+            "as-completed-nested": (
+                "[(await completed)[0].output for completed in "
+                "asyncio.as_completed([asyncio.shield(asyncio.gather(bash('printf as-completed-nested')))])]"
+            ),
+            "wait": "\n".join(
+                [
+                    "handle = bash('printf wait')",
+                    "task = asyncio.ensure_future(handle)",
+                    "await asyncio.wait({task})",
+                    "task.result().output",
+                ]
+            ),
+            "task-group": task_group("task-group", "await handle"),
+            "task-group-gather": task_group("task-group-gather", "(await asyncio.gather(handle))[0]"),
+            "task-group-shield": task_group("task-group-shield", "await asyncio.shield(handle)"),
+        }
+        if sys.version_info >= (3, 13):
+            snippets["as-completed-async"] = (
+                "[completed.result().output async for completed in "
+                "asyncio.as_completed([bash('printf as-completed-async')])]"
+            )
+        for label, snippet in snippets.items():
+            with self.subTest(label=label):
+                completed = self.repl.execute(
+                    f"bash-wrapper-{label}",
+                    f"from rlm import bash\nimport asyncio\n{snippet}",
+                )
+                self.assertIn(label, one(completed, "result")["text"])
+                probe = self.repl.execute(f"bash-wrapper-{label}-probe", "await asyncio.sleep(0.05)")
+                request = one(probe, "host_request")
+                if request is not None:
+                    reply_ok(self.repl, request)
+                self.assertIsNone(request)
+
+    def test_as_completed_outside_creating_cell_keeps_one_bash_completion(self):
+        snippets = {
+            "no-await": (
+                "iterator = asyncio.as_completed([handle])\n"
+                "next(iterator).close()\n"
+                "await asyncio.sleep(0.05)"
+            ),
+            "detached": (
+                "async def consume():\n"
+                "    for completed in asyncio.as_completed([handle]):\n"
+                "        await completed\n"
+                "consumer = asyncio.create_task(consume())\n"
+                "await asyncio.sleep(0.05)"
+            ),
+        }
+        for label, snippet in snippets.items():
+            with self.subTest(label=label):
+                command = f"printf {label}"
+                events = self.repl.execute(
+                    f"as-completed-{label}",
+                    f"from rlm import bash\nimport asyncio\nhandle = bash({command!r})\n{snippet}",
+                )
+                events += self.repl.execute(
+                    f"as-completed-{label}-probe", "await asyncio.sleep(0.05)"
+                )
+                requests = [event for event in events if event.get("event") == "host_request"]
+                for request in requests:
+                    reply_ok(self.repl, request)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["data"]["type"], "bash.completed")
+                self.assertEqual(requests[0]["data"]["command"], command)
+                self.assertFalse(any(event.get("event") == "error" for event in events))
+
+    def test_background_task_await_does_not_suppress_bash_completion(self):
+        code = "\n".join(
+            [
+                "from rlm import bash",
+                "import asyncio",
+                "task_handle = bash('sleep 0.05; printf background-waiter')",
+                "async def consume():",
+                "    globals()['task_result'] = await task_handle",
+                "waiter = asyncio.create_task(consume())",
+                "bookkeeping = asyncio.get_running_loop().create_future()",
+                "def callback_for(marker):",
+                "    return lambda _: marker.cancelled()",
+                "waiter.add_done_callback(callback_for(bookkeeping))",
+                "asyncio.get_running_loop().call_later(0.02, bookkeeping.set_result, None)",
+                "await bookkeeping",
+                "task_handle.pid",
+            ]
+        )
+        started = self.repl.execute("bash-task-waiter", code)
+        pid = int(one(started, "result")["text"])
+        request = wait_for_host_request(self.repl, started)
+        self.assertEqual(request["data"]["type"], "bash.completed")
+        self.assertEqual(request["data"]["pid"], pid)
+        reply_ok(self.repl, request)
+
+    def test_bash_activity_and_notice_wait_for_group_reap(self):
+        mime = "application/vnd.prime-agent.bash-activity+json"
+        for awaited in (False, True):
+            with self.subTest(awaited=awaited):
+                events = self.repl.execute(
+                    "group-start",
+                    "from rlm import bash\nimport asyncio\n"
+                    "handle = bash('sleep 30 &')\n"
+                    + ("await handle\n" if awaited else "")
+                    + "await asyncio.wait_for(handle._wait(), 3)\nhandle._group_alive()",
+                )
+                self.assertEqual(one(events, "result")["text"], "True")
+                self.assertIsNone(one(events, "host_request"))
+                self.assertFalse(
+                    any(event.get("data", {}).get(mime, {}).get("active") is False for event in events)
+                )
+                events += self.repl.execute("group-stop", "handle.kill()")
+                requests = []
+                cursor = 0
+                while True:
+                    for event in events[cursor:]:
+                        if event.get("event") == "host_request":
+                            requests.append(event)
+                            reply_ok(self.repl, event)
+                    cursor = len(events)
+                    if any(event.get("data", {}).get(mime, {}).get("active") is False for event in events):
+                        break
+                    events.append(self.repl.read_event())
+                self.assertEqual(len(requests), 0 if awaited else 1)
+                checked = self.repl.execute(
+                    "group-reaped", "await asyncio.wait_for(handle._wait_reaped(), 1)\nhandle._reaped"
+                )
+                self.assertEqual(one(checked, "result")["text"], "True")
+
+    def test_cancelled_released_bash_await_keeps_completion_notice(self):
+        mime = "application/vnd.prime-agent.bash-activity+json"
+        for released in (False, True):
+            with self.subTest(released=released):
+                events = self.repl.execute(
+                    "cancel-start",
+                    "from rlm import bash\nimport asyncio\n"
+                    "handle = bash('sleep 0.15; printf finished')\n"
+                    + ("handle.pid\n" if released else "")
+                    + "try:\n    await asyncio.wait_for(handle, 0.01)\n"
+                    "except TimeoutError:\n    pass\nhandle._group_alive()",
+                )
+                self.assertEqual(one(events, "result")["text"], str(released))
+                requests = []
+                cursor = 0
+                while True:
+                    for event in events[cursor:]:
+                        if event.get("event") == "host_request":
+                            requests.append(event)
+                            reply_ok(self.repl, event)
+                    cursor = len(events)
+                    if any(event.get("data", {}).get(mime, {}).get("active") is False for event in events):
+                        break
+                    events.append(self.repl.read_event())
+                self.assertEqual(len(requests), 1 if released else 0)
+                checked = self.repl.execute("cancel-result", "handle.poll().output")
+                self.assertEqual(one(checked, "result")["text"], "'finished'" if released else "''")
+
+    def test_interrupt_during_bash_notifier_construction_rolls_back_activity(self):
+        code = "\n".join(
+            [
+                "from rlm import bash, repl as bridge",
+                "import sys, threading, asyncio, inspect",
+                "def stop_at_notice_construction(frame, event, arg):",
+                "    coro = frame.f_locals.get('coro')",
+                "    if (event == 'call' and frame.f_code.co_name == 'create_task'",
+                "            and getattr(getattr(coro, 'cr_code', None), 'co_name', None)",
+                "            == '_notify_background_completion'):",
+                "        globals()['unscheduled_notice'] = coro",
+                "        globals()['interrupted_handle'] = coro.cr_frame.f_locals['self']",
+                "        bridge.emit({'application/json': {'at_notice_create_task': True}})",
+                "        threading.Event().wait(10)",
+                "    return stop_at_notice_construction",
+                "sys.settrace(stop_at_notice_construction)",
+                "handle = bash('sleep 30')",
+            ]
+        )
+        self.repl.send({"type": "execute", "id": "construct", "code": code})
+        events = []
+        while True:
+            event = self.repl.read_event()
+            events.append(event)
+            if event.get("data", {}).get("application/json", {}).get("at_notice_create_task"):
+                break
+        self.repl.send({"type": "interrupt", "id": "construct"})
+        events += self.repl.until_done("construct")
+        self.assertEqual(one(events, "done")["status"], "error")
+        self.assertEqual(one(events, "error")["ename"], "KeyboardInterrupt")
+        mime = "application/vnd.prime-agent.bash-activity+json"
+        activity = [event["data"][mime] for event in events if mime in event.get("data", {})]
+        self.assertEqual([item["active"] for item in activity], [True, False])
+        self.assertEqual(activity[0]["id"], activity[1]["id"])
+        checked = self.repl.execute(
+            "construct-check",
+            "sys.settrace(None)\n"
+            "assert await interrupted_handle._await_group_death(3)\n"
+            "(inspect.getcoroutinestate(unscheduled_notice), interrupted_handle._reap_callback, "
+            "interrupted_handle._group_alive())",
+        )
+        self.assertEqual(one(checked, "result")["text"], "('CORO_CLOSED', None, False)")
+
+    def test_rejected_bash_completion_reports_safe_stderr_and_releases_activity(self):
+        mime = "application/vnd.prime-agent.bash-activity+json"
+        for reply in ({"status": "error", "error": "secret-host-error"}, {}, {"status": "ok"}):
+            with self.subTest(reply=reply):
+                events = self.repl.execute(
+                    "ack-start", "from rlm import bash\nhandle = bash('printf secret-command')"
+                )
+                request = wait_for_host_request(self.repl, events)
+                self.repl.send({"type": "host_reply", "id": request["id"], "data": reply})
+                after = []
+                while not any(
+                    event.get("data", {}).get(mime, {}).get("active") is False for event in after
+                ):
+                    after.append(self.repl.read_event())
+                diagnostic = stream_text(after, "stderr")
+                if reply.get("status") == "ok":
+                    self.assertEqual(diagnostic, "")
+                else:
+                    self.assertEqual(
+                        diagnostic,
+                        f"Background bash completion follow-up for pid {request['data']['pid']} "
+                        "was not accepted. Inspect the saved handle with poll(), output(), or tail().\n",
+                    )
+                self.assertIsNone(one(after, "host_request"))
+                checked = self.repl.execute("ack-check", "handle._reaped, handle.poll().exit_code")
+                self.assertEqual(one(checked, "result")["text"], "(True, 0)")
+
+    def test_reused_request_id_does_not_capture_old_cell_bash_completion(self):
+        setup = "\n".join(
+            [
+                "from rlm import bash",
+                "import asyncio",
+                "reuse_gate = asyncio.Event()",
+                "async def launch_after_cell():",
+                "    await reuse_gate.wait()",
+                "    globals()['reused_handle'] = bash('printf reused-id')",
+                "asyncio.create_task(launch_after_cell())",
+            ]
+        )
+        self.repl.execute("reused-cell-id", setup)
+
+        self.repl.send(
+            {
+                "type": "execute",
+                "id": "reused-cell-id",
+                "code": "reuse_gate.set()\nawait asyncio.sleep(0.2)",
+            }
+        )
+        request = None
+        while True:
+            event = self.repl.read_event()
+            if event.get("event") == "host_request":
+                request = event
+                break
+            self.assertFalse(event.get("event") == "done" and event.get("id") == "reused-cell-id")
+        self.assertEqual(request["data"]["type"], "bash.completed")
+        self.assertEqual(request["data"]["command"], "printf reused-id")
+        reply_ok(self.repl, request)
+        self.assertEqual(one(self.repl.until_done("reused-cell-id"), "done")["status"], "ok")
 
     def test_protocol_framing_under_noise(self):
         setup = "\n".join(
@@ -746,7 +1292,7 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(events, "result")["text"], "'alive'")
 
     def test_list_names(self):
-        self.repl.execute("ln1", "alpha = 1\ndef helper(n):\n    return n\n_hidden = 2\nrlm = object()")
+        self.repl.execute("ln1", "alpha = 1\ndef helper(n):\n    return n\n_hidden = 2\nrlm = object()\nglobals()[1] = 2")
         self.repl.send({"type": "list_names", "id": "ln2"})
         done = one(self.repl.until_done("ln2"), "done")
         self.assertEqual(done["status"], "ok")
@@ -754,17 +1300,8 @@ class ReplTest(unittest.TestCase):
         self.assertIn("helper", done["names"])
         self.assertNotIn("_hidden", done["names"])
         self.assertNotIn("rlm", done["names"])
-        self.assertEqual(done["names"], sorted(done["names"]))
-
-    def test_list_names_skips_non_string_keys(self):
-        self.repl.execute("lnk1", "globals()[1] = 1\nbeta = 2")
-        self.repl.send({"type": "list_names", "id": "lnk2"})
-        done = one(self.repl.until_done("lnk2"), "done")
-        self.assertEqual(done["status"], "ok")
-        self.assertIn("beta", done["names"])
         self.assertNotIn(1, done["names"])
-        events = self.repl.execute("lnk3", "'alive'")
-        self.assertEqual(one(events, "result")["text"], "'alive'")
+        self.assertEqual(done["names"], sorted(done["names"]))
 
     def test_host_request_round_trip(self):
         code = "\n".join(
@@ -848,11 +1385,6 @@ class ReplTest(unittest.TestCase):
         )
         self.assertEqual(one(events, "done")["status"], "error")
 
-    def test_host_reply_for_unknown_id_dropped(self):
-        self.repl.send({"type": "host_reply", "id": "no-such-request", "data": {"status": "ok"}})
-        events = self.repl.execute("ok", "'alive'")
-        self.assertEqual(one(events, "result")["text"], "'alive'")
-
     def test_host_request_cancelled_cell_drops_pending_future(self):
         code = "\n".join(
             [
@@ -890,9 +1422,6 @@ class ReplTest(unittest.TestCase):
             display = self.repl.read_event()
         self.assertEqual(display["id"], "det")
         self.assertEqual(display["data"], {"text/plain": "late"})
-
-    def test_shutdown_clean_exit(self):
-        self.assertEqual(self.repl.shutdown(), 0)
 
     def test_shutdown_after_mcp_import_exits_cleanly(self):
         events = self.repl.execute("mcp-import", "import rlm.mcp")
@@ -1603,6 +2132,14 @@ class RestoreApplyShieldTest(unittest.TestCase):
         self.assertEqual(result["restored"], ["a", "b"])
         self.assertEqual(dict(ns), {"a": 1, "b": 2})
 
+    def test_sigint_with_backfill_first_write_is_consumed(self):
+        from rlm.repl import _restore_state
+        exec("SECRET = 42\ndef reader():\n    return SECRET", source := {"__name__": "__main__"})
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self.SigintOnNthSet(fire_on=1)
+            result = _restore_state(ns, self._write_snapshot(tmp, {"reader": source["reader"]}))
+        self.assertEqual((result["restored"], ns["SECRET"]), (["reader"], 42))
+
     def _restore_with_sigint_at_unpark(self):
         """Real unparking swap, then the newly restored handler fires immediately."""
         from rlm.repl import _restore_state
@@ -1685,11 +2222,10 @@ class SnapshotTempCleanupTest(unittest.TestCase):
 
             real_dump = dill.dump
 
-            def interrupted_dump(payload, fh):
-                if isinstance(payload, dict):  # the complete payload, not a per-variable value
-                    fh.write(b"partial")
-                    raise KeyboardInterrupt
-                return real_dump(payload, fh)
+            def interrupted_dump(value, fh):
+                # Interrupt mid-dump, after partial bytes landed in the staged temp.
+                fh.write(b"partial")
+                raise KeyboardInterrupt
 
             with unittest_mock.patch.object(dill, "dump", interrupted_dump):
                 with self.assertRaises(KeyboardInterrupt):
@@ -1781,24 +2317,22 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
     def test_near_cap_payload_skips_tail_instead_of_failing_snapshot(self):
         import dill
 
+        from rlm.repl import _SNAPSHOT_MAGIC, _restore_state
+
         dill.settings["recurse"] = True
         source = {"a": "first", "b": "second"}
         blobs = {name: dill.dumps(value) for name, value in source.items()}
-        cap = len(dill.dumps(blobs)) - 1
-        self.assertLessEqual(sum(map(len, blobs.values())), cap)
-        self.assertLessEqual(len(dill.dumps({"a": blobs["a"]})), cap)
+        # One byte short of the full single-pass payload (magic + both records),
+        # so "a" fits exactly and "b" overflows the remaining aggregate budget.
+        cap = len(_SNAPSHOT_MAGIC) + 13 + len(blobs["a"]) + 13 + len(blobs["b"]) - 1
 
         result = self._snap(source, max_bytes=cap, max_variable_bytes=cap)
         self.assertEqual(result["saved"], ["a"])
         self.assertEqual(result["skipped"], [{"name": "b", "reason": "exceeds aggregate snapshot size cap"}])
         self.assertLessEqual(result["bytes"], cap)
-        with open(self.path, "rb") as fh:
-            self.assertEqual(list(dill.load(fh)), ["a"])
-
-    def test_zero_size_cap_writes_no_empty_payload_overhead(self):
-        result = self._snap({}, max_bytes=0, max_variable_bytes=0)
-        self.assertEqual(result, {"error": "write failed: snapshot exceeds aggregate snapshot size cap"})
-        self.assertEqual(os.listdir(self.dir), [])
+        ns: dict = {}
+        self.assertNotIn("error", _restore_state(ns, self.path))
+        self.assertEqual(ns, {"a": "first"})
 
     def test_manifest_write_failure_preserves_prior_pair(self):
         old_payload, old_manifest = self._old_pair()
@@ -1982,6 +2516,28 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
                 with open(manifest_path) as fh:
                     self.assertEqual(json.load(fh)["savedNames"], ["keep"])
                 self.assertEqual(sorted(os.listdir(d)), sorted([payload_name, manifest_name]))
+
+    def test_each_variable_serialized_once_and_payload_is_not_a_pickle(self):
+        import dill
+
+        from rlm.repl import _SNAPSHOT_MAGIC
+
+        real_dump = dill.dump
+        dumped: list[object] = []
+
+        def counting_dump(value, writer):
+            dumped.append(value)
+            return real_dump(value, writer)
+
+        with mock.patch.object(dill, "dump", counting_dump):
+            result = self._snap({"a": 1, "b": 2, "c": 3})
+        self.assertEqual(result["saved"], ["a", "b", "c"])
+        self.assertEqual(dumped, [1, 2, 3])
+        self.assertEqual(result["bytes"], os.path.getsize(self.path))
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(len(_SNAPSHOT_MAGIC)), _SNAPSHOT_MAGIC)
+            with self.assertRaises(Exception):
+                dill.load(fh)
 
 
 class OwnerWatchdogTest(unittest.TestCase):

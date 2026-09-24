@@ -260,14 +260,14 @@ class McpIntegration:
             async with AsyncExitStack() as stack:
                 session = await self._open_session(stack)
                 resp = await session.list_tools()
-                self._tools = {
-                    t.name: {
+                tools: dict[str, Any] = {}
+                for t in resp.tools:
+                    tools[t.name] = {
                         "name": t.name,
                         "description": getattr(t, "description", "") or "",
                         "inputSchema": _tool_input_schema(t),
                     }
-                    for t in resp.tools
-                }
+                self._tools = tools
 
     async def call_tool(self, tool: str, arguments: dict[str, Any] | None = None) -> Any:
         """Call ``tool`` on the server and return its parsed result.

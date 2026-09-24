@@ -9,6 +9,7 @@ import {
 	AgentContinueError,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentModelOverride,
 	type AgentState,
 	type AgentTool,
 	type GetContinuationMessagesContext,
@@ -26,13 +27,14 @@ import type {
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import {
+	clampServiceTier,
 	clampThinkingLevel,
 	cleanupSessionResources,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
 	resetApiProviders,
-	supportsFastMode,
+	supportsServiceTier,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
@@ -42,12 +44,12 @@ import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
 	type AgentFamilyCatalogEntry,
-	type AgentFamilyRosterResult,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessageReceipt,
+	agentFamilyMemberName,
 	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
@@ -55,6 +57,7 @@ import {
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
+	isAgentSessionMessageId,
 	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
@@ -71,7 +74,6 @@ import {
 	normalizeObserveMaxChars,
 	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
 } from "./agent-observe.js";
-import { flushAgentTraceUpload } from "./agent-traces.js";
 import {
 	addLoginGuidanceToAuthError,
 	formatAuthenticationFailedMessage,
@@ -86,11 +88,20 @@ import {
 	type AutonomousRuntimeState,
 	addAutonomousContinuation,
 	addAutonomousUsage,
+	autonomousLimitReason,
 	autonomousStatus,
+	createAutonomousContinuationMessage,
+	createAutonomousGateFailureContinuationMessage,
 	createAutonomousRuntimeState,
+	createAutonomousSubagentKeepAliveMessage,
+	isUnlimitedAutonomousLimit,
+	MAX_SUBAGENT_KEEP_ALIVE_MS,
 	nextAutonomousContinuation,
 	refreshAutonomousQualityGates,
 	setAutonomousEnabled,
+	setAutonomousLimits,
+	shouldAutonomouslyContinue,
+	UNLIMITED_AUTONOMOUS_LIMIT,
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
@@ -99,7 +110,9 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	estimateBranchSummaryRequestTokens,
 	estimateContextTokens,
+	estimateSummaryRequestTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	serializeConversation,
@@ -112,8 +125,13 @@ import {
 	loadContextTreeChildFromDisk,
 	loadContextTreeChildrenFromDisk,
 } from "./context-tree.js";
-import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
-import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
+import {
+	type AgentCronJob,
+	AgentCronJobStore,
+	type AgentRlmHeartbeatController,
+	type AgentRlmHeartbeatStatusUpdate,
+	normalizeHeartbeatDeliveryMode,
+} from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
@@ -151,6 +169,7 @@ import {
 	GOAL_CONTEXT_PREVIEW_LABEL,
 	GOAL_SKILL_NAME,
 	GOAL_STATE_CUSTOM_TYPE,
+	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
 	type GoalStatus,
@@ -161,43 +180,74 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import { resolveImageModelOverride } from "./image-model-routing.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
+	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
+	type AsyncBashCompletionDetails,
 	type BashExecutionMessage,
 	type CompactionOutcome,
 	type CompactionOutcomeReason,
 	type CustomMessage,
 	convertToLlm,
+	createAsyncBashCompletionMessage,
 	createCompactionOutcomeMessage,
+	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
+	createRefinementNoticeMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
+	type HarnessDigestDetails,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
+	type RefinementSource,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { findExactModelReferenceMatch } from "./model-resolver.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
-import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
+import {
+	isAgentLifecycleFailure,
+	isFauxProviderQueueExhausted,
+	isPermanentProviderFailureKind,
+	type ProviderWaitPolicy,
+	parseProviderResetMs,
+	providerParkDecision,
+	providerRetryDelay,
+	providerRetryPolicy,
+	providerStreamFailureKind,
+	providerStreamFailureRetryAfterMs,
+	providerStreamFailureStatus,
+	providerWaitClass,
+	providerWaitDecision,
+} from "./provider-retry.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
 	appendGlobalRefinement,
 	applyRefinementProposal,
+	formatHarnessStateForPrompt,
 	generateRefinementId,
 	getGlobalHarnessStateDir,
 	getLocalHarnessStateDir,
 	getRefinementHistory,
+	type HarnessQueryTerms,
 	type HarnessState,
+	harnessDigestFingerprint,
+	harnessQueryTerms,
 	inferRefinementResultScope,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
@@ -215,23 +265,40 @@ import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
+	createAsyncBashCompletionHostHandler,
+	createAsyncBashConsumedHostHandler,
 	createDefaultRlmSubagentSessionName,
+	createRlmCollectHostHandler,
+	createRlmCreateSessionHostHandler,
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
+	createRlmProgressNoteHostHandler,
 	createRlmRunHostHandler,
 	findRlmModelMatches,
+	findUniqueRlmShortFormModelMatch,
+	formatRlmModelUnavailableError,
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
+	type RlmCollectResult,
+	type RlmCollectResultEntry,
+	type RlmCreateSessionResult,
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
+	type RlmProgressNoteResult,
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import {
+	modelRequestHeaders,
+	SemanticEdgeRecorder,
+	semanticEdgeLedgerPath,
+	wrapStreamFnWithSemanticEdges,
+} from "./semantic-edges.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -244,13 +311,22 @@ import {
 	queuedMessageLaneDeliveryPolicy,
 	type RuntimeActivity,
 	type SessionAction,
+	type SessionActionPlacement,
+	type SessionActionPriority,
 	type SessionActionSnapshot,
 	type SessionCommandPayload,
 	type SessionTurnPayload,
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	ChildUsageAttributionEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionEntry,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -261,20 +337,32 @@ import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import {
+	BUILTIN_SLASH_COMMANDS,
+	findSlashCommandSuggestion,
+	isBuiltinSlashCommandName,
 	parseRefineCommandOptions,
 	parseSessionSlashCommand,
 	parseSlashCommand,
+	SESSION_SLASH_COMMAND_NAMES,
 	type SessionSlashCommand,
 	type SlashCommandInfo,
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
+import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
-import { IpythonKernelProvisioner } from "./tools/ipython.js";
+import { IpythonKernelProvisioner, type UnavailablePythonSkills } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, emptyUsage } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+	subtractAssistantUsage,
+} from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -304,8 +392,22 @@ export interface RlmChildAgentSnapshot {
 	sessionDir: string;
 	activity?: RlmChildAgentActivity;
 	repliedSinceTask?: boolean;
+	/** Latest child progress note (`rlm.progress.note`), newest wins. */
+	progressNote?: string;
+	/** Wall-clock ms of the last tracked child activity (seeded at admission, then model/tool/note events). */
+	lastActivityAt?: number;
+	/**
+	 * Active time in ms since the last tracked activity, once past the staleness
+	 * threshold, for a running child that is not executing a tool call.
+	 * Measured against the monotonic clock, so a host sleep that freezes the
+	 * session does not flag every running child stale on wake.
+	 */
+	activityStaleMs?: number;
 	error?: string;
 }
+
+/** The observable state rlm_child_update events dedup on. */
+type RlmChildStableSnapshot = Omit<RlmChildAgentSnapshot, "lastActivityAt" | "activityStaleMs">;
 
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
 
@@ -341,12 +443,18 @@ export type AgentSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			/** Why the retry loop re-issues the turn; absent = ordinary quick retry. */
+			reason?: "usage" | "unavailable" | "backup";
+			/** Present when reason is "backup": "provider/model-id" of the backup. */
+			backupModel?: string;
 	  }
 	| {
 			type: "auto_retry_end";
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			/** "provider/model-id" restored after a backup-model retry succeeded. */
+			restoredModel?: string;
 	  }
 	| {
 			type: "auth_stale";
@@ -354,6 +462,7 @@ export type AgentSessionEvent =
 			sourceTokens?: readonly AuthSourceToken[];
 	  }
 	| { type: "rlm_child_update"; child: RlmChildAgentSnapshot }
+	| { type: "rlm_progress_note"; message: string; timestamp: number }
 	| { type: "recap_update"; recap: string | undefined }
 	| { type: "goal_update"; goal: GoalState }
 	| {
@@ -442,6 +551,8 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
@@ -487,6 +598,7 @@ export type SerializedBackgroundPlanResult =
 			options: { instructions?: string; rollbackId?: string; global?: boolean };
 			abort: AbortController;
 			branchVersion: number;
+			source: Exclude<RefinementSource, "user">;
 	  }
 	| { status: "skip"; explicit?: boolean }
 	| { status: "invalidated"; branchVersion: number }
@@ -516,6 +628,8 @@ export interface PromptOptions {
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
+	/** Overrides the queue priority inferred from the source and message. */
+	priority?: SessionActionPriority;
 }
 
 interface InternalPromptOptions extends PromptOptions {
@@ -617,6 +731,8 @@ interface PreparedPromptPreparation {
 
 class DeferredSessionInputError extends Error {}
 
+class SessionInputAdmissionPausedError extends Error {}
+
 function oncePreflight(
 	preflightResult: ((success: boolean, queued?: boolean) => void) | undefined,
 ): (success: boolean, queued?: boolean) => void {
@@ -674,6 +790,7 @@ export interface SessionActionRecoveryAction {
 	source: InputSource | "internal";
 	delivery: DeliveryPolicy;
 	wake: WakePolicy;
+	priority?: SessionActionPriority;
 	payload: SessionActionRecoveryPayload;
 	queueKey?: string;
 	agentMessageId?: string;
@@ -700,6 +817,25 @@ function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessag
 	};
 }
 
+function isHumanInputSource(source: InputSource | "internal"): boolean {
+	return source === "interactive" || source === "rpc";
+}
+
+/**
+ * Only input a person submits outranks the rest of the queue. Agent-to-agent prompts carry an
+ * agent message id, and every machine-generated turn (bash completions, heartbeats, continuations,
+ * restored internal input) is either a custom message or admitted from a non-human source. Ids
+ * callers mint to await their own prompt are not agent traffic and keep human priority.
+ */
+function sessionActionPriorityFor(
+	humanSource: boolean,
+	message: QueuedAgentMessage | undefined,
+	agentMessageId: string | undefined,
+): SessionActionPriority {
+	if (!humanSource || isAgentSessionMessageId(agentMessageId)) return "background";
+	return message === undefined || message.role === "user" ? "user" : "background";
+}
+
 function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
 	if (action.payload.kind !== "turn") throw new Error(`Session action ${action.id} is not a turn`);
 	const record = action.payload.records.find((candidate) => candidate.role === "primary");
@@ -720,11 +856,26 @@ function normalizeMessageContent(content: string | (TextContent | ImageContent)[
 	return { text, ...(images.length > 0 ? { images } : {}) };
 }
 
+/**
+ * Whether a delivered message attaches image content. Used to route
+ * image-carrying turns off session models without image input.
+ */
+function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boolean {
+	const content = (message as { content?: unknown }).content;
+	return Array.isArray(content) && content.some((part: { type?: string }) => part?.type === "image");
+}
+
 function queuedAgentMessagePreview(action: QueuedSessionAction): string {
 	const payload = action.payload;
 	if (payload.kind === "session_command") return payload.text;
 	if (payload.customMessage && isAgentSessionMessage(payload.customMessage)) {
 		return `${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: ${payload.customMessage.details.message}`;
+	}
+	if (payload.customMessage?.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE) {
+		const details = payload.customMessage.details as AsyncBashCompletionDetails | undefined;
+		return details
+			? `${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: pid ${details.pid}, exit ${details.exitCode}`
+			: ASYNC_BASH_COMPLETION_PREVIEW_LABEL;
 	}
 	return payload.preview ?? payload.text;
 }
@@ -803,6 +954,8 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 	switch (message.customType) {
 		case HEARTBEAT_PROMPT_CUSTOM_TYPE:
 			return HEARTBEAT_PROMPT_PREVIEW_LABEL;
+		case ASYNC_BASH_COMPLETION_CUSTOM_TYPE:
+			return ASYNC_BASH_COMPLETION_PREVIEW_LABEL;
 		case GOAL_CONTEXT_CUSTOM_TYPE:
 			return GOAL_CONTEXT_PREVIEW_LABEL;
 		default:
@@ -864,7 +1017,7 @@ type GoalSlashCommand =
 	| { kind: "resume" }
 	| { kind: "start"; objective: string; tokenBudget?: number };
 
-type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
+type AutonomousSlashCommand = { kind: "status" } | { kind: "on"; config?: AgentAutonomousConfig } | { kind: "off" };
 
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
@@ -882,6 +1035,8 @@ type AutonomousRuntimeSnapshot = Pick<
 interface RlmChildRun {
 	id: string;
 	prompt: string;
+	/** rlmChildLabel(prompt), computed once: the prompt never changes. */
+	label: string;
 	sessionName: string;
 	sessionDir: string;
 	model: Model<Api>;
@@ -890,6 +1045,20 @@ interface RlmChildRun {
 	answerPreview?: string;
 	toolUseCount: number;
 	activity?: RlmChildAgentActivity;
+	/** Bounded ring of the child's latest progress notes (newest last). */
+	progressNotes: string[];
+	/**
+	 * Wall-clock ms of the last tracked child activity; carried into snapshots.
+	 * Seeded at admission so a child that never emits a tracked event still
+	 * crosses the staleness threshold once running.
+	 */
+	lastActivityAt?: number;
+	/**
+	 * Monotonic counterpart of lastActivityAt (performance.now()), written by
+	 * the same events. Staleness measures this so wall-clock jumps (a host
+	 * sleep freezing the whole session) do not inflate it.
+	 */
+	lastActivityMonotonicAt?: number;
 	error?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
@@ -912,11 +1081,14 @@ interface RlmChildRun {
 	deletionCleanupFailed?: boolean;
 	deletionRunFinished?: boolean;
 	deletionNotice?: Promise<void>;
+	deletionFailureNotice?: Promise<void>;
 	deletionNeedsCompletionNotice?: boolean;
 	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
-	lastEmittedUpdate?: string;
+	lastEmittedUpdate?: RlmChildStableSnapshot;
+	/** Monotonic time of the last streamed-delta emit; other event kinds still emit at once. */
+	lastStreamedUpdateMonotonicAt?: number;
 	unsubscribe?: () => void;
 }
 
@@ -925,12 +1097,82 @@ interface RetainedRlmChild {
 	run?: RlmChildRun;
 }
 
+/**
+ * A delete receipt frees the name once the child runtime is bound and only the
+ * detached deletion unwind remains. A deleted startup without a bound session
+ * still reserves its name until that startup settles, because the queued
+ * runtime work can still surface under it.
+ */
+function freedRlmChildSessionId(run: RlmChildRun): string | undefined {
+	return run.detachedDeletion !== undefined ? run.session?.sessionId : undefined;
+}
+
 interface RlmSubagentModelSelection {
 	model: Model<Api>;
 }
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+
+/**
+ * No-model sentinel for a tombstoned run-less deletion: mirrors the agent core's
+ * unknown/unknown placeholder. Only the snapshot's `provider/id` string reads it.
+ */
+const UNKNOWN_RLM_CHILD_MODEL = { provider: "unknown", id: "unknown" } as Model<Api>;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
+/** Minimum spacing between accepted progress notes from one child session. */
+const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
+/** Minimum spacing between streamed-delta child update emits per child run. */
+export const RLM_CHILD_UPDATE_MIN_INTERVAL_MS = 1_000;
+/** Bounded ring of progress notes kept per child run; the snapshot exposes the newest. */
+const RLM_CHILD_PROGRESS_NOTE_RING_MAX = 5;
+/** A running child with no tracked activity for this long reports activityStaleMs. */
+const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
+/** Hard cap for answer previews carried into kernel roster entries. */
+const RLM_REGISTRY_ANSWER_PREVIEW_MAX_LENGTH = 200;
+/** Hard cap for labels carried into kernel roster entries (snapshots keep the full prompt). */
+const RLM_REGISTRY_LABEL_MAX_LENGTH = 200;
+
+/** Session-log entry recorded when a quota-blocked session parks until the provider reset. */
+const QUOTA_PARK_CUSTOM_ENTRY_TYPE = "provider_quota_park";
+/** Session-log entry recorded when a parked session resumes, or when its wake could not resume it. */
+const QUOTA_RESUME_CUSTOM_ENTRY_TYPE = "provider_quota_resume";
+/** Label for the durable one-shot wake that resumes a parked session. */
+const QUOTA_RESUME_CRON_LABEL = "quota-resume";
+/**
+ * In-context marker delivered on resume: tells the model the pause happened and
+ * that it should continue the interrupted task. The same text is the prompt of
+ * the durable wake job, so daemon-delivered resumes read identically.
+ */
+const QUOTA_RESUME_MARKER_TEXT =
+	"<provider_quota_resumed>\n" +
+	"The provider usage limit that paused this session has been reported as reset; this resume is automatic (retry.provider.waitForUsage.pauseUntilReset). Continue the interrupted task from where it stopped.\n" +
+	"</provider_quota_resumed>";
+/** Node caps timers at 2^31-1 ms; longer delays overflow setTimeout and fire after ~1ms. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** Retry delay for a wake that was consumed without resuming (refused admission, aborted probe). */
+const QUOTA_WAKE_RETRY_DELAY_MS = 60_000;
+/** Cap on those retries: a park that can never wake is dropped instead of parked forever. */
+const QUOTA_WAKE_MAX_RETRIES = 3;
+
+/** Data carried by a persisted provider_quota_park entry, used to restore a park after a restart. */
+interface PersistedQuotaParkData {
+	resumeAt: string;
+	parkCount: number;
+	jobId?: string;
+}
+
+function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkData {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const record = value as Record<string, unknown>;
+	return (
+		typeof record.resumeAt === "string" &&
+		typeof record.parkCount === "number" &&
+		Number.isFinite(record.parkCount) &&
+		(record.jobId === undefined || typeof record.jobId === "string")
+	);
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -978,6 +1220,129 @@ function parseGoalBudgetValue(value: string): number {
 	return budget;
 }
 
+const AUTONOMOUS_STATUS_NUMBER_FORMAT = new Intl.NumberFormat("en-US");
+
+const AUTONOMOUS_BUDGET_USAGE =
+	"Usage: /autonomous [status|off] or /autonomous on [--max-continuations <n|unlimited>] [--max-turns <n|unlimited>] [--max-tokens <n|unlimited>] [--timeout-ms <n|unlimited>] [--gate <command>] [--gate-retries <n>] [--gate-timeout-ms <n>] [--subagent-keep-alive-ms <n>]";
+
+// `/autonomous` budget flags mirror the `--autonomous-*` CLI options. The CLI
+// spelling (`--autonomous-max-continuations`) is accepted as an alias so the
+// exact CLI budget flags also work from the slash command.
+const AUTONOMOUS_BUDGET_FLAGS: ReadonlySet<string> = new Set([
+	"max-continuations",
+	"max-turns",
+	"max-tokens",
+	"timeout-ms",
+	"gate",
+	"gate-retries",
+	"gate-timeout-ms",
+	"subagent-keep-alive-ms",
+]);
+
+/** Keep-alive windows accept 0 (disable the valve) or a positive integer. */
+function parseSubagentKeepAliveMs(value: string): number {
+	const digits = value.replace(/[,_]/g, "");
+	if (digits === "0" || /^[1-9]\d*$/.test(digits)) {
+		const parsed = Number(digits);
+		if (parsed <= MAX_SUBAGENT_KEEP_ALIVE_MS) {
+			return parsed;
+		}
+	}
+	throw new Error(
+		`--subagent-keep-alive-ms must be 0 or a positive integer up to ${MAX_SUBAGENT_KEEP_ALIVE_MS}. ${AUTONOMOUS_BUDGET_USAGE}`,
+	);
+}
+
+function parseAutonomousBudgetInt(flag: string, value: string, allowUnlimited = false): number {
+	if (allowUnlimited && value.toLowerCase() === "unlimited") {
+		return UNLIMITED_AUTONOMOUS_LIMIT;
+	}
+	// Commas and underscores are accepted as digit separators (100,000,000).
+	const digits = value.replace(/[,_]/g, "");
+	if (!/^[1-9]\d*$/.test(digits)) {
+		throw new Error(
+			`--${flag} must be a positive integer${allowUnlimited ? ' or "unlimited"' : ""}. ${AUTONOMOUS_BUDGET_USAGE}`,
+		);
+	}
+	return Number(digits);
+}
+
+function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
+	const config: AgentAutonomousConfig = {};
+	const gateCommands: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		if (!token.startsWith("--")) {
+			throw new Error(`Unexpected autonomous argument: ${token}. ${AUTONOMOUS_BUDGET_USAGE}`);
+		}
+		const equalsIndex = token.indexOf("=");
+		const rawFlag = equalsIndex === -1 ? token : token.slice(0, equalsIndex);
+		const inlineValue = equalsIndex === -1 ? undefined : token.slice(equalsIndex + 1);
+		const flag = rawFlag.startsWith("--autonomous-") ? rawFlag.slice("--autonomous-".length) : rawFlag.slice(2);
+		if (!AUTONOMOUS_BUDGET_FLAGS.has(flag)) {
+			throw new Error(`Unknown autonomous budget flag: ${rawFlag}. ${AUTONOMOUS_BUDGET_USAGE}`);
+		}
+		let value = inlineValue;
+		if (value === undefined) {
+			const next = tokens[i + 1];
+			if (next === undefined || next.startsWith("--")) {
+				throw new Error(`Missing value for ${rawFlag}. ${AUTONOMOUS_BUDGET_USAGE}`);
+			}
+			value = next;
+			i++;
+		}
+		if (value === "") {
+			throw new Error(`Missing value for ${rawFlag}. ${AUTONOMOUS_BUDGET_USAGE}`);
+		}
+		switch (flag) {
+			case "gate":
+				gateCommands.push(value);
+				break;
+			case "gate-retries":
+				config.gates = config.gates ?? {};
+				config.gates.maxRetries = parseAutonomousBudgetInt(flag, value);
+				break;
+			case "gate-timeout-ms":
+				config.gates = config.gates ?? {};
+				config.gates.timeoutMs = parseAutonomousBudgetInt(flag, value);
+				break;
+			case "max-continuations":
+				config.maxContinuations = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "max-turns":
+				config.maxTurns = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "max-tokens":
+				config.maxTokens = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "timeout-ms":
+				config.timeoutMs = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "subagent-keep-alive-ms":
+				config.subagentKeepAliveMs = parseSubagentKeepAliveMs(value);
+				break;
+		}
+	}
+	if (gateCommands.length > 0) {
+		config.gates = { ...config.gates, commands: gateCommands };
+	}
+	// Named budget flags define the whole budget: any limit the user did not
+	// name stops cutting the run short. With no budget flags at all, the
+	// configured or default limits still apply.
+	if (
+		config.maxContinuations !== undefined ||
+		config.maxTurns !== undefined ||
+		config.maxTokens !== undefined ||
+		config.timeoutMs !== undefined
+	) {
+		config.maxContinuations ??= UNLIMITED_AUTONOMOUS_LIMIT;
+		config.maxTurns ??= UNLIMITED_AUTONOMOUS_LIMIT;
+		config.maxTokens ??= UNLIMITED_AUTONOMOUS_LIMIT;
+		config.timeoutMs ??= UNLIMITED_AUTONOMOUS_LIMIT;
+	}
+	return config;
+}
+
 export function compactRlmText(text: string, maxLength = 160): string {
 	const compact = text.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) {
@@ -997,11 +1362,101 @@ export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
+/** `satisfies` makes a field without a compare entry a compile error, not a silently suppressed rlm_child_update. */
+const RLM_CHILD_STABLE_SNAPSHOT_KEYS = Object.keys({
+	id: true,
+	parentId: true,
+	activeSessionId: true,
+	sessionName: true,
+	model: true,
+	label: true,
+	status: true,
+	durationMs: true,
+	answerPreview: true,
+	toolUseCount: true,
+	tokenCount: true,
+	recap: true,
+	sessionDir: true,
+	activity: true,
+	repliedSinceTask: true,
+	progressNote: true,
+	error: true,
+} satisfies Record<keyof RlmChildStableSnapshot, true>) as (keyof RlmChildStableSnapshot)[];
+
+/** Fields are primitives except activity, compared by value because each delta assigns a fresh activity object. */
+function rlmChildStableFieldsEqual(a: RlmChildStableSnapshot, b: RlmChildStableSnapshot): boolean {
+	for (const key of RLM_CHILD_STABLE_SNAPSHOT_KEYS) {
+		if (key === "activity") {
+			if (a.activity?.kind !== b.activity?.kind || a.activity?.toolName !== b.activity?.toolName) return false;
+		} else if (a[key] !== b[key]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Record a tracked child activity on both clocks: lastActivityAt stays
+ * wall-clock ms for snapshots, and its monotonic twin bounds staleness so a
+ * host sleep cannot inflate it.
+ */
+function touchRlmChildActivity(run: RlmChildRun): void {
+	run.lastActivityAt = Date.now();
+	run.lastActivityMonotonicAt = performance.now();
+}
+
+/**
+ * Lazily computed staleness for a running child: how long since the last
+ * tracked activity, once past the threshold. Computed at snapshot build time
+ * only — no background timers update it.
+ *
+ * A tool call in flight (activity "executing") is legitimately quiet for its
+ * whole duration — a minutes-long bash() run emits no events while it works —
+ * so an executing child never reports stale. Staleness measures active time:
+ * the wall clock alone would mark every running child stale after a laptop
+ * sleep, so the smaller of the wall and monotonic clock deltas bounds it to
+ * time the host was actually awake.
+ */
+function rlmActivityStaleMs(
+	status: RlmChildAgentStatus,
+	activity: RlmChildAgentActivity | undefined,
+	lastActivityAt: number | undefined,
+	lastActivityMonotonicAt: number | undefined,
+): number | undefined {
+	if (status !== "running" || lastActivityAt === undefined) return undefined;
+	if (activity?.kind === "executing") return undefined;
+	const wallStaleMs = Date.now() - lastActivityAt;
+	const monotonicStaleMs =
+		lastActivityMonotonicAt === undefined ? wallStaleMs : performance.now() - lastActivityMonotonicAt;
+	// Integer ms like every other roster wire field: performance.now() deltas
+	// are fractional, and the kernel parser rejects non-int activity_stale_ms.
+	const staleMs = Math.floor(Math.min(wallStaleMs, monotonicStaleMs));
+	return staleMs >= RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS ? staleMs : undefined;
+}
+
 function readAssistantText(message: AssistantMessage): string {
 	return message.content
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
 		.join("");
+}
+
+// Trailing window feeding the streaming answer preview: message_update fires per token delta, so
+// rejoining the whole message costs O(length²); the preview shows the latest output, not the head.
+// Equal to compactRlmText's cap, so compaction never cuts the newest characters.
+const RLM_ANSWER_PREVIEW_TAIL_CHARS = 160;
+
+function tailRlmAnswerPreview(message: AssistantMessage): string {
+	const tail: string[] = [];
+	let collected = 0;
+	for (let index = message.content.length - 1; index >= 0 && collected < RLM_ANSWER_PREVIEW_TAIL_CHARS; index -= 1) {
+		const block = message.content[index];
+		if (block.type !== "text") continue;
+		const remaining = RLM_ANSWER_PREVIEW_TAIL_CHARS - collected;
+		tail.unshift(block.text.slice(-remaining));
+		collected += Math.min(block.text.length, remaining);
+	}
+	return compactRlmText(tail.join(""));
 }
 
 function waitForPromiseOrAbort<T>(
@@ -1033,6 +1488,26 @@ function waitForPromiseOrAbort<T>(
 	});
 }
 
+// Bounds how much accumulated child usage a parent process crash can lose.
+const RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS = 60_000;
+
+/** Label a child completion's usage by the nearest preceding prompt that triggered it. */
+function rlmChildUsageOrigin(
+	messages: readonly AgentMessage[],
+	assistant: AssistantMessage,
+): ChildUsageAttributionEntry["origin"] {
+	for (let index = messages.lastIndexOf(assistant) - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "user" && message.role !== "custom") continue;
+		return message.role === "custom" && isAgentSessionMessage(message)
+			? message.details.id.startsWith("spawn:")
+				? "spawn_task"
+				: "agent_message"
+			: "direct_user";
+	}
+	return "direct_user";
+}
+
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	const parentContextTokens =
 		parentUsage.totalTokens ||
@@ -1057,15 +1532,15 @@ export class AgentSession {
 
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
-	private _lastSessionActionSnapshot: SessionActionSnapshot = {
-		queuedCount: 0,
-		steering: [],
-		followUps: [],
-	};
+	/** Serialized last-emitted queue snapshot, so a mutation pays one stringify, not two. */
+	private _lastSessionActionSnapshot = JSON.stringify({ queuedCount: 0, steering: [], followUps: [] });
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	// One-shot "all" steering batch armed by abortAndSendQueued: read on selection, never
+	// consumed on read, and disarmed once the armed actions leave the steering queue.
+	private _forcedAllSteeringActionIds: ReadonlySet<string> | undefined;
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	private _sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
@@ -1095,6 +1570,20 @@ export class AgentSession {
 	private _autonomousState: AutonomousRuntimeState;
 	private _autonomousContinuationSuppressionDepth = 0;
 	private _autonomousContinuationSuppressedMessages = new WeakSet<AgentMessage>();
+	// Held autonomous continuation owed while descendant or background bash
+	// work runs; mirrors _goalContinuationAwaitsRlmWork. Child replies, exit
+	// notices, and background bash completion follow-ups are the real
+	// wake-up signals, so timer-driven continuations pause instead of
+	// re-prompting a waiting parent (and pause without consuming budget).
+	private _autonomousContinuationAwaitsRlmWork = false;
+	private _autonomousSubagentKeepAliveTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	// In-flight gate evaluation for an owed continuation; holds the promise so
+	// settlement sites never double-fire the resume.
+	private _autonomousContinuationResumeTask: Promise<void> | undefined = undefined;
+	// Monotonic count of admitted RLM child terminal notices; differencing
+	// against the arrival epoch separates sibling notices (benign for the
+	// owed continuation) from user-driven admissions.
+	private _rlmTerminalNoticeAdmissionCount = 0;
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -1110,13 +1599,56 @@ export class AgentSession {
 
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/** Bumped by every retry resolution; stale scheduled-continue callbacks check it before touching retry state. */
+	private _retryGeneration = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+	/** Ongoing wait-for-recovery state: pings issued and when the wait started. */
+	private _providerWait: { attempts: number; startedAtMs: number } | undefined = undefined;
+	/**
+	 * Quota park state: the session ended its turn because the provider-reported
+	 * usage reset was beyond the bounded wait, and a wake (in-process timer plus
+	 * a durable one-shot scheduled job) will resume the task automatically. While
+	 * parked the session itself makes no model calls.
+	 */
+	private _quotaPark:
+		| {
+				/** Parks consumed in this quota episode; bounded by waitForUsage.maxParks. */
+				parkCount: number;
+				/** Wall-clock wake time for the current park. */
+				resumeAtMs: number;
+				/** Id of the durable one-shot wake job, when the session persists artifacts. */
+				jobId?: string;
+				/** Pending in-process wake timer for the current park. */
+				timer?: ReturnType<typeof setTimeout>;
+				/** True from the wake until the park state clears: the resume probe is running, or a wake already due is owned by the durable job. */
+				waking?: boolean;
+				/** Wake re-arms consumed without a resume; bounded by QUOTA_WAKE_MAX_RETRIES. */
+				wakeRetries?: number;
+		  }
+		| undefined = undefined;
+	/** Lazily built session-artifact store for durable quota-resume wake jobs. */
+	private _quotaResumeJobStore: AgentCronJobStore | undefined = undefined;
+	/** Wake jobs branch navigation cancelled, so returning to the parked branch can rebuild one. */
+	private readonly _navigationCancelledWakeJobs = new Set<string>();
+	/** Set while turns are routed to the user-configured backup model. */
+	private _backupModel:
+		| {
+				backup: Model<any>;
+				primary: Model<any>;
+				thinkingLevel: ThinkingLevel;
+				serviceTier: ServiceTier;
+				/** Image-model routing active when the backup took over; restored on return. */
+				routedOverride?: AgentModelOverride;
+		  }
+		| undefined = undefined;
 	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
 	private readonly _unpersistedOutcomes: CustomMessage[] = [];
+	/** Fresh/empty contexts defer digest injection to the first committed turn so untouched sessions stay empty. */
+	private _harnessDigestPending = false;
 
 	private _bashAbortControllers = new Set<AbortController>();
 	private _userBashRunning = false;
@@ -1132,6 +1664,7 @@ export class AgentSession {
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
+	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _agentDir?: string;
@@ -1169,12 +1702,19 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
+	// Shared by children charged to the same assistant; excludes usage not yet attributed on disk.
+	private _rlmDurableParentUsage = new WeakMap<AssistantMessage, Usage>();
+	// Child usage not yet represented by an indexed attribution, including a delayed parent entry.
+	private _rlmUnindexedChildUsage = new WeakMap<AssistantMessage, Usage>();
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	/** Wall-clock ms of the last accepted progress note; throttles rlm.progress.note. */
+	private _lastRlmProgressNoteAt: number | undefined;
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
 	private _rlmQuiescenceWaitAborts = new Set<AbortController>();
@@ -1183,6 +1723,11 @@ export class AgentSession {
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, RetainedRlmChild>();
 	private _deletedRlmChildIds = new Set<string>();
+	// An accepted delete outlives the run it cancelled: once the run is removed
+	// from both lookup maps, this tombstone keeps the child's identity so collect
+	// can still answer with its settled cancelled envelope.
+	// Entries live until the parent session is disposed, like _deletedRlmChildIds.
+	private _deletedRlmChildRuns = new Map<string, RlmChildRun>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
 	private _rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
@@ -1277,6 +1822,16 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		this._semanticEdges = new SemanticEdgeRecorder({
+			ledgerPath: semanticEdgeLedgerPath({
+				rlmSessionDir: this._rlmSessionDir,
+				sessionArtifactDir: this.sessionManager.getSessionArtifactDir(),
+			}),
+			sessionId: this.sessionManager.getSessionId(),
+			parentSessionId: config.semanticParentSessionId,
+			spawnedByRequestId: config.semanticSpawnedByRequestId,
+		});
+		this.agent.streamFn = wrapStreamFnWithSemanticEdges(this.agent.streamFn, this._semanticEdges);
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1286,6 +1841,7 @@ export class AgentSession {
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
 		this._autonomousState = createAutonomousRuntimeState(config.autonomous, {
 			cwd: this._cwd,
+			defaultLimits: this.settingsManager.getAutonomousLimits(),
 		});
 		this._goalState = this._loadPersistedGoalState();
 		// Seed initial goal from CLI --goal flag, but only for top-level sessions
@@ -1300,6 +1856,8 @@ export class AgentSession {
 			this._pendingNextTurnMessages.push(createGoalContextMessage(this._goalState, "continuation"));
 		}
 		this._restoreLateIpythonSentAgentMessages();
+		// Cannot await in a constructor; a live wake job restores within a microtask, only a rebuilt job waits on the store.
+		void this._restoreQuotaPark();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -1313,6 +1871,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this._ensureHarnessDigestContext();
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -1344,6 +1903,10 @@ export class AgentSession {
 			if (servers.length > 0) throw new Error("MCP is unavailable in this session");
 			return;
 		}
+		if (servers.length > 0 && !this._ipythonKernelProvisioner) {
+			throw new Error("ACP MCP servers require the built-in cpython tool");
+		}
+		this._assertAcpMcpToolNamesAvailable(acpMcpToolNames(servers));
 		if (!this._mcpManager.replaceAcpServers(servers, ownerId)) return;
 		this._rebuildRuntimeForAcpMcpServers();
 	}
@@ -1351,8 +1914,11 @@ export class AgentSession {
 	async releaseAcpMcpServers(ownerId: string, serverNames: readonly string[]): Promise<void> {
 		if (!this._mcpManager?.canReleaseAcpServers(ownerId)) return;
 		if (this._mcpManager.replaceAcpServers([], ownerId)) {
-			// Host MCP handlers read this manager dynamically, so credentials disappear
-			// before the kernel-side transport is closed.
+			const removedToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+			const activeToolNames = this.getActiveToolNames().filter((name) => !removedToolNames.has(name));
+			for (const name of removedToolNames) this._allowedToolNames?.delete(name);
+			this._acpMcpTools = [];
+			this._refreshToolRegistry({ activeToolNames, includeAllExtensionTools: true });
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
@@ -1390,9 +1956,27 @@ export class AgentSession {
 		}
 	}
 
+	private _assertAcpMcpToolNamesAvailable(names: readonly string[]): void {
+		const occupiedNames = new Set([
+			...this._baseToolDefinitions.keys(),
+			...this._customTools.map((tool) => tool.name),
+			...this._extensionRunner.getAllRegisteredTools().map((tool) => tool.definition.name),
+		]);
+		for (const name of names) {
+			if (occupiedNames.has(name)) {
+				throw new Error(`ACP MCP tool name conflicts with an existing tool: ${name}`);
+			}
+		}
+	}
+
 	private _rebuildRuntimeForAcpMcpServers(): void {
+		const previousToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+		const nextToolNames = acpMcpToolNames(this._mcpManager?.getAcpServers() ?? []);
+		this._assertAcpMcpToolNamesAvailable(nextToolNames);
+		const activeToolNames = this.getActiveToolNames().filter((name) => !previousToolNames.has(name));
+		activeToolNames.push(...nextToolNames);
 		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
+			activeToolNames,
 			includeAllExtensionTools: true,
 		});
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
@@ -1415,6 +1999,7 @@ export class AgentSession {
 	private async _getRequiredRequestAuth(model: Model<Api>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestModel: Model<Api>;
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -1424,7 +2009,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -1516,8 +2101,9 @@ export class AgentSession {
 
 	private _emitQueueUpdate(): void {
 		const actions = this.getSessionActionSnapshot();
-		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
-		this._lastSessionActionSnapshot = actions;
+		const serialized = JSON.stringify(actions);
+		if (serialized === this._lastSessionActionSnapshot) return;
+		this._lastSessionActionSnapshot = serialized;
 		this._emit({ type: "session_action_update", actions });
 	}
 
@@ -1654,8 +2240,25 @@ export class AgentSession {
 		return true;
 	}
 
-	private _reloadGoalStateFromBranch(): void {
-		this._goalState = this._loadPersistedGoalState();
+	private _reloadGoalStateFromBranch(options: { monotonicTokens?: boolean } = {}): void {
+		const previous = this._goalState;
+		const reloaded = this._loadPersistedGoalState();
+		if (options.monotonicTokens && reloaded.goalId !== undefined && reloaded.goalId === previous.goalId) {
+			// A context rebuild continues the same timeline, but the rebuilt branch's
+			// last persisted goal entry can lag the in-memory state (queue/flush
+			// races; child-usage attribution landing late). Neither the accounting
+			// counters nor an already-fired gate (budget limit, pause, completion)
+			// for the same logical goal may regress across the cold boundary. Tree
+			// navigation keeps faithful branch semantics by calling without the flag.
+			this._goalState = {
+				...previous,
+				tokensUsed: Math.max(previous.tokensUsed, reloaded.tokensUsed),
+				continuationsUsed: Math.max(previous.continuationsUsed, reloaded.continuationsUsed),
+				timeUsedSeconds: Math.max(previous.timeUsedSeconds, reloaded.timeUsedSeconds),
+			};
+		} else {
+			this._goalState = reloaded;
+		}
 		this._goalAccountingStartedAt = this._goalState.status === "active" ? Date.now() : undefined;
 		this._emitGoalUpdate();
 	}
@@ -1760,12 +2363,26 @@ export class AgentSession {
 				const restorable = payload.records
 					.filter(
 						(record): record is DeliveryRecord & { message: CustomMessage } =>
-							(record.role === "next_turn" || (payload.acceptedAgentMessage && record.role === "prefix")) &&
+							// Prefix records are parked next-turn context the action captured
+							// on admission; a cancelled turn hands them back, like the
+							// admission-rejection and dispatch-failure paths already do.
+							(record.role === "next_turn" || record.role === "prefix") &&
 							record.message.role === "custom" &&
+							record.message.customType !== HARNESS_DIGEST_CUSTOM_TYPE &&
 							!record.durable,
 					)
 					.map((record) => cloneCustomMessage(record.message));
 				restorableMessages.push(...restorable);
+				// Lazy injection owns digest delivery: a cancelled turn re-arms it
+				// instead of restoring a possibly stale digest message.
+				if (
+					payload.records.some(
+						(record) =>
+							record.message.role === "custom" && record.message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+					)
+				) {
+					this._harnessDigestPending = true;
+				}
 				if (dispatched) {
 					payload.captureRunMessages = new Set(payload.records.map((record) => record.message));
 					this.agent.state.messages = this.agent.state.messages.filter(
@@ -1894,6 +2511,12 @@ export class AgentSession {
 				this._goalAbortInProgress = false;
 				return;
 			}
+			// A live quota park owns the resume: the parked turn is the park's
+			// pause, not the goal's death, so the goal survives until the wake
+			// (or a spent park budget, which clears the park first) ends it.
+			if (this._quotaPark !== undefined) {
+				return;
+			}
 			this._finishGoalWithError(message.errorMessage || "Assistant response failed");
 		}
 	}
@@ -1965,23 +2588,45 @@ export class AgentSession {
 	private _parseAutonomousSlashCommand(text: string): AutonomousSlashCommand | undefined {
 		const command = parseSessionSlashCommand(text);
 		if (command?.name !== "autonomous") return undefined;
-		const rest = command.args.toLowerCase();
-		if (!rest || rest === "status") {
+		const tokens = parseCommandArgs(command.args);
+		if (tokens.length === 0 || tokens[0]!.toLowerCase() === "status") {
+			if (tokens.length > 1) {
+				throw new Error(`Unexpected autonomous argument: ${tokens[1]}. ${AUTONOMOUS_BUDGET_USAGE}`);
+			}
 			return { kind: "status" };
 		}
-		if (rest === "on" || rest === "enable" || rest === "enabled") {
-			return { kind: "on" };
+		const subcommand = tokens[0]!.toLowerCase();
+		if (subcommand === "on" || subcommand === "enable" || subcommand === "enabled") {
+			return { kind: "on", config: parseAutonomousBudgetOptions(tokens.slice(1)) };
 		}
-		if (rest === "off" || rest === "disable" || rest === "disabled") {
+		if (subcommand === "off" || subcommand === "disable" || subcommand === "disabled") {
+			if (tokens.length > 1) {
+				throw new Error(`Unexpected autonomous argument: ${tokens[1]}. ${AUTONOMOUS_BUDGET_USAGE}`);
+			}
 			return { kind: "off" };
 		}
-		throw new Error("Usage: /autonomous [on|off|status]");
+		throw new Error(AUTONOMOUS_BUDGET_USAGE);
 	}
 
 	private _formatAutonomousStatus(): string {
 		const status = this.getAutonomousStatus();
 		const state = status.enabled ? "on" : "off";
-		return `Autonomous mode: ${state}. Continuations: ${status.continuationsUsed}/${status.limits.maxContinuations}. Turns: ${status.turnsUsed}/${status.limits.maxTurns}. Tokens: ${status.tokensUsed}/${status.limits.maxTokens}.`;
+		const elapsedSeconds = status.startedAt ? Math.round((Date.now() - status.startedAt) / 1000) : 0;
+		const gateSummary =
+			status.gates.commands.length > 0 ? status.gates.commands.map((command) => `"${command}"`).join(", ") : "none";
+		const formatCount = (value: number): string =>
+			isUnlimitedAutonomousLimit(value) ? "unlimited" : AUTONOMOUS_STATUS_NUMBER_FORMAT.format(value);
+		const timeBudget = isUnlimitedAutonomousLimit(status.limits.timeoutMs)
+			? "unlimited"
+			: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(status.limits.timeoutMs / 1000))}s`;
+		const subagentKeepAliveMs = status.subagentKeepAliveMs ?? 0;
+		const keepAlive =
+			subagentKeepAliveMs > 0
+				? subagentKeepAliveMs >= 60_000
+					? `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(subagentKeepAliveMs / 60_000))}m`
+					: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(subagentKeepAliveMs)}ms`
+				: "off";
+		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}. Subagent keep-alive: ${keepAlive}.`;
 	}
 
 	private _emitAutonomousStatus(): void {
@@ -2011,9 +2656,18 @@ export class AgentSession {
 		}
 		if (command.kind === "on") {
 			setAutonomousEnabled(this._autonomousState, true, { cwd: this._cwd });
+			setAutonomousLimits(this._autonomousState, command.config);
+			// Re-sync the keep-alive with the new window: a 0 setting must
+			// disarm an already-armed timer, and a shortened window must not
+			// keep the old one pending.
+			this._disarmAutonomousSubagentKeepAlive();
+			if (this._autonomousContinuationAwaitsRlmWork) {
+				this._armAutonomousSubagentKeepAlive();
+			}
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
 			this._clearQueuedAutonomousContinuations();
+			this._clearAutonomousContinuationAwait();
 		}
 		this._emitAutonomousStatus();
 		return true;
@@ -2050,6 +2704,87 @@ export class AgentSession {
 	}
 
 	/**
+	 * Routing decision for a dispatched turn batch: when any delivered message
+	 * attaches images and the session model has no image input, serve the turn
+	 * on the user-configured imageModel (settings.imageModel) instead.
+	 *
+	 * The override is stored on the agent, so retries and post-compaction
+	 * continuations of the routed turn keep serving it; the next dispatch
+	 * re-evaluates it, so later image-free turns return to the session model.
+	 * A missing session model is reported by _validateCanStartAgentRun.
+	 */
+	private _imageModelOverrideForTurns(
+		turns: SessionAction<PreparedTurnPayload>[],
+		extraMessages: AgentMessage[] = [],
+	): AgentModelOverride | undefined {
+		const sessionModel = this.model;
+		if (!sessionModel) return undefined;
+		const carriesImages =
+			extraMessages.some((message) => messageCarriesImages(message)) ||
+			turns.some((action) => action.payload.records.some((record) => messageCarriesImages(record.message)));
+		if (!carriesImages) return undefined;
+		return resolveImageModelOverride({
+			sessionModel,
+			thinkingLevel: this.thinkingLevel,
+			serviceTier: this.serviceTier,
+			imageModelReference: this.settingsManager.getImageModel(),
+			availableModels: this._modelRegistry.getAvailable(),
+			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+			blockImages: this.settingsManager.getBlockImages(),
+		});
+	}
+
+	/**
+	 * Model serving the current run: the routed image model while a routed
+	 * turn (or its retries/continuations) is active, the session model
+	 * otherwise. Compaction decisions compare context against the model that
+	 * actually serves the requests, so a routed run uses the routed model's
+	 * context window and accepts its assistant messages as its own.
+	 */
+	private _runModel(): Model<any> | undefined {
+		return this.agent.modelOverride?.model ?? this.model;
+	}
+
+	/**
+	 * Whether a dispatched turn is still in flight: streaming, retrying with
+	 * backoff, compacting before a continuation, an overflow recovery or
+	 * provider wait still settling, or a post-compaction continuation that
+	 * has been scheduled but not yet dispatched. Model selection during any
+	 * of these must not tear down a routed run's override, or the run's
+	 * retries, continuations, and failure attribution would leave the
+	 * image-capable model mid-turn.
+	 */
+	private get _hasActiveTurnLifecycle(): boolean {
+		return (
+			this.isStreaming ||
+			this.isRetrying ||
+			this.isCompacting ||
+			this._postCompactionContinuationScheduled ||
+			// Covers the whole submission-to-settled window: preflight (before the
+			// action enqueues), the queued turn, and any in-flight run - without
+			// latching on stale overflow-recovery state.
+			this._promptSubmissionInFlight ||
+			this._hasPendingOrRunningTurnAction
+		);
+	}
+
+	private get _hasPendingOrRunningTurnAction(): boolean {
+		return this._actionStore.unfinishedActions().some((action) => action.payload.kind === "turn");
+	}
+
+	/**
+	 * An explicit selection wins over image-model routing still lingering from
+	 * the last dispatched turn, but not over the model already serving an
+	 * active run. Cycling or switching mid-stream keeps the routed override
+	 * until the turn settles; the next dispatch re-evaluates the routing
+	 * against the new selection.
+	 */
+	private _clearModelOverrideWhenIdle(): void {
+		if (this._hasActiveTurnLifecycle) return;
+		this.agent.modelOverride = undefined;
+	}
+
+	/**
 	 * Goals are pursued through the kernel goal skill, so the only tool the
 	 * model needs is ipython. Force-activate it (including into a live
 	 * continuation context) so the model can always reach `goal.complete()`.
@@ -2078,7 +2813,14 @@ export class AgentSession {
 
 	private _maybeResumeGoalContinuationAfterRlmWork(): void {
 		if (!this._goalContinuationAwaitsRlmWork) return;
-		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
+		if (
+			this._disposed ||
+			this._disposing ||
+			this._hasUnsettledRlmQuiescenceWork() ||
+			this._hasLiveBackgroundBashHandles()
+		) {
+			return;
+		}
 		if (this._goalState.status !== "active" || !this._goalState.objective) {
 			this._goalContinuationAwaitsRlmWork = false;
 			return;
@@ -2111,6 +2853,280 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Hold the timer-driven autonomous continuation while descendant or
+	 * background bash work is unsettled, mirroring the goal gate: delegating
+	 * and ending the turn is correct behavior, and child replies, exit
+	 * notices, and background bash completion follow-ups are the real
+	 * wake-up signals. The owed continuation is delivered when the pending
+	 * work settles without consuming the continuation budget while it waits.
+	 * An active goal holds its own continuation, so the held continuation is
+	 * not double-queued behind it.
+	 */
+	private _holdAutonomousContinuationForRlmWork(message: AssistantMessage): boolean {
+		if (!this._autonomousState.enabled) {
+			return false;
+		}
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			return false;
+		}
+		if (autonomousLimitReason(this._autonomousState)) {
+			// The run is over: hold nothing so the hook can apply the limit.
+			return false;
+		}
+		if (!this._hasUnsettledRlmQuiescenceWork() && !this._hasLiveBackgroundBashHandles()) {
+			return false;
+		}
+		// An active goal's own continuation gate owns the wake-up discipline;
+		// drop any owed continuation so both are never queued.
+		if (this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
+			return true;
+		}
+		this._autonomousContinuationAwaitsRlmWork = true;
+		this._armAutonomousSubagentKeepAlive();
+		return true;
+	}
+
+	/** True while an active goal's continuation loop owns the session wake-ups. */
+	private _goalOwnsContinuationWakeup(): boolean {
+		return this._goalState.status === "active" && !!this._goalState.objective;
+	}
+
+	/**
+	 * True while the session's kernel still runs background bash() handles.
+	 * The kernel's bash-activity tracking (the same state that powers the
+	 * bash-done completion follow-ups) is the liveness surface, so a live
+	 * handle's completion notice is the wake-up a held continuation waits for.
+	 */
+	private _hasLiveBackgroundBashHandles(): boolean {
+		return this._ipythonKernelProvisioner?.manager?.hasBackgroundWork === true;
+	}
+
+	/** Deliver the owed continuation once descendant work settles. */
+	private _maybeResumeAutonomousContinuationAfterRlmWork(): void {
+		if (!this._autonomousContinuationAwaitsRlmWork) return;
+		if (
+			this._disposed ||
+			this._disposing ||
+			this._hasUnsettledRlmQuiescenceWork() ||
+			this._hasLiveBackgroundBashHandles()
+		) {
+			return;
+		}
+		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
+			return;
+		}
+		// Keep the deferral while admission is paused or the pump is suspended
+		// (post-abort); the pause release and resumeQueuedWork retry.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		if (this._autonomousContinuationResumeTask) return;
+		this._autonomousContinuationResumeTask = this._resumeOwedAutonomousContinuation().finally(() => {
+			this._autonomousContinuationResumeTask = undefined;
+		});
+	}
+
+	/**
+	 * Deliver the owed continuation, evaluating configured quality gates first
+	 * so a settlement never spends a turn when the gates already pass. Counted
+	 * at delivery like a goal continuation; a failed admission rolls the count
+	 * back and keeps the deferral for the pause-release retry.
+	 */
+	private async _resumeOwedAutonomousContinuation(): Promise<void> {
+		const snapshot = this._snapshotAutonomousRuntimeState();
+		const beforeGates = {
+			arrivalEpoch: this._sessionInputArrivalEpoch,
+			noticeAdmissions: this._rlmTerminalNoticeAdmissionCount,
+		};
+		try {
+			// agent_end clears the live field, so fall back to the transcript;
+			// either way the session's last assistant turn decides the gate run.
+			const lastAssistantMessage =
+				this._lastAssistantMessage ?? this._findLastAssistantInMessages(this.agent.state.messages);
+			if (!lastAssistantMessage) {
+				if (autonomousLimitReason(this._autonomousState)) {
+					// The run is over; no continuation is owed anymore.
+					this._clearAutonomousContinuationAwait();
+					return;
+				}
+				addAutonomousContinuation(this._autonomousState);
+				this._admitOwedAutonomousContinuation(createAutonomousContinuationMessage(this._autonomousState));
+				return;
+			}
+			// Configured quality gates decide whether the run is already done.
+			// The decision runs before any accounting is written so a stale
+			// drop never spends a continuation or clobbers a user reset.
+			const decision = await shouldAutonomouslyContinue(this._autonomousState, lastAssistantMessage, {
+				cwd: this._cwd,
+				signal: this.agent.signal,
+			});
+			if (!decision.shouldContinue) {
+				this._clearAutonomousContinuationAwait();
+				return;
+			}
+			// Re-validate after the gate await: mode-off, a goal takeover, or
+			// any user-driven admission (finished or queued) must not be
+			// bypassed by a stale continuation. Sibling terminal notices are
+			// the exception: this owed continuation is exactly the wake that
+			// reads them.
+			const admissions = this._sessionInputArrivalEpoch - beforeGates.arrivalEpoch;
+			const noticeAdmissions = this._rlmTerminalNoticeAdmissionCount - beforeGates.noticeAdmissions;
+			const userDrivenAdmissions = admissions > noticeAdmissions;
+			if (
+				this._disposed ||
+				this._disposing ||
+				!this._autonomousState.enabled ||
+				this._goalOwnsContinuationWakeup() ||
+				userDrivenAdmissions
+			) {
+				this._clearAutonomousContinuationAwait();
+				return;
+			}
+			addAutonomousContinuation(this._autonomousState);
+			const message =
+				(decision.reason === "gate_failed"
+					? createAutonomousGateFailureContinuationMessage(this._autonomousState)
+					: undefined) ?? createAutonomousContinuationMessage(this._autonomousState);
+			this._admitOwedAutonomousContinuation(message);
+		} catch {
+			// Admission can race a new pause; roll back so the retry re-counts.
+			this._restoreAutonomousRuntimeSnapshot(snapshot);
+		}
+	}
+
+	/** Admit an already-built owed continuation behind pending notices. */
+	private _admitOwedAutonomousContinuation(message: UserMessage): void {
+		const normalized = normalizeMessageContent(message.content);
+		// No front: a settling child's terminal notice must be read first.
+		this._admitSessionInput(
+			this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+				message,
+				resumeIfIdle: true,
+			}),
+		);
+		this._clearAutonomousContinuationAwait();
+	}
+
+	/**
+	 * Deliver the keep-alive continuation while subagents are still active.
+	 * Returns false when admission raced a pause so the window can re-arm.
+	 */
+	private _deliverAutonomousSubagentKeepAlive(): boolean {
+		if (autonomousLimitReason(this._autonomousState)) {
+			// The run is over; no keep-alive is owed anymore.
+			this._clearAutonomousContinuationAwait();
+			return true;
+		}
+		const snapshot = this._snapshotAutonomousRuntimeState();
+		try {
+			addAutonomousContinuation(this._autonomousState);
+			this._admitOwedAutonomousContinuation(createAutonomousSubagentKeepAliveMessage(this._autonomousState));
+			return true;
+		} catch {
+			// Admission can race a new pause; roll back so the retry re-counts.
+			this._restoreAutonomousRuntimeSnapshot(snapshot);
+			return false;
+		}
+	}
+
+	/** One keep-alive continuation per window of continuous subagent activity. */
+	private _armAutonomousSubagentKeepAlive(): void {
+		if (this._autonomousSubagentKeepAliveTimer !== undefined) return;
+		const keepAliveMs = this._autonomousState.subagentKeepAliveMs;
+		if (!keepAliveMs || keepAliveMs <= 0) return;
+		const timer = setTimeout(() => {
+			this._autonomousSubagentKeepAliveTimer = undefined;
+			this._fireAutonomousSubagentKeepAlive();
+		}, keepAliveMs);
+		// A pending keep-alive must not hold the event loop open on its own.
+		timer.unref();
+		this._autonomousSubagentKeepAliveTimer = timer;
+	}
+
+	private _disarmAutonomousSubagentKeepAlive(): void {
+		if (this._autonomousSubagentKeepAliveTimer === undefined) return;
+		clearTimeout(this._autonomousSubagentKeepAliveTimer);
+		this._autonomousSubagentKeepAliveTimer = undefined;
+	}
+
+	private _clearAutonomousContinuationAwait(): void {
+		this._autonomousContinuationAwaitsRlmWork = false;
+		this._disarmAutonomousSubagentKeepAlive();
+	}
+
+	/**
+	 * Safety valve for hung children: while subagents stay active past the
+	 * keep-alive window, wake the parent so it can inspect and unblock them
+	 * (a stopped SIGTTIN child never delivers its exit notice).
+	 */
+	private _fireAutonomousSubagentKeepAlive(): void {
+		if (!this._autonomousContinuationAwaitsRlmWork) return;
+		if (this._disposed || this._disposing) return;
+		if (!this._hasUnsettledRlmQuiescenceWork() && !this._hasLiveBackgroundBashHandles()) {
+			// Descendants and background handles settled while the keep-alive
+			// was pending; the normal resume path owns delivery.
+			this._maybeResumeAutonomousContinuationAfterRlmWork();
+			return;
+		}
+		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
+			this._clearAutonomousContinuationAwait();
+			return;
+		}
+		// Keep the deferral while admission is paused or the pump is suspended
+		// (post-abort); the pause release and resumeQueuedWork retry.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) {
+			this._armAutonomousSubagentKeepAlive();
+			return;
+		}
+		if (!this._hasUnsettledRlmQuiescenceWork()) {
+			// Only background bash handles are pending: their completion
+			// follow-ups are the wake-up, so keep the deferral without waking
+			// the parent with a subagent keep-alive and poll again after
+			// another window.
+			this._armAutonomousSubagentKeepAlive();
+			return;
+		}
+		if (!this._deliverAutonomousSubagentKeepAlive()) {
+			// Admission raced a pause; retry after another window.
+			this._armAutonomousSubagentKeepAlive();
+		}
+	}
+
+	/**
+	 * Queued goal continuations snapshot goal accounting at queue time, but
+	 * delivery can lag arbitrarily (a threshold compaction, admission pauses,
+	 * other queued work) while usage keeps accruing. A continuation's whole
+	 * purpose is "here is the current goal state — keep working", so stale
+	 * numbers misreport the budget and can mislead the model into stopping
+	 * early or ignoring limits. Refresh the frozen content in place at
+	 * delivery, preserving the message identity every queue/dedup marker
+	 * (post-compaction continuation tracking, threshold dedup) matches on.
+	 * Budget-limit steers are excluded: they are created immediately after the
+	 * accounting event they report, and `objective_updated` carries the
+	 * objective snapshot that was the event.
+	 */
+	private _refreshGoalContextMessageAtDelivery(message: AgentMessage): void {
+		if (message.role !== "custom" || message.customType !== GOAL_CONTEXT_CUSTOM_TYPE) return;
+		const custom = message as CustomMessage<GoalContextDetails | undefined>;
+		const details = custom.details;
+		if (details?.kind !== "continuation" || details.goalId === undefined) return;
+		if (
+			this._goalState.status !== "active" ||
+			this._goalState.goalId !== details.goalId ||
+			!this._goalState.objective
+		) {
+			return;
+		}
+		const images = Array.isArray(custom.content)
+			? custom.content.filter((block): block is ImageContent => block.type === "image")
+			: undefined;
+		const fresh = createGoalContextMessage(this._goalState, "continuation", images);
+		custom.content = fresh.content;
+		custom.details = fresh.details;
+		custom.timestamp = fresh.timestamp;
+	}
+
 	private _runOrQueueGoalContext(kind: "continuation" | "objective_updated", images?: ImageContent[]): void {
 		if (!this._goalState.objective) return;
 		this._ensureGoalRuntimeActive();
@@ -2119,6 +3135,8 @@ export class AgentSession {
 		const action = this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
 			message,
 			resumeIfIdle: true,
+			// Front insertion only holds while nothing can be admitted ahead of it.
+			priority: "pinned",
 		});
 		this._admitSessionInput(action, { front: true, wake: false });
 	}
@@ -2376,7 +3394,7 @@ export class AgentSession {
 		if (pending) {
 			this._pendingRequestedRefine = undefined;
 			try {
-				await this._runSerializedRefine(pending);
+				await this._runSerializedRefine(pending, "self");
 			} catch (error) {
 				this._emitRefineFailed(error);
 			}
@@ -2522,7 +3540,7 @@ export class AgentSession {
 		});
 		this._refineInFlight = applySettled;
 		try {
-			await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort);
+			await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort, bgResult.source);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
@@ -2635,6 +3653,7 @@ export class AgentSession {
 				options: planOptions,
 				abort: refineAbort,
 				branchVersion,
+				source: skipReview ? "self" : "auto",
 			};
 		} catch (error) {
 			if (this._disposed || this._disposing || branchVersion !== this._autoRefineBranchVersion) {
@@ -2669,7 +3688,7 @@ export class AgentSession {
 			rollbackId?: string;
 			global?: boolean;
 		},
-		trigger: "manual" | "auto" = "manual",
+		source: Exclude<RefinementSource, "user">,
 	): Promise<void> {
 		if (this._disposed || this._disposing) {
 			return;
@@ -2694,7 +3713,7 @@ export class AgentSession {
 		const refineAbort = new AbortController();
 		this._refineAbortController = refineAbort;
 
-		const planRun = this._planRefine(options, refineAbort.signal, trigger);
+		const planRun = this._planRefine(options, refineAbort.signal, source === "auto" ? "auto" : "manual");
 		const planSettled = planRun.then(
 			() => undefined,
 			() => undefined,
@@ -2731,7 +3750,7 @@ export class AgentSession {
 		});
 		this._refineInFlight = applySettled;
 		try {
-			await this._applyRefine(plan, options, refineAbort);
+			await this._applyRefine(plan, options, refineAbort, source);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
@@ -2746,7 +3765,7 @@ export class AgentSession {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this._runModel()?.contextWindow ?? 0;
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
@@ -2795,6 +3814,11 @@ export class AgentSession {
 		const queuedMessage = this._queuedAutonomousThresholdContinuations.get(message);
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return queuedMessage;
+		}
+		// Hold the post-compaction continuation while descendants are unsettled;
+		// the owed continuation is delivered when they settle.
+		if (this._holdAutonomousContinuationForRlmWork(message)) {
+			return undefined;
 		}
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
@@ -3085,7 +4109,7 @@ export class AgentSession {
 				}
 				return {
 					scheduled: true,
-					note: "Refinement runs when the current turn ends; the harness rebuilds the system prompt and resumes you automatically. Continue working normally.",
+					note: "Refinement runs when the current turn ends; applied edits are appended to your context as a refinement notice and you resume automatically. Continue working normally.",
 				};
 			}
 			default:
@@ -3098,7 +4122,10 @@ export class AgentSession {
 	 * These heartbeats are internal to this active session and never read or
 	 * mutate the user-level /heartbeat.
 	 */
-	handleRlmHeartbeatHostRequest(type: string, payload: Record<string, unknown> = {}): Record<string, unknown> {
+	async handleRlmHeartbeatHostRequest(
+		type: string,
+		payload: Record<string, unknown> = {},
+	): Promise<Record<string, unknown>> {
 		const controller = this._rlmHeartbeatController;
 		if (!controller) {
 			throw new Error("RLM heartbeat skill is not available in this session");
@@ -3125,7 +4152,7 @@ export class AgentSession {
 				const deliveryMode = normalizeHeartbeatDeliveryMode(payload.delivery_mode ?? payload.deliveryMode);
 				return {
 					heartbeat: rlmHeartbeatHostResponse(
-						controller.createRlmHeartbeat({
+						await controller.createRlmHeartbeat({
 							instruction: payload.instruction,
 							interval: payload.interval,
 							label: payload.label,
@@ -3161,7 +4188,7 @@ export class AgentSession {
 				) {
 					throw new Error("rlm_heartbeat.update requires at least one field to update");
 				}
-				const heartbeat = controller.updateRlmHeartbeat({
+				const heartbeat = await controller.updateRlmHeartbeat({
 					id: payload.id,
 					instruction: payload.instruction,
 					interval: payload.interval,
@@ -3177,7 +4204,7 @@ export class AgentSession {
 				if (typeof payload.id !== "string") {
 					throw new Error("rlm_heartbeat.delete id must be a string");
 				}
-				const heartbeat = controller.deleteRlmHeartbeat(payload.id);
+				const heartbeat = await controller.deleteRlmHeartbeat(payload.id);
 				return {
 					heartbeat: heartbeat ? rlmHeartbeatHostResponse(heartbeat) : null,
 				};
@@ -3190,18 +4217,11 @@ export class AgentSession {
 	handleAgentMessageHostRequest(
 		type: string,
 		payload: Record<string, unknown> = {},
-	):
-		| Promise<AgentSessionMessageListResult | AgentSessionMessageReceipt | AgentFamilyRosterResult>
-		| AgentSessionMessageListResult
-		| AgentFamilyRosterResult {
+	): Promise<AgentSessionMessageReceipt> {
 		if (!this._agentMessageController) {
 			throw new Error("agent messaging is not available in this session");
 		}
 		switch (type) {
-			case "agent_message.list_agents":
-				if (!this._agentMessageController.roster)
-					throw new Error("agent family roster is not available in this session");
-				return this._agentMessageController.roster();
 			case "agent_message.send": {
 				if (typeof payload.target !== "string") {
 					throw new Error("agent_message.send target must be a string");
@@ -3304,9 +4324,10 @@ export class AgentSession {
 		if (signal?.aborted || this._goalState.status !== "active" || !this._goalState.objective) {
 			return [];
 		}
-		// Delegating and ending the turn is correct behavior; hold the continuation
-		// until descendants settle instead of re-prompting a waiting parent.
-		if (this._hasUnsettledRlmQuiescenceWork()) {
+		// Delegating and ending the turn is correct behavior; hold the
+		// continuation until descendants settle or the background bash
+		// handles finish instead of re-prompting a waiting parent.
+		if (this._hasUnsettledRlmQuiescenceWork() || this._hasLiveBackgroundBashHandles()) {
 			this._goalContinuationAwaitsRlmWork = true;
 			return [];
 		}
@@ -3355,6 +4376,12 @@ export class AgentSession {
 			this._autonomousContinuationSuppressionDepth > 0 ||
 			context.newMessages.some((message) => this._autonomousContinuationSuppressedMessages.has(message))
 		) {
+			return [];
+		}
+		// Delegating and ending the turn is correct behavior; hold the
+		// continuation until descendants settle instead of re-prompting a
+		// waiting parent, mirroring the goal gate above.
+		if (this._holdAutonomousContinuationForRlmWork(context.message)) {
 			return [];
 		}
 		const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
@@ -3647,12 +4674,22 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+					const restoredModel = this._restorePrimaryModelAfterBackup();
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
+						...(restoredModel ? { restoredModel } : {}),
 					});
 					this._retryAttempt = 0;
+					this._providerWait = undefined;
+				}
+				if (assistantMsg.stopReason === "aborted") {
+					await this._handleAbortedQuotaPark();
+				} else if (assistantMsg.stopReason !== "error" && this._quotaPark) {
+					// A parked session that completes a model call has its quota back:
+					// clear the park (cancelling the pending wake) and resume the task.
+					await this._completeQuotaParkResume();
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
 					const message = createGoalContextMessage(this._goalState, "budget_limit");
@@ -3694,6 +4731,7 @@ export class AgentSession {
 			this._finishActiveRetryWithFailure(msg);
 			this._resolveRetry();
 			if (!compactionWillRetry) {
+				await this._handleErroredQuotaParkProbe(msg);
 				this._finishGoalForTerminalAssistantMessage(msg);
 				// In serialized mode, agent-callable refine.run is serviced
 				// at the shouldStopAfterTurn boundary, not here at agent_end.
@@ -3708,6 +4746,8 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
+		this._retryGeneration += 1;
+		this._semanticEdges.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
 			this._retryResolve = undefined;
@@ -3967,7 +5007,7 @@ export class AgentSession {
 			const pending = this._pendingRequestedRefine;
 			this._pendingRequestedRefine = undefined;
 			try {
-				await this._runSerializedRefine(pending);
+				await this._runSerializedRefine(pending, "self");
 			} catch {
 				// Best-effort drain; refinement errors must not block disposal.
 			}
@@ -4056,6 +5096,7 @@ export class AgentSession {
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
+		this._deletedRlmChildRuns.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
 		} catch {
@@ -4102,6 +5143,13 @@ export class AgentSession {
 				clearTimeout(timer);
 			}
 			this._scheduledAutoRefineTimers.clear();
+			this._disarmAutonomousSubagentKeepAlive();
+			// The in-process wake dies with the session; the durable one-shot job
+			// stays so a restart can still restore the session and resume the task.
+			if (this._quotaPark) {
+				if (this._quotaPark.timer) clearTimeout(this._quotaPark.timer);
+				this._quotaPark = undefined;
+			}
 			this._serializedPlanInFlight = undefined;
 			this._serializedExplicitRefineOptions = undefined;
 			this._pendingRequestedRefine = undefined;
@@ -4118,6 +5166,7 @@ export class AgentSession {
 			this._rlmChildSessions.clear();
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
+			this._deletedRlmChildRuns.clear();
 			this._pendingNextTurnMessages = [];
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
@@ -4269,6 +5318,10 @@ export class AgentSession {
 		return this._rlmDepth;
 	}
 
+	get semanticEdges(): SemanticEdgeRecorder {
+		return this._semanticEdges;
+	}
+
 	get rlmMaxDepth(): number {
 		return this._rlmMaxDepth;
 	}
@@ -4383,8 +5436,7 @@ export class AgentSession {
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
-			harnessState: this._loadMergedHarnessState(),
-			genericMcpServers: this._mcpManager?.getEnabledGenericServers(),
+			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -4404,12 +5456,47 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		policy: SubmissionNormalizationPolicy,
 	): NormalizedSubmission {
+		if (policy.expandPromptTemplates) this._throwIfUnknownSlashCommand(text);
 		let expandedText = text;
 		if (policy.expandSkills) expandedText = this._expandSkillCommand(expandedText);
 		if (policy.expandPromptTemplates) {
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
 		return { kind: "prompt", text: expandedText, images };
+	}
+
+	/**
+	 * Reject slash-command typos before they burn a model round trip and
+	 * pollute the transcript. Only fires when a registered command name is
+	 * close enough to be the intended one; anything else passes through so
+	 * genuine prompts that merely start with "/" keep working.
+	 */
+	private _throwIfUnknownSlashCommand(text: string): void {
+		const parsed = parseSlashCommand(text);
+		if (!parsed) return;
+		// No registered command name is anywhere near this long; oversized
+		// /-prefixed inputs are prompts, and fuzzy-matching them would be
+		// quadratic work on the event loop.
+		if (parsed.name.length > 64) return;
+		if (isBuiltinSlashCommandName(parsed.name)) return;
+		if (this.promptTemplates.some((template) => template.name === parsed.name)) return;
+		if (
+			parsed.name.startsWith("skill:") &&
+			this.resourceLoader.getSkills().skills.some((skill) => skill.name === parsed.name.slice("skill:".length))
+		) {
+			return;
+		}
+		const skills = this.resourceLoader.getSkills().skills.map((skill) => skill.name);
+		const candidates = [
+			...BUILTIN_SLASH_COMMANDS.flatMap((command) => [command.name, ...(command.aliases ?? [])]),
+			...SESSION_SLASH_COMMAND_NAMES,
+			...this.promptTemplates.map((template) => template.name),
+			...this._extensionRunner.getRegisteredCommands().map((command) => command.invocationName),
+			...skills.map((skill) => `skill:${skill}`),
+		];
+		const suggestion = findSlashCommandSuggestion(parsed.name, candidates);
+		if (!suggestion) return;
+		throw new Error(`Unknown command: /${parsed.name}. Did you mean /${suggestion}?`);
 	}
 
 	private _normalizeSubmission(
@@ -4625,7 +5712,7 @@ export class AgentSession {
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
 		const message = createHeartbeatPromptMessage(job);
-		await this._promptInjectedMessage(job.prompt, message, {
+		await this._promptInjectedMessage(message.content, message, {
 			...options,
 			followUpQueueKey: options?.followUpQueueKey ?? `heartbeat:${job.id}`,
 			resumeIfIdle: true,
@@ -4669,6 +5756,7 @@ export class AgentSession {
 		try {
 			const result = this._admitSessionInput(action, { wake: false });
 			if (!result.accepted) throw new Error("RLM child terminal notice was not admitted.");
+			this._rlmTerminalNoticeAdmissionCount++;
 		} catch (error) {
 			this._durableRlmTerminalNoticeActionIds.delete(action.id);
 			throw error;
@@ -4761,6 +5849,37 @@ export class AgentSession {
 		for (const id of ids) this._durableRlmTerminalNoticeActionIds.delete(id);
 	}
 
+	/**
+	 * The kernel read the command's result before the notice reached the model, so
+	 * the notice has nothing left to report: drop it while it is still queued.
+	 * Delivered notices are no longer clearable, which makes this a no-op.
+	 */
+	private _withdrawAsyncBashCompletionNotice(details: { pid: number; command: string }): void {
+		// One read withdraws one notice: pid reuse can queue an identical key twice,
+		// and the read belongs to the older handle, which is the earlier notice.
+		const notice = this._actionStore
+			.clearableActions()
+			.find((action) => this._isAsyncBashCompletionActionFor(action, details));
+		if (!notice) return;
+		this._cancelSessionActions(
+			(action) => action === notice,
+			new Error("Background command completion notice withdrawn: the kernel read the result first."),
+		);
+		this._emitQueueUpdate();
+	}
+
+	private _isAsyncBashCompletionActionFor(
+		action: QueuedSessionAction,
+		details: { pid: number; command: string },
+	): boolean {
+		if (action.payload.kind !== "turn") return false;
+		const message = primaryDeliveryRecord(action).message;
+		if (message.role !== "custom" || message.customType !== ASYNC_BASH_COMPLETION_CUSTOM_TYPE) return false;
+		// pids are reused across handles, so the command has to match too.
+		const completion = message.details as AsyncBashCompletionDetails | undefined;
+		return completion?.pid === details.pid && completion.command === details.command;
+	}
+
 	private async _promptInjectedMessage(
 		text: string,
 		message: CustomMessage,
@@ -4801,6 +5920,7 @@ export class AgentSession {
 					options?.resumeIfIdle ||
 					(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
 				source: options?.source ?? "internal",
+				priority: options?.priority,
 				executionPolicy:
 					options?.executionPolicy ??
 					(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
@@ -4837,7 +5957,21 @@ export class AgentSession {
 		}
 	}
 
+	private _promptSubmissionInFlight = false;
+
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		// Synchronous preflight guard: from submission until the prompt promise
+		// settles, a model switch must not tear down a routed turn's override
+		// (the routing decision for this turn's images may already be made).
+		this._promptSubmissionInFlight = true;
+		try {
+			return await this._promptInner(text, options);
+		} finally {
+			this._promptSubmissionInFlight = false;
+		}
+	}
+
+	private async _promptInner(text: string, options?: InternalPromptOptions): Promise<void> {
 		const resumeSuspendedInput = options?.resumeIfIdle !== false;
 		if (!this.isStreaming) {
 			if (resumeSuspendedInput) this._resumeSessionInputAdmission();
@@ -4904,6 +6038,7 @@ export class AgentSession {
 						{
 							agentMessageId: options?.agentMessageId,
 							source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+							priority: options?.priority,
 						},
 					);
 					const result = this._admitSessionInput(action, {
@@ -4958,6 +6093,7 @@ export class AgentSession {
 						options?.resumeIfIdle ||
 						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
 					source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+					priority: options?.priority,
 					executionPolicy: visibleQueued
 						? this._turnExecutionPolicy("queued")
 						: this._turnExecutionPolicy("directPrompt", {
@@ -5044,7 +6180,7 @@ export class AgentSession {
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return undefined;
-		const context = this._extensionRunner.createCommandContext();
+		const context = this._extensionRunner.createCommandContext(command.sourceInfo.path);
 		return Promise.resolve()
 			.then(() => command.handler(args, context))
 
@@ -5105,6 +6241,7 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
+			priority?: SessionActionPriority;
 		} = {},
 	): Promise<void> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -5121,6 +6258,7 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
+			priority: options.priority ?? sessionActionPriorityFor(true, undefined, options.agentMessageId),
 		});
 	}
 
@@ -5138,6 +6276,7 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
+			priority?: SessionActionPriority;
 		} = {},
 	): Promise<boolean> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -5154,6 +6293,7 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
+			priority: options.priority ?? sessionActionPriorityFor(true, undefined, options.agentMessageId),
 		});
 	}
 
@@ -5226,10 +6366,15 @@ export class AgentSession {
 									}
 								: {}),
 						};
+			const primaryMessage =
+				payload.kind === "turn" ? payload.records.find((record) => record.role === "primary")?.message : undefined;
 			return {
 				id: recovered.id,
 				source: recovered.source,
 				delivery: recovered.delivery,
+				priority:
+					recovered.priority ??
+					sessionActionPriorityFor(isHumanInputSource(recovered.source), primaryMessage, recovered.agentMessageId),
 				wake: recovered.wake,
 				payload,
 				lifecycle: { state: "queued" },
@@ -5265,6 +6410,7 @@ export class AgentSession {
 			this._createSessionCommandAction(text, customMessage.details.command, images, schedule, {
 				agentMessageId,
 				source: "internal",
+				priority: sessionActionPriorityFor(true, undefined, agentMessageId),
 			}),
 			{ restore: true },
 		).accepted;
@@ -5278,6 +6424,9 @@ export class AgentSession {
 			message: snapshot.customMessage,
 			prefixMessages: snapshot.prefixMessages,
 			source: "internal",
+			priority: sessionActionPriorityFor(true, snapshot.customMessage, snapshot.agentMessageId),
+			// Restored input replays the order it was admitted in.
+			preserveOrder: true,
 		});
 	}
 
@@ -5456,6 +6605,7 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			priority?: SessionActionPriority;
 			executionPolicy?: TurnExecutionPolicy;
 			queueVisible?: boolean;
 			acceptedAgentMessage?: boolean;
@@ -5489,10 +6639,13 @@ export class AgentSession {
 			acceptedAgentMessage: options.acceptedAgentMessage ?? false,
 			acceptedBeforeCompletion: options.acceptedBeforeCompletion ?? false,
 		};
+		const source = options.source ?? "internal";
 		return {
 			id,
-			source: options.source ?? "internal",
+			source,
 			delivery: this._deliveryPolicy(schedule),
+			priority:
+				options.priority ?? sessionActionPriorityFor(isHumanInputSource(source), message, options.agentMessageId),
 			wake:
 				options.resumeIfIdle === true
 					? "immediate"
@@ -5515,12 +6668,16 @@ export class AgentSession {
 		options: {
 			agentMessageId?: string;
 			source?: InputSource | "internal";
+			priority?: SessionActionPriority;
 		} = {},
 	): QueuedSessionAction {
+		const source = options.source ?? "internal";
 		return {
 			id: randomUUID(),
-			source: options.source ?? "internal",
+			source,
 			delivery: this._deliveryPolicy(schedule),
+			priority:
+				options.priority ?? sessionActionPriorityFor(isHumanInputSource(source), undefined, options.agentMessageId),
 			wake: "immediate",
 			payload: { kind: "session_command", text, command, images },
 			lifecycle: { state: "queued" },
@@ -5546,7 +6703,9 @@ export class AgentSession {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new Error("Cannot admit a session action while session input admission is paused.");
+			throw new SessionInputAdmissionPausedError(
+				"Cannot admit a session action while session input admission is paused.",
+			);
 		}
 		if (this._sessionInputPumpSuspended) {
 			throw new Error("Cannot admit a session action while queued session input is suspended.");
@@ -5558,6 +6717,7 @@ export class AgentSession {
 		options: {
 			restore?: boolean;
 			front?: boolean;
+			preserveOrder?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
 		} = {},
@@ -5570,7 +6730,9 @@ export class AgentSession {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new Error("Cannot admit a session action while session input admission is paused.");
+			throw new SessionInputAdmissionPausedError(
+				"Cannot admit a session action while session input admission is paused.",
+			);
 		}
 		if (
 			options.restore !== true &&
@@ -5595,8 +6757,12 @@ export class AgentSession {
 		const canStartImmediately =
 			options.immediatelyEligible === true &&
 			(this._actionStore.unfinishedActions().length === 0 || options.front === true);
-		if (options.front) this._actionStore.enqueueFront(action);
-		else this._actionStore.enqueue(action);
+		const placement: SessionActionPlacement = options.front
+			? "front"
+			: options.restore || options.preserveOrder
+				? "tail"
+				: "priority";
+		this._actionStore.enqueue(action, placement);
 		let disposition: "starts_when_admitted" | "queued" = "queued";
 		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
 		const controller = this._actionStore.ticketFor(action);
@@ -5637,13 +6803,15 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			priority?: SessionActionPriority;
+			preserveOrder?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action).accepted;
+		return this._admitSessionInput(action, { preserveOrder: options.preserveOrder }).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -5737,13 +6905,20 @@ export class AgentSession {
 					return;
 				}
 
-				const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
+				const forcedAllSteeringActionIds = this._forcedAllSteeringBatch(first);
+				const mode =
+					forcedAllSteeringActionIds !== undefined
+						? "all"
+						: first.delivery === "next_turn_boundary"
+							? this.steeringMode
+							: this.followUpMode;
 				const actions: QueuedSessionAction[] = [first];
 				while (!preselected && mode === "all") {
 					const next = this._actionStore.queuedActions(first.delivery)[0];
 					if (
 						!next ||
 						next.payload.kind !== "turn" ||
+						(forcedAllSteeringActionIds !== undefined && !forcedAllSteeringActionIds.has(next.id)) ||
 						!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
 					) {
 						break;
@@ -5906,6 +7081,12 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Busy inputs: compaction, retry, bash, plus (for "pump") disposal,
+	 * suspension, queued-work pauses, and branch-summary mutation. Waiters
+	 * parked on this predicate rely on every clear site notifying the
+	 * session-input checkpoint waiters.
+	 */
 	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
 		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
 		if (point === "pump") {
@@ -5963,8 +7144,14 @@ export class AgentSession {
 		const firstTurn = activeTurns()[0];
 		if (!firstTurn) return;
 		const executionPolicy = firstTurn.payload.executionPolicy;
+		// The digest is never parked as pending context; lazy injection re-arms instead.
+		const parkNextTurnMessages = (messages: CustomMessage[]) => {
+			const parked = messages.filter((message) => message.customType !== HARNESS_DIGEST_CUSTOM_TYPE);
+			if (parked.length !== messages.length) this._harnessDigestPending = true;
+			this._pendingNextTurnMessages.unshift(...parked);
+		};
 		const restoreNextTurnContext = () => {
-			this._pendingNextTurnMessages.unshift(...nextTurnMessages);
+			parkNextTurnMessages(nextTurnMessages);
 			nextTurnMessages = [];
 		};
 		try {
@@ -5973,6 +7160,12 @@ export class AgentSession {
 					if (this._isSessionInputHandoffDeferred(epoch)) {
 						throw new DeferredSessionInputError("Session input paused before preflight");
 					}
+					// Re-evaluate image routing for this batch before any pre-commit read of
+					// the serving model: pre-turn compaction must not follow the previous
+					// turn's override. Retries and post-compaction continuations of a routed
+					// turn re-read the override, so they keep serving it; the next dispatch
+					// overwrites it with its fresh decision.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(activeTurns());
 				},
 				prepare: async () => {
 					if (executionPolicy.nextTurnContextTiming === "preparation") {
@@ -6030,11 +7223,29 @@ export class AgentSession {
 					if (executionPolicy.nextTurnContextTiming === "commit") {
 						nextTurnMessages = this._takePendingNextTurnMessages();
 					}
+					if (this._harnessDigestPending) {
+						// The first-turn digest rides the turn's delivery records so a
+						// cancelled first turn strips it with the rest of the turn.
+						this._harnessDigestPending = false;
+						const { digest, stateFingerprint } = this._harnessDigestWithFingerprint();
+						const latest = this._latestContextHarnessDigestDetails();
+						if (!latest || !this._harnessDigestIsFresh(latest, digest, stateFingerprint)) {
+							nextTurnMessages = [
+								createHarnessDigestMessage(digest, Date.now(), stateFingerprint),
+								...nextTurnMessages,
+							];
+						}
+					}
 					const contextRecords = nextTurnMessages.map((message) =>
 						this._createDeliveryRecord(turns[0].id, "next_turn", message),
 					);
 					const firstPrimaryIndex = turns[0].payload.records.indexOf(primaryDeliveryRecord(turns[0]));
 					turns[0].payload.records.splice(firstPrimaryIndex, 0, ...contextRecords);
+					for (const action of turns) {
+						// Queued continuations must report goal accounting as of delivery,
+						// not as of queue time (see refresh rationale).
+						this._refreshGoalContextMessageAtDelivery(primaryDeliveryRecord(action).message);
+					}
 					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
 						action.payload.records.map((record) => record.message),
 					);
@@ -6052,6 +7263,10 @@ export class AgentSession {
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
+					// Re-evaluate image routing for the exact message set being sent:
+					// before_agent_start injections land after the earlier per-turn
+					// decision and may carry images the session model cannot serve.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -6075,7 +7290,7 @@ export class AgentSession {
 			this._forgetConsumedPostCompactionContinuations(turns.map((action) => primaryDeliveryRecord(action).message));
 		} catch (error) {
 			const delivered = new Set(this.agent.state.messages);
-			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
+			parkNextTurnMessages(nextTurnMessages.filter((message) => !delivered.has(message)));
 			for (const action of actions) {
 				if (action.payload.kind === "turn") {
 					action.payload.records = action.payload.records.filter((record) => record.role !== "next_turn");
@@ -6343,10 +7558,22 @@ export class AgentSession {
 
 	clearQueuedAgentMessages(): { steering: string[]; followUp: string[] } {
 		this._agentMessageClearEpoch++;
-		return this.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
+		// customType identifies agent messages; the text parser covers persisted pre-grammar prompts.
+		return this._clearQueuedTurnActionsMatching(
+			(action) =>
+				isAgentSessionMessage(primaryDeliveryRecord(action).message) ||
+				isAgentSessionMessagePrompt(action.payload.text),
+		);
 	}
 
 	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
+		return this._clearQueuedTurnActionsMatching((action) => predicate(action.payload.text));
+	}
+
+	private _clearQueuedTurnActionsMatching(matches: (action: QueuedSessionAction) => boolean): {
+		steering: string[];
+		followUp: string[];
+	} {
 		const ownedActions = this._actionStore.ownedActions();
 		const dispatchedTurnCount = ownedActions.filter(
 			(action) =>
@@ -6357,7 +7584,7 @@ export class AgentSession {
 			(action) =>
 				action.payload.kind === "turn" &&
 				action.agentMessageId !== undefined &&
-				predicate(action.payload.text) &&
+				matches(action) &&
 				(action.lifecycle.state === "queued" ||
 					action.lifecycle.state === "selected" ||
 					action.lifecycle.state === "preparing" ||
@@ -6491,6 +7718,7 @@ export class AgentSession {
 
 	get isSessionActive(): boolean {
 		return (
+			this._ipythonKernelProvisioner?.manager?.hasBackgroundWork === true ||
 			this.isStreaming ||
 			this.isCompacting ||
 			this.isRetrying ||
@@ -6526,7 +7754,7 @@ export class AgentSession {
 						active: {
 							kind: active.payload.kind,
 							phase,
-							label: compactRlmText(active.payload.text),
+							label: compactRlmText(queuedAgentMessagePreview(active)),
 						},
 					}
 				: {}),
@@ -6564,6 +7792,7 @@ export class AgentSession {
 				id: action.id,
 				source: action.source,
 				delivery: action.delivery,
+				priority: action.priority,
 				wake: action.wake,
 				...(action.queueKey ? { queueKey: action.queueKey } : {}),
 				...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
@@ -6725,6 +7954,7 @@ export class AgentSession {
 				this._notifySessionInputCheckpointChange();
 				this._flushDeferredRlmTerminalNotices();
 				this._maybeResumeGoalContinuationAfterRlmWork();
+				this._maybeResumeAutonomousContinuationAfterRlmWork();
 				this._scheduleSessionInputPump();
 			},
 		};
@@ -6842,6 +8072,7 @@ export class AgentSession {
 	resumeQueuedWork(): boolean {
 		this._resumeSessionInputAdmission();
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 		this._scheduleSessionInputPump();
 		return this._hasSelectableSessionInput();
 	}
@@ -6867,7 +8098,10 @@ export class AgentSession {
 	private async _waitForIdleOrSettlement(settlement?: PostCompactionContinuationSettlement): Promise<void> {
 		while (settlement === undefined || this._postCompactionContinuationSettlement === settlement) {
 			if (this._actionStore.queuedActions().length > 0) {
-				if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) {
+				// Park while the pump would refuse scheduling or selection: rescheduling
+				// a blocked pump completes on already-resolved promises, so looping here
+				// would spin on the microtask queue and starve the IO that ends the busy state.
+				if (this._isBusyForSessionInput("pump")) {
 					let wake = () => {};
 					const changed = new Promise<void>((resolve) => {
 						wake = resolve;
@@ -7002,6 +8236,50 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Abort the active run and deliver every queued user steering message in one new turn.
+	 * Abort-only when the visible steering queue is empty or the scheduler must stay
+	 * suspended; an update-restart suspension is left untouched. steeringMode is never changed.
+	 */
+	abortAndSendQueued(): boolean {
+		// requestAbort would clear the restart flag, letting later admissions resume
+		// work during the restart window; abortForUpdateRestart already aborted the run.
+		if (this._sessionInputSuspendedForUpdateRestart) {
+			return false;
+		}
+		const queuedSteering = visibleSessionActionProjection(
+			this._actionStore.queuedActions("next_turn_boundary"),
+		).filter(
+			(action) =>
+				action.payload.kind === "turn" &&
+				!action.payload.acceptedAgentMessage &&
+				primaryDeliveryRecord(action).message.role === "user",
+		);
+		const canResume =
+			!this._disposed &&
+			!this._disposing &&
+			this._sessionInputAdmissionPauses.size === 0 &&
+			this._queuedWorkPauses.size === 0;
+		if (queuedSteering.length === 0 || !canResume) {
+			this.requestAbort();
+			return false;
+		}
+		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
+		this.requestAbort();
+		this.resumeQueuedWork();
+		return true;
+	}
+
+	private _forcedAllSteeringBatch(first: QueuedSessionAction): ReadonlySet<string> | undefined {
+		const armed = this._forcedAllSteeringActionIds;
+		if (armed === undefined) return undefined;
+		if (first.delivery === "next_turn_boundary" && armed.has(first.id)) return armed;
+		if (!this._actionStore.queuedActions("next_turn_boundary").some((action) => armed.has(action.id))) {
+			this._forcedAllSteeringActionIds = undefined;
+		}
+		return undefined;
+	}
+
 	abortForUpdateRestart(): void {
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.
@@ -7060,17 +8338,29 @@ export class AgentSession {
 	}
 
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
-		if (!this._modelRegistry.hasConfiguredAuth(model)) {
+		// Explicit selection recovers from a stale-auth lockout, but only a fully
+		// validated switch commits the clear (single owner): failed selections never unlock.
+		const staleOnly =
+			!this._modelRegistry.hasConfiguredAuth(model) &&
+			this._modelRegistry.getProviderAuthStatus(model.provider).source === "stale";
+		if (!staleOnly && !this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
-		if (!(await this._modelRegistry.canUseModel(model))) {
+		if (!(await this._modelRegistry.canUseModel(model, { assumeAuthConfigured: staleOnly }))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
+		}
+		if (staleOnly) {
+			this._modelRegistry.clearProviderAuthStale(model.provider);
+			if (!this._modelRegistry.hasConfiguredAuth(model)) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
 		}
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = model;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
@@ -7138,6 +8428,7 @@ export class AgentSession {
 		const serviceTier = this._getServiceTierForModelSwitch();
 
 		this.agent.state.model = next.model;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
@@ -7177,6 +8468,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = nextModel;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
@@ -7223,16 +8515,19 @@ export class AgentSession {
 
 	setServiceTier(serviceTier: ServiceTier): void {
 		const effectiveServiceTier = this._getEffectiveServiceTier(serviceTier);
-		const preferenceChanged = effectiveServiceTier !== this._serviceTierPreference;
+		const preferenceChanged = serviceTier !== this._serviceTierPreference;
 		const effectiveTierChanged = effectiveServiceTier !== this.agent.state.serviceTier;
 		if (!preferenceChanged && !effectiveTierChanged) {
 			return;
 		}
-		this._serviceTierPreference = effectiveServiceTier;
+		// The preference and the session entry keep the REQUESTED tier (only the
+		// active state clamps), so switching to or resuming on a capable model
+		// re-activates it instead of a clamped "default" shadowing it.
+		this._serviceTierPreference = serviceTier;
 		if (preferenceChanged) {
-			this.sessionManager.appendServiceTierChange(effectiveServiceTier);
-			if (this.model && supportsFastMode(this.model)) {
-				this.settingsManager.setDefaultServiceTier(effectiveServiceTier);
+			this.sessionManager.appendServiceTierChange(serviceTier);
+			if (this.model && supportsServiceTier(this.model, serviceTier)) {
+				this.settingsManager.setDefaultServiceTier(serviceTier);
 			}
 		}
 		if (effectiveTierChanged) {
@@ -7245,7 +8540,7 @@ export class AgentSession {
 	}
 
 	private _getEffectiveServiceTier(serviceTier: ServiceTier): ServiceTier {
-		return serviceTier === "priority" && (!this.model || !supportsFastMode(this.model)) ? "default" : serviceTier;
+		return clampServiceTier(this.model, serviceTier);
 	}
 
 	private _getServiceTierForModelSwitch(): ServiceTier {
@@ -7324,9 +8619,9 @@ export class AgentSession {
 				? ` Variables above the per-variable snapshot limit were removed: ${pruned.join(", ")}.`
 				: "";
 		const content = [
-			"<ipython_state>",
+			"[python-state]",
+			"",
 			`Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.${prunedDetail}${detail}`,
-			"</ipython_state>",
 		].join("\n");
 		const message = {
 			role: "custom" as const,
@@ -7349,7 +8644,7 @@ export class AgentSession {
 	}
 
 	private _onIpythonStateRestored(result: RestoreResult): void {
-		const lines = ["<ipython_state_restored>"];
+		const lines = ["[python-state-restored]", ""];
 		if (result.restored.length > 0) {
 			lines.push(
 				`Your Python kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
@@ -7364,13 +8659,40 @@ export class AgentSession {
 				`These could not be restored and must be recreated if needed: ${result.failed.map((f) => f.name).join(", ")}.`,
 			);
 		}
-		lines.push("</ipython_state_restored>");
 		void this.sendCustomMessage(
 			{
 				customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 				content: lines.join("\n"),
 				display: true,
 				details: { restored: result.restored.length > 0 },
+			},
+			{ deliverAs: "nextTurn" },
+		).catch(() => {});
+	}
+
+	/**
+	 * Tell the model which pre-imported Python skills failed to import into the
+	 * freshly started kernel, before it spends turns reading their SKILL.md and
+	 * calling them (the placeholder objects only raise on first call).
+	 */
+	private _onPythonSkillsUnavailable(errors: UnavailablePythonSkills): void {
+		const lines = ["[python-skills-unavailable]", ""];
+		lines.push(
+			"These installed Python skill modules failed to import into the Python kernel, so calling them raises an error:",
+		);
+		for (const [name, error] of Object.entries(errors)) {
+			lines.push(`- ${name}: ${error}`);
+		}
+		lines.push(
+			"",
+			"Their shell command forms fail the same way. Fix the import error first (for example install the missing dependency with `uv pip install <pkg>` or reinstall the skill into the kernel venv), or use another approach.",
+		);
+		void this.sendCustomMessage(
+			{
+				customType: PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
+				content: lines.join("\n"),
+				display: true,
+				details: { skills: Object.keys(errors) },
 			},
 			{ deliverAs: "nextTurn" },
 		).catch(() => {});
@@ -7395,7 +8717,8 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		if (!options.skipAbort) await this.abort();
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		const compactionAbort = new AbortController();
+		this._compactionAbortController = compactionAbort;
 		let resolveCompactionOperation: () => void = () => {};
 		const compactionOperation = new Promise<void>((resolve) => {
 			resolveCompactionOperation = resolve;
@@ -7412,13 +8735,13 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(this.model);
 			const result = await this._performCompaction({
-				model: this.model,
+				model: requestModel,
 				apiKey,
 				headers,
 				customInstructions,
-				signal: this._compactionAbortController.signal,
+				signal: compactionAbort.signal,
 			});
 
 			this._emit({
@@ -7460,13 +8783,21 @@ export class AgentSession {
 			this._scheduleSessionInputPump();
 			if (didCompact) {
 				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
+				if (this._goalState.status === "active" && !compactionAbort.signal.aborted) {
+					this._goalContinuationAwaitsRlmWork ||= !this.agent.hasQueuedMessages();
+					this.resumeQueuedWork();
+					if (this.agent.hasQueuedMessages()) this._schedulePostCompactionContinue();
+				}
 				if (hadPostCompactionContinue) {
 					this._schedulePostCompactionContinue(continueAfterSessionInput);
 				}
 				// Queued agent or session-owned inputs resume the loop; defer refine
 				// behind them instead of interleaving it before their turns.
 				this._scheduleAutoRefineAfterCompaction(
-					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.unfinishedActionCount > 0,
+					this._goalContinuationAwaitsRlmWork ||
+						hadPostCompactionContinue ||
+						this.agent.hasQueuedMessages() ||
+						this.unfinishedActionCount > 0,
 				);
 			}
 		}
@@ -7500,41 +8831,141 @@ export class AgentSession {
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
 
-		if (this._extensionRunner.hasHandlers("session_before_compact")) {
-			const result = (await this._extensionRunner.emit({
-				type: "session_before_compact",
-				preparation,
-				branchEntries: pathEntries,
-				customInstructions,
-				signal,
-			})) as SessionBeforeCompactResult | undefined;
+		const semanticCompaction = this._semanticEdges.beginCompaction();
+		let compactionRecorded = false;
+		const uncommittedSlices: string[] = [];
+		let compactionSettled = false;
+		let summary: string;
+		let firstKeptEntryId: string;
+		let tokensBefore: number;
+		let details: CompactionResult["details"];
+		let usage: CompactionResult["usage"];
+		try {
+			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+				const result = (await this._extensionRunner.emit({
+					type: "session_before_compact",
+					preparation,
+					// slice: getBranch() returns the live leaf-branch cache, which appends
+					// extend in place, so the awaited handler gets a snapshot.
+					branchEntries: pathEntries.slice(),
+					customInstructions,
+					signal,
+				})) as SessionBeforeCompactResult | undefined;
 
-			if (result?.cancel) {
+				if (result?.cancel) {
+					throw new Error("Compaction cancelled");
+				}
+
+				if (result?.compaction) {
+					extensionCompaction = result.compaction;
+					fromExtension = true;
+				}
+			}
+
+			if (extensionCompaction) {
+				({ summary, firstKeptEntryId, tokensBefore, details, usage } = extensionCompaction);
+			} else {
+				// Compaction fires at context peak, and the summarizer runs with its own
+				// prompt prefix (a different system prompt, no tools), so it cannot hit
+				// the session's cached prefix: on the session model the summary re-reads
+				// its whole input at peak price, and on OpenAI-style providers it rides
+				// the session's prompt_cache_key with a divergent prefix, depressing
+				// hit rates. Route summaries to the auxiliary model when one is configured.
+				const summarization = (await this._resolveAuxiliaryModel(
+					"compaction summary",
+					{ model, apiKey, headers },
+					// The summary request serializes the whole conversation, so a
+					// smaller auxiliary window must fall back to the session model
+					// instead of failing over-limit and stranding the context.
+					estimateSummaryRequestTokens(preparation, customInstructions),
+				)) ?? {
+					model,
+					apiKey,
+					headers,
+				};
+				// Each summary wire call gets its own request ID: split turns send two
+				// different bodies, and one Idempotency-Key must never cover both. A slice
+				// that succeeds on the wire stays uncommitted until the compaction itself
+				// commits: a racing sibling's failure (or an abort) must leave no committed
+				// summary request for the next turn's continuation edge to attach to.
+				const summaryCall = async <T>(
+					call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+				): Promise<T> => {
+					const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+					if (requestId === undefined) {
+						return call(summarization.headers);
+					}
+					try {
+						const result = await call({ ...summarization.headers, ...modelRequestHeaders(requestId) });
+						// A slice resolving after a sibling's rejection already settled the
+						// compaction would push into a drained list and stay in-flight forever.
+						if (compactionSettled) {
+							this._semanticEdges.failRequest(requestId);
+						} else {
+							uncommittedSlices.push(requestId);
+						}
+						return result;
+					} catch (error) {
+						this._semanticEdges.failRequest(requestId);
+						throw error;
+					}
+				};
+				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
+					preparation,
+					summarization.model,
+					summarization.apiKey,
+					summarization.headers,
+					customInstructions,
+					signal,
+					// Summarizing is transcription, not reasoning: no thinking level is
+					// requested, so the summary call stays cheap and cannot trip an invalid
+					// reasoning effort for the summary model.
+					undefined,
+					summaryCall,
+					providerRetryPolicy(this.settingsManager),
+					this.sessionId,
+				));
+			}
+
+			if (signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			if (result?.compaction) {
-				extensionCompaction = result.compaction;
-				fromExtension = true;
+			// Ledger-before-effect: the compaction outcome is durable before the transcript
+			// commits it. Marked first: the ID is consumed even when the write throws, and a
+			// second finish attempt would mask the original I/O error.
+			compactionRecorded = true;
+			compactionSettled = true;
+			for (const requestId of uncommittedSlices.splice(0)) {
+				this._semanticEdges.finishRequest(requestId);
 			}
+			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
+			// Attached mechanically; the digest never flows through the summarizer LLM.
+			const { digest: harnessDigest, stateFingerprint: harnessStateFingerprint } =
+				this._harnessDigestWithFingerprint();
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				customInstructions,
+				usage,
+				harnessDigest,
+				harnessStateFingerprint,
+			);
+		} catch (error) {
+			compactionSettled = true;
+			for (const requestId of uncommittedSlices.splice(0)) {
+				this._semanticEdges.failRequest(requestId);
+			}
+			if (!compactionRecorded) {
+				const cancelled =
+					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
+				this._semanticEdges.finishCompaction(semanticCompaction.compactionId, cancelled ? "cancelled" : "failed");
+			}
+			throw error;
 		}
-
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
-
-		if (signal.aborted) {
-			throw new Error("Compaction cancelled");
-		}
-
-		this.sessionManager.appendCompaction(
-			summary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			customInstructions,
-		);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
@@ -7645,7 +9076,7 @@ export class AgentSession {
 		const pending = this._pendingRequestedRefine;
 		if (!pending) return false;
 		this._pendingRequestedRefine = undefined;
-		void this.refine(pending).catch((error) => this._emitRefineFailed(error));
+		void this.refine(pending, { source: "self" }).catch((error) => this._emitRefineFailed(error));
 		return true;
 	}
 
@@ -7998,26 +9429,263 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Background LLM passes (refinement review and planning, compaction summaries,
+	 * branch summaries) run with their own prompts, so they cannot hit the
+	 * session's cached prefix: on the session model they re-read their whole input
+	 * at peak price, and on OpenAI-style providers a divergent prefix riding the
+	 * session's prompt_cache_key depresses hit rates. Route them to the configured
+	 * auxiliary model when it is set and usable; fall back to the session model
+	 * otherwise.
+	 *
+	 * Callers that already resolved the session request auth pass it as
+	 * `fallback` so the fallback path reuses it instead of resolving again.
+	 */
+	private async _resolveAuxiliaryModel(
+		purpose: string,
+		fallback?: { model: Model<Api>; apiKey: string; headers?: Record<string, string> },
+		requiredContextTokens?: number,
+	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
+		const sessionModel = this.model;
+		if (!sessionModel) {
+			return fallback;
+		}
+		const resolveSessionAuth = async () => {
+			if (fallback) {
+				return fallback;
+			}
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(sessionModel);
+			return { model: requestModel, apiKey, headers };
+		};
+		const selector = this.settingsManager.getAuxiliaryModel()?.trim().toLowerCase();
+		if (!selector || `${sessionModel.provider}/${sessionModel.id}`.toLowerCase() === selector) {
+			return await resolveSessionAuth();
+		}
+		try {
+			const model = (await this._authenticatedRlmModels()).find(
+				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === selector,
+			);
+			if (!model) {
+				throw new Error(`model "${selector}" is unavailable, unauthenticated, or expired`);
+			}
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(model);
+			// Callers that know the size of the request they will issue pass it in:
+			// an auxiliary model whose context window cannot hold that request
+			// fails over-limit on the wire (e.g. a compaction summary covering the
+			// whole conversation), leaving the caller unable to make progress. A
+			// known window that is too small routes to the session model through the
+			// warning below; an unknown window (<= 0) keeps the routing as-is
+			// rather than guessing. The throw lands in the catch, whose logging
+			// stays selector-only (CodeQL js/clear-text-logging).
+			if (
+				requiredContextTokens !== undefined &&
+				requestModel.contextWindow > 0 &&
+				requestModel.contextWindow < requiredContextTokens
+			) {
+				throw new Error("auxiliary model context window is too small for the request");
+			}
+			return { model: requestModel, apiKey, headers };
+		} catch {
+			// Error details from the auth stack can embed credential material, so only
+			// the selector is logged (CodeQL js/clear-text-logging).
+			console.warn(`Warning: auxiliaryModel "${selector}" unusable for ${purpose}; using the session model.`);
+			return await resolveSessionAuth();
+		}
+	}
+
 	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context, signal);
 		}
-		const model = this.model;
-		if (!model) {
+		const refinementModel = await this._resolveAuxiliaryModel("refinement");
+		if (!refinementModel) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
-			model,
-			apiKey,
+			refinementModel.model,
+			refinementModel.apiKey,
 			context,
-			headers,
+			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
+			providerRetryPolicy(this.settingsManager),
+			this.sessionId,
 		);
+	}
+
+	/**
+	 * Harness digest material loaded exactly once per digest build: the merged
+	 * state plus the render options (including the current query terms).
+	 */
+	private _harnessDigestMaterial(): {
+		state: HarnessState;
+		options: {
+			includeIpythonExamples: boolean;
+			includeShellExamples: boolean;
+			includeRefineExamples: boolean;
+			queryTerms: HarnessQueryTerms;
+		};
+	} {
+		const tools = this.getActiveToolNames();
+		const hasIpython = tools.includes("ipython");
+		const visibleSkills = this._modelVisibleSkills().filter((skill) => !skill.disableModelInvocation);
+		const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
+		return {
+			state: this._loadMergedHarnessState(),
+			options: {
+				includeIpythonExamples: hasIpython,
+				includeShellExamples: tools.includes("bash"),
+				includeRefineExamples: hasIpython && hasRefineSkill,
+				queryTerms: this._buildHarnessDigestQueryTerms(),
+			},
+		};
+	}
+
+	/**
+	 * Digest plus the fingerprint of the state that produced it. Cold boundaries
+	 * compare fingerprints instead of rendered text: relevance query terms
+	 * change per turn, so a rendered-text comparison re-delivers an unchanged
+	 * digest (and busts the provider prefix cache) at every boundary.
+	 */
+	private _harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string } {
+		const { state, options } = this._harnessDigestMaterial();
+		const { queryTerms: _queryTerms, ...renderFlags } = options;
+		return {
+			digest: formatHarnessStateForPrompt(state, options),
+			stateFingerprint: harnessDigestFingerprint(state, renderFlags),
+		};
+	}
+
+	/**
+	 * Relevance signal for the harness digest: terms from the active goal
+	 * objective (strongest) and the last few user/assistant messages,
+	 * newest first. Term overlap is cheap and capped so scoring stays trivial.
+	 */
+	private _buildHarnessDigestQueryTerms(): HarnessQueryTerms {
+		const terms = new Map<string, number>();
+		const addText = (text: string | undefined, weight: number) => {
+			if (!text) return;
+			for (const raw of harnessQueryTerms(text)) {
+				if (terms.size >= 48 && !terms.has(raw)) return;
+				if (!terms.has(raw)) terms.set(raw, weight);
+			}
+		};
+		addText(this._goalState.objective, 3);
+		const recent = this.agent.state.messages
+			.filter(
+				(message): message is UserMessage | AssistantMessage =>
+					message.role === "user" || message.role === "assistant",
+			)
+			.slice(-4)
+			.reverse();
+		let recencyWeight = 2;
+		for (const message of recent) {
+			const text =
+				message.role === "assistant"
+					? readAssistantText(message)
+					: typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter((block): block is TextContent => block.type === "text")
+								.map((block) => block.text)
+								.join(" ");
+			addText(text, recencyWeight);
+			recencyWeight = Math.max(1, recencyWeight - 0.5);
+		}
+		return terms;
+	}
+
+	/** Cold-boundary digest delivery: empty contexts defer to the first committed turn (untouched sessions must stay empty); non-empty contexts append only when the newest in-context digest mismatches disk. */
+	private _ensureHarnessDigestContext(): void {
+		if (this.agent.state.messages.length === 0) {
+			this._harnessDigestPending = true;
+			return;
+		}
+		this._harnessDigestPending = false;
+		this._appendHarnessDigestIfStale();
+	}
+
+	private _appendHarnessDigestIfStale(): void {
+		const { digest, stateFingerprint } = this._harnessDigestWithFingerprint();
+		const latest = this._latestContextHarnessDigestDetails();
+		if (latest && this._harnessDigestIsFresh(latest, digest, stateFingerprint)) return;
+		const message = createHarnessDigestMessage(digest, Date.now(), stateFingerprint);
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} catch {
+			// Unpersisted session: context-only injection.
+		}
+		// The fresh digest is authoritative and older in-context copies are
+		// regenerable redundancy, so the append replaces them instead of stacking.
+		const withoutOlderDigests = this.agent.state.messages.filter(
+			(existing) => !(existing.role === "custom" && existing.customType === HARNESS_DIGEST_CUSTOM_TYPE),
+		);
+		if (withoutOlderDigests.length !== this.agent.state.messages.length) {
+			this.agent.state.messages = withoutOlderDigests;
+		}
+		// The fresh append outranks the compaction snapshot the same way a newer
+		// digest entry does at rebuild time, so the live summary must yield its
+		// snapshot now: the context would otherwise render both the superseded
+		// snapshot and the fresh digest until the next rebuild.
+		for (const existing of this.agent.state.messages) {
+			if (existing.role === "compactionSummary" && existing.harnessDigest !== undefined) {
+				existing.harnessDigest = undefined;
+				existing.harnessStateFingerprint = undefined;
+			}
+		}
+		this.agent.state.messages.push(message);
+	}
+
+	/**
+	 * Whether the newest in-context digest already reflects the current harness
+	 * state. A digest is fresh when its state fingerprint matches the current
+	 * one; a digest without a fingerprint is compared by rendered
+	 * text instead.
+	 */
+	private _harnessDigestIsFresh(
+		latest: { digest: string; stateFingerprint?: string },
+		freshDigest: string,
+		freshFingerprint: string,
+	): boolean {
+		return latest.stateFingerprint !== undefined
+			? latest.stateFingerprint === freshFingerprint
+			: latest.digest === freshDigest;
+	}
+
+	private _latestContextHarnessDigestDetails():
+		| { timestamp: number; digest: string; stateFingerprint?: string }
+		| undefined {
+		// Retained pre-compaction messages follow the compaction head, so recency is by timestamp, not position.
+		let latest: { timestamp: number; digest: string; stateFingerprint?: string } | undefined;
+		for (const message of this.agent.state.messages) {
+			if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+				const details = message.details as HarnessDigestDetails | undefined;
+				if (details?.digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+					latest = {
+						timestamp: message.timestamp,
+						digest: details.digest,
+						stateFingerprint: details.stateFingerprint,
+					};
+				}
+			} else if (message.role === "compactionSummary") {
+				if (message.harnessDigest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+					latest = {
+						timestamp: message.timestamp,
+						digest: message.harnessDigest,
+						stateFingerprint: message.harnessStateFingerprint,
+					};
+				}
+			}
+		}
+		return latest;
 	}
 
 	/** Global harness state overlaid with this session's local state, when persisted. */
@@ -8050,7 +9718,7 @@ export class AgentSession {
 			rollbackId?: string;
 			global?: boolean;
 		} = {},
-		internal: { skipAbort?: boolean; trigger?: "manual" | "auto" } = {},
+		internal: { skipAbort?: boolean; trigger?: "manual" | "auto"; source?: RefinementSource } = {},
 	): Promise<RefinementResult> {
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
@@ -8143,7 +9811,12 @@ export class AgentSession {
 			if (this._disposed || refineAbort.signal.aborted) {
 				throw new Error("Refinement cancelled because the session was disposed.");
 			}
-			return await this._applyRefine(plan, options, refineAbort);
+			return await this._applyRefine(
+				plan,
+				options,
+				refineAbort,
+				internal.source ?? (internal.trigger === "auto" ? "auto" : "user"),
+			);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
@@ -8187,8 +9860,10 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 
-		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const refinementModel = await this._resolveAuxiliaryModel("refinement");
+		if (!refinementModel) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -8250,12 +9925,13 @@ export class AgentSession {
 			this.agent.state.messages,
 			planningState,
 			history,
-			model,
-			apiKey,
-			options,
-			headers,
+			refinementModel.model,
+			refinementModel.apiKey,
+			{ ...options, retry: providerRetryPolicy(this.settingsManager) },
+			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
+			this.sessionId,
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -8264,7 +9940,16 @@ export class AgentSession {
 	}
 
 	private _recordRefinementOutcome(result: RefinementResult): void {
-		const message = createRefinementOutcomeMessage(result);
+		this._appendDurableRefineMessage(createRefinementOutcomeMessage(result));
+	}
+
+	/** In-context notice for an applied refinement. Refinements with zero applied edits emit nothing. */
+	private _recordRefinementNotice(result: RefinementResult, source: RefinementSource): void {
+		if (!result.appliedEdits.some((edit) => edit.applied)) return;
+		this._appendDurableRefineMessage(createRefinementNoticeMessage(result, source));
+	}
+
+	private _appendDurableRefineMessage(message: CustomMessage): void {
 		try {
 			this.sessionManager.appendCustomMessageEntryWithRollback(
 				message.customType,
@@ -8290,6 +9975,7 @@ export class AgentSession {
 		plan: RefinementPlan,
 		options: { instructions?: string; rollbackId?: string; global?: boolean },
 		refineAbort: AbortController,
+		source: RefinementSource,
 	): Promise<RefinementResult> {
 		if (this._disposed) {
 			throw new Error("Cannot refine a disposed session.");
@@ -8365,8 +10051,8 @@ export class AgentSession {
 				if (!refinementAuditAppendError) throw error;
 			}
 			if (refinementAuditAppendError) throw refinementAuditAppendError.error;
-			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			// The prompt stays byte-identical so the provider prefix cache survives; the notice carries the change.
+			this._recordRefinementNotice(result, source);
 			try {
 				this._emit({ type: "refine_complete", result });
 			} catch {
@@ -8464,14 +10150,18 @@ export class AgentSession {
 		}
 
 		const settings = this.settingsManager.getCompactionSettings();
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const runModel = this._runModel();
+		const contextWindow = runModel?.contextWindow ?? 0;
 
 		// Skip overflow check if the message came from a different model.
 		// This handles the case where user switched from a smaller-context model (e.g. opus)
 		// to a larger-context model (e.g. codex) - the overflow error from the old model
-		// shouldn't trigger compaction for the new model.
+		// shouldn't trigger compaction for the new model. A routed image-model turn keeps
+		// its override, so its overflow errors recover like the session model's own.
 		const sameModel =
-			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
+			runModel !== undefined &&
+			assistantMessage.provider === runModel.provider &&
+			assistantMessage.model === runModel.id;
 
 		// Skip overflow/threshold checks if this assistant message is older than the
 		// latest compaction boundary. This prevents a stale pre-compaction usage/error
@@ -8651,7 +10341,7 @@ export class AgentSession {
 			}
 
 			const result = await this._performCompaction({
-				model: this.model,
+				model: authResult.requestModel ?? this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
@@ -8848,6 +10538,19 @@ export class AgentSession {
 			: undefined;
 	}
 
+	refreshModelMetadata(): void {
+		if (this.model?.provider === "xai") {
+			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
+			this.setThinkingLevel(this.thinkingLevel);
+			this._clampServiceTierForModel();
+		}
+		this._scopedModels = this._scopedModels.map((scoped) =>
+			scoped.model.provider === "xai"
+				? { ...scoped, model: this._modelRegistry.getModelForCurrentAuth(scoped.model) }
+				: scoped,
+		);
+	}
+
 	private _refreshCurrentModelFromRegistry(): void {
 		const currentModel = this.model;
 		if (!currentModel) {
@@ -8978,14 +10681,16 @@ export class AgentSession {
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedToolNames = this._allowedToolNames;
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
+		const sdkToolEntry = (definition: ToolDefinition) => ({
+			definition,
+			sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
+				source: "sdk" as const,
+			}),
+		});
 		const allCustomTools = [
 			...registeredTools,
-			...this._customTools.map((definition) => ({
-				definition,
-				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
-					source: "sdk",
-				}),
-			})),
+			...this._customTools.map(sdkToolEntry),
+			...this._acpMcpTools.map(sdkToolEntry),
 		];
 		const isAllowedTool = (name: string): boolean => !allowedToolNames || allowedToolNames.has(name);
 		const allowedCustomTools = allCustomTools.filter((tool) => isAllowedTool(tool.definition.name));
@@ -9105,6 +10810,11 @@ export class AgentSession {
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
+				onUnavailableSkills: (errors) => this._onPythonSkillsUnavailable(errors),
+				onBackgroundWorkSettled: () => {
+					this._maybeResumeGoalContinuationAfterRlmWork();
+					this._maybeResumeAutonomousContinuationAfterRlmWork();
+				},
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				ipython: {
@@ -9134,6 +10844,7 @@ export class AgentSession {
 			extensionsResult.runtime.getExecEnv = this._execEnvProvider;
 		}
 
+		const previousRunner: ExtensionRunner | undefined = this._extensionRunner;
 		this._extensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -9141,11 +10852,32 @@ export class AgentSession {
 			this.sessionManager,
 			this._modelRegistry,
 		);
+		// Retire only when the extension world restarts (reload); runtime-only rebuilds adopt the timer host instead, so session_start timers survive and unload still cancels them.
+		if (previousRunner) {
+			if (previousRunner.builtFromSameExtensions(extensionsResult.extensions)) {
+				this._extensionRunner.adoptHostTimers(previousRunner);
+			} else {
+				previousRunner.retire();
+			}
+		}
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
 		}
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
+
+		const previousAcpMcpToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+		const acpServers = this._mcpManager?.getAcpServers() ?? [];
+		if (acpServers.length > 0 && !this._ipythonKernelProvisioner) {
+			throw new Error("ACP MCP servers require the built-in cpython tool");
+		}
+		const acpMcpTools = this._ipythonKernelProvisioner
+			? createAcpMcpToolDefinitions(acpServers, this._ipythonKernelProvisioner)
+			: [];
+		this._assertAcpMcpToolNamesAvailable(acpMcpTools.map((tool) => tool.name));
+		for (const name of previousAcpMcpToolNames) this._allowedToolNames?.delete(name);
+		for (const tool of acpMcpTools) this._allowedToolNames?.add(tool.name);
+		this._acpMcpTools = acpMcpTools;
 
 		const defaultActiveToolNames = this._baseToolsOverride ? Object.keys(this._baseToolsOverride) : ["ipython"];
 		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
@@ -9204,8 +10936,43 @@ export class AgentSession {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),
+			"rlm.create_session": createRlmCreateSessionHostHandler(async ({ prompt, kwargs }) => ({
+				...(await this.createRlmSession(prompt, kwargs)),
+			})),
+			"bash.completed": createAsyncBashCompletionHostHandler(async (details) => {
+				const message = createAsyncBashCompletionMessage(details);
+				const disposeSignal = this._sessionActionCommitDisposeAbortController.signal;
+				while (true) {
+					let admissionCommitted = false;
+					try {
+						await this._promptInjectedMessage(message.content, message, {
+							streamingBehavior: "steer",
+							queueIfBusy: true,
+							resumeIfIdle: true,
+							returnAfterAccepted: true,
+							suppressAutonomousContinuation: true,
+							admissionCommitted: () => {
+								admissionCommitted = true;
+							},
+						});
+						return;
+					} catch (error) {
+						if (admissionCommitted || !(error instanceof SessionInputAdmissionPausedError)) throw error;
+						while (this._sessionInputAdmissionPauses.size > 0 && !disposeSignal.aborted) {
+							await this._waitForSessionActivityChange(disposeSignal);
+						}
+					}
+				}
+			}),
+			"bash.consumed": createAsyncBashConsumedHostHandler((details) => {
+				this._withdrawAsyncBashCompletionNotice(details);
+			}),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
+			"rlm.collect": createRlmCollectHostHandler((targets, timeoutMs) =>
+				this.collectRlmChildren(targets, timeoutMs),
+			),
+			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
 			"model.info": async () => ({
 				id: this.model?.id ?? null,
@@ -9243,12 +11010,16 @@ export class AgentSession {
 				.filter((skill) => !skill.disableModelInvocation)
 				.map((skill) => skill.name),
 		);
-		if (this._agentMessageController && visibleKernelSkillNames.has(AGENT_MESSAGE_SKILL_NAME)) {
+		const messageController = this._agentMessageController;
+		if (messageController && visibleKernelSkillNames.has(AGENT_MESSAGE_SKILL_NAME)) {
 			Object.assign(
 				handlers,
 				createAgentMessageHostHandlers({
-					roster: async () =>
-						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
+					family: async () => {
+						if (!messageController.family)
+							throw new Error("agent family roster is not available in this session");
+						return messageController.family();
+					},
 					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
 					sendAgentMessage: async (input) => {
 						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
@@ -9257,13 +11028,13 @@ export class AgentSession {
 						})) as AgentSessionMessageReceipt;
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";
-							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
+							if (input.receiverRole === undefined && messageController.family) {
 								try {
-									const roster = await this._agentMessageController.roster();
-									addressedParent = roster.entries.some(
-										(entry) =>
-											entry.relationship === "parent" &&
-											(entry.id === input.target || entry.name === input.target),
+									addressedParent = (await messageController.family()).some(
+										(member) =>
+											member.relationship === "parent" &&
+											(member.entry.id === input.target ||
+												agentFamilyMemberName(member.entry) === input.target),
 									);
 								} catch {
 									addressedParent = false;
@@ -9453,7 +11224,9 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
+		spawnedByRequestId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
+		const freedSessionIds = this._freedRlmChildSessionIds();
 		return {
 			parentSession: this,
 			id: options.id,
@@ -9464,8 +11237,7 @@ export class AgentSession {
 			model: options.model,
 			thinkingLevel:
 				options.thinkingLevel ?? (clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel),
-			serviceTier:
-				this.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : this.serviceTier,
+			serviceTier: this._serviceTierPreference,
 			scopedModels: [...this._scopedModels],
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
@@ -9475,6 +11247,11 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
+			spawnedByRequestId: options.spawnedByRequestId,
+			// The daemon host re-asserts the name at the runtime boundary
+			// against a catalog that still lists the unwinding child, so the
+			// receipt's freed ids must survive that second check.
+			...(freedSessionIds.length > 0 ? { ignoreSessionIds: freedSessionIds } : {}),
 		};
 	}
 
@@ -9503,7 +11280,7 @@ export class AgentSession {
 				systemPrompt: "",
 				model: options.model,
 				thinkingLevel: options.thinkingLevel,
-				serviceTier: options.serviceTier,
+				serviceTier: clampServiceTier(options.model, options.serviceTier),
 				tools: [],
 			},
 			convertToLlm: this.agent.convertToLlm,
@@ -9517,7 +11294,6 @@ export class AgentSession {
 			sessionId: childSessionManager.getSessionId(),
 			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
 			transport: this.settingsManager.getTransport(),
-			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
 		});
 
@@ -9525,6 +11301,7 @@ export class AgentSession {
 			agent: childAgent,
 			sessionManager: childSessionManager,
 			settingsManager: this.settingsManager,
+			serviceTierPreference: options.serviceTier,
 			cwd: this._cwd,
 			agentDir: this._agentDir,
 			scopedModels: options.scopedModels,
@@ -9540,6 +11317,8 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+			semanticParentSessionId: options.parentSession.sessionId,
+			semanticSpawnedByRequestId: options.spawnedByRequestId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -9562,6 +11341,7 @@ export class AgentSession {
 		this._unsettledRlmChildRuns.delete(run);
 		run.settlement.resolve();
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
 	private _cancelActiveRlmChildRuns(reason: string): void {
@@ -9610,8 +11390,64 @@ export class AgentSession {
 		return run.session?.sessionId;
 	}
 
+	/**
+	 * Child-side progress note admission. The host wrapper validated shape and
+	 * length; this throttles per session (event-loop spam guard) and re-emits
+	 * an `rlm_progress_note` event for the parent's child-event subscription.
+	 * Pull-based only: rejected notes return a retry hint instead of an error.
+	 */
+	noteRlmProgress(message: string): RlmProgressNoteResult {
+		const now = Date.now();
+		const lastAt = this._lastRlmProgressNoteAt;
+		if (lastAt !== undefined && now - lastAt < RLM_PROGRESS_NOTE_MIN_INTERVAL_MS) {
+			return { accepted: false, retry_after_ms: RLM_PROGRESS_NOTE_MIN_INTERVAL_MS - (now - lastAt) };
+		}
+		this._lastRlmProgressNoteAt = now;
+		this._emit({ type: "rlm_progress_note", message, timestamp: now });
+		return { accepted: true, retry_after_ms: undefined };
+	}
+
 	async listRlmSubagents(): Promise<RlmListSubagentsResult> {
 		return this._buildRlmSubagentList(await this._agentMessageController?.listAgents());
+	}
+
+	/**
+	 * Project bounded snapshot fields onto kernel roster entries so the parent
+	 * model sees nearly as much as daemon clients do. Answer previews are
+	 * hard-capped here (compactRlmText already caps at 160).
+	 */
+	private _rlmRegistryExtrasFromSnapshot(
+		snapshot: RlmChildAgentSnapshot,
+	): Pick<
+		RlmSubagentRegistryEntry,
+		| "activity"
+		| "tool_use_count"
+		| "duration_ms"
+		| "answer_preview"
+		| "replied_since_task"
+		| "progress_note"
+		| "label"
+		| "last_activity_at"
+		| "activity_stale_ms"
+	> {
+		return {
+			// Project to the registry's snake_case wire shape; the Python kernel
+			// reads activity.tool_name directly from the JSON payload.
+			activity: snapshot.activity
+				? {
+						kind: snapshot.activity.kind,
+						...(snapshot.activity.toolName ? { tool_name: snapshot.activity.toolName } : {}),
+					}
+				: undefined,
+			tool_use_count: snapshot.toolUseCount,
+			duration_ms: snapshot.durationMs,
+			answer_preview: snapshot.answerPreview?.slice(0, RLM_REGISTRY_ANSWER_PREVIEW_MAX_LENGTH),
+			replied_since_task: snapshot.repliedSinceTask,
+			progress_note: snapshot.progressNote,
+			label: snapshot.label.slice(0, RLM_REGISTRY_LABEL_MAX_LENGTH),
+			last_activity_at: snapshot.lastActivityAt,
+			activity_stale_ms: snapshot.activityStaleMs,
+		};
 	}
 
 	private _buildRlmSubagentList(listedAgents?: AgentSessionMessageListResult): RlmListSubagentsResult {
@@ -9642,19 +11478,12 @@ export class AgentSession {
 				session_id: daemonChild?.sessionId ?? run.session?.sessionId ?? null,
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
-				status:
-					run.status === "queued"
-						? "queued"
-						: run.status === "done"
-							? "completed"
-							: run.status === "error"
-								? "error"
-								: "running",
-				...(run.error !== undefined ? { error: normalizeRlmChildError(run.error) } : {}),
+				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
+				...this._rlmRegistryExtrasFromSnapshot(this._rlmChildSnapshotForRun(run)),
 			});
 			recorded.add(run.id);
 		}
-		for (const [childId, { session: childSession }] of this._rlmChildSessions) {
+		for (const [childId, { session: childSession, run: retainedRun }] of this._rlmChildSessions) {
 			if (
 				this._deletingRlmChildren.has(childId) ||
 				recorded.has(childId) ||
@@ -9667,6 +11496,9 @@ export class AgentSession {
 			if (!sessionDir) {
 				continue;
 			}
+			const extrasSnapshot = retainedRun
+				? this._rlmChildSnapshotForRun(retainedRun, childSession)
+				: this._rlmChildSnapshotForSession(childId, childSession);
 			subagents.push({
 				rlm_child_id: childId,
 				active_session_id: daemonChild?.activeSessionId ?? null,
@@ -9675,6 +11507,7 @@ export class AgentSession {
 					daemonChild?.sessionName ?? childSession.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: sessionDir,
 				status: "completed",
+				...this._rlmRegistryExtrasFromSnapshot(extrasSnapshot),
 			});
 			recorded.add(childId);
 		}
@@ -9698,6 +11531,221 @@ export class AgentSession {
 			});
 		}
 		return { subagents };
+	}
+
+	/**
+	 * Typed fan-in for direct RLM children: wait (bounded) for the selected
+	 * runs to settle and return result envelopes. Never steers the parent and
+	 * never rejects on timeout — a timeout returns the current snapshots so
+	 * the caller can end its turn, poll, or retry. `targets` are child ids or
+	 * session names; an empty list means every direct child that is not being
+	 * deleted. A target whose delete receipt already returned resolves
+	 * immediately to a settled cancelled envelope instead of an
+	 * unknown-selector error.
+	 */
+	async collectRlmChildren(targets: string[], timeoutMs: number): Promise<RlmCollectResult> {
+		const candidates = new Map<string, RlmChildRun>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			candidates.set(run.id, run);
+		}
+		// Terminal cleanup moves settled runs out of _activeRlmChildRuns while their
+		// envelope stays retained in _rlmChildSessions until deleted; collect must see
+		// both or a completed child can no longer be re-collected.
+		for (const [childId, retained] of this._rlmChildSessions) {
+			if (retained.run && !candidates.has(childId)) {
+				candidates.set(childId, retained.run);
+			}
+		}
+		const runs = new Map<string, RlmChildRun>();
+		// Deleted targets resolve immediately to cancelled envelopes: their delete
+		// receipt already accepted the cancellation, so waiting for the detached
+		// unwind (or reporting an unsettled snapshot) would only mislead callers.
+		// Only detachedDeletion marks an accepted delete. A run merely reserved in
+		// _deletingRlmChildren is still inside delete preflight and can surface a
+		// passive-selector conflict that fails the delete, so it stays hidden from
+		// collect like every other selector view until the delete settles. That
+		// preflight reservation also blocks the deleted fallback: a reused name
+		// makes the previous generation's accepted delete match the same selector,
+		// and answering with its cancelled envelope would report a run that is not
+		// the target while the new delete can still fail and leave it live. The
+		// selector throws no-match instead, exactly like a fresh-name collect
+		// racing its own delete preflight. An accepted delete keeps its
+		// _deletingRlmChildren reservation until the unwind settles, so only a
+		// reservation without detachedDeletion blocks the fallback. Once the
+		// unwind does settle, the run leaves both lookup maps and only its
+		// _deletedRlmChildRuns tombstone still carries the receipt-bound identity,
+		// so a later collect keeps answering with the same cancelled envelope. A
+		// mid-preflight run blocks tombstone matches too: that delete can still
+		// fail and leave a live replacement under the reused selector. The same
+		// protection must not end at preflight: a run-less retained child is
+		// invisible to candidates, yet while it is live it owns its reused name, so
+		// the deleted generation of that name never answers for it. A live
+		// replacement of a reused name always beats the deleted-generation fallback.
+		const deletedRuns = new Map<string, RlmChildRun>();
+		if (targets.length === 0) {
+			for (const [childId, run] of candidates) {
+				if (!run.detachedDeletion && !this._deletingRlmChildren.has(run.id)) {
+					runs.set(childId, run);
+				}
+			}
+		} else {
+			for (const target of targets) {
+				const matches = [...candidates.values()].filter(
+					(run) =>
+						!run.detachedDeletion &&
+						!this._deletingRlmChildren.has(run.id) &&
+						this._rlmChildRunMatchesTarget(run, target),
+				);
+				if (matches.length === 0) {
+					// Mid-preflight runs stay hidden and must not fall through to the
+					// deleted generation of the same selector. An accepted delete keeps
+					// its reservation until the unwind settles, so only a reservation
+					// without detachedDeletion is still inside preflight.
+					const candidatePreflight = [...candidates.values()].some(
+						(run) =>
+							run.detachedDeletion === undefined &&
+							this._deletingRlmChildren.has(run.id) &&
+							this._rlmChildRunMatchesTarget(run, target),
+					);
+					// A run-less retained child is invisible to candidates, so its own
+					// reservation is the only preflight signal. A reservation is kept past
+					// the receipt only for an accepted delete with an active run, and the
+					// accepted run-less delete is excluded by its tombstone, so a visible
+					// run-less reservation is still inside preflight.
+					const runlessPreflight = [...this._deletingRlmChildren].some(
+						([childId, reservation]) =>
+							!candidates.has(childId) &&
+							!this._deletedRlmChildRuns.has(childId) &&
+							this._rlmSubagentMatchesTarget(reservation.subagent, target),
+					);
+					const preflight = candidatePreflight || runlessPreflight;
+					// A live run-less retained child (a daemon-hydrated child, for example)
+					// never enters candidates, so without this scan the deleted generation
+					// of a reused name would answer for it. While the replacement stays
+					// resident it owns the selector: a reservation or receipt may hide it
+					// from listings, and a failed delete cleanup hides it from listings
+					// only — it never returned a receipt, so both deleted-generation
+					// fallbacks stay silent and the selector throws no-match, exactly
+					// like the mid-preflight convention.
+					const liveRunlessMatch = [...this._rlmChildSessions].some(
+						([childId, retained]) =>
+							!retained.run &&
+							!candidates.has(childId) &&
+							!this._deletingRlmChildren.has(childId) &&
+							!this._deletedRlmChildIds.has(childId) &&
+							(childId === target ||
+								retained.session.sessionId === target ||
+								retained.session.sessionName === target),
+					);
+					// A run still mid-unwind stays in candidates; one whose unwind already
+					// finished is reachable only through its tombstone.
+					const unwoundMatches = [...candidates.values()].filter(
+						(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
+					);
+					const unwoundIds = new Set(unwoundMatches.map((run) => run.id));
+					const tombstoneMatches = [...this._deletedRlmChildRuns.values()].filter(
+						(run) => !unwoundIds.has(run.id) && this._rlmDeletedRunMatchesTarget(run, target),
+					);
+					const deletedMatches = preflight || liveRunlessMatch ? [] : [...unwoundMatches, ...tombstoneMatches];
+					if (deletedMatches.length === 0) {
+						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+					}
+					if (deletedMatches.length > 1) {
+						throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
+					}
+					deletedRuns.set(deletedMatches[0].id, deletedMatches[0]);
+					continue;
+				}
+				if (matches.length > 1) {
+					throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
+				}
+				runs.set(matches[0].id, matches[0]);
+			}
+		}
+		if (timeoutMs > 0) {
+			const deadline = Date.now() + timeoutMs;
+			await Promise.all(
+				[...runs.values()].map((run) => {
+					if (run.settled) return undefined;
+					const remainingMs = deadline - Date.now();
+					if (remainingMs <= 0) return undefined;
+					let timer: NodeJS.Timeout | undefined;
+					const timeout = new Promise<void>((resolve) => {
+						timer = setTimeout(resolve, remainingMs);
+						timer.unref?.();
+					});
+					return Promise.race([
+						// A settled failure is terminal state, not a collect error.
+						run.settlement.promise.then(
+							() => undefined,
+							() => undefined,
+						),
+						timeout,
+					]).finally(() => {
+						clearTimeout(timer);
+					});
+				}),
+			);
+		}
+		return {
+			results: [
+				...[...runs.values()].map((run) => this._rlmCollectEntryForRun(run)),
+				...[...deletedRuns.values()].map((run) => this._rlmDeletedCollectEntryForRun(run)),
+			],
+		};
+	}
+
+	private _rlmChildRunMatchesTarget(run: RlmChildRun, target: string): boolean {
+		const session = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+		return (
+			run.id === target ||
+			run.sessionName === target ||
+			session?.sessionId === target ||
+			session?.sessionName === target
+		);
+	}
+
+	/**
+	 * Tombstoned runs have no session object left, so registry identity stands in
+	 * for the session selectors a mid-unwind run still answered to.
+	 */
+	private _rlmDeletedRunMatchesTarget(run: RlmChildRun, target: string): boolean {
+		return (
+			this._rlmChildRunMatchesTarget(run, target) ||
+			(run.detachedDeletion !== undefined && this._rlmSubagentMatchesTarget(run.detachedDeletion, target))
+		);
+	}
+
+	private _rlmCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
+		const snapshot = this._rlmChildSnapshotForRun(run);
+		return {
+			rlm_child_id: snapshot.id,
+			session_name: snapshot.sessionName,
+			session_dir: snapshot.sessionDir,
+			status: snapshot.status,
+			settled: run.settled,
+			answer_preview: snapshot.answerPreview,
+			error: snapshot.error,
+			duration_ms: snapshot.durationMs,
+			tool_use_count: snapshot.toolUseCount,
+			replied_since_task: snapshot.repliedSinceTask,
+		};
+	}
+
+	/**
+	 * Typed envelope for a target whose delete receipt already returned. The
+	 * detached unwind may still hold the run unsettled; the parent-facing
+	 * projection is terminal regardless, so the entry reports cancellation as a
+	 * settled answer instead of a snapshot that invites re-polling.
+	 */
+	private _rlmDeletedCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
+		const entry = this._rlmCollectEntryForRun(run);
+		return {
+			...entry,
+			status: "cancelled",
+			settled: true,
+			error: entry.error ?? "Deleted by parent orchestrator",
+		};
 	}
 
 	private _rlmSubagentMatchesTarget(entry: RlmSubagentRegistryEntry, target: string): boolean {
@@ -9725,44 +11773,45 @@ export class AgentSession {
 		childId: string,
 		isExternallyRunning: () => boolean = () => false,
 	): Promise<"deleted" | "not_found" | "running"> {
-		const isRunning = (): boolean => {
-			const status = this._activeRlmChildRuns.get(childId)?.status;
-			return status === "queued" || status === "running" || isExternallyRunning();
-		};
-		if (isRunning()) {
-			return "running";
-		}
-		const subagent = [...(await this.listRlmSubagents()).subagents, ...this._rlmChildCleanupFailures.values()].find(
-			(entry) => entry.rlm_child_id === childId,
-		);
-		if (!subagent) {
-			for (const run of this._activeRlmChildRuns.values()) {
-				const result = await run.session?.deleteInactiveRlmSubagent(childId, isExternallyRunning);
-				if (result && result !== "not_found") {
-					return result;
-				}
-			}
-			for (const { session: retained } of this._rlmChildSessions.values()) {
-				const result = await retained.deleteInactiveRlmSubagent(childId, isExternallyRunning);
-				if (result !== "not_found") {
-					return result;
-				}
-			}
-			return "not_found";
-		}
-		if (isRunning()) {
-			return "running";
-		}
-		const result = await this._trackRlmSubagentDeletion(subagent, () => {
+		for (const owner of this._rlmSubtreeSessions()) {
+			const isRunning = (): boolean => {
+				const status = owner._activeRlmChildRuns.get(childId)?.status;
+				return status === "queued" || status === "running" || isExternallyRunning();
+			};
 			if (isRunning()) {
-				return Promise.resolve({ subagent, outcome: "skipped_running" });
+				return "running";
 			}
-			return this._deleteResolvedRlmSubagent(subagent);
-		});
-		return result.outcome === "skipped_running" ? "running" : "deleted";
+			const subagent = [
+				...(await owner.listRlmSubagents()).subagents,
+				...owner._rlmChildCleanupFailures.values(),
+			].find((entry) => entry.rlm_child_id === childId);
+			if (!subagent) continue;
+			if (isRunning()) {
+				return "running";
+			}
+			const result = await owner._trackRlmSubagentDeletion(subagent, () => {
+				if (isRunning()) {
+					return Promise.resolve({ subagent, outcome: "skipped_running" });
+				}
+				return owner._deleteResolvedRlmSubagent(subagent);
+			});
+			return result.outcome === "skipped_running" ? "running" : "deleted";
+		}
+		return "not_found";
 	}
 
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
+		// Freeing a name at the delete receipt reaches two transient selector
+		// states, both inherent to that design and recoverable, so neither is
+		// guarded away: (a) while an old generation with an accepted delete
+		// still unwinds, its reservation matches the reused name and unions
+		// with the live replacement below, so a name delete of the replacement
+		// throws ambiguous until the unwind settles; the replacement stays
+		// deletable by child id. (b) if that old generation's detached cleanup
+		// fails after a replacement took the name, the cleanup-failure entry
+		// keeps the name blocked for new spawns even after the replacement is
+		// deleted, until the failed delete is retried by child id and the
+		// cleanup succeeds.
 		const inFlight = [...this._deletingRlmChildren.values()].filter(({ subagent }) =>
 			this._rlmSubagentMatchesTarget(subagent, target),
 		);
@@ -9909,6 +11958,7 @@ export class AgentSession {
 		run.deletionReservation.resolve();
 		this._unsettledRlmChildRuns.delete(run);
 		this._maybeResumeGoalContinuationAfterRlmWork();
+		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
 	private _observeRlmRunDeletionCleanup(
@@ -9946,6 +11996,13 @@ export class AgentSession {
 	}
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+		// Every removal of an accepted-delete run funnels through here, so the
+		// tombstone covers the settled unwind, an already-settled errored delete, and
+		// the no-run retained delete. Other removals keep no tombstone: only a delete
+		// receipt promises a collectable cancelled envelope.
+		if (run?.detachedDeletion) {
+			this._deletedRlmChildRuns.set(childId, run);
+		}
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
 		this._rlmChildUnsubscribes.delete(childId);
@@ -9959,6 +12016,14 @@ export class AgentSession {
 			run.abort = noopRlmChildAbort;
 			run.unsubscribe = undefined;
 			run.session = undefined;
+			if (run.detachedDeletion) {
+				// Tombstones only need the label (derived from prompt) and the last
+				// progress note to build the cancelled collect envelope. Strip the
+				// full values so a long-lived parent with many deletions does not
+				// accumulate unbounded memory.
+				run.prompt = rlmChildLabel(run.prompt);
+				run.progressNotes = run.progressNotes.slice(-1);
+			}
 		}
 	}
 
@@ -9978,6 +12043,44 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Accepted-delete marker for a child removed without an active run: a retained
+	 * completed child, or a daemon-hydrated passive child that never had one. The
+	 * retained run is reused when the parent still holds it, because it is already
+	 * out of both lookup maps by removal time and the tombstone is its only
+	 * remaining reader; otherwise the tombstone carries the registry snapshot.
+	 */
+	private _runForRetainedRlmChildDeletion(
+		childId: string,
+		subagent: RlmSubagentRegistryEntry,
+		retained: RetainedRlmChild | undefined,
+	): RlmChildRun {
+		if (retained?.run) {
+			retained.run.detachedDeletion = subagent;
+			return retained.run;
+		}
+		return {
+			id: childId,
+			prompt: subagent.label ?? "",
+			label: rlmChildLabel(subagent.label ?? ""),
+			sessionName: subagent.session_name,
+			sessionDir: subagent.session_dir,
+			model: retained?.session.model ?? this.model ?? UNKNOWN_RLM_CHILD_MODEL,
+			status: "cancelled",
+			durationMs: subagent.duration_ms,
+			answerPreview: subagent.answer_preview,
+			toolUseCount: subagent.tool_use_count ?? 0,
+			progressNotes: subagent.progress_note ? [subagent.progress_note] : [],
+			error: "Deleted by parent orchestrator",
+			abort: noopRlmChildAbort,
+			publication: createAgentMessageDeferred(),
+			settlement: createAgentMessageDeferred(),
+			settled: true,
+			deletionReservation: createAgentMessageDeferred(),
+			detachedDeletion: subagent,
+		};
+	}
+
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
@@ -9987,6 +12090,7 @@ export class AgentSession {
 				// resolved child. A failed preflight must leave the prior retry boundary
 				// intact so a later call can acquire it.
 				run.deletionCleanupFailed = false;
+				run.deletionFailureNotice = undefined;
 				run.deletionReservation = createAgentMessageDeferred();
 			}
 			// The detached task remains the sole lifecycle owner. Mark deletion before
@@ -10019,20 +12123,22 @@ export class AgentSession {
 		}
 
 		this._emitRlmSubagentRemoval(subagent);
-		const retained = this._rlmChildSessions.get(childId)?.session;
+		const retained = this._rlmChildSessions.get(childId);
 		try {
-			await this._deleteRlmSubagentSession(childId, retained);
+			await this._deleteRlmSubagentSession(childId, retained?.session);
 		} catch (error) {
 			if (this._disposed || this._disposing) {
 				this._removeRlmSubagentTracking(childId);
-				void retained?.disposeAsync().catch(() => undefined);
+				void retained?.session.disposeAsync().catch(() => undefined);
 			} else {
 				this._rlmChildCleanupFailures.set(childId, subagent);
 			}
 			throw error;
 		}
 		this._deletedRlmChildIds.add(childId);
-		this._removeRlmSubagentTracking(childId);
+		// The receipt promises a collectable cancelled envelope, so a child deleted
+		// without an active run still needs its accepted-delete tombstone.
+		this._removeRlmSubagentTracking(childId, this._runForRetainedRlmChildDeletion(childId, subagent, retained));
 		return { subagent };
 	}
 
@@ -10081,17 +12187,14 @@ export class AgentSession {
 		};
 	}
 
-	private _rlmChildSnapshotForRun(
-		run: RlmChildRun,
-		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
-	): RlmChildAgentSnapshot {
+	private _rlmChildStableSnapshotForRun(run: RlmChildRun, child: AgentSession | undefined): RlmChildStableSnapshot {
 		const model = child?.model ?? run.model;
 		return {
 			id: run.id,
 			parentId: this._rlmParentNodeId,
 			sessionName: child?.sessionName ?? run.sessionName,
 			model: `${model.provider}/${model.id}`,
-			label: rlmChildLabel(run.prompt),
+			label: run.label,
 			status: run.status,
 			durationMs: run.durationMs,
 			answerPreview: run.answerPreview,
@@ -10101,7 +12204,19 @@ export class AgentSession {
 			sessionDir: run.sessionDir,
 			activity: run.activity,
 			repliedSinceTask: child?._repliedToParentSinceTask,
-			error: run.error,
+			progressNote: run.progressNotes.at(-1),
+			error: run.error === undefined ? undefined : normalizeRlmChildError(run.error),
+		};
+	}
+
+	private _rlmChildSnapshotForRun(
+		run: RlmChildRun,
+		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
+	): RlmChildAgentSnapshot {
+		return {
+			...this._rlmChildStableSnapshotForRun(run, child),
+			lastActivityAt: run.lastActivityAt,
+			activityStaleMs: rlmActivityStaleMs(run.status, run.activity, run.lastActivityAt, run.lastActivityMonotonicAt),
 		};
 	}
 
@@ -10184,18 +12299,11 @@ export class AgentSession {
 
 	/** True when any direct or nested subagent is still running or queued. */
 	hasRunningRlmChildren(): boolean {
-		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.status === "running" || run.status === "queued") {
-				return true;
-			}
-			if (run.session?.hasRunningRlmChildren()) {
-				return true;
-			}
-		}
-		// A finished direct child can still have a running nested subagent.
-		for (const { session } of this._rlmChildSessions.values()) {
-			if (session.hasRunningRlmChildren()) {
-				return true;
+		for (const session of this._rlmSubtreeSessions()) {
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (run.status === "running" || run.status === "queued") {
+					return true;
+				}
 			}
 		}
 		return false;
@@ -10271,20 +12379,11 @@ export class AgentSession {
 
 	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
 	getRlmChildSession(childId: string): AgentSession | undefined {
-		const direct = this._activeRlmChildRuns.get(childId)?.session ?? this._rlmChildSessions.get(childId)?.session;
-		if (direct) {
-			return direct;
-		}
-		for (const candidate of this._activeRlmChildRuns.values()) {
-			const nested = candidate.session?.getRlmChildSession(childId);
-			if (nested) {
-				return nested;
-			}
-		}
-		for (const { session: retained } of this._rlmChildSessions.values()) {
-			const nested = retained.getRlmChildSession(childId);
-			if (nested) {
-				return nested;
+		for (const session of this._rlmSubtreeSessions()) {
+			const direct =
+				session._activeRlmChildRuns.get(childId)?.session ?? session._rlmChildSessions.get(childId)?.session;
+			if (direct) {
+				return direct;
 			}
 		}
 		return undefined;
@@ -10297,26 +12396,79 @@ export class AgentSession {
 	 * was suppressed; false when the id is unknown or the run already settled.
 	 */
 	cancelRlmChildRun(childId: string, reason = "Cancelled by user"): boolean {
-		const run = this._activeRlmChildRuns.get(childId);
-		if (run) {
-			if (run.status !== "running" && run.status !== "queued" && !run.settled) {
-				if (this._sessionInputPumpSuspended) this._abandonRlmRunForQuiescence(run);
-				else run.suppressTerminalNotice = true;
-				return true;
+		for (const session of this._rlmSubtreeSessions()) {
+			const run = session._activeRlmChildRuns.get(childId);
+			if (run) {
+				if (run.status !== "running" && run.status !== "queued" && !run.settled) {
+					if (session._sessionInputPumpSuspended) session._abandonRlmRunForQuiescence(run);
+					else run.suppressTerminalNotice = true;
+					return true;
+				}
+				// The abort cascade never reaches running work retained under a settled descendant.
+				const cancelled = session._cancelRlmChildRun(run, reason);
+				const descendantsCancelled = run.session?.cancelRunningRlmDescendants(reason) ?? false;
+				if (cancelled || descendantsCancelled) {
+					return true;
+				}
 			}
-			return this._cancelRlmChildRun(run, reason);
-		}
-		for (const candidate of this._activeRlmChildRuns.values()) {
-			if (candidate.session?.cancelRlmChildRun(childId, reason)) {
-				return true;
-			}
-		}
-		for (const { session: retained } of this._rlmChildSessions.values()) {
-			if (retained.cancelRlmChildRun(childId, reason)) {
+			// A fruitless match keeps walking: child ids are only mkdir-unique among
+			// siblings, so a colliding live run elsewhere must stay reachable.
+			if (session._rlmChildSessions.get(childId)?.session.cancelRunningRlmDescendants(reason)) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+	// A done child sits in BOTH maps until passivation; the visited set keeps that dual membership from doubling the walk.
+	private *_rlmSubtreeSessions(): Generator<AgentSession> {
+		const visited = new Set<AgentSession>([this]);
+		const stack: AgentSession[] = [this];
+		while (stack.length > 0) {
+			const session = stack.pop()!;
+			yield session;
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (run.session && !visited.has(run.session)) {
+					visited.add(run.session);
+					stack.push(run.session);
+				}
+			}
+			for (const { session: retained } of session._rlmChildSessions.values()) {
+				if (!visited.has(retained)) {
+					visited.add(retained);
+					stack.push(retained);
+				}
+			}
+		}
+	}
+
+	/** Cancel every running or queued run in this session's subtree. */
+	cancelRunningRlmDescendants(reason = "Cancelled by user"): boolean {
+		let cancelled = false;
+		for (const session of this._rlmSubtreeSessions()) {
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (session._cancelRlmChildRun(run, reason)) cancelled = true;
+			}
+		}
+		return cancelled;
+	}
+
+	/**
+	 * Session ids of every child whose delete receipt already returned. Both the
+	 * name-availability check and the spawn options the daemon host re-asserts
+	 * with must ignore the same set, or a same-name respawn that admission
+	 * allowed fails later inside the detached child startup.
+	 */
+	private _freedRlmChildSessionIds(): string[] {
+		const freed = new Set<string>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			const sessionId = freedRlmChildSessionId(run);
+			if (sessionId) freed.add(sessionId);
+		}
+		for (const { session, run } of this._rlmChildSessions.values()) {
+			if (run && freedRlmChildSessionId(run)) freed.add(session.sessionId);
+		}
+		return [...freed];
 	}
 
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
@@ -10324,11 +12476,20 @@ export class AgentSession {
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
+		// A daemon catalog still lists the closing child under its old name while
+		// the detached unwind runs, which is after the delete receipt returned.
+		// Forward every freed session id so both controller paths below admit the
+		// immediate same-name respawn the receipt already promised.
+		const ignoreSessionIds = new Set(this._freedRlmChildSessionIds());
 		const localConflict =
 			[...this._activeRlmChildRuns.values()].some(
-				(run) => run.session?.sessionName === name || (!run.session && run.sessionName === name),
+				(run) =>
+					freedRlmChildSessionId(run) === undefined &&
+					(run.session?.sessionName === name || (!run.session && run.sessionName === name)),
 			) ||
-			[...this._rlmChildSessions.values()].some(({ session }) => session.sessionName === name) ||
+			[...this._rlmChildSessions.values()].some(
+				({ session, run }) => !run?.detachedDeletion && session.sessionName === name,
+			) ||
 			[...this._rlmChildCleanupFailures.values()].some((entry) => entry.session_name === name);
 		if (localConflict) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
@@ -10340,6 +12501,7 @@ export class AgentSession {
 			depth,
 			parentSessionId: this.sessionId,
 			parentSessionPath: this.sessionFile,
+			...(ignoreSessionIds.size > 0 ? { ignoreSessionIds: [...ignoreSessionIds] } : {}),
 		};
 		if (controller.assertSessionNameAvailable) {
 			await controller.assertSessionNameAvailable(input);
@@ -10373,7 +12535,10 @@ export class AgentSession {
 		};
 	}
 
-	private async _resolveRlmSubagentModel(reference: string | undefined): Promise<RlmSubagentModelSelection> {
+	private async _resolveRlmSubagentModel(
+		reference: string | undefined,
+		target = "subagent",
+	): Promise<RlmSubagentModelSelection> {
 		const parentModel = this.model;
 		if (!parentModel) {
 			throw new Error(formatNoModelSelectedMessage());
@@ -10384,18 +12549,36 @@ export class AgentSession {
 
 		const normalizedReference = reference.toLowerCase();
 		if (`${parentModel.provider}/${parentModel.id}`.toLowerCase() === normalizedReference) {
+			// The parent model is in active use, so a catalog miss must not
+			// exclude it (e.g. an offline discovery refresh), but a stale or
+			// expired provider has to fail the spawn here instead of starting
+			// a child that fails its first model request.
+			const status = this._modelRegistry.getProviderAuthStatus(parentModel.provider);
+			if (status.source === "stale" || status.label === "expired") {
+				throw new Error(`Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`);
+			}
+			const auth = await this._modelRegistry.getApiKeyAndHeaders(parentModel);
+			if (!auth.ok) {
+				throw new Error(`Requested ${target} model "${reference}" failed authentication preflight`);
+			}
 			return { model: parentModel };
 		}
-		const model = (await this._authenticatedRlmModels()).find(
-			(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
-		);
+		const candidates = await this._authenticatedRlmModels();
+		// The parent model can be missing from the authenticated catalog (offline
+		// discovery or expired credentials) while staying selectable, so it backs
+		// the short-form lookup when the catalog has no match. Several catalog
+		// matches still leave the reference unresolved.
+		const model =
+			candidates.find(
+				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
+			) ?? findUniqueRlmShortFormModelMatch(reference, candidates, parentModel);
 		if (!model) {
-			throw new Error(`Requested subagent model "${reference}" is unavailable, unauthenticated, or expired`);
+			throw new Error(formatRlmModelUnavailableError(reference, target, candidates));
 		}
 
 		const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) {
-			throw new Error(`Requested subagent model "${reference}" failed authentication preflight`);
+			throw new Error(`Requested ${target} model "${reference}" failed authentication preflight`);
 		}
 		return { model };
 	}
@@ -10405,10 +12588,14 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		// Snapshot before any await: the spawning request is the turn whose tool call is
+		// executing now. A spawn arriving outside an active run (a detached kernel task
+		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
+		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
-			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
+			throw new Error(`Unsupported rlm.spawn kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
@@ -10425,39 +12612,128 @@ export class AgentSession {
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
+		// The name stays reserved until the spawn admission settles: the
+		// detached runtime task releases it at admission completion (success
+		// or failure), and every pre-admission failure path releases it here.
+		const releaseReservedSessionName = () => {
+			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+		};
 		let modelSelection: RlmSubagentModelSelection;
+		let childSessionDir: string;
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
-			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
-		} finally {
-			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
-		}
-		if (requestedThinkingLevel !== undefined) {
-			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
-			if (!supported.includes(requestedThinkingLevel)) {
-				throw new Error(
-					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
-				);
+			// An unpinned spawn model resolves against the persisted subagent
+			// default; an unavailable default fails the spawn instead of silently
+			// inheriting the parent model.
+			modelSelection = await this._resolveRlmSubagentModel(
+				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
+			);
+			if (requestedThinkingLevel !== undefined) {
+				const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+				if (!supported.includes(requestedThinkingLevel)) {
+					throw new Error(
+						`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+					);
+				}
 			}
+			if (this._disposed || this._disposing) {
+				throw new Error("Cannot spawn a subagent after its parent was disposed");
+			}
+			childSessionDir = this._createChildRlmSessionDir();
+		} catch (error) {
+			releaseReservedSessionName();
+			throw error;
 		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
-
-		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
+		if (parentAssistantForUsage && !this._rlmDurableParentUsage.has(parentAssistantForUsage)) {
+			this._rlmDurableParentUsage.set(parentAssistantForUsage, cloneUsage(parentAssistantForUsage.usage));
+		}
+		// Child completions accumulate per origin and flush one durable entry per
+		// settle boundary (agent_end, settlement); the staleness checkpoints and
+		// timer bound crash loss to one window of accumulated usage.
+		const pendingChildUsage = new Map<ChildUsageAttributionEntry["origin"], Usage>();
+		let pendingChildUsageSince = 0;
+		let pendingChildUsageTimer: ReturnType<typeof setTimeout> | undefined;
+		let parentEntryDrainScheduled = false;
+		const flushPendingChildUsageAttribution = (afterParentDrain = false) => {
+			if (pendingChildUsageTimer !== undefined) {
+				clearTimeout(pendingChildUsageTimer);
+				pendingChildUsageTimer = undefined;
+			}
+			if (pendingChildUsage.size === 0 || !parentAssistantForUsage) return;
+			const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
+			if (!parentEntry) {
+				if (!afterParentDrain && !parentEntryDrainScheduled) {
+					parentEntryDrainScheduled = true;
+					const flushAfterParentDrain = () => {
+						parentEntryDrainScheduled = false;
+						flushPendingChildUsageAttribution(true);
+					};
+					// A message_end extension may still be holding the parent assistant before its append.
+					// The parent drain owns this retry; child settlement never waits for that queue.
+					this._agentEventQueue = this._agentEventQueue.then(flushAfterParentDrain, flushAfterParentDrain);
+					this._agentEventQueue.catch(() => {});
+				}
+				return;
+			}
+			const batches = [...pendingChildUsage.entries()];
+			pendingChildUsage.clear();
+			for (const [origin, childUsage] of batches) {
+				const aggregateUsage = cloneUsage(this._rlmDurableParentUsage.get(parentAssistantForUsage)!);
+				attributeChildUsage(aggregateUsage, childUsage);
+				const liveUsage = parentAssistantForUsage.usage;
+				const entryCount = this.sessionManager.getEntries().length;
+				try {
+					this.sessionManager.appendChildUsageAttribution(parentEntry.id, childUsage, aggregateUsage, origin);
+					this._rlmDurableParentUsage.set(parentAssistantForUsage, aggregateUsage);
+				} catch {
+					// Attribution is recoverable bookkeeping; a failed append must not break run settlement.
+				} finally {
+					// The manager updates this same message; retain siblings' still-pending live usage.
+					parentAssistantForUsage.usage = liveUsage;
+					const indexed = this.sessionManager.getEntries()[entryCount];
+					const unindexedUsage = this._rlmUnindexedChildUsage.get(parentAssistantForUsage);
+					// _persist can throw after indexing. That row already participates in live own-usage subtraction.
+					if (
+						indexed?.type === "child_usage_attributed" &&
+						indexed.targetId === parentEntry.id &&
+						unindexedUsage
+					) {
+						subtractAssistantUsage(unindexedUsage, childUsage);
+					}
+					this._ownUsageMemo = undefined;
+				}
+			}
+		};
+		const flushPendingChildUsageIfStale = () => {
+			if (
+				pendingChildUsage.size > 0 &&
+				Date.now() - pendingChildUsageSince >= RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS
+			) {
+				flushPendingChildUsageAttribution();
+			}
+		};
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
+		const startedMonotonicAt = performance.now();
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
+			label: rlmChildLabel(prompt),
 			sessionName,
 			sessionDir: childSessionDir,
 			model: modelSelection.model,
 			status: "queued",
 			toolUseCount: 0,
+			progressNotes: [],
+			// Seed the staleness clock at admission: a child hung before its
+			// first tracked event still crosses the threshold once running.
+			lastActivityAt: startedAt,
+			lastActivityMonotonicAt: startedMonotonicAt,
 			settled: false,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),
@@ -10470,11 +12746,18 @@ export class AgentSession {
 		this._activeRlmChildRuns.set(run.id, run);
 		this._unsettledRlmChildRuns.add(run);
 		const emitChildUpdate = () => {
-			const child = this._rlmChildSnapshotForRun(run);
-			const serialized = JSON.stringify(child);
-			if (serialized === run.lastEmittedUpdate) return;
-			run.lastEmittedUpdate = serialized;
-			this._emit({ type: "rlm_child_update", child });
+			// Dedup compares observable child state, not clock-derived fields:
+			// lastActivityAt advances on every streamed token delta and
+			// activityStaleMs is recomputed on each snapshot build, so including
+			// either would re-emit on every delta once answerPreview saturates its
+			// cap. Streamed deltas would otherwise pay a snapshot build plus a serialization
+			// each; only a detected change builds the fresh snapshot, which carries both clock fields.
+			const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+			const next = this._rlmChildStableSnapshotForRun(run, child);
+			if (run.lastEmittedUpdate && rlmChildStableFieldsEqual(run.lastEmittedUpdate, next)) return;
+			// next holds run.activity by reference; safe because activity objects are replaced, never mutated.
+			run.lastEmittedUpdate = next;
+			this._emit({ type: "rlm_child_update", child: this._rlmChildSnapshotForRun(run, child) });
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
@@ -10498,6 +12781,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				thinkingLevel: requestedThinkingLevel,
+				spawnedByRequestId,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10527,14 +12811,17 @@ export class AgentSession {
 
 		run.reportDeletionCleanupFailure = (error) => {
 			if (run.suppressTerminalNotice || this._disposed || this._disposing) return Promise.resolve();
+			if (run.deletionFailureNotice) return run.deletionFailureNotice;
 			const cleanupError = error instanceof Error ? error.message : String(error);
-			return deliverTerminalMessageToParent(
+			const notice = deliverTerminalMessageToParent(
 				createRlmChildFailureMessage({
 					childId: run.id,
 					sessionName,
 					error: `Deletion cleanup failed; retry rlm.delete_subagent("${run.id}") before completion: ${cleanupError}`,
 				}),
 			);
+			run.deletionFailureNotice = notice;
+			return notice;
 		};
 
 		// Runtime startup and the task run are deliberately detached. The public
@@ -10543,7 +12830,14 @@ export class AgentSession {
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {
-				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				try {
+					childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				} finally {
+					// Admission settled: in daemon mode the spawn edge is now
+					// durable, so the name transfers from the pending reservation
+					// to the admitted run. A failed admission frees the name.
+					releaseReservedSessionName();
+				}
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
@@ -10558,57 +12852,79 @@ export class AgentSession {
 					}
 					if (event.type === "agent_start") {
 						run.activity = { kind: "waiting" };
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
+						flushPendingChildUsageAttribution();
 						run.activity = undefined;
+						touchRlmChildActivity(run);
+						emitChildUpdate();
+					} else if (event.type === "rlm_progress_note") {
+						run.progressNotes.push(event.message);
+						if (run.progressNotes.length > RLM_CHILD_PROGRESS_NOTE_RING_MAX) {
+							run.progressNotes.shift();
+						}
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+							// Flush before the fold: a persisted aggregate may only include
+							// completions whose childUsage is durable with or before it.
+							flushPendingChildUsageIfStale();
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
+								const unindexedUsage =
+									this._rlmUnindexedChildUsage.get(parentAssistantForUsage) ?? emptyUsage();
+								addAssistantUsage(unindexedUsage, assistant.usage);
+								this._rlmUnindexedChildUsage.set(parentAssistantForUsage, unindexedUsage);
+								this._ownUsageMemo = undefined;
+								const origin = rlmChildUsageOrigin(child.messages, assistant);
+								if (pendingChildUsage.size === 0) {
+									pendingChildUsageSince = Date.now();
+									// Wall-clock backstop for long tool runs without checkpoints.
+									pendingChildUsageTimer = setTimeout(
+										flushPendingChildUsageAttribution,
+										RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS,
 									);
+									pendingChildUsageTimer.unref?.();
 								}
+								const bucket = pendingChildUsage.get(origin) ?? emptyUsage();
+								addAssistantUsage(bucket, assistant.usage);
+								pendingChildUsage.set(origin, bucket);
 							}
 						}
-						const text = compactRlmText(readAssistantText(assistant));
+						const text = tailRlmAnswerPreview(assistant);
 						if (text) run.answerPreview = text;
-						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
-							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
+							const text = tailRlmAnswerPreview(event.message as AssistantMessage);
 							if (text) run.answerPreview = text;
 							run.activity = { kind: "writing" };
-							emitChildUpdate();
+							touchRlmChildActivity(run);
+							// Snapshot+stringify per delta dominates streaming cost; message_end emits the final preview.
+							const now = performance.now();
+							if (
+								run.lastStreamedUpdateMonotonicAt === undefined ||
+								now - run.lastStreamedUpdateMonotonicAt >= RLM_CHILD_UPDATE_MIN_INTERVAL_MS
+							) {
+								run.lastStreamedUpdateMonotonicAt = now;
+								emitChildUpdate();
+							}
 						}
 					} else if (event.type === "tool_execution_start") {
+						flushPendingChildUsageIfStale();
 						run.toolUseCount += 1;
 						runningToolCount += 1;
 						run.activity = { kind: "executing", toolName: event.toolName };
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "tool_execution_end") {
 						runningToolCount = Math.max(0, runningToolCount - 1);
 						if (runningToolCount === 0) run.activity = { kind: "waiting" };
+						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
 						emitChildUpdate();
@@ -10643,6 +12959,11 @@ export class AgentSession {
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
+				// Only successful completions return; the edge lands on the parent's next commit.
+				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
+				if (childLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
+				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
 				emitChildUpdate();
@@ -10676,6 +12997,13 @@ export class AgentSession {
 				if (run.status !== "cancelled") {
 					run.status = "error";
 					run.error = runError.message;
+				}
+				// A failed child still returns an error outcome the parent consumes;
+				// cancelled runs and zero-commit children return nothing.
+				const failedChild = childSession ?? childRuntime?.session;
+				const failedLastCommitted = failedChild?.semanticEdges.lastCommittedRequestId;
+				if (run.status === "error" && failedChild && failedLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
 				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
@@ -10738,6 +13066,7 @@ export class AgentSession {
 					}
 				}
 			} finally {
+				flushPendingChildUsageAttribution();
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;
 					if (!run.settled) {
@@ -10774,6 +13103,7 @@ export class AgentSession {
 					run.settlement.resolve();
 					this._unsettledRlmChildRuns.delete(run);
 					this._maybeResumeGoalContinuationAfterRlmWork();
+					this._maybeResumeAutonomousContinuationAfterRlmWork();
 				}
 			}
 		})().catch(() => undefined);
@@ -10784,6 +13114,64 @@ export class AgentSession {
 			session_dir: childSessionDir,
 			model: `${modelSelection.model.provider}/${modelSelection.model.id}`,
 		};
+	}
+
+	async createRlmSession(prompt: string, kwargs: Record<string, unknown> = {}): Promise<RlmCreateSessionResult> {
+		const { name: rawName, model: rawModel, thinking: rawThinking, cwd: rawCwd, ...unsupported } = kwargs;
+		const unsupportedKeys = Object.keys(unsupported);
+		if (unsupportedKeys.length > 0) {
+			throw new Error(`Unsupported rlm.create_session kwargs: ${unsupportedKeys.sort().join(", ")}`);
+		}
+		if (!prompt.trim()) {
+			throw new Error("rlm.create_session prompt must not be empty");
+		}
+		if (this._rlmDepth !== 0) {
+			throw new Error("rlm.create_session is available only from a depth-0 session");
+		}
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot create a top-level session after the current session was disposed");
+		}
+		const host = this._subagentRuntimeHost;
+		if (!host?.createRlmRootSession) {
+			throw new Error("rlm.create_session requires a daemon-backed depth-0 session");
+		}
+
+		const operation = "rlm.create_session";
+		const sessionName = normalizeRequestedRlmSubagentSessionName(rawName, operation);
+		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel, operation);
+		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking, operation);
+		if (sessionName) {
+			assertDirectAgentMessageTarget(sessionName);
+			const controller = this._agentMessageController;
+			if (controller?.assertSessionNameAvailable) {
+				await controller.assertSessionNameAvailable({ name: sessionName, depth: 0 });
+			}
+		}
+		if (rawCwd !== undefined && (typeof rawCwd !== "string" || !rawCwd.trim())) {
+			throw new Error("rlm.create_session cwd must be a non-empty string");
+		}
+		const cwd = rawCwd === undefined ? this._cwd : resolve(this._cwd, rawCwd.trim());
+		const modelSelection = await this._resolveRlmSubagentModel(requestedModel, "top-level session");
+		if (requestedThinkingLevel !== undefined) {
+			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+			if (!supported.includes(requestedThinkingLevel)) {
+				throw new Error(
+					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+				);
+			}
+		}
+		const thinkingLevel =
+			requestedThinkingLevel ?? (clampThinkingLevel(modelSelection.model, this.thinkingLevel) as ThinkingLevel);
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot create a top-level session after the current session was disposed");
+		}
+		return host.createRlmRootSession({
+			prompt,
+			sessionName,
+			cwd,
+			model: modelSelection.model,
+			thinkingLevel,
+		});
 	}
 
 	async runRlmChild(
@@ -10797,7 +13185,7 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this._runModel()?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		if (this._isFauxProviderQueueExhausted(message)) {
@@ -10816,80 +13204,36 @@ export class AgentSession {
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
-		return message.provider === "faux" && message.errorMessage === "No more faux responses queued";
+		return isFauxProviderQueueExhausted(message);
 	}
 
 	private _isAgentLifecycleFailure(message: AssistantMessage): boolean {
-		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_lifecycle_failure") ?? false;
-	}
-
-	private _getProviderStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {
-		const failure = message.diagnostics?.find((diagnostic) => diagnostic.type === "provider_stream_failure");
-		const details = failure?.details;
-		if (!details || typeof details !== "object") {
-			return undefined;
-		}
-		return details;
+		return isAgentLifecycleFailure(message);
 	}
 
 	private _getProviderStreamFailureKind(message: AssistantMessage): string | undefined {
-		const kind = this._getProviderStreamFailureDetails(message)?.kind;
-		return typeof kind === "string" ? kind : undefined;
-	}
-
-	private _isStructuredPermanentProviderFailure(message: AssistantMessage): boolean {
-		const kind = this._getProviderStreamFailureKind(message);
-		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
+		return providerStreamFailureKind(message);
 	}
 
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message);
-	}
-
-	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
-		const details = this._getProviderStreamFailureDetails(message);
-		if (!details) {
-			return undefined;
-		}
-
-		const kind = details.kind;
-		if (kind !== "auth") {
-			return undefined;
-		}
-
-		const status = details.status;
-		if (typeof status === "number") {
-			return status;
-		}
-		if (typeof status === "string") {
-			const parsed = Number(status);
-			return Number.isInteger(parsed) ? parsed : undefined;
-		}
-		return undefined;
+		return isPermanentProviderFailureKind(
+			this._getProviderStreamFailureKind(message),
+			this._retryAttempt,
+			providerStreamFailureStatus(message),
+		);
 	}
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
-
-		const structuredStatus = this._getProviderStreamFailureAuthStatus(message);
-		if (structuredStatus === 401 || structuredStatus === 403) {
-			return true;
-		}
-
-		if (/\b(?:401|403)\b/.test(message.errorMessage) && /\bstatus code\b/i.test(message.errorMessage)) {
-			return true;
-		}
-
-		return (
-			/\b(?:401|403)\b/.test(message.errorMessage) &&
-			/auth|unauthori[sz]ed|forbidden|api.?key|token|credential/i.test(message.errorMessage)
-		);
+		// Only the provider's structured classification counts as an auth failure.
+		return this._getProviderStreamFailureKind(message) === "auth";
 	}
 
 	private _finishActiveRetryWithFailure(message: AssistantMessage): void {
 		if (this._retryAttempt === 0) {
 			return;
 		}
+		this._restorePrimaryModelAfterBackup();
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -10897,13 +13241,22 @@ export class AgentSession {
 			finalError: message.errorMessage,
 		});
 		this._retryAttempt = 0;
+		this._providerWait = undefined;
 	}
 
 	/**
 	 * Handle retryable errors with exponential backoff.
 	 * @returns true if retry was initiated, false if max retries exceeded or disabled
 	 */
-	private async _handleRetryableError(message: AssistantMessage): Promise<boolean> {
+	private async _handleRetryableError(
+		message: AssistantMessage,
+		// Retained for the wait/backup helpers' signatures; this fork never marks
+		// provider auth stale after retry exhaustion (#24), so it is not acted on.
+		options?: {
+			markAuthStaleOnFailure?: boolean;
+			authSourceTokens?: readonly AuthSourceToken[];
+		},
+	): Promise<boolean> {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled) {
 			this._resolveRetry();
@@ -10916,33 +13269,106 @@ export class AgentSession {
 			});
 		}
 
+		const waitClass = providerWaitClass(providerStreamFailureKind(message), providerStreamFailureStatus(message));
+
+		// User-defined backup model (settings.providerBackupModel, default none):
+		// route the failed turn to the backup instead of waiting while the
+		// primary is quota-blocked or its provider is unavailable. The guard
+		// compares against the model serving the run, so a backup equal to a
+		// routed turn's image model is recognized as the duplicate it is instead
+		// of reporting a no-op backup switch with a zero-delay retry.
+		if (waitClass !== "permanent") {
+			const backupModel = this._resolveBackupModel();
+			if (backupModel && !modelsAreEqual(this._runModel(), backupModel)) {
+				return this._handleBackupModelRetry(message, options, backupModel);
+			}
+		}
+
 		this._retryAttempt++;
 
+		const waitPolicy = this.settingsManager.getProviderWaitSettings();
+		// Quota/subscription exhaustion: wait for usage to come back with bounded
+		// exponential-backoff pings (and a scheduled resume when the provider
+		// reports a reset time) instead of the quick-retry loop.
+		if (waitClass === "quota" && waitPolicy.enabled) {
+			return this._handleProviderWait(message, options, waitPolicy, "usage");
+		}
+
 		if (this._retryAttempt > settings.maxRetries) {
-			// Max retries exceeded, emit final failure and reset
+			// Quick retries exhausted on an unavailable provider: keep pinging
+			// with bounded exponential backoff instead of giving up.
+			if (waitClass === "transient" && waitPolicy.enabled) {
+				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
+			}
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt - 1,
 				finalError: message.errorMessage,
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
 			this._resolveRetry(); // Resolve so waitForRetry() completes
 			return false;
 		}
 
-		// Exponential backoff, capped: without a ceiling a large maxRetries stops
-		// being a retry policy (attempt 30 at a 1s base waits ~6000 days).
-		const uncappedDelayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
-		const delayMs = settings.maxBackoffMs > 0 ? Math.min(uncappedDelayMs, settings.maxBackoffMs) : uncappedDelayMs;
-
-		this._emit({
-			type: "auto_retry_start",
-			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
-			delayMs,
-			errorMessage: message.errorMessage || "Unknown error",
+		// Server-requested waits are honored, capped by retry.provider.maxRetryDelayMs (0 disables).
+		const maxRetryDelayMs = this.settingsManager.getProviderRetrySettings().maxRetryDelayMs;
+		const delay = providerRetryDelay(this._retryAttempt, providerStreamFailureRetryAfterMs(message), {
+			baseDelayMs: settings.baseDelayMs,
+			maxRetryDelayMs,
 		});
+		if (delay.kind === "exceeds-cap") {
+			const restoredModel = this._restorePrimaryModelAfterBackup();
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt - 1,
+				finalError: `Provider requested a ${Math.ceil(delay.retryAfterMs / 1000)}s wait before retrying (above retry.provider.maxRetryDelayMs=${maxRetryDelayMs}ms): ${message.errorMessage || "unknown error"}`,
+				...(restoredModel ? { restoredModel } : {}),
+			});
+			this._retryAttempt = 0;
+			this._resolveRetry();
+			return false;
+		}
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: settings.maxRetries,
+				delayMs: delay.delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+			},
+			delay.delayMs,
+		);
+	}
+
+	/**
+	 * Shared retry tail: park the failed turn, surface the retry attempt, wait,
+	 * and re-issue the turn. Returns false when the retry was aborted instead.
+	 */
+	private async _retryAfterDelay(
+		_message: AssistantMessage,
+		_options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		emitStart: Extract<AgentSessionEvent, { type: "auto_retry_start" }>,
+		delayMs: number,
+	): Promise<boolean> {
+		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
+		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
+		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
+			this._semanticEdges.prepareTurnRetry();
+		}
+
+		this._emit(emitStart);
 
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -10956,22 +13382,643 @@ export class AgentSession {
 			const attempt = this._retryAttempt;
 			this._retryAttempt = 0;
 			this._retryAbortController = undefined;
+			this._providerWait = undefined;
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt,
 				finalError: "Retry cancelled",
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._resolveRetry();
 			return false;
 		}
 		this._retryAbortController = undefined;
 
+		const retryGeneration = this._retryGeneration;
 		setTimeout(() => {
-			this.agent.continue().catch(() => {});
+			// A retry aborted between the sleep and this scheduled start must not
+			// re-issue the turn (e.g. onto a quota-blocked primary after a restore).
+			if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+			this.agent.continue().catch((error: unknown) => {
+				// A continue that never starts must still resolve the retry (else isRetrying
+				// sticks forever) — unless a newer retry owns the state by now.
+				if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+				const restoredModel = this._restorePrimaryModelAfterBackup();
+				const attempt = this._retryAttempt;
+				this._retryAttempt = 0;
+				this._providerWait = undefined;
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError: error instanceof Error ? error.message : String(error),
+					...(restoredModel ? { restoredModel } : {}),
+				});
+				this._resolveRetry();
+			});
 		}, 0);
 
 		return true;
+	}
+
+	/**
+	 * Resolve the user-configured backup model reference against the available
+	 * models. Unknown or unauthenticated references resolve to undefined: the
+	 * wait loop runs instead, and never surprises the user with a switch. A
+	 * run routed for images also rejects a text-only backup the same way: the
+	 * retry then stays on the routed model instead of serving the turn's
+	 * images to a model that would silently downgrade them to placeholders.
+	 */
+	private _resolveBackupModel(): Model<any> | undefined {
+		const reference = this.settingsManager.getProviderBackupModel();
+		if (!reference) return undefined;
+		const backupModel = findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
+		if (!backupModel || !this._modelRegistry.hasConfiguredAuth(backupModel)) {
+			return undefined;
+		}
+		if (this.agent.modelOverride && !backupModel.input.includes("image")) {
+			return undefined;
+		}
+		return backupModel;
+	}
+
+	/** Route the failed turn to the backup model and retry immediately on it. */
+	private _handleBackupModelRetry(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		backupModel: Model<any>,
+	): Promise<boolean> {
+		const previousModel = this.agent.state.model;
+		const previousThinkingLevel = this.agent.state.thinkingLevel;
+		const previousServiceTier = this.agent.state.serviceTier;
+		// A routed image-model turn keeps serving on the override, so the backup
+		// must take the override too or the retry would silently return to the
+		// routed model while reporting the backup.
+		const routedOverride = this.agent.modelOverride;
+		this.agent.state.model = backupModel;
+		// Clamp per-request fields to what the backup supports; all of them are
+		// restored when the turn returns to the primary.
+		this.agent.state.thinkingLevel = clampThinkingLevel(backupModel, previousThinkingLevel) as ThinkingLevel;
+		this._clampServiceTierForModel();
+		if (routedOverride) {
+			this.agent.modelOverride = {
+				model: backupModel,
+				thinkingLevel: this.agent.state.thinkingLevel,
+				serviceTier: this.agent.state.serviceTier,
+			};
+		}
+		// Session-log the switch so primary->backup->primary transitions stay debuggable.
+		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
+		this._backupModel = {
+			backup: backupModel,
+			primary: previousModel,
+			thinkingLevel: previousThinkingLevel,
+			serviceTier: previousServiceTier,
+			routedOverride,
+		};
+		this._retryAttempt++;
+		this._providerWait = undefined;
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: this.settingsManager.getRetrySettings().maxRetries,
+				delayMs: 0,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason: "backup",
+				backupModel: `${backupModel.provider}/${backupModel.id}`,
+			},
+			0,
+		);
+	}
+
+	/**
+	 * One bounded wait-for-recovery ping: exponential backoff with jitter, a
+	 * scheduled resume when the provider reports a reset time, and hard abort
+	 * bounds so the wait can never hang.
+	 */
+	private async _handleProviderWait(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		policy: ProviderWaitPolicy,
+		reason: "usage" | "unavailable",
+	): Promise<boolean> {
+		const wait = this._providerWait;
+		const startedAtMs = wait?.startedAtMs ?? Date.now();
+		const pingAttempt = (wait?.attempts ?? 0) + 1;
+		this._providerWait = { attempts: pingAttempt, startedAtMs };
+
+		const resetMs = providerStreamFailureRetryAfterMs(message) ?? parseProviderResetMs(message.errorMessage);
+		const decision = providerWaitDecision(pingAttempt, Date.now() - startedAtMs, resetMs, policy);
+		if (decision.kind === "abort") {
+			// A quota reset beyond the bounded wait parks the session instead of
+			// dying mid-task: end the turn cleanly and resume at the reset time.
+			if (reason === "usage" && decision.reason === "reset-too-far") {
+				const park = providerParkDecision(this._quotaPark?.parkCount ?? 0, resetMs, policy);
+				if (park.kind === "park") {
+					return this._parkForQuotaReset(message, options, park.delayMs, decision.message, pingAttempt - 1);
+				}
+			}
+			// A quota wait that gives up ends the episode's park: its wake has
+			// already fired (or was never armed), so nothing else would resume it.
+			// Future-scheduled parks survive; only stale post-wake parks clear.
+			const stalePark = this._quotaPark;
+			if (reason === "usage" && stalePark !== undefined && stalePark.resumeAtMs <= Date.now()) {
+				await this._cancelQuotaParkWake(stalePark);
+				this._quotaPark = undefined;
+			}
+			const restoredModel = this._restorePrimaryModelAfterBackup();
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: pingAttempt - 1,
+				finalError: `${decision.message}: ${message.errorMessage || "unknown error"}`,
+				...(restoredModel ? { restoredModel } : {}),
+			});
+			this._retryAttempt = 0;
+			this._providerWait = undefined;
+			this._resolveRetry();
+			return false;
+		}
+
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: pingAttempt,
+				maxAttempts: policy.maxAttempts,
+				delayMs: decision.delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason,
+			},
+			decision.delayMs,
+		);
+	}
+
+	/**
+	 * Park a quota-blocked session: end the failed turn cleanly, record the
+	 * parked transition in the session log, and schedule one wake (a durable
+	 * one-shot scheduled job plus an in-process timer) at the provider-reported
+	 * reset time. While parked the session makes no model calls; the wake
+	 * delivers the resume marker, whose first model call probes the quota.
+	 */
+	private async _parkForQuotaReset(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		pauseMs: number,
+		abortMessage: string,
+		parkedAttempt: number,
+	): Promise<boolean> {
+		const existing = this._quotaPark;
+		if (existing !== undefined && existing.resumeAtMs > Date.now()) {
+			// Already parked for this window (e.g. a heartbeat turn failed while
+			// parked): keep the scheduled wake, consume no park, end the turn.
+			this._finishQuotaParkedTurn(
+				message,
+				options,
+				parkedAttempt,
+				`Session is parked until ${new Date(existing.resumeAtMs).toISOString()} waiting for the provider usage reset; this turn ended without a retry: ${message.errorMessage || "unknown error"}`,
+			);
+			return false;
+		}
+		await this._cancelQuotaParkWake(existing);
+		const parkCount = (existing?.parkCount ?? 0) + 1;
+		const resumeAtMs = Date.now() + pauseMs;
+		const jobId = await this._createQuotaResumeJob(resumeAtMs);
+		const timer = this._scheduleQuotaResumeTimer(resumeAtMs);
+		this._quotaPark = {
+			parkCount,
+			resumeAtMs,
+			...(jobId !== undefined ? { jobId } : {}),
+			...(timer !== undefined ? { timer } : {}),
+		};
+		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+			resumeAt: new Date(resumeAtMs).toISOString(),
+			parkCount,
+			...(jobId !== undefined ? { jobId } : {}),
+			provider: message.provider,
+		});
+		this._finishQuotaParkedTurn(
+			message,
+			options,
+			parkedAttempt,
+			`${abortMessage}. Session parked until ${new Date(resumeAtMs).toISOString()} and will resume automatically (retry.provider.waitForUsage.pauseUntilReset): ${message.errorMessage || "unknown error"}`,
+		);
+		return false;
+	}
+
+	/** Shared park tail: mark auth stale, surface the parked status, end the retry and the turn. */
+	private _finishQuotaParkedTurn(
+		_message: AssistantMessage,
+		_options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		parkedAttempt: number,
+		finalError: string,
+	): void {
+		this._emit({ type: "auto_retry_end", success: false, attempt: parkedAttempt, finalError });
+		this._retryAttempt = 0;
+		this._providerWait = undefined;
+		this._resolveRetry();
+	}
+
+	/**
+	 * Durable wake: a one-shot scheduled job in this session's artifacts, so a
+	 * restart or closed worker still restores the session and delivers the
+	 * resume marker at the reset time. Best-effort: the in-process timer covers
+	 * live sessions when this cannot be persisted (e.g. in-memory sessions).
+	 */
+	private async _createQuotaResumeJob(resumeAtMs: number): Promise<string | undefined> {
+		const sessionFile = this.sessionFile;
+		const store = this._quotaResumeStore();
+		if (!sessionFile || !store) {
+			return undefined;
+		}
+		try {
+			const job = await store.create({
+				activeSessionId: this.sessionId,
+				sessionId: this.sessionId,
+				sessionFile,
+				cwd: this.sessionManager.getCwd(),
+				label: QUOTA_RESUME_CRON_LABEL,
+				prompt: QUOTA_RESUME_MARKER_TEXT,
+				scheduleText: `at ${new Date(resumeAtMs).toISOString()}`,
+				runtimeKind: this._rlmDepth > 0 ? "subagent" : "top-level",
+			});
+			return job.id;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** In-process wake for live sessions; unref'd so a parked session never holds the process open. */
+	private _scheduleQuotaResumeTimer(resumeAtMs: number): ReturnType<typeof setTimeout> | undefined {
+		const delayMs = Math.min(Math.max(resumeAtMs - Date.now(), 0), MAX_TIMER_DELAY_MS);
+		const timer = setTimeout(() => {
+			void this._resumeFromQuotaPark();
+		}, delayMs);
+		timer.unref();
+		return timer;
+	}
+
+	/** Store over this session's artifact file; undefined for in-memory sessions. */
+	private _quotaResumeStore(): AgentCronJobStore | undefined {
+		if (this._quotaResumeJobStore) {
+			return this._quotaResumeJobStore;
+		}
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		if (!this.sessionFile || !artifactDir) {
+			return undefined;
+		}
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact(this.sessionId, artifactDir);
+		this._quotaResumeJobStore = store;
+		return store;
+	}
+
+	/**
+	 * Settle a park's durable wake: report a job the daemon already ran as
+	 * delivered (its prompt drives the resume) and leave it alone — rewriting a
+	 * completed job to cancelled would hide that the wake landed — cancel one
+	 * that has not run, and report a user cancellation as such. Anything else is
+	 * gone, leaving the in-process timer as the wake.
+	 */
+	private async _resolveQuotaResumeJob(jobId: string): Promise<"delivered" | "user-cancelled" | "cancelled" | "gone"> {
+		const job = this._findQuotaResumeJob(jobId);
+		if (job?.status === "completed") {
+			return "delivered";
+		}
+		if (job?.status === "cancelled") {
+			return "user-cancelled";
+		}
+		const store = this._quotaResumeStore();
+		if (!store) {
+			return "gone";
+		}
+		try {
+			return (await store.cancel(jobId)) === undefined ? "gone" : "cancelled";
+		} catch {
+			return "gone";
+		}
+	}
+
+	/** Cancel a park's pending wake: the in-process timer and the durable job. */
+	private async _cancelQuotaParkWake(
+		park: { resumeAtMs: number; jobId?: string; timer?: ReturnType<typeof setTimeout> } | undefined,
+	): Promise<void> {
+		if (!park) return;
+		if (park.timer) {
+			clearTimeout(park.timer);
+			park.timer = undefined;
+		}
+		if (park.jobId !== undefined) {
+			await this._resolveQuotaResumeJob(park.jobId);
+		}
+		park.jobId = undefined;
+	}
+
+	/**
+	 * Wake a parked session and deliver the resume marker: its first model call
+	 * probes the quota, resumes the interrupted task on success, and re-parks
+	 * with the newly reported reset on failure. The durable wake job and this
+	 * timer race for live sessions; whoever lands first owns the resume — the
+	 * job's prompt is the same marker text, so both paths read identically.
+	 */
+	private async _resumeFromQuotaPark(): Promise<void> {
+		const park = this._quotaPark;
+		if (!park || park.waking || park.resumeAtMs > Date.now()) {
+			return;
+		}
+		if (park.jobId !== undefined) {
+			const resolved = await this._resolveQuotaResumeJob(park.jobId);
+			if (resolved === "delivered") {
+				// The daemon dispatched the durable wake; its prompt drives the resume.
+				park.waking = true;
+				return;
+			}
+			if (resolved === "user-cancelled") {
+				// The user cancelled the wake: honor it and drop the park.
+				this._quotaPark = undefined;
+				return;
+			}
+			// Cancelled by this timer or gone: the timer owns the resume.
+		}
+		park.waking = true;
+		try {
+			await this._queuePreparedPrompt("followUp", QUOTA_RESUME_MARKER_TEXT, undefined, {
+				source: "internal",
+				priority: "background",
+				resumeIfIdle: true,
+			});
+		} catch {
+			// A refused admission must not leave a park whose wake is gone: re-arm
+			// it (bounded) so the session still resumes, or drop the park.
+			park.waking = false;
+			await this._recoverQuotaParkWake("wake-failed");
+		}
+	}
+
+	/**
+	 * An aborted turn is not evidence the quota is back. A wake whose resume
+	 * marker is still queued owns the resume, so an abort of some other turn must
+	 * not re-arm the wake under it; a wake this turn consumed re-arms instead.
+	 */
+	private async _handleAbortedQuotaPark(): Promise<void> {
+		const park = this._quotaPark;
+		if (!park || (park.waking === true && this._hasQueuedQuotaResumeMarker())) {
+			return;
+		}
+		park.waking = false;
+		await this._recoverQuotaParkWake("wake-aborted");
+	}
+
+	/** Whether the park wake's resume marker is still waiting in the session input queue. */
+	private _hasQueuedQuotaResumeMarker(): boolean {
+		return this._actionStore.unfinishedActions().some((action) => {
+			if (action.payload.kind !== "turn" || action.lifecycle.state !== "queued") {
+				return false;
+			}
+			const { text } = normalizeMessageContent(primaryDeliveryRecord(action).message.content);
+			return text.includes(QUOTA_RESUME_MARKER_TEXT);
+		});
+	}
+
+	/**
+	 * A turn that ended in a plain error after the wake's probe consumed the
+	 * marker is neither a resume nor a re-park: the park would sit `waking` with
+	 * no timer or job left, never resuming. Re-arm the wake (bounded) instead,
+	 * or drop the park once the retries are spent. A marker still queued owns
+	 * the resume, so an error from another turn must not re-arm under it.
+	 */
+	private async _handleErroredQuotaParkProbe(message: AssistantMessage): Promise<void> {
+		const park = this._quotaPark;
+		if (message.stopReason !== "error" || park?.waking !== true || this._hasQueuedQuotaResumeMarker()) {
+			return;
+		}
+		park.waking = false;
+		await this._recoverQuotaParkWake("wake-error");
+	}
+
+	/**
+	 * Wake re-arm for a park whose wake was consumed without resuming (refused
+	 * admission, aborted or errored probe turn). Bounded so a park that can
+	 * never wake ends instead of staying parked with no wake and no way to
+	 * resume.
+	 */
+	private async _recoverQuotaParkWake(outcome: "wake-failed" | "wake-aborted" | "wake-error"): Promise<void> {
+		const park = this._quotaPark;
+		if (!park || park.waking || park.resumeAtMs > Date.now()) {
+			return;
+		}
+		const retries = (park.wakeRetries ?? 0) + 1;
+		if (retries > QUOTA_WAKE_MAX_RETRIES) {
+			await this._cancelQuotaParkWake(park);
+			this._quotaPark = undefined;
+			this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, { outcome });
+			return;
+		}
+		park.wakeRetries = retries;
+		park.resumeAtMs = Date.now() + QUOTA_WAKE_RETRY_DELAY_MS;
+		park.jobId = await this._createQuotaResumeJob(park.resumeAtMs);
+		park.timer = this._scheduleQuotaResumeTimer(park.resumeAtMs);
+		// Record the replacement wake, or a restart reads the spent park entry,
+		// drops the park, and leaves this retry job armed with no owner to cancel.
+		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+			resumeAt: new Date(park.resumeAtMs).toISOString(),
+			parkCount: park.parkCount,
+			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
+		});
+	}
+
+	private _findQuotaResumeJob(jobId: string): AgentCronJob | undefined {
+		const store = this._quotaResumeStore();
+		if (!store) {
+			return undefined;
+		}
+		try {
+			return store.list().find((job) => job.id === jobId);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Durable wake for a restored park: reuse a job that can still fire and
+	 * recreate one that was cancelled (a navigation cancels the left-behind
+	 * leaf's wake) or removed, so a restored park never waits on a dead job.
+	 */
+	private async _restoreQuotaWakeJob(
+		jobId: string | undefined,
+		resumeAtMs: number,
+	): Promise<string | undefined | "user-cancelled"> {
+		if (jobId === undefined) {
+			return this._createQuotaResumeJob(resumeAtMs);
+		}
+		const job = this._findQuotaResumeJob(jobId);
+		if (job === undefined || job.status !== "cancelled") {
+			// Not cancelled: still scheduled, or already delivered by the daemon.
+			return jobId;
+		}
+		// A cancelled wake stays cancelled unless navigation cancelled it, which
+		// frees the wake so returning to the parked branch can rebuild it.
+		if (this._navigationCancelledWakeJobs.has(jobId)) {
+			return this._createQuotaResumeJob(resumeAtMs);
+		}
+		return "user-cancelled";
+	}
+
+	/**
+	 * Rebuild the park for the branch this navigation selected. The old leaf's
+	 * wake is cancelled with it, so a parked leaf that was left behind cannot
+	 * resume its task on the selected branch.
+	 */
+	private async _reloadQuotaParkFromBranch(): Promise<void> {
+		const previous = this._quotaPark;
+		this._quotaPark = undefined;
+		if (previous?.timer) {
+			clearTimeout(previous.timer);
+			previous.timer = undefined;
+		}
+		if (previous?.jobId !== undefined) {
+			// Only a wake this navigation actually cancels may be rebuilt on the way
+			// back; a wake the user cancelled in /cron stays cancelled.
+			if ((await this._resolveQuotaResumeJob(previous.jobId)) === "cancelled") {
+				this._navigationCancelledWakeJobs.add(previous.jobId);
+			}
+		}
+		await this._restoreQuotaPark();
+	}
+
+	/**
+	 * Restore the park this branch ended on: a restart (daemon or worker) leaves
+	 * waitForUsage.maxParks unbounded otherwise, because the park count would
+	 * start over at 1 each time. Parks recorded before the branch's last resume
+	 * entry are spent, and a park whose wake time has passed is restored without
+	 * a timer when its durable job still owns the wake; with no job the
+	 * in-process timer wakes it at once.
+	 */
+	private async _restoreQuotaPark(): Promise<void> {
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index -= 1) {
+			const entry = branch[index];
+			if (entry.type !== "custom") {
+				continue;
+			}
+			if (entry.customType === QUOTA_RESUME_CUSTOM_ENTRY_TYPE) {
+				return;
+			}
+			if (entry.customType !== QUOTA_PARK_CUSTOM_ENTRY_TYPE || !isPersistedQuotaParkData(entry.data)) {
+				continue;
+			}
+			const resumeAtMs = Date.parse(entry.data.resumeAt);
+			if (!Number.isFinite(resumeAtMs)) {
+				return;
+			}
+			const jobId = await this._restoreQuotaWakeJob(entry.data.jobId, resumeAtMs);
+			if (jobId === "user-cancelled") {
+				return;
+			}
+			if (jobId !== undefined && jobId !== entry.data.jobId) {
+				// A rebuilt wake replaces the cancelled one: record it, so the next
+				// restore reuses this job instead of arming another one beside it.
+				this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+					resumeAt: entry.data.resumeAt,
+					parkCount: entry.data.parkCount,
+					jobId,
+				});
+			}
+			// A wake already due belongs to its durable job (the daemon delivers it,
+			// or the next turn settles it): keep the park so its count still bounds
+			// the episode, and arm no timer that would race that delivery. With no
+			// job left (a one-shot cannot be rebuilt in the past) the in-process
+			// timer wakes the park at once.
+			const pastDue = resumeAtMs <= Date.now();
+			this._quotaPark = {
+				parkCount: entry.data.parkCount,
+				resumeAtMs,
+				...(jobId !== undefined ? { jobId } : {}),
+				...(pastDue && jobId !== undefined
+					? { waking: true }
+					: { timer: this._scheduleQuotaResumeTimer(resumeAtMs) }),
+			};
+			return;
+		}
+	}
+
+	/**
+	 * A parked session completed a model call successfully: the quota is back.
+	 * Clear the park (cancelling any pending wake), record the resumed
+	 * transition, and — unless this success WAS the wake probe — deliver the
+	 * resume marker so the interrupted task continues right away.
+	 */
+	private async _completeQuotaParkResume(): Promise<void> {
+		const park = this._quotaPark;
+		if (!park) return;
+		// A wake the daemon already delivered owns the resume even when the timer
+		// never observed it: the job's marker prompt is the continuation, so this
+		// success must not queue a second one.
+		const delivered = park.jobId !== undefined && (await this._resolveQuotaResumeJob(park.jobId)) === "delivered";
+		await this._cancelQuotaParkWake(park);
+		const wasWaking = park.waking === true || delivered;
+		const restoredModel = this._restorePrimaryModelAfterBackup();
+		this._quotaPark = undefined;
+		this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
+			outcome: wasWaking ? "wake" : "early",
+			...(restoredModel ? { restoredModel } : {}),
+		});
+		if (!wasWaking) {
+			void this._queuePreparedPrompt("followUp", QUOTA_RESUME_MARKER_TEXT, undefined, {
+				source: "internal",
+				priority: "background",
+				resumeIfIdle: true,
+			}).catch(() => {
+				// The early-resume marker could not be queued; the park is cleared,
+				// so a later quota failure parks again with a fresh schedule.
+			});
+		}
+	}
+
+	/**
+	 * Return to the primary model after a backup-model retry, unless the user
+	 * switched models meanwhile. Returns the restored "provider/model-id"
+	 * reference for the retry-end event.
+	 */
+	private _restorePrimaryModelAfterBackup(): string | undefined {
+		const backup = this._backupModel;
+		this._backupModel = undefined;
+		if (!backup || !modelsAreEqual(this.model, backup.backup)) return undefined;
+		this.agent.state.model = backup.primary;
+		this.agent.state.thinkingLevel = backup.thinkingLevel;
+		this.agent.modelOverride = backup.routedOverride;
+		// Restore the saved effective tier: reclamping from the current state
+		// would keep the tier the backup clamped it to.
+		this._clampServiceTierForModel(backup.serviceTier);
+		this.sessionManager.appendModelChange(backup.primary.provider, backup.primary.id);
+		return `${backup.primary.provider}/${backup.primary.id}`;
 	}
 
 	abortRetry(): void {
@@ -10982,13 +14029,16 @@ export class AgentSession {
 		if (this._retryAttempt > 0) {
 			this._autoCompactionAbortController?.abort();
 			this._cancelPostCompactionContinue();
+			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt,
 				finalError: "Retry cancelled",
+				...(restoredModel ? { restoredModel } : {}),
 			});
 			this._retryAttempt = 0;
+			this._providerWait = undefined;
 		}
 		this._resolveRetry();
 	}
@@ -11004,6 +14054,11 @@ export class AgentSession {
 
 	get isRetrying(): boolean {
 		return this._retryPromise !== undefined;
+	}
+
+	/** True while the session is parked waiting out a provider-reported usage reset. */
+	get isQuotaParked(): boolean {
+		return this._quotaPark !== undefined;
 	}
 
 	get hasAcceptedPromptInFlight(): boolean {
@@ -11481,18 +14536,43 @@ export class AgentSession {
 
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
+			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
-				const result = await generateBranchSummary(entriesToSummarize, {
+				// Branch summary fires at a tree-navigation context boundary, and the
+				// summarizer runs with its own prompt prefix (SUMMARIZATION_SYSTEM_PROMPT
+				// plus the <conversation> wrapper), so it cannot hit the session's cached
+				// prefix: on the session model the summary re-reads the whole branch at
+				// peak price. Route it to the auxiliary model when one is configured.
+				const summarization = (await this._resolveAuxiliaryModel(
+					"branch summary",
+					{ model, apiKey, headers },
+					// The estimator sizes the request the session model would issue for
+					// the branch being left. A smaller auxiliary window must fall back
+					// rather than truncate away branch context or fail over-limit and
+					// strand the navigation.
+					estimateBranchSummaryRequestTokens(entriesToSummarize, {
+						contextWindow: model.contextWindow,
+						reserveTokens: branchSummarySettings.reserveTokens,
+						customInstructions,
+						replaceInstructions,
+					}),
+				)) ?? {
 					model,
 					apiKey,
 					headers,
+				};
+				const result = await generateBranchSummary(entriesToSummarize, {
+					model: summarization.model,
+					apiKey: summarization.apiKey,
+					headers: summarization.headers,
 					signal: this._branchSummaryAbortController.signal,
+					sessionId: this.sessionId,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
+					retry: providerRetryPolicy(this.settingsManager),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
@@ -11501,6 +14581,7 @@ export class AgentSession {
 					throw new Error(result.error);
 				}
 				summaryText = result.summary;
+				summaryUsage = result.usage;
 				summaryDetails = {
 					readFiles: result.readFiles || [],
 					modifiedFiles: result.modifiedFiles || [],
@@ -11536,6 +14617,7 @@ export class AgentSession {
 					summaryText,
 					summaryDetails,
 					fromExtension,
+					summaryUsage,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
@@ -11556,8 +14638,14 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
-			this._reloadGoalStateFromBranch();
+			// Context rebuild = cold boundary: refresh the digest like resume.
+			// Summary navigation continues the same timeline (compaction), so the
+			// same goal's accounting must never regress; a plain branch move is
+			// time travel and keeps faithful branch semantics.
+			this._ensureHarnessDigestContext();
+			this._reloadGoalStateFromBranch({ monotonicTokens: Boolean(summaryText) });
 			this._reloadRlmMaxDepthFromBranch();
+			await this._reloadQuotaParkFromBranch();
 			this._invalidateQueuedPromptPreparation();
 
 			await this._extensionRunner.emit({
@@ -11706,18 +14794,42 @@ export class AgentSession {
 		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
 	}
 
+	private _subtractUnindexedChildUsage(ownUsage: Usage, entries: SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const unindexedUsage = this._rlmUnindexedChildUsage.get(entry.message);
+			if (unindexedUsage) subtractAssistantUsage(ownUsage, unindexedUsage);
+		}
+	}
+
+	private _ownUsageMemo?: { count: number; tailId: string | undefined; usage: SessionUsageSummary | undefined };
+
+	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
+	getOwnUsageSummary(): SessionUsageSummary | undefined {
+		const entries = this.sessionManager.getEntries();
+		const tailId = entries.at(-1)?.id;
+		const memo = this._ownUsageMemo;
+		if (memo && memo.count === entries.length && memo.tailId === tailId) {
+			return memo.usage;
+		}
+		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		this._subtractUnindexedChildUsage(ownUsage, entries);
+		const usage = sessionUsageSummaryFrom(ownUsage);
+		this._ownUsageMemo = { count: entries.length, tailId, usage };
+		return usage;
+	}
+
 	/**
 	 * Build the agent context overview for /context: this session as the root
-	 * plus one node per RLM sub-agent, recursively. Running children are read
-	 * from their live sessions; completed children from their persisted session
-	 * dirs, so the tree survives child disposal and session resume.
+	 * plus one node per RLM sub-agent, recursively. Running and resident
+	 * finished children come from their live sessions, others from their
+	 * persisted session dirs, so the tree survives child disposal and session resume.
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		const branch = this.sessionManager.getBranch();
+		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
+		this._subtractUnindexedChildUsage(ownUsage, branch);
 
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();
@@ -11732,11 +14844,39 @@ export class AgentSession {
 					children: [],
 				}),
 				id: run.id,
-				label: rlmChildLabel(run.prompt),
+				label: run.label,
 				status: run.status,
 			});
 		}
-		children.push(...loadContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, liveIds));
+		// Resident finished children project from their live sessions: usage
+		// reaches their session file only at settle boundaries, so memory is fresher than a re-parse.
+		const residentIds = new Set<string>(liveIds);
+		const rlmSessionDir = this._rlmSessionDirForReading();
+		for (const [childId, retained] of this._rlmChildSessions) {
+			if (
+				residentIds.has(childId) ||
+				this._deletingRlmChildren.has(childId) ||
+				this._deletedRlmChildIds.has(childId)
+			) {
+				continue;
+			}
+			// Only project children the disk walk would enumerate, so visibility stays identical.
+			const childDir = retained.session._rlmSessionDir ?? retained.session.sessionManager.getSessionDir();
+			if (!rlmSessionDir || basename(childDir) !== childId || dirname(childDir) !== rlmSessionDir) {
+				continue;
+			}
+			residentIds.add(childId);
+			children.push({
+				...retained.session.getContextTree(),
+				id: childId,
+				label: retained.run ? rlmChildLabel(retained.run.prompt) : (retained.session.sessionName ?? "child agent"),
+				// Without a run, status stays "done", matching _rlmChildSnapshotForSession.
+				status: retained.run?.status ?? "done",
+			});
+		}
+		children.push(
+			...loadContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, residentIds),
+		);
 
 		const model = this.model;
 		return {
@@ -11842,9 +14982,10 @@ export class AgentSession {
 	// =========================================================================
 
 	createReplacedSessionContext(): ReplacedSessionContext {
+		// The initiating extension is not in scope here; label timers with the context kind instead.
 		const context = Object.defineProperties(
 			{},
-			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext()),
+			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext("<session-replacement>")),
 		) as ReplacedSessionContext;
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
 		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);

@@ -10,6 +10,12 @@ import {
 	shouldCompact,
 } from "./compaction/index.js";
 import { convertToLlm, createCompactionSummaryMessage } from "./messages.js";
+import {
+	completeWithProviderRetry,
+	DEFAULT_PROVIDER_RETRY_POLICY,
+	type ProviderRetryPolicy,
+} from "./provider-retry.js";
+import { unwrapSemanticEdgeStreamFn } from "./semantic-edges.js";
 import type { SideQuestionRecorder } from "./side-question-store.js";
 
 export type SideQuestionStatus = "running" | "complete" | "cancelled" | "error";
@@ -40,10 +46,17 @@ export interface SideQuestionDependencies {
 	 * persisted parent session (tests, headless runs) simply do not record.
 	 */
 	recorder?: SideQuestionRecorder;
+	/** Standalone side agents bypass the session auto-retry loop; this policy retries them. */
+	retry?: ProviderRetryPolicy;
 }
 
 const SIDE_QUESTION_INSTRUCTION =
-	"Answer this side question using only the conversation context above. Do not use tools. The user may send follow-up side questions; none of this side conversation is added to the main session.";
+	"The user asked this via `/btw` — a temporary side thread cloned from the main conversation to answer a question without interrupting the main work. Tools (including `ipython`) are deactivated in this side thread and return an error if called; answer using only the conversation context above. The user may send follow-up side questions. Nothing here is added to the main session, so don't start or plan main-session work from this thread.";
+
+const SIDE_QUESTION_TOOL_BLOCKED = "Tools are deactivated in this side thread. Answer from the conversation context.";
+
+/** Backstop for a model that keeps calling deactivated tools instead of answering. */
+const SIDE_QUESTION_MAX_TURNS = 3;
 
 const SIDE_QUESTION_SUMMARY_INSTRUCTION =
 	"Preserve the information needed to answer side questions, including prior side questions and answers. The continuing agent must answer only from the supplied conversation context and must not use tools.";
@@ -228,6 +241,7 @@ async function generateBoundedSideSummary(
 	signal: AbortSignal,
 	parent: Agent,
 	onCompletion?: (message: AssistantMessage) => void,
+	retry: ProviderRetryPolicy = DEFAULT_PROVIDER_RETRY_POLICY,
 ): Promise<string | undefined> {
 	const budget = getSideSummaryBudget(model, settings.reserveTokens);
 	if (!budget) return undefined;
@@ -242,27 +256,27 @@ async function generateBoundedSideSummary(
 				content: [{ type: "text", text: `Conversation segment ${index + 1} of ${segments.length}:\n${segment}` }],
 				timestamp: Date.now(),
 			} satisfies UserMessage;
-			summaries.push(
-				await generateSummary(
-					[segmentMessage],
-					model,
-					budget.reserveTokens,
-					apiKey,
-					headers,
-					signal,
-					SIDE_QUESTION_SUMMARY_INSTRUCTION,
-					undefined,
-					"off",
-					{
-						onPayload: parent.onPayload,
-						onResponse: parent.onResponse,
-						serviceTier: parent.state.serviceTier,
-						sessionId: parent.sessionId,
-						maxRetryDelayMs: parent.maxRetryDelayMs,
-						onCompletion,
-					},
-				),
+			const slice = await generateSummary(
+				[segmentMessage],
+				model,
+				budget.reserveTokens,
+				apiKey,
+				headers,
+				signal,
+				SIDE_QUESTION_SUMMARY_INSTRUCTION,
+				undefined,
+				"off",
+				retry,
+				parent.sessionId,
+				undefined,
+				{
+					onPayload: parent.onPayload,
+					onResponse: parent.onResponse,
+					serviceTier: parent.state.serviceTier,
+					onCompletion,
+				},
 			);
+			summaries.push(slice.summary);
 		}
 		throwIfAborted(signal);
 		if (summaries.length === 1) return summaries[0];
@@ -364,6 +378,7 @@ async function compactSideContext(
 					signal,
 					parent,
 					onCompletion,
+					dependencies.retry ?? DEFAULT_PROVIDER_RETRY_POLICY,
 				);
 				if (summary === undefined) return undefined;
 				summaryCache.set(key, summary);
@@ -437,6 +452,7 @@ export function startSideQuestion(
 	const requestTokens =
 		hiddenOverheadTokens + estimatedMainTokens + replayTokens + imageTokens + estimateTokens(promptMessage);
 	const settings = dependencies?.getCompactionSettings();
+	const retry = dependencies?.retry ?? DEFAULT_PROVIDER_RETRY_POLICY;
 	const runAbort = new AbortController();
 
 	let answer = "";
@@ -445,29 +461,39 @@ export function startSideQuestion(
 	const emit = (status: SideQuestionStatus, errorMessage?: string) =>
 		onEvent({ id, question, answer, status, ...(errorMessage ? { errorMessage } : {}) });
 
-	const createSideAgent = (messages: AgentMessage[]): Agent =>
-		new Agent({
+	const createSideAgent = (messages: AgentMessage[]): Agent => {
+		let turnCount = 0;
+		return new Agent({
 			initialState: {
 				model,
 				systemPrompt: parent.state.systemPrompt,
 				messages,
-				thinkingLevel: "off",
+				// Anthropic message-level caching keys on the thinking parameters, so a
+				// different level here would re-read the whole cloned conversation.
+				thinkingLevel: parent.state.thinkingLevel,
 				serviceTier: parent.state.serviceTier,
-				tools: [],
+				// Providers serialize tool declarations ahead of the cached prefix, so an
+				// empty list would miss the main cache; execution is blocked in beforeToolCall.
+				tools: parent.state.tools,
 			},
 			convertToLlm: parent.convertToLlm,
 			transformContext: parent.transformContext,
-			streamFn: parent.streamFn,
+			// Side questions are excluded from session history; their calls carry no provenance.
+			streamFn: unwrapSemanticEdgeStreamFn(parent.streamFn),
 			getApiKey: parent.getApiKey,
 			onPayload: parent.onPayload,
 			onResponse: parent.onResponse,
-			shouldStopAfterTurn: () => true,
+			beforeToolCall: async () => ({ block: true, reason: SIDE_QUESTION_TOOL_BLOCKED }),
+			shouldStopAfterTurn: ({ message }) => {
+				turnCount += 1;
+				return turnCount >= SIDE_QUESTION_MAX_TURNS || !message.content.some((block) => block.type === "toolCall");
+			},
 			sessionId: parent.sessionId,
 			thinkingBudgets: parent.thinkingBudgets,
 			transport: "sse",
-			maxRetryDelayMs: parent.maxRetryDelayMs,
 			toolExecution: parent.toolExecution,
 		});
+	};
 
 	const answerOnce = async (messages: AgentMessage[]): Promise<AssistantMessage | undefined> => {
 		throwIfAborted(runAbort.signal);
@@ -478,24 +504,46 @@ export function startSideQuestion(
 				return;
 			}
 			const nextAnswer = readAssistantText(event.message);
+			// A tool-call turn is not the answer: its text (if any) is kept, but the
+			// run only completes on a turn without tool calls (or at the turn cap).
 			const completedMessage =
 				event.type === "message_end" &&
 				event.message.role === "assistant" &&
 				event.message.stopReason !== "error" &&
 				event.message.stopReason !== "aborted" &&
+				!event.message.content.some((block) => block.type === "toolCall") &&
 				!isContextOverflow(event.message, model.contextWindow);
-			if (nextAnswer === answer && !completedMessage) {
+			if ((!nextAnswer || nextAnswer === answer) && !completedMessage) {
 				return;
 			}
-			answer = nextAnswer;
+			if (nextAnswer) answer = nextAnswer;
 			// The daemon writes side-question events directly to the attached client,
 			// so a reconnect between message_end and run settlement could otherwise
 			// leave the pane permanently "running". Emit completion at both boundaries.
 			await emit(completedMessage ? "complete" : "running");
 		});
 		try {
-			await sideAgent.prompt(prompt);
-			return lastAssistantMessage(sideAgent.state.messages);
+			const clonedMessageCount = sideAgent.state.messages.length;
+			let promptedOnce = false;
+			await completeWithProviderRetry(
+				async () => {
+					if (promptedOnce) {
+						// Session-loop recovery: drop the failed assistant turn and re-run.
+						sideAgent.state.messages = sideAgent.state.messages.slice(0, -1);
+						await sideAgent.continue();
+					} else {
+						promptedOnce = true;
+						await sideAgent.prompt(prompt);
+					}
+					const last = lastAssistantMessage(sideAgent.state.messages.slice(clonedMessageCount));
+					if (!last) {
+						throw new Error(sideAgent.state.errorMessage || "Side question produced no assistant message");
+					}
+					return last;
+				},
+				{ policy: retry, signal: runAbort.signal },
+			);
+			return lastAssistantMessage(sideAgent.state.messages.slice(clonedMessageCount));
 		} finally {
 			unsubscribe();
 			if (activeAgent === sideAgent) {

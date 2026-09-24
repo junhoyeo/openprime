@@ -1,12 +1,21 @@
 import { Buffer } from "node:buffer";
-import type { Dirent } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { type Dirent, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { appendRotatingLog, getAgentTracesLogPath, getSessionsDir, VERSION } from "../config.js";
+import { appendRotatingLog, getAgentDir, getAgentTracesLogPath, getSessionsDir, VERSION } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
-	loadPrimeCliConfig,
+	fetchWithTimeout,
+	isRecord,
+	numberField,
+	parseResponseObject,
+	readResponseMessage,
+	stringEnv,
+	stringField,
+} from "./prime-http.js";
+import {
 	PRIME_AGENT_TRACES_PROVIDER_ID,
 	PRIME_INFERENCE_PROVIDER_ID,
 	resolvePrimeAgentTracesBaseUrl,
@@ -27,6 +36,7 @@ const TRACE_UPLOAD_ALL_CONCURRENCY = 4;
 const TRACE_UPLOAD_RATE_LIMIT_REQUESTS = 5;
 const TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS = 60_000;
 const TRACE_UPLOAD_RATE_LIMIT_SAFETY_MS = 100;
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const TRACE_UPLOAD_ALL_MIN_REQUEST_INTERVAL_MS =
 	Math.ceil(TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS / TRACE_UPLOAD_RATE_LIMIT_REQUESTS) + TRACE_UPLOAD_RATE_LIMIT_SAFETY_MS;
 
@@ -47,12 +57,19 @@ export type AgentTraceUploadResult =
 			key?: string;
 	  }
 	| { status: "disabled" }
+	| { status: "unchanged" }
 	| { status: "missing_credentials" }
 	| { status: "no_session_file" }
 	| { status: "empty_session" }
 	| { status: "invalid_session"; message: string }
 	| { status: "too_large"; size: number; maxBytes: number }
-	| { status: "failed"; statusCode?: number; message: string };
+	| { status: "failed"; statusCode?: number; message: string; retryAfterMs?: number };
+
+export interface AgentTraceUploadDelay {
+	/** Retry backoff after a failed attempt, or the batch gate holding the platform rate limit. */
+	reason: "retry-backoff" | "rate-limit";
+	delayMs: number;
+}
 
 export interface AgentTraceUploadOptions {
 	sessionFile: string | undefined;
@@ -61,24 +78,42 @@ export interface AgentTraceUploadOptions {
 	/** Require the global automatic-sharing opt-in. Set false only for an explicit one-shot upload command. */
 	requireEnabled?: boolean;
 	baseUrl?: string;
-	configPath?: string;
 	fetchFn?: typeof fetch;
 	reloadConfig?: boolean;
 	requestTimeoutMs?: number;
 	signal?: AbortSignal;
+	/** Reports every wait the upload arms before its next request. */
+	onUploadDelay?: (delay: AgentTraceUploadDelay) => void;
 }
 
 export interface AgentTraceSessionUploadOptions extends Omit<AgentTraceUploadOptions, "sessionFile"> {
 	sessionManager: SessionManager;
 }
 
+export interface AgentTraceUploadSchedule {
+	delayMs: number;
+}
+
 export interface AgentTraceUploadInstallOptions {
 	authStorage: AuthStorage;
 	settingsManager: SettingsManager;
 	baseUrl?: string;
-	configPath?: string;
 	fetchFn?: typeof fetch;
 	requestTimeoutMs?: number;
+	/** The session's semantic-edge ledger; registered with the outbox as its own delivery kind. */
+	semanticEdgesLedgerPath?: string;
+	/** Reports the timer the scheduler arms for its next automatic upload. */
+	onUploadScheduled?: (schedule: AgentTraceUploadSchedule) => void;
+	/** Reports each scheduled cycle once it settles, after any follow-up cycle is armed. */
+	onUploadSettled?: (outcome: AgentTraceUploadCycleOutcome) => void;
+}
+
+/** A scheduled cycle either finishes an upload or folds into the upload already in flight. */
+export type AgentTraceUploadCycleOutcome = AgentTraceUploadResult | { status: "coalesced" };
+
+export interface AgentTraceUploadInstallation {
+	/** Resolves once the startup catch-up and any in-flight automatic upload have finished writing. */
+	whenIdle: () => Promise<void>;
 }
 
 export type AgentTracePreviewResult =
@@ -131,15 +166,6 @@ export interface AgentTraceUploadAllResult {
 	results: Array<{ sessionFile: string; result: AgentTraceUploadResult }>;
 }
 
-function stringEnv(name: string): string | undefined {
-	const value = process.env[name];
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function describeError(error: unknown): string {
 	if (!(error instanceof Error)) {
 		return String(error);
@@ -176,7 +202,8 @@ const RETRIABLE_NETWORK_CODES = new Set([
 	"UND_ERR_CONNECT_TIMEOUT",
 ]);
 
-const RETRIABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+// 429 is deliberately absent: a rate-limited upload is rescheduled by its caller instead of sleeping in-request.
+const RETRIABLE_HTTP_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 
 function isRetriableNetworkError(error: unknown): boolean {
 	if (error instanceof TraceUploadTimeoutError) {
@@ -187,16 +214,6 @@ function isRetriableNetworkError(error: unknown): boolean {
 	}
 	const cause = (error as { cause?: unknown }).cause;
 	return isRecord(cause) && typeof cause.code === "string" && RETRIABLE_NETWORK_CODES.has(cause.code);
-}
-
-function stringField(data: Record<string, unknown>, key: string): string | undefined {
-	const value = data[key];
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function numberField(data: Record<string, unknown>, key: string): number | undefined {
-	const value = data[key];
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function isSessionHeader(value: unknown): value is SessionHeader {
@@ -293,74 +310,6 @@ function resolveTraceContext(
 	return { traceId, parentSessionId };
 }
 
-function parseResponseObject(text: string): Record<string, unknown> | undefined {
-	if (!text.trim()) {
-		return undefined;
-	}
-	try {
-		const parsed = JSON.parse(text) as unknown;
-		return isRecord(parsed) ? parsed : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function readResponseMessage(response: Response): Promise<string> {
-	const text = await response.text().catch(() => "");
-	if (!text.trim()) {
-		return response.statusText || "Unknown error";
-	}
-
-	const parsed = parseResponseObject(text);
-	if (parsed) {
-		const error = parsed.error;
-		if (isRecord(error)) {
-			const message = stringField(error, "message");
-			if (message) return message;
-		}
-		const detail = stringField(parsed, "detail");
-		if (detail) return detail;
-		const message = stringField(parsed, "message");
-		if (message) return message;
-	}
-
-	return text.trim();
-}
-
-async function fetchWithTimeout(
-	fetchFn: typeof fetch,
-	url: string,
-	init: RequestInit,
-	timeoutMs: number,
-	signal?: AbortSignal,
-): Promise<Response> {
-	const controller = new AbortController();
-	const timeoutError = new TraceUploadTimeoutError(timeoutMs);
-	let timedOut = false;
-	const timeout = setTimeout(() => {
-		timedOut = true;
-		controller.abort(timeoutError);
-	}, timeoutMs);
-	const onAbort = () => controller.abort(signal?.reason);
-	if (signal?.aborted) {
-		onAbort();
-	} else {
-		signal?.addEventListener("abort", onAbort, { once: true });
-	}
-
-	try {
-		return await fetchFn(url, { ...init, signal: controller.signal });
-	} catch (error) {
-		if (timedOut) {
-			throw timeoutError;
-		}
-		throw error;
-	} finally {
-		clearTimeout(timeout);
-		signal?.removeEventListener("abort", onAbort);
-	}
-}
-
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve) => {
 		if (signal?.aborted) {
@@ -368,6 +317,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 			return;
 		}
 		const timeout = setTimeout(finish, ms);
+		timeout.unref();
 		const onAbort = () => finish();
 		function finish() {
 			clearTimeout(timeout);
@@ -387,31 +337,33 @@ function traceUploadRetryDelay(retryIndex: number): number {
 	return Math.max(0, Math.round(exponentialDelay * jitterMultiplier));
 }
 
-function retryAfterDelay(response: Response): number | undefined {
+function retryAfterDelay(response: Response, capMs: number = TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS): number | undefined {
 	const value = response.headers.get("retry-after")?.trim();
 	if (!value) {
 		return undefined;
 	}
 	const seconds = Number(value);
 	if (Number.isFinite(seconds) && seconds >= 0) {
-		return Math.min(Math.ceil(seconds * 1_000), TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS);
+		return Math.min(Math.ceil(seconds * 1_000), capMs);
 	}
 	const retryAt = Date.parse(value);
-	return Number.isFinite(retryAt)
-		? Math.min(Math.max(0, retryAt - Date.now()), TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS)
-		: undefined;
+	return Number.isFinite(retryAt) ? Math.min(Math.max(0, retryAt - Date.now()), capMs) : undefined;
 }
 
 type BeforeTraceUploadRequest = () => Promise<void>;
 
-async function fetchWithRetry(
-	fetchFn: typeof fetch,
-	url: string,
-	init: RequestInit,
-	timeoutMs: number,
-	signal?: AbortSignal,
-	beforeRequest?: BeforeTraceUploadRequest,
-): Promise<Response> {
+interface TraceUploadRequest {
+	fetchFn: typeof fetch;
+	url: string;
+	init: RequestInit;
+	timeoutMs: number;
+	signal?: AbortSignal;
+	beforeRequest?: BeforeTraceUploadRequest;
+	onUploadDelay?: (delay: AgentTraceUploadDelay) => void;
+}
+
+async function fetchWithRetry(request: TraceUploadRequest): Promise<Response> {
+	const { fetchFn, url, init, timeoutMs, signal, beforeRequest, onUploadDelay } = request;
 	for (let attempt = 0; ; attempt += 1) {
 		let retryDelayMs: number | undefined;
 		try {
@@ -419,13 +371,14 @@ async function fetchWithRetry(
 			if (signal?.aborted) {
 				throw signal.reason ?? new Error("Trace upload cancelled");
 			}
-			const response = await fetchWithTimeout(fetchFn, url, init, timeoutMs, signal);
+			const response = await fetchWithTimeout(fetchFn, url, init, timeoutMs, {
+				timeoutError: new TraceUploadTimeoutError(timeoutMs),
+				signal,
+			});
 			if (attempt >= TRACE_UPLOAD_MAX_RETRIES || !RETRIABLE_HTTP_STATUSES.has(response.status)) {
 				return response;
 			}
-			if (response.status === 429) {
-				retryDelayMs = retryAfterDelay(response) ?? TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS;
-			} else if (response.status === 503) {
+			if (response.status === 503) {
 				retryDelayMs = retryAfterDelay(response);
 			}
 			await response.body?.cancel().catch(() => undefined);
@@ -438,7 +391,11 @@ async function fetchWithRetry(
 			}
 		}
 
-		await delay(retryDelayMs ?? traceUploadRetryDelay(attempt), signal);
+		const backoffMs = retryDelayMs ?? traceUploadRetryDelay(attempt);
+		if (!signal?.aborted) {
+			onUploadDelay?.({ reason: "retry-backoff", delayMs: backoffMs });
+		}
+		await delay(backoffMs, signal);
 		if (signal?.aborted) {
 			throw signal.reason ?? new Error("Trace upload cancelled");
 		}
@@ -546,13 +503,17 @@ export async function findAgentTraceFiles(sessionDir: string = getSessionsDir())
 	return [...files].sort();
 }
 
-function createTraceUploadAllRequestGate(signal?: AbortSignal): BeforeTraceUploadRequest {
+function createTraceUploadAllRequestGate(
+	signal?: AbortSignal,
+	onUploadDelay?: (delay: AgentTraceUploadDelay) => void,
+): BeforeTraceUploadRequest {
 	let nextRequestAt = 0;
 	let queue = Promise.resolve();
 	return () => {
 		const slot = queue.then(async () => {
 			const waitMs = Math.max(0, nextRequestAt - Date.now());
 			if (waitMs > 0) {
+				onUploadDelay?.({ reason: "rate-limit", delayMs: waitMs });
 				await delay(waitMs, signal);
 			}
 			if (!signal?.aborted) {
@@ -571,7 +532,7 @@ export async function uploadAllAgentTraces(options: AgentTraceUploadAllOptions):
 	const results: Array<UploadResultItem | undefined> = new Array(sessionFiles.length);
 	let cursor = 0;
 	let completed = 0;
-	const beforeRequest = createTraceUploadAllRequestGate(uploadOptions.signal);
+	const beforeRequest = createTraceUploadAllRequestGate(uploadOptions.signal, uploadOptions.onUploadDelay);
 	onProgress?.({ completed, total: sessionFiles.length });
 
 	const worker = async () => {
@@ -632,9 +593,209 @@ export async function uploadAllAgentTraces(options: AgentTraceUploadAllOptions):
 	};
 }
 
+interface AgentTraceUploadedSignature {
+	size: number;
+	mtimeMs: number;
+}
+
+export const SEMANTIC_EDGES_OUTBOX_KIND = "semantic-edges";
+
+export interface AgentTraceCatchUpResult {
+	pruned: number;
+	/** Registered semantic-edge ledgers with bytes beyond their cursor; no delivery endpoint exists yet. */
+	semanticEdgeLedgersPending: number;
+	results: Array<{ sessionFile: string; result: AgentTraceUploadResult }>;
+}
+
+function getAgentTraceOutboxDir(): string {
+	return join(getAgentDir(), "agent-traces-outbox");
+}
+
+// One entry file per session file (keyed by path hash): concurrent writers cannot lose each other's cursors, and a bad read costs only its own entry.
+function agentTraceOutboxEntryPath(sessionFile: string): string {
+	const key = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+	return join(getAgentTraceOutboxDir(), `${key}.json`);
+}
+
+function parseOutboxEntry(raw: string):
+	| {
+			sessionFile: string;
+			kind?: string;
+			uploaded: AgentTraceUploadedSignature | null;
+			uploadedBytes?: number;
+	  }
+	| undefined {
+	const parsed = parseResponseObject(raw);
+	if (!parsed || typeof parsed.sessionFile !== "string") {
+		return undefined;
+	}
+	const uploaded =
+		typeof parsed.size === "number" && typeof parsed.mtimeMs === "number"
+			? { size: parsed.size, mtimeMs: parsed.mtimeMs }
+			: null;
+	return {
+		sessionFile: parsed.sessionFile,
+		kind: typeof parsed.kind === "string" ? parsed.kind : undefined,
+		uploaded,
+		uploadedBytes: typeof parsed.uploadedBytes === "number" ? parsed.uploadedBytes : undefined,
+	};
+}
+
+/** `undefined` = no usable cursor; `null` = scheduled but never uploaded. */
+async function readAgentTraceOutboxEntry(sessionFile: string): Promise<AgentTraceUploadedSignature | null | undefined> {
+	let raw: string;
+	try {
+		raw = await readFile(agentTraceOutboxEntryPath(sessionFile), "utf8");
+	} catch {
+		return undefined;
+	}
+	const entry = parseOutboxEntry(raw);
+	return entry && entry.sessionFile === sessionFile ? entry.uploaded : undefined;
+}
+
+function signatureEquals(a: AgentTraceUploadedSignature | null | undefined, b: AgentTraceUploadedSignature): boolean {
+	return a != null && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+/** Session files with a live upload controller in this process; catch-up leaves them to their controller. */
+const locallyManagedSessionFiles = new Set<string>();
+
+/** Best-effort and synchronous: upload intent must be on disk the moment the transcript persist returns. */
+function markAgentTraceOutboxPendingSync(sessionFile: string, kind?: string): boolean {
+	try {
+		const entryPath = agentTraceOutboxEntryPath(sessionFile);
+		if (existsSync(entryPath)) {
+			return true;
+		}
+		mkdirSync(getAgentTraceOutboxDir(), { recursive: true });
+		const tempPath = `${entryPath}.${process.pid}.${randomUUID()}.tmp`;
+		writeFileSync(
+			tempPath,
+			`${JSON.stringify(kind === undefined ? { sessionFile } : { sessionFile, kind })}\n`,
+			"utf8",
+		);
+		renameSync(tempPath, entryPath);
+		return true;
+	} catch {
+		// A broken agent dir must not break session persists.
+		return false;
+	}
+}
+
+async function recordAgentTraceOutboxUpload(
+	sessionFile: string,
+	signature: AgentTraceUploadedSignature,
+): Promise<void> {
+	const entryPath = agentTraceOutboxEntryPath(sessionFile);
+	await mkdir(getAgentTraceOutboxDir(), { recursive: true });
+	const tempPath = `${entryPath}.${process.pid}.${randomUUID()}.tmp`;
+	await writeFile(tempPath, `${JSON.stringify({ sessionFile, ...signature })}\n`, "utf8");
+	await rename(tempPath, entryPath);
+}
+
+/**
+ * Startup catch-up: upload every outbox entry whose file content is ahead of its
+ * cursor, and prune entries whose file no longer exists. Runs once per process,
+ * in whichever process hosts sessions (the only place trace upload is installed).
+ */
+export async function catchUpAgentTraceUploads(
+	options: Omit<AgentTraceUploadOptions, "sessionFile">,
+): Promise<AgentTraceCatchUpResult> {
+	const catchUp: AgentTraceCatchUpResult = { pruned: 0, semanticEdgeLedgersPending: 0, results: [] };
+	if (options.requireEnabled !== false && !(await getAgentTracesEnabled(options))) {
+		return catchUp;
+	}
+	let entryNames: string[];
+	try {
+		entryNames = await readdir(getAgentTraceOutboxDir());
+	} catch {
+		return catchUp;
+	}
+	const beforeRequest = createTraceUploadAllRequestGate(options.signal);
+	for (const entryName of entryNames) {
+		if (options.signal?.aborted) {
+			break;
+		}
+		if (!entryName.endsWith(".json")) {
+			continue;
+		}
+		const entryPath = join(getAgentTraceOutboxDir(), entryName);
+		let raw: string;
+		try {
+			raw = await readFile(entryPath, "utf8");
+		} catch {
+			// Transient read error: keep the entry and retry at the next startup.
+			continue;
+		}
+		const entry = parseOutboxEntry(raw);
+		if (!entry) {
+			await unlink(entryPath).catch(() => undefined);
+			catchUp.pruned += 1;
+			continue;
+		}
+		if (entry.kind === SEMANTIC_EDGES_OUTBOX_KIND) {
+			let ledgerStats: Awaited<ReturnType<typeof stat>>;
+			try {
+				ledgerStats = await stat(entry.sessionFile);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					await unlink(entryPath).catch(() => undefined);
+					catchUp.pruned += 1;
+				}
+				continue;
+			}
+			if (!ledgerStats.isFile()) {
+				await unlink(entryPath).catch(() => undefined);
+				catchUp.pruned += 1;
+				continue;
+			}
+			// Append-only byte cursor: a ledger whose size equals its delivered offset has nothing new.
+			if (ledgerStats.size === entry.uploadedBytes) {
+				continue;
+			}
+			// No delivery endpoint exists yet (verifiers#2449 consumes edges in-band over ACP
+			// metadata; the trace server has no semantic-edges route). The delta and cursor stay
+			// untouched so the first real sender delivers the whole backlog.
+			catchUp.semanticEdgeLedgersPending += 1;
+			continue;
+		}
+		if (entry.kind !== undefined) {
+			// A newer build may register kinds this one cannot deliver; leave their cursors alone.
+			continue;
+		}
+		if (locallyManagedSessionFiles.has(entry.sessionFile)) {
+			continue;
+		}
+		let stats: Awaited<ReturnType<typeof stat>>;
+		try {
+			stats = await stat(entry.sessionFile);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				await unlink(entryPath).catch(() => undefined);
+				catchUp.pruned += 1;
+			}
+			continue;
+		}
+		if (!stats.isFile()) {
+			await unlink(entryPath).catch(() => undefined);
+			catchUp.pruned += 1;
+			continue;
+		}
+		if (signatureEquals(entry.uploaded, { size: stats.size, mtimeMs: stats.mtimeMs })) {
+			continue;
+		}
+		const result = await uploadAgentTraceFileWithRequestGate(
+			{ ...options, sessionFile: entry.sessionFile, reloadConfig: false },
+			beforeRequest,
+		);
+		catchUp.results.push({ sessionFile: entry.sessionFile, result });
+	}
+	return catchUp;
+}
+
 export async function getPrimeAgentTraceCredential(
 	authStorage: AuthStorage,
-	options: { reloadAuth?: boolean; configPath?: string } = {},
+	options: { reloadAuth?: boolean } = {},
 ): Promise<AgentTraceCredential | undefined> {
 	const traceEnvKey = stringEnv("PRIME_AGENT_TRACES_API_KEY");
 	if (traceEnvKey) {
@@ -661,11 +822,6 @@ export async function getPrimeAgentTraceCredential(
 		if (primeKey) {
 			return { apiKey: primeKey, source: "prime-inference", label: "Prime Inference credential" };
 		}
-	}
-
-	const primeCliKey = loadPrimeCliConfig(options.configPath).apiKey;
-	if (primeCliKey) {
-		return { apiKey: primeCliKey, source: "prime-cli", label: "Prime CLI credential" };
 	}
 
 	return undefined;
@@ -730,21 +886,26 @@ async function performAgentTraceUpload(
 		return { status: "no_session_file" };
 	}
 
-	let fileSize: number;
+	let signature: AgentTraceUploadedSignature;
 	try {
 		const stats = await stat(options.sessionFile);
 		if (!stats.isFile()) {
 			return { status: "no_session_file" };
 		}
-		fileSize = stats.size;
+		signature = { size: stats.size, mtimeMs: stats.mtimeMs };
 	} catch {
 		return { status: "no_session_file" };
 	}
+	const fileSize = signature.size;
 	if (fileSize === 0) {
 		return { status: "empty_session" };
 	}
 	if (fileSize > MAX_TRACE_BYTES) {
 		return { status: "too_large", size: fileSize, maxBytes: MAX_TRACE_BYTES };
+	}
+	// Cursor invariant: an automatic upload never re-sends a file whose content already matches its uploaded cursor.
+	if (requireEnabled && signatureEquals(await readAgentTraceOutboxEntry(options.sessionFile), signature)) {
+		return { status: "unchanged" };
 	}
 
 	const header = readSessionHeader(options.sessionFile);
@@ -753,7 +914,6 @@ async function performAgentTraceUpload(
 	}
 
 	const credential = await getPrimeAgentTraceCredential(options.authStorage, {
-		configPath: options.configPath,
 		reloadAuth: options.reloadConfig !== false,
 	});
 	if (!credential) {
@@ -805,18 +965,15 @@ async function performAgentTraceUpload(
 
 	let response: Response;
 	try {
-		response = await fetchWithRetry(
+		response = await fetchWithRetry({
 			fetchFn,
 			url,
-			{
-				method: "PUT",
-				headers,
-				body,
-			},
-			options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-			options.signal,
+			init: { method: "PUT", headers, body },
+			timeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+			signal: options.signal,
 			beforeRequest,
-		);
+			onUploadDelay: options.onUploadDelay,
+		});
 	} catch (error) {
 		return { status: "failed", message: describeError(error) };
 	}
@@ -826,11 +983,17 @@ async function performAgentTraceUpload(
 			status: "failed",
 			statusCode: response.status,
 			message: await readResponseMessage(response),
+			retryAfterMs: retryAfterDelay(response, MAX_TIMER_DELAY_MS),
 		};
 	}
 
 	const responseText = await response.text().catch(() => "");
 	const responseData = parseResponseObject(responseText);
+	try {
+		await recordAgentTraceOutboxUpload(options.sessionFile, signature);
+	} catch (error) {
+		return { status: "failed", message: `stored, but recording the upload cursor failed: ${describeError(error)}` };
+	}
 	return {
 		status: "uploaded",
 		sessionId: responseData ? (stringField(responseData, "session_id") ?? header.id) : header.id,
@@ -847,13 +1010,15 @@ export function uploadAgentTraceSession(options: AgentTraceSessionUploadOptions)
 	});
 }
 
+/** Bounds whenIdle() drain loops so a retry that re-arms cannot spin forever. */
+const MAX_IDLE_DRAIN_CYCLES = 4;
+
 class AgentTraceUploadController {
 	private timeout: NodeJS.Timeout | undefined;
 	private pending = false;
 	private inFlight: Promise<AgentTraceUploadResult> | undefined;
-	private flushPromise: Promise<AgentTraceUploadResult | undefined> | undefined;
 	private lastUploadStartedAt: number | undefined;
-	private lastUploadedSignature: string | undefined;
+	private notBeforeAt = 0;
 
 	constructor(
 		private readonly sessionManager: SessionManager,
@@ -866,123 +1031,146 @@ class AgentTraceUploadController {
 
 	schedule = (): void => {
 		this.pending = true;
-		pendingUploadControllers.add(this);
-		if (this.timeout) {
-			clearTimeout(this.timeout);
+		// Intent is consent-gated at persist time: an entry created while sharing
+		// is off would turn a later enable into retroactive collection of
+		// opted-out sessions. Marking re-runs every persist (existsSync-cheap),
+		// so an entry pruned by a racing catch-up is re-registered.
+		if (this.options.settingsManager.getAgentTracesEnabled()) {
+			const sessionFile = this.sessionManager.getSessionFile();
+			if (
+				sessionFile &&
+				!locallyManagedSessionFiles.has(sessionFile) &&
+				markAgentTraceOutboxPendingSync(sessionFile)
+			) {
+				locallyManagedSessionFiles.add(sessionFile);
+			}
+			const ledgerPath = this.options.semanticEdgesLedgerPath;
+			if (ledgerPath) {
+				markAgentTraceOutboxPendingSync(ledgerPath, SEMANTIC_EDGES_OUTBOX_KIND);
+			}
 		}
-		const elapsed = this.lastUploadStartedAt === undefined ? 0 : Date.now() - this.lastUploadStartedAt;
-		const throttleDelay =
-			this.lastUploadStartedAt === undefined ? 0 : Math.max(0, TRACE_UPLOAD_MIN_INTERVAL_MS - elapsed);
-		this.timeout = setTimeout(
-			() => {
-				this.timeout = undefined;
-				void this.flush().catch(() => undefined);
-			},
-			Math.max(TRACE_UPLOAD_DEBOUNCE_MS, throttleDelay),
-		);
+		this.arm();
 	};
 
-	private async getCurrentFileSignature(): Promise<string | undefined> {
-		const sessionFile = this.sessionManager.getSessionFile();
-		if (!sessionFile) {
-			return undefined;
-		}
-		try {
-			const stats = await stat(sessionFile);
-			return `${sessionFile}:${stats.size}:${stats.mtimeMs}`;
-		} catch {
-			return undefined;
+	async whenIdle(): Promise<void> {
+		// A debounced upload is still work in progress: waiting only on `inFlight`
+		// lets a caller tear down during the delay and drop the scheduled upload.
+		// Flush the armed timer instead of waiting for it, so draining never
+		// depends on wall-clock time. Bounded because a retry re-arms.
+		for (let drain = 0; drain < MAX_IDLE_DRAIN_CYCLES; drain += 1) {
+			// An active writer is always awaited first, so a drain never returns while a
+			// request is still in flight.
+			if (this.inFlight !== undefined) {
+				await this.inFlight;
+				continue;
+			}
+			if (this.timeout !== undefined) {
+				if (!this.isUploadDue()) {
+					// Backoff outlives this drain; the durable outbox replays it on the
+					// next catch-up rather than overrunning the server's Retry-After.
+					return;
+				}
+				clearTimeout(this.timeout);
+				this.timeout = undefined;
+				await this.runScheduledUpload();
+				continue;
+			}
+			return;
 		}
 	}
 
-	async flush(): Promise<AgentTraceUploadResult | undefined> {
-		if (this.flushPromise) {
-			const result = await this.flushPromise;
-			if (!this.pending) {
-				return result;
-			}
-			return (await this.flush()) ?? result;
-		}
-
-		this.flushPromise = this.runFlush();
-		try {
-			return await this.flushPromise;
-		} finally {
-			this.flushPromise = undefined;
-			if (!this.pending) {
-				pendingUploadControllers.delete(this);
-			}
-		}
-	}
-
-	private async runFlush(): Promise<AgentTraceUploadResult | undefined> {
+	private arm(): void {
 		if (this.timeout) {
 			clearTimeout(this.timeout);
+		}
+		const elapsed = this.lastUploadStartedAt === undefined ? undefined : Date.now() - this.lastUploadStartedAt;
+		const throttleDelay = elapsed === undefined ? 0 : Math.max(0, TRACE_UPLOAD_MIN_INTERVAL_MS - elapsed);
+		const notBeforeDelay = Math.max(0, this.notBeforeAt - Date.now());
+		const delayMs = Math.max(TRACE_UPLOAD_DEBOUNCE_MS, throttleDelay, notBeforeDelay);
+		this.timeout = setTimeout(() => {
 			this.timeout = undefined;
+			void this.runScheduledUpload();
+		}, delayMs);
+		this.timeout.unref();
+		this.options.onUploadScheduled?.({ delayMs });
+	}
+
+	/** True when neither the server's Retry-After nor the throttle window blocks an upload. */
+	private isUploadDue(): boolean {
+		const now = Date.now();
+		if (now < this.notBeforeAt) {
+			return false;
+		}
+		return this.lastUploadStartedAt === undefined || now - this.lastUploadStartedAt >= TRACE_UPLOAD_MIN_INTERVAL_MS;
+	}
+
+	private async runScheduledUpload(): Promise<void> {
+		if (!this.isUploadDue()) {
+			// A flush must not overrun Retry-After or the throttle window; re-arm instead.
+			this.pending = true;
+			this.arm();
+			return;
 		}
 		if (this.inFlight) {
-			await this.inFlight.catch(() => undefined);
+			// Keep the work pending so the in-flight upload's settle path re-arms:
+			// the coalesce notice always has a guaranteed follow-up behind it.
+			this.pending = true;
+			this.options.onUploadSettled?.({ status: "coalesced" });
+			return;
 		}
-		if (!this.pending) {
-			return undefined;
-		}
-
-		const signature = await this.getCurrentFileSignature();
-		if (signature && signature === this.lastUploadedSignature) {
-			this.pending = false;
-			return undefined;
-		}
-
 		this.pending = false;
 		this.lastUploadStartedAt = Date.now();
-		this.inFlight = uploadAgentTraceSession({
+		const upload = uploadAgentTraceSession({
 			...this.options,
 			sessionManager: this.sessionManager,
-		});
-		try {
-			const result = await this.inFlight;
-			if (result.status === "uploaded" && signature) {
-				this.lastUploadedSignature = signature;
+		}).catch((error: unknown): AgentTraceUploadResult => ({ status: "failed", message: describeError(error) }));
+		this.inFlight = upload;
+		const result = await upload;
+		if (result.status === "failed" && isRescheduledUploadFailure(result.statusCode)) {
+			this.pending = true;
+			if (result.retryAfterMs !== undefined) {
+				this.notBeforeAt = Date.now() + result.retryAfterMs;
 			}
-			return result;
-		} finally {
-			this.inFlight = undefined;
 		}
+		this.inFlight = undefined;
+		if (this.pending) {
+			this.arm();
+		}
+		this.options.onUploadSettled?.(result);
 	}
+}
+
+function isRescheduledUploadFailure(statusCode: number | undefined): boolean {
+	return statusCode === undefined || statusCode === 429 || RETRIABLE_HTTP_STATUSES.has(statusCode);
 }
 
 const traceUploadControllers = new WeakMap<SessionManager, AgentTraceUploadController>();
-// Disposal never awaits uploads; exit paths drain this set instead.
-const pendingUploadControllers = new Set<AgentTraceUploadController>();
+let startupCatchUp: Promise<void> | undefined;
 
-export function installAgentTraceUpload(sessionManager: SessionManager, options: AgentTraceUploadInstallOptions): void {
+export function installAgentTraceUpload(
+	sessionManager: SessionManager,
+	options: AgentTraceUploadInstallOptions,
+): AgentTraceUploadInstallation {
+	if (!startupCatchUp) {
+		startupCatchUp = catchUpAgentTraceUploads(options).then(
+			() => undefined,
+			() => undefined,
+		);
+	}
+	const pendingCatchUp = startupCatchUp;
 	let controller = traceUploadControllers.get(sessionManager);
 	if (controller) {
 		controller.update(options);
-		return;
+	} else {
+		controller = new AgentTraceUploadController(sessionManager, options);
+		traceUploadControllers.set(sessionManager, controller);
+		sessionManager.onPersist(controller.schedule);
 	}
-
-	controller = new AgentTraceUploadController(sessionManager, options);
-	traceUploadControllers.set(sessionManager, controller);
-	sessionManager.onPersist(controller.schedule);
-}
-
-export async function flushAgentTraceUpload(
-	sessionManager: SessionManager,
-): Promise<AgentTraceUploadResult | undefined> {
-	return traceUploadControllers.get(sessionManager)?.flush();
-}
-
-/** Exit barrier: drains every scheduled or in-flight trace upload. */
-export async function flushAllPendingAgentTraceUploads(): Promise<void> {
-	await Promise.allSettled([...pendingUploadControllers].map((controller) => controller.flush()));
-}
-
-/** Log a detached (fire-and-forget) flush rejection; upload outcomes themselves are already logged per attempt. */
-export function logDetachedAgentTraceFlushFailure(sessionFile: string | undefined, error: unknown): void {
-	const suffix = sessionFile ? ` [${sessionFile}]` : "";
-	appendRotatingLog(
-		getAgentTracesLogPath(),
-		`[${new Date().toISOString()}] detached flush failed: ${describeError(error)}${suffix}`,
-	);
+	const installed = controller;
+	return {
+		whenIdle: async () => {
+			await pendingCatchUp;
+			await installed.whenIdle();
+		},
+	};
 }

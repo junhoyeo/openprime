@@ -1,6 +1,6 @@
 import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
-import { isDirectAgentChild } from "../../agents-view/agents-view-state.js";
+import { collectSubagentDescendantSummaries } from "../../agents-view/agents-view-state.js";
 import { type AgentRosterStatus, classifyAgentStatus } from "../../daemon/agent-roster.js";
 import { classifySessionRosterStatus, type SessionSummary } from "../../daemon/daemon-session-list.js";
 import { theme } from "../theme/theme.js";
@@ -13,10 +13,7 @@ export interface SubagentSummaryCounts {
 	inactive: number;
 }
 
-export function classifySubagentSnapshotStatus(
-	child: AgentConnectionRlmChildAgentSnapshot,
-	activeHeartbeatSessionIds: ReadonlySet<string>,
-): AgentRosterStatus {
+export function classifySubagentSnapshotStatus(child: AgentConnectionRlmChildAgentSnapshot): AgentRosterStatus {
 	// Activity implies a live session; the in-process connection never stamps activeSessionId.
 	const resident = child.activeSessionId !== undefined || child.activity !== undefined;
 	const busy = child.status === "running" || child.status === "queued" || child.activity !== undefined;
@@ -24,20 +21,29 @@ export function classifySubagentSnapshotStatus(
 		resident,
 		queuedChild: !resident && busy,
 		busy,
-		hasActiveHeartbeat: child.activeSessionId !== undefined && activeHeartbeatSessionIds.has(child.activeSessionId),
 	});
 }
 
-export function countDirectSubagentStatuses(
+/** Status counts over every snapshot descending from `parentId`; the recursive roster carries the whole subtree. */
+export function countSubtreeSubagentStatuses(
 	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
 	parentId: string | undefined,
-	activeHeartbeatSessionIds: ReadonlySet<string>,
 ): SubagentSummaryCounts {
 	const counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
-	for (const child of children) {
-		if (child.parentId !== parentId || child.status === "cancelled") continue;
-		counts.total += 1;
-		counts[classifySubagentSnapshotStatus(child, activeHeartbeatSessionIds)] += 1;
+	const knownNodes = new Set<string | undefined>([parentId]);
+	const pending = [...children].filter((child) => child.status !== "cancelled");
+	let matched = true;
+	while (matched) {
+		matched = false;
+		for (let index = pending.length - 1; index >= 0; index--) {
+			const child = pending[index]!;
+			if (!knownNodes.has(child.parentId)) continue;
+			pending.splice(index, 1);
+			matched = true;
+			counts.total += 1;
+			counts[classifySubagentSnapshotStatus(child)] += 1;
+			knownNodes.add(child.id);
+		}
 	}
 	return counts;
 }
@@ -45,18 +51,13 @@ export function countDirectSubagentStatuses(
 export function countRosterSubagentStatuses(
 	summaries: Iterable<SessionSummary>,
 	parent: { activeSessionId?: string | undefined; sessionId?: string | undefined; sessionFile?: string | undefined },
-	activeHeartbeatSessionIds: ReadonlySet<string>,
 ): SubagentSummaryCounts {
 	const counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
-	for (const child of summaries) {
-		if (child.runtimeKind !== "subagent" || child.lifecycle !== "live") continue;
-		if (!isDirectAgentChild(child, parent)) continue;
+	// The daemon roster spans every tree: count live rows in this session's subtree, at any depth.
+	for (const child of collectSubagentDescendantSummaries(summaries, parent)) {
+		if (child.lifecycle !== "live") continue;
 		counts.total += 1;
-		const status =
-			child.activeSessionId !== undefined && activeHeartbeatSessionIds.has(child.activeSessionId)
-				? "running"
-				: (child.rosterStatus ?? classifySessionRosterStatus(child));
-		counts[status] += 1;
+		counts[child.rosterStatus ?? classifySessionRosterStatus(child)] += 1;
 	}
 	return counts;
 }
@@ -75,6 +76,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		private readonly getLocationLabel: () => string | undefined = () => undefined,
 		private readonly getContextLabel: () => string | undefined = () => undefined,
 		private readonly getOverrideLabel: () => string | undefined = () => undefined,
+		private readonly getPickerOpen: () => boolean = () => false,
 	) {}
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
@@ -86,7 +88,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	isSelectable(): boolean {
-		return this.counts.total > 0 && this.openable;
+		return !this.getPickerOpen() && this.counts.total > 0 && this.openable;
 	}
 
 	handleInput(data: string): void {
@@ -107,12 +109,13 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		if (this.getPickerOpen()) return [];
 		const lines = this.renderInfoLine(width);
 		if (this.counts.total === 0) return lines;
 		if (width < 2) return lines;
 		const safeWidth = width;
 		const inner = safeWidth - 2;
-		const label = theme.fg("accent", "[1msubagents[22m");
+		const label = theme.fg("accent", "subagents");
 		const top = truncateToWidth(
 			`${theme.fg("border", "╭─ ")}${label}${theme.fg("border", ` ${"─".repeat(Math.max(0, inner - 3 - visibleWidth(label)))}╮`)}`,
 			safeWidth,
