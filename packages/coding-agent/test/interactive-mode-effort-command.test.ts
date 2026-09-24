@@ -289,16 +289,20 @@ describe("InteractiveMode /effort", () => {
 	});
 
 	describe("Fast mode", () => {
-		it("enables Fast mode and refreshes the model tray", async () => {
-			const context = makeFastContext();
+		it.each([
+			["GPT-5.5", testModel("openai-codex", "gpt-5.5", "openai-codex-responses")],
+			["GPT-6 Astra", testModel("openai-codex", "gpt-6-astra", "openai-codex-responses")],
+		])("enables Fast mode for %s and refreshes the model tray", async (_name, model) => {
+			const context = makeFastContext(model);
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showStatus).toHaveBeenCalledWith("Fast mode: on"));
+			await context.fastModeToggleQueue;
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "priority" });
 			expect(context.footer.invalidate).toHaveBeenCalledWith();
 			expect(context.subagentSummaryLine.invalidate).toHaveBeenCalledWith();
+			expect(context.showStatus).toHaveBeenCalledWith("Fast mode: on");
 		});
 
 		it("disables Fast mode when it is already enabled", async () => {
@@ -403,7 +407,7 @@ describe("InteractiveMode /effort", () => {
 
 			expect(context.agentConnection.setServiceTier).not.toHaveBeenCalled();
 			expect(context.showStatus).toHaveBeenCalledWith(
-				"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json",
+				"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json",
 			);
 		});
 

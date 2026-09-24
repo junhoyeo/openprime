@@ -26,6 +26,7 @@
 - Added Qwen 3.8 Max to the featured Prime Inference catalog ([#1247](https://github.com/PrimeIntellect-ai/prime-agent/pull/1247) by [@eliebak](https://github.com/eliebak)).
 - Refreshed generated provider catalogs, removed retired routes, and aligned provider defaults and cross-provider handoff fixtures with models currently served.
 
+- Added GPT-6 Astra to the OpenAI API-key, Azure OpenAI, and Codex subscription model catalogs, including Fast mode for ChatGPT-authenticated requests.
 - Added `compat.supportsFastMode` for `openai-responses` models so an endpoint that forwards `service_tier` to a ChatGPT-authenticated upstream can serve Fast mode.
 - Fixed interrupted tool turns replaying late tool results after an interposed user message ([#1102](https://github.com/PrimeIntellect-ai/prime-agent/pull/1102) by [@junhoyeo](https://github.com/junhoyeo)).
 

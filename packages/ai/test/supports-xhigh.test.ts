@@ -91,6 +91,27 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toContain("off");
 	});
 
+	it("registers GPT-6 Astra with mandatory low-through-max reasoning on OpenAI and Codex", () => {
+		const apiModel = getModel("openai", "gpt-6-astra");
+		const codexModel = getModel("openai-codex", "gpt-6-astra");
+
+		expect(apiModel).toMatchObject({
+			api: "openai-responses",
+			input: ["text", "image"],
+			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+			contextWindow: 1050000,
+			maxTokens: 128000,
+		});
+		expect(codexModel).toMatchObject({
+			api: "openai-codex-responses",
+			input: ["text", "image"],
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		expect(getSupportedThinkingLevels(apiModel)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+		expect(getSupportedThinkingLevels(codexModel)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+	});
+
 	it("includes only high/xhigh plus off for DeepSeek V4 Flash on the DeepSeek provider", () => {
 		const model = getModel("deepseek", "deepseek-v4-flash");
 		expect(model).toBeDefined();

@@ -260,7 +260,8 @@ function supportsOpenAiXhigh(modelId: string): boolean {
 		modelId.includes("gpt-5.3") ||
 		modelId.includes("gpt-5.4") ||
 		modelId.includes("gpt-5.5") ||
-		modelId.includes("gpt-5.6")
+		modelId.includes("gpt-5.6") ||
+		modelId.includes("gpt-6-astra")
 	);
 }
 
@@ -299,6 +300,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.id.includes("gpt-5.6")) {
 		mergeThinkingLevelMap(model, { minimal: null, max: "max" });
+	}
+	if (model.id.includes("gpt-6-astra")) {
+		mergeThinkingLevelMap(model, { off: null, minimal: null, max: "max" });
 	}
 	// Per-family effort support per the Anthropic effort docs. Opus 4.6 / Sonnet 4.6
 	// have no xhigh; Fable 5 / Mythos 5 / Mythos Preview think every turn (off: null).
@@ -345,7 +349,8 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (
 		model.provider === "openai-codex" &&
 		supportsOpenAiXhigh(model.id) &&
-		!model.id.includes("gpt-5.6")
+		!model.id.includes("gpt-5.6") &&
+		!model.id.includes("gpt-6-astra")
 	) {
 		mergeThinkingLevelMap(model, { minimal: "low" });
 	}
@@ -1871,6 +1876,26 @@ async function generateModels() {
 		});
 	}
 
+	if (!allModels.some((m) => m.provider === "openai" && m.id === "gpt-6-astra")) {
+		allModels.push({
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			provider: "openai",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 10,
+				output: 50,
+				cacheRead: 1,
+				cacheWrite: 12.5,
+			},
+			contextWindow: 1050000,
+			maxTokens: 128000,
+		});
+	}
+
 	const deepseekV4Models: Model<"openai-completions">[] = [
 		{
 			id: "deepseek-v4-flash",
@@ -2061,6 +2086,18 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},

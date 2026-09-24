@@ -171,6 +171,7 @@
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Fixed ctrl+p ("Toggle agent message expansion") only toggling received agent messages; it now expands and collapses sent agent messages together with received ones.
 
+- Added `/fast` support for GPT-6 Astra with ChatGPT authentication.
 - Added `compat.supportsFastMode` in `models.json` so `/fast` works for an `openai-responses` model served through a proxy or gateway that forwards `service_tier`.
 - Fixed `/btw` side panes remaining stuck in a running state when the final daemon event was lost during reconnect.
 - Fixed multi-turn `/btw` side conversations exhausting large model contexts by compacting their transient in-memory history while preserving recent follow-ups.
@@ -180,6 +181,7 @@
 - Changed `rlm.list_subagents()` to distinguish process-local queued children from running ones and include bounded failure details while the parent tracks the run.
 - Fixed prompts to archived daemon sessions failing with unknown-session errors instead of reviving the saved session.
 - Added `retry.maxBackoffMs` (default 60s) to cap agent-level retry backoff so a large `retry.maxRetries` keeps retrying on a bounded interval instead of sleeping for days.
+- Fixed authentication failures marking configured credentials as expired, so a later prompt can retry a recovered gateway without signing in again.
 
 ## [0.7.2] - 2026-08-11
 

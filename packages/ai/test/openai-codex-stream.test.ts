@@ -659,6 +659,65 @@ describe("openai-codex streaming", () => {
 		},
 	);
 
+	it.each([
+		["no tier when unset", undefined, undefined],
+		["the explicit default tier", "default", "default"],
+		["Fast mode", "priority", "priority"],
+	] as const)("sends GPT-6 Astra with %s", async (_description, serviceTier, expectedServiceTier) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
+		process.env.PI_CODING_AGENT_DIR = tempDir;
+		const encoder = new TextEncoder();
+
+		global.fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+				expect(body.model).toBe("gpt-6-astra");
+				if (expectedServiceTier === undefined) {
+					expect(body).not.toHaveProperty("service_tier");
+				} else {
+					expect(body.service_tier).toBe(expectedServiceTier);
+				}
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode(buildSSEPayload({ status: "completed" })));
+							controller.close();
+						},
+					}),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 0 }],
+		};
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: mockToken(),
+			serviceTier,
+			transport: "sse",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(global.fetch).toHaveBeenCalledOnce();
+	});
+
 	it("does not set session_id/x-client-request-id headers when sessionId is not provided", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;

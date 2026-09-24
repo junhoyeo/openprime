@@ -8049,7 +8049,7 @@ export class InteractiveMode {
 
 	private handleFastCommand(): void {
 		const unavailableMessage =
-			"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json";
+			"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json";
 		if (!this.currentModelSupportsFastMode()) {
 			this.showStatus(unavailableMessage);
 			return;

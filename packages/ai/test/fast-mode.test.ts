@@ -20,7 +20,7 @@ function model(provider: string, id: string, api: Api, compat?: OpenAIResponsesC
 }
 
 describe("Fast mode", () => {
-	it.each(["gpt-5.4", "gpt-5.5", "gpt-5.6-luna"])("supports %s through ChatGPT auth", (id) => {
+	it.each(["gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-6-astra"])("supports %s through ChatGPT auth", (id) => {
 		expect(supportsFastMode(model("openai-codex", id, "openai-codex-responses"))).toBe(true);
 	});
 
