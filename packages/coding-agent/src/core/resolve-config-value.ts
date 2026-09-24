@@ -3,14 +3,14 @@
  * Used by auth-storage.ts and model-registry.ts.
  */
 
-import { execSync, spawnSync } from "child_process";
+import { execSyncHidden, spawnSyncHidden } from "../utils/child-process.js";
 import { getShellConfig } from "../utils/shell.js";
 
-const commandResultCache = new Map<string, string | undefined>();
+const commandResultCache = new Map<string, string>();
 
 /**
  * Resolve a config value (API key, header value, etc.) to an actual value.
- * - If starts with "!", executes the rest as a shell command and uses stdout (cached)
+ * - If starts with "!", executes the rest as a shell command and uses stdout (successful results are cached)
  * - Otherwise checks environment variable first, then treats as literal (not cached)
  */
 export function resolveConfigValue(config: string): string | undefined {
@@ -32,12 +32,11 @@ function resolveEnvOrLiteral(config: string): string | undefined {
 function executeWithConfiguredShell(command: string): { executed: boolean; value: string | undefined } {
 	try {
 		const { shell, args } = getShellConfig();
-		const result = spawnSync(shell, [...args, command], {
+		const result = spawnSyncHidden(shell, [...args, command], {
 			encoding: "utf-8",
 			timeout: 10000,
 			stdio: ["ignore", "pipe", "ignore"],
 			shell: false,
-			windowsHide: true,
 		});
 
 		if (result.error) {
@@ -61,7 +60,7 @@ function executeWithConfiguredShell(command: string): { executed: boolean; value
 
 function executeWithDefaultShell(command: string): string | undefined {
 	try {
-		const output = execSync(command, {
+		const output = execSyncHidden(command, {
 			encoding: "utf-8",
 			timeout: 10000,
 			stdio: ["ignore", "pipe", "ignore"],
@@ -83,12 +82,18 @@ function executeCommandUncached(commandConfig: string): string | undefined {
 }
 
 function executeCommand(commandConfig: string): string | undefined {
-	if (commandResultCache.has(commandConfig)) {
-		return commandResultCache.get(commandConfig);
+	const cached = commandResultCache.get(commandConfig);
+	if (cached !== undefined) {
+		return cached;
 	}
 
+	// A command that produced no value is not a resolution: a locked keychain, a
+	// missing network, or a rotated secret must be retried on the next lookup
+	// instead of pinning the failure for the lifetime of the process.
 	const result = executeCommandUncached(commandConfig);
-	commandResultCache.set(commandConfig, result);
+	if (result !== undefined) {
+		commandResultCache.set(commandConfig, result);
+	}
 	return result;
 }
 

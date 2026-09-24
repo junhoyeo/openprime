@@ -2,33 +2,30 @@
 
 from __future__ import annotations
 
-import asyncio
-import atexit
+import functools
 import json
 import os
-import secrets
-import selectors
-import shutil
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from . import _winjob
 
-_IS_POSIX = os.name == "posix"
+# Boot-lean imports: asyncio, secrets, shutil, datetime, selectors, struct,
+# fcntl/termios, and atexit load on first use below so `import rlm` (and with
+# it the kernel's pre-ready startup path) stays small. asyncio is bound onto
+# this module's globals by BashHandle.__init__ before any code path here can
+# touch it; every other user imports inside the function that needs it.
 
-if _IS_POSIX:
-    import fcntl
-    import termios
+_IS_POSIX = os.name == "posix"
 
 _HEAD_CAP = 512 * 1024
 _TAIL_CAP = 3 * 512 * 1024
@@ -43,11 +40,130 @@ _COMPLETION_SUFFIX = b"\x1f"
 # wait for a confirmed group exit before CancelledError propagates.
 _CANCEL_TERM_GRACE = 0.5
 _CANCEL_KILL_WAIT = 2.0
+_COMPLETION_NOTICE_COMMAND_CAP = 1000
+_ASYNCIO_WRAPPER_CALLBACKS = {
+    ("asyncio.tasks", "gather.<locals>._done_callback"),
+    ("asyncio.tasks", "shield.<locals>._inner_done_callback"),
+    ("asyncio.tasks", "_wait.<locals>._on_completion"),
+    ("asyncio.tasks", "as_completed.<locals>._on_completion"),
+    ("asyncio.tasks", "_release_waiter"),
+}
 
 _live_handles: set["BashHandle"] = set()
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
+
+
+def _current_cell_completion_context() -> tuple[asyncio.Event, asyncio.Task[Any] | None] | None:
+    """Get the creating REPL cell's lifecycle without coupling standalone use to repl."""
+    try:
+        from . import repl
+
+        if repl.is_active():
+            return repl.current_cell_completion_context()
+    except (ImportError, RuntimeError):
+        pass
+    return None
+
+
+def _consume_notice_task(task: asyncio.Task[None]) -> None:
+    """Retrieve detached notifier failures so they never become loop warnings."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _completion_reaches(
+    start: asyncio.Future[Any], targets: tuple[asyncio.Future[Any], ...]
+) -> bool:
+    """Follow asyncio's wrapper and TaskGroup ownership callbacks."""
+    pending = [start]
+    seen_futures: set[int] = set()
+    seen_values: set[int] = set()
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if isinstance(value, asyncio.Future):
+            pending.append(value)
+            return
+        identity = id(value)
+        if depth >= 4 or identity in seen_values:
+            return
+        seen_values.add(identity)
+
+        nested: list[Any] = []
+        if isinstance(value, asyncio.Queue):
+            pending.extend(value._getters)
+        elif isinstance(value, functools.partial):
+            nested.extend((value.func, value.args, value.keywords))
+        elif isinstance(value, dict):
+            nested.extend(value.keys())
+            nested.extend(value.values())
+        elif isinstance(value, (tuple, list, set, frozenset)):
+            nested.extend(value)
+        else:
+            closure = getattr(value, "__closure__", None) or ()
+            for cell in closure:
+                try:
+                    nested.append(cell.cell_contents)
+                except ValueError:
+                    pass
+            bound_self = getattr(value, "__self__", None)
+            if bound_self is not None:
+                nested.append(bound_self)
+        for item in nested:
+            collect(item, depth + 1)
+
+    while pending:
+        future = pending.pop()
+        if any(future is target for target in targets):
+            return True
+        if id(future) in seen_futures:
+            continue
+        seen_futures.add(id(future))
+        for entry in getattr(future, "_callbacks", None) or ():
+            callback = entry[0] if isinstance(entry, tuple) else entry
+            base = callback.func if isinstance(callback, functools.partial) else callback
+            identity = (getattr(base, "__module__", None), getattr(base, "__qualname__", None))
+            if identity in _ASYNCIO_WRAPPER_CALLBACKS:
+                collect(callback)
+            elif identity == ("asyncio.tasks", "_AsCompletedIterator._handle_completion"):
+                collect(base.__self__._done)
+            elif identity == (None, "Task.task_wakeup"):
+                task = getattr(callback, "__self__", None)
+                if isinstance(task, asyncio.Task):
+                    pending.append(task)
+            elif identity == ("asyncio.taskgroups", "TaskGroup._on_task_done"):
+                parent = getattr(getattr(callback, "__self__", None), "_parent_task", None)
+                if isinstance(parent, asyncio.Future):
+                    pending.append(parent)
+    return False
+
+
+def _creating_cell_waits_for(
+    owner: asyncio.Task[Any] | None, awaiter: asyncio.Task[Any] | None
+) -> bool:
+    """Return whether the cell owner directly or transitively waits for awaiter."""
+    if owner is None or awaiter is None:
+        return False
+    if owner is awaiter:
+        return True
+    waiter = getattr(owner, "_fut_waiter", None)
+    targets: tuple[asyncio.Future[Any], ...] = (owner,)
+    if isinstance(waiter, asyncio.Future):
+        targets += (waiter,)
+    return _completion_reaches(awaiter, targets)
+
+
+def _live_cell_owner() -> asyncio.Task[Any] | None:
+    """Body task of the cell executing right now, ignoring detached context copies."""
+    try:
+        from . import repl
+
+        if repl.is_active():
+            return repl.active_cell_task()
+    except (ImportError, RuntimeError):
+        pass
+    return None
 
 
 @dataclass(frozen=True)
@@ -116,7 +232,17 @@ class BashHandle:
     """
 
     def __init__(self, command: str) -> None:
+        # Every asyncio use in this module runs on a handle path (bash() is the
+        # only constructor), so bind the module global here, before
+        # _schedule_background_completion_notice or any await can run.
+        global asyncio
+        import asyncio
+
         self.command = command
+        completion_context = _current_cell_completion_context()
+        self._creating_cell_finished = completion_context[0] if completion_context else None
+        self._creating_cell_task = completion_context[1] if completion_context else None
+        self._awaited_by_creating_cell = False
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
@@ -129,6 +255,9 @@ class BashHandle:
         self._reaped = False
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
+        self._reap_callback: Callable[[], None] | None = None
+        self._result_consumed = False
+        self._consumed_notice: Callable[[], None] | None = None
         self._callback_lock = threading.Lock()
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
@@ -144,6 +273,8 @@ class BashHandle:
         self._completion_marker: bytes | None = None
         status_write = -1
         if _IS_POSIX:
+            import secrets
+
             # Full-duplex status channel: the child end rides in as stdin (fd 0)
             # and the script remaps it to _STATUS_FD before swapping in /dev/null
             # (dash rejects multi-digit fds in redirections at parse time). The
@@ -235,6 +366,7 @@ class BashHandle:
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._report, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
+        self._schedule_background_completion_notice()
 
     @property
     def pid(self) -> int:
@@ -250,14 +382,17 @@ class BashHandle:
 
     def output(self) -> str:
         self._released = True
+        self._note_result_consumed()
         return self._buffer.text()
 
     def tail(self, n: int = 50) -> str:
         self._released = True
+        self._note_result_consumed()
         return "\n".join(self._buffer.text().splitlines()[-n:])
 
     def poll(self) -> BashResult | None:
         self._released = True
+        self._note_result_consumed()
         return self._result if self._done.is_set() else None
 
     def kill(self, sig: int = signal.SIGTERM, grace: float = 5.0) -> None:
@@ -290,6 +425,8 @@ class BashHandle:
             _signal_group(self._pid, signal.SIGKILL)
 
     def _pump(self) -> None:
+        import selectors
+
         stdout = self._proc.stdout
         assert stdout is not None
         if not _IS_POSIX:
@@ -409,6 +546,10 @@ class BashHandle:
             if not _IS_POSIX:
                 # Reaped: pid fallbacks are gone, so the handle may finally close.
                 cast("_winjob.JobProcess", self._proc).close()
+        with self._callback_lock:
+            callback, self._reap_callback = self._reap_callback, None
+        if callback is not None:
+            callback()
         if delivered:
             _record_journal(self._pid, active=False)
         with _live_lock:
@@ -438,6 +579,8 @@ class BashHandle:
     def _read_status(self) -> int | None:
         if self._status_read < 0:
             return None
+        import selectors
+
         try:
             # DefaultSelector (kqueue/epoll) instead of select(): select() rejects
             # fds >= FD_SETSIZE (1024) even when the process fd limit is higher.
@@ -484,6 +627,9 @@ class BashHandle:
         # quiescence heuristic (best-effort parity).
         if not _IS_POSIX or self._eof.is_set():
             return False
+        import fcntl
+        import struct
+        import termios
         stdout = self._proc.stdout
         if stdout is None:
             return False
@@ -514,6 +660,145 @@ class BashHandle:
                 self._callbacks.append(callback)
                 return
         callback()
+
+    def _note_result_consumed(self, awaiter: asyncio.Task[Any] | None = None) -> None:
+        """Record a result read that reaches the model: only reads during a live
+        cell count (a detached reader between turns must keep the notice — it is
+        the idle session's only wake-up), and an awaiting reader must be one the
+        live cell waits for."""
+        if not self._done.is_set():
+            return
+        owner = _live_cell_owner()
+        if owner is None:
+            return
+        if awaiter is not None and not _creating_cell_waits_for(owner, awaiter):
+            return
+        with self._callback_lock:
+            if self._result_consumed:
+                return
+            self._result_consumed = True
+            notice, self._consumed_notice = self._consumed_notice, None
+        if notice is not None:
+            notice()
+
+    def _schedule_background_completion_notice(self) -> None:
+        cell_finished = self._creating_cell_finished
+        if cell_finished is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        from . import repl
+        import secrets
+
+        activity = {"id": secrets.token_hex(16), "pid": self._pid, "active": True}
+        # Publish synchronously before bash() returns and the creating cell can end.
+        repl.emit({"application/vnd.prime-agent.bash-activity+json": activity})
+        notice = self._notify_background_completion(cell_finished, activity)
+        try:
+            task = loop.create_task(notice)
+        except BaseException:
+            self.kill(signal.SIGKILL if _IS_POSIX else signal.SIGTERM)
+            notice.close()
+            repl.emit({"application/vnd.prime-agent.bash-activity+json": {**activity, "active": False}})
+            raise
+        task.add_done_callback(_consume_notice_task)
+
+    async def _notify_background_completion(
+        self, cell_finished: asyncio.Event, activity: dict[str, Any]
+    ) -> None:
+        from . import repl
+
+        try:
+            result = await self._wait()
+            await self._wait_reaped()
+            # The cell may do other work before awaiting this handle. Do not classify
+            # it as detached until that whole cell has crossed its completion barrier.
+            await cell_finished.wait()
+            if self._awaited_by_creating_cell or self._result_consumed or not repl.is_active():
+                return
+            command = self.command
+            if len(command) > _COMPLETION_NOTICE_COMMAND_CAP:
+                command = command[:_COMPLETION_NOTICE_COMMAND_CAP] + "\n... [command truncated]"
+            reply = await repl.host_request(
+                {
+                    "type": "bash.completed",
+                    "pid": self._pid,
+                    "command": command,
+                    "exitCode": result.exit_code,
+                }
+            )
+            if isinstance(reply, dict) and reply.get("status") == "ok":
+                # Notice accepted by the host; later reads must ask it to withdraw.
+                self._arm_consumed_notice(command)
+            else:
+                sys.stderr.write(
+                    f"Background bash completion follow-up for pid {self._pid} was not accepted. "
+                    "Inspect the saved handle with poll(), output(), or tail().\n"
+                )
+        except (OSError, RuntimeError):
+            # Standalone runtimes have no host handler, and teardown can close
+            # the bridge while a process is finishing. Shell results stay usable.
+            return
+        finally:
+            # Reap and deliver (or report rejection) before releasing kernel residency.
+            repl.emit({"application/vnd.prime-agent.bash-activity+json": {**activity, "active": False}})
+
+    def _arm_consumed_notice(self, command: str) -> None:
+        # Armed only post-acceptance: the withdrawal can never overtake its notice.
+        dispatch = functools.partial(self._notify_result_consumed, command)
+
+        with self._callback_lock:
+            if not self._result_consumed:
+                self._consumed_notice = dispatch
+                return
+        dispatch()
+
+    def _notify_result_consumed(self, command: str) -> None:
+        """Ship the withdrawal inside the read, ahead of the cell's done event.
+
+        The host delivers a queued notice at the reading cell's turn boundary,
+        which begins when that cell's done event is processed: a withdrawal
+        frame that leaves the kernel after done arrives too late, and the stale
+        notice wakes the model anyway. Reads happen inside a live cell, so
+        writing the frame right here puts it ahead of done on the wire, where
+        the host must withdraw before it can dispatch. The reply never matters
+        (unknown reply ids are dropped), so the request is fire-and-forget:
+        no future to await, no event-loop hop that could run after the cell.
+        """
+        from . import repl
+
+        if not repl.is_active():
+            return
+        repl._send(
+            {
+                "event": "host_request",
+                "id": uuid.uuid4().hex,
+                "data": {"type": "bash.consumed", "pid": self._pid, "command": command},
+            }
+        )
+
+    async def _wait_reaped(self) -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def wake() -> None:
+            try:
+                loop.call_soon_threadsafe(lambda: future.done() or future.set_result(None))
+            except RuntimeError:
+                pass
+
+        with self._callback_lock:
+            if self._reaped:
+                return
+            self._reap_callback = wake
+        try:
+            await future
+        finally:
+            with self._callback_lock:
+                if self._reap_callback is wake:
+                    self._reap_callback = None
 
     async def _wait(self) -> BashResult:
         # Asyncio-native wakeup: no executor thread is parked for the command's
@@ -639,10 +924,27 @@ class BashHandle:
         # A handle awaited before any other API use is a one-shot command tied
         # to the await (kill-on-cancel); touching the handle API first marks it
         # as a deliberate background handle whose awaits only wait.
-        if self._released:
-            return self._wait().__await__()
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        creating_cell_waited = _creating_cell_waits_for(self._creating_cell_task, current_task)
+        owned = not self._released
+        wait = self._wait_owned() if owned else self._wait()
         self._released = True
-        return self._wait_owned().__await__()
+        completed = False
+        try:
+            result = yield from wait.__await__()
+            completed = True
+            return result
+        finally:
+            if (completed or owned) and (
+                creating_cell_waited
+                or _creating_cell_waits_for(self._creating_cell_task, current_task)
+            ):
+                self._awaited_by_creating_cell = True
+            if completed:
+                self._note_result_consumed(current_task)
 
     def __repr__(self) -> str:
         state = f"exit_code={self._result.exit_code}" if self._result else "running"
@@ -671,6 +973,8 @@ def bash(command: str) -> BashHandle:
 
 
 def _shell() -> str:
+    import shutil
+
     # Read per call so env changes made in the REPL apply to later commands.
     override = os.environ.get("PRIME_AGENT_BASH_SHELL")
     if override:
@@ -697,6 +1001,8 @@ def _with_prefix(command: str) -> str:
 
 
 def _fence_printf() -> str:
+    import shutil
+
     # `\command -p printf` defeats alias expansion but not a user-defined shell
     # function named `command`, which would swallow both fence frames and leave
     # the await hanging until the shell dies (wedged behind background jobs). A
@@ -729,7 +1035,33 @@ def _status_script(command: str, completion_a: str, completion_b: str) -> str:
 
 
 def _child_env() -> dict[str, str]:
-    return {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "CLICOLOR": "0", "FORCE_COLOR": "0"}
+    """Environment for kernel-spawned shell commands.
+
+    Same non-interactive guard as the coding-agent shell tool
+    (packages/coding-agent/src/utils/shell.ts): agent shell commands have no
+    usable stdin, so interactive prompts (git commit without -m opening
+    $EDITOR, credential asks, pagers) can only hang. Fail fast or no-op
+    instead. Deliberately overrides inherited terminal settings; a
+    per-command inline assignment (`GIT_EDITOR=vim git commit`) still wins
+    because it replaces the exported value for that command.
+    """
+    return {
+        **os.environ,
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "CLICOLOR": "0",
+        "FORCE_COLOR": "0",
+        "GIT_EDITOR": "true",
+        "GIT_SEQUENCE_EDITOR": "true",
+        "GIT_TERMINAL_PROMPTS": "0",
+        "GIT_ASKPASS": "true",
+        "SSH_ASKPASS_REQUIRE": "never",
+        "EDITOR": "true",
+        "VISUAL": "true",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "DEBIAN_FRONTEND": "noninteractive",
+    }
 
 
 def _signal_group(pid: int, sig: int) -> bool:
@@ -816,6 +1148,8 @@ def _record_journal(pid: int, active: bool) -> bool:
     # Returns False only when the journal is configured but enrollment failed;
     # active-record callers must then fail closed. Active records always carry
     # a processStartId so host reaping stays identity-verified.
+    from datetime import datetime, timezone
+
     path = os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL")
     owner = os.environ.get("PRIME_AGENT_KERNEL_OWNER_PID")
     if not path or not owner:
@@ -883,6 +1217,8 @@ def _kill_live_handles() -> None:
 
 def _install_shutdown_hook() -> None:
     global _hook_installed
+    import atexit
+
     with _hook_lock:
         if _hook_installed:
             return

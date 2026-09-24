@@ -3,7 +3,6 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
-import { flushAllPendingAgentTraceUploads } from "../../core/agent-traces.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -16,6 +15,8 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import type { CustomMessage } from "../../core/messages.js";
+import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -174,11 +175,17 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getAvailableModels(): Promise<AgentConnectionModel[]> {
-		return this.session.modelRegistry.refreshAvailableModels();
+		const session = this.session;
+		const models = await session.modelRegistry.refreshAvailableModels();
+		session.refreshModelMetadata();
+		return models;
 	}
 
 	async getModelCatalog(): Promise<AgentConnectionModelCatalog> {
-		return this.session.modelRegistry.refreshModelCatalog();
+		const session = this.session;
+		const catalog = await session.modelRegistry.refreshModelCatalog();
+		session.refreshModelMetadata();
+		return catalog;
 	}
 
 	async getSessionStats(): Promise<SessionStats> {
@@ -336,6 +343,12 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.sessionManager.appendLabelChange(entryId, label);
 	}
 
+	async appendCustomMessage(
+		message: Pick<CustomMessage, "customType" | "content" | "display" | "details">,
+	): Promise<void> {
+		await this.session.sendCustomMessage(message);
+	}
+
 	async respondToExtensionUiRequest(_requestId: string, _response: AgentConnectionExtensionUiResponse): Promise<void> {
 		// In-process extension UI requests are handled directly by InteractiveMode.
 	}
@@ -405,6 +418,7 @@ export class InProcessAgentConnection implements AgentConnection {
 				getCompactionSettings: () => this.session.settingsManager.getCompactionSettings(),
 				getRequestAuth: (model) => this.session.getRequestAuth(model),
 				recorder: this.resolveSideQuestionRecorder(previousTurns, paneId),
+				retry: providerRetryPolicy(this.session.settingsManager),
 			},
 		);
 		this.sideQuestionRuns.set(id, run);
@@ -459,6 +473,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.requestAbort();
 	}
 
+	async abortAndSendQueued(): Promise<void> {
+		this.session.abortAndSendQueued();
+	}
+
 	async cancelRlmChild(childId: string): Promise<boolean> {
 		return this.session.cancelRlmChildRun(childId);
 	}
@@ -484,10 +502,13 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
-		const availableModels = await this.session.modelRegistry.refreshAvailableModels();
-		const model = availableModels.find((candidate) => {
-			return candidate.provider === provider && candidate.id === modelId;
-		});
+		const registry = this.session.modelRegistry;
+		const availableModels = await registry.refreshAvailableModels();
+		const model =
+			availableModels.find((candidate) => candidate.provider === provider && candidate.id === modelId) ??
+			// Stale-auth providers are excluded from the available list; the lookup
+			// never mutates stale state (session.setModel owns the clear).
+			(registry.getProviderAuthStatus(provider).source === "stale" ? registry.find(provider, modelId) : undefined);
 		if (!model) {
 			throw new Error(`Model not found: ${provider}/${modelId}`);
 		}
@@ -671,11 +692,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			this.runtimeHost.setBeforeSessionInvalidate(undefined);
 		}
 		this.runtimeHost.setRebindSession(undefined);
-		try {
-			await this.runtimeHost.dispose();
-		} finally {
-			await flushAllPendingAgentTraceUploads();
-		}
+		await this.runtimeHost.dispose();
 	}
 
 	private get session() {

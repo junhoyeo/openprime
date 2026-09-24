@@ -1,5 +1,4 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -8,7 +7,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	createAssistantMessageEventStream,
-	getModel,
+	fauxAssistantMessage,
 	type TextContent,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -17,31 +16,37 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type AgentSessionMessageController,
 	createAgentSessionMessage,
+	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
-import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
+import {
+	AgentSession,
+	compactRlmText,
+	RLM_CHILD_UPDATE_MIN_INTERVAL_MS,
+	type RlmChildAgentSnapshot,
+} from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
-import { ensureKernelPython } from "../src/core/kernel/bootstrap.js";
-import { type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
-import { convertToLlm } from "../src/core/messages.js";
+import { type HostRequestHandler, type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
+import { ASYNC_BASH_COMPLETION_CUSTOM_TYPE, convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
 	createDefaultRlmSubagentSessionName,
-	createRlmDeleteSubagentHostHandler,
 	createRlmRunHostHandler,
 	type SubagentRuntimeHost,
 } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import type { BashOperations } from "../src/core/tools/bash.js";
-import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import { waitForHeadlessCompletion } from "../src/modes/headless-completion.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
+import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
-const model = getModel("anthropic", "claude-sonnet-4-5")!;
+const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 function userText(context: Context): string {
 	const lastMessage = context.messages[context.messages.length - 1] as AgentMessage | undefined;
@@ -105,6 +110,8 @@ interface InspectableRlmRun {
 	error?: string;
 	abandonedForQuiescence?: boolean;
 	activity?: { kind: string };
+	lastStreamedUpdateMonotonicAt?: number;
+	progressNotes: string[];
 	emitUpdate?: () => void;
 	publication?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
 	settlement?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
@@ -167,11 +174,29 @@ function deferred<T = void>(): {
 	return { promise, resolve, reject };
 }
 
+function customNotices(session: AgentSession, customType: string): AgentMessage[] {
+	return session.messages.filter((message) => message.role === "custom" && message.customType === customType);
+}
+
+/** Terminal child notices admitted into a parent transcript. */
+function terminalNotices(session: AgentSession): AgentMessage[] {
+	return customNotices(session, "rlm_child_terminal_notice");
+}
+
+/** Child failure notices admitted into a parent transcript. */
+function failureNotices(session: AgentSession): AgentMessage[] {
+	return customNotices(session, "rlm_child_failure");
+}
+
 describe("AgentSession rlm recursion", () => {
+	const originalRlmDepth = process.env.RLM_DEPTH;
+	const originalRlmMaxDepth = process.env.RLM_MAX_DEPTH;
 	let tempDir: string;
 	let session: AgentSession | undefined;
 
 	beforeEach(() => {
+		delete process.env.RLM_DEPTH;
+		delete process.env.RLM_MAX_DEPTH;
 		tempDir = join(tmpdir(), `pi-rlm-recursion-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 	});
@@ -179,6 +204,10 @@ describe("AgentSession rlm recursion", () => {
 	afterEach(() => {
 		session?.dispose();
 		session = undefined;
+		if (originalRlmDepth === undefined) delete process.env.RLM_DEPTH;
+		else process.env.RLM_DEPTH = originalRlmDepth;
+		if (originalRlmMaxDepth === undefined) delete process.env.RLM_MAX_DEPTH;
+		else process.env.RLM_MAX_DEPTH = originalRlmMaxDepth;
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -250,6 +279,51 @@ describe("AgentSession rlm recursion", () => {
 		return session;
 	}
 
+	/** Session with a zero-usage parent assistant whose child answers a tool loop: usages[i] per request, tool calls until the last, then stop. */
+	function createToolLoopSession(requests: number, usages: Usage[], onRequest?: (toolResultCount: number) => void) {
+		const tool = {
+			name: "echo",
+			description: "Echo a value",
+			label: "echo",
+			parameters: Type.Object({ value: Type.String() }),
+			execute: async (_toolCallId: string, params: { value: string }) => ({
+				content: [{ type: "text" as const, text: params.value }],
+				details: {},
+			}),
+		};
+		const root = createSession({
+			customTools: [tool],
+			streamFn: (_model, context) => {
+				const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
+				onRequest?.(toolResultCount);
+				const last = toolResultCount >= requests - 1;
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = last
+						? assistantMessage("done", usages[toolResultCount])
+						: {
+								...assistantMessage("", usages[toolResultCount]),
+								content: [
+									{
+										type: "toolCall" as const,
+										id: `echo-${toolResultCount}`,
+										name: "echo",
+										arguments: { value: "ok" },
+									},
+								],
+								stopReason: "toolUse" as const,
+							};
+					stream.push({ type: "done", reason: last ? "stop" : "toolUse", message });
+				});
+				return stream;
+			},
+		});
+		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
+		root.agent.state.messages.push(parentAssistant);
+		root.sessionManager.appendMessage(parentAssistant);
+		return root;
+	}
+
 	function createAbortInsensitiveChild(): {
 		child: AgentSession;
 		completion: ReturnType<typeof deferred<void>>;
@@ -271,25 +345,103 @@ describe("AgentSession rlm recursion", () => {
 		return { child, completion, hasStarted: () => started };
 	}
 
-	it("propagates skipped-running deletion outcomes through the host handler", async () => {
-		const subagent = {
-			rlm_child_id: "running-child",
-			active_session_id: "running-session",
-			session_id: "running-session",
-			session_name: "running-worker",
-			session_dir: join(tempDir, "running-child"),
-			status: "running" as const,
-		};
-		const deleteHandler = createRlmDeleteSubagentHostHandler(async () => ({
-			subagent,
-			outcome: "skipped_running",
-		}));
+	function hostHandler(target: AgentSession, name: string): HostRequestHandler {
+		const handler = (target as unknown as InspectableRlmSession)._createKernelHostHandlers()[name];
+		if (!handler) throw new Error(`Missing ${name} host handler`);
+		return handler;
+	}
 
-		await expect(deleteHandler({ target: subagent.rlm_child_id })).resolves.toEqual({
-			subagent,
-			outcome: "skipped_running",
+	/** Root whose child turns block until released; gatedPrompts limits which prompts wait. */
+	function createGatedRoot(
+		options: Parameters<typeof createSession>[0] = {},
+		gatedPrompts?: readonly string[],
+	): {
+		root: AgentSession;
+		releaseChild: (prompt?: string) => void;
+		hasStarted: () => boolean;
+	} {
+		const gates = new Map<string, ReturnType<typeof deferred<void>>>();
+		const started = new Set<string>();
+		const root = createSession({
+			...options,
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				const answer = () => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+				};
+				if (gatedPrompts && !gatedPrompts.includes(text)) {
+					queueMicrotask(answer);
+					return stream;
+				}
+				started.add(text);
+				let gate = gates.get(text);
+				if (!gate) {
+					gate = deferred<void>();
+					gates.set(text, gate);
+				}
+				void gate.promise.then(answer);
+				return stream;
+			},
 		});
-	});
+		return {
+			root,
+			releaseChild: (prompt?: string) => {
+				for (const [key, gate] of gates) if (prompt === undefined || key === prompt) gate.resolve();
+			},
+			hasStarted: () => started.size > 0,
+		};
+	}
+
+	/** Root whose hosted child runtime creation blocks until released. */
+	function createStartupGatedRoot(host: Partial<SubagentRuntimeHost> = {}): {
+		root: AgentSession;
+		hostedChild: AgentSession;
+		releaseStartup: () => void;
+		hasStarted: () => boolean;
+	} {
+		const gate = deferred<void>();
+		let started = false;
+		const hostedChild = createSession();
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					started = true;
+					await gate.promise;
+					return { session: hostedChild };
+				},
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+				...host,
+			},
+		});
+		return { root, hostedChild, releaseStartup: () => gate.resolve(), hasStarted: () => started };
+	}
+
+	/** Child session holding one gated bash command, for quiescence boundaries. */
+	function gatedBashChild(name: string): {
+		session: AgentSession;
+		started: Promise<void>;
+		completion: ReturnType<typeof deferred<void>>;
+		bash: Promise<unknown>;
+	} {
+		const started = deferred<void>();
+		const completion = deferred<void>();
+		const child = createSession({ rlmSessionDir: join(tempDir, name) });
+		const bash = child.executeBash(name, undefined, {
+			operations: {
+				exec: async () => {
+					started.resolve();
+					await completion.promise;
+					return { exitCode: 0 };
+				},
+			},
+		});
+		return { session: child, started: started.promise, completion, bash };
+	}
+
+	function quiescenceWaitAborts(target: AgentSession): number {
+		return (target as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size;
+	}
 
 	it("persists RLM_DEPTH for a fresh session and reports the seeded depth", () => {
 		vi.stubEnv("RLM_DEPTH", "1");
@@ -306,32 +458,23 @@ describe("AgentSession rlm recursion", () => {
 		}
 	});
 
-	it("prefers persisted depth over RLM_DEPTH when resuming a session", () => {
-		const persistedManager = SessionManager.create(tempDir, join(tempDir, "resumed-sessions"));
-		persistedManager.newSession({ rlmDepth: 2 });
-		persistedManager.flushNow();
-		vi.stubEnv("RLM_DEPTH", "1");
-		try {
-			const resumed = createSession({ maxDepth: 3, sessionManager: persistedManager });
-			expect(resumed.rlmDepth).toBe(2);
-		} finally {
-			vi.unstubAllEnvs();
-		}
-	});
-
-	it.each([-1, "0"])("ignores invalid persisted RLM depth %j", (invalidDepth) => {
-		const persistedManager = SessionManager.create(tempDir, join(tempDir, "invalid-depth-sessions"));
+	it.each([
+		{ persisted: 2, expected: 2 },
+		{ persisted: -1, expected: 1 },
+		{ persisted: "0", expected: 1 },
+	])("resolves persisted RLM depth $persisted against RLM_DEPTH", ({ persisted, expected }) => {
+		const persistedManager = SessionManager.create(tempDir, join(tempDir, "depth-sessions"));
 		persistedManager.newSession({ rlmDepth: 2 });
 		persistedManager.flushNow();
 		const sessionFile = persistedManager.getSessionFile();
 		if (!sessionFile) throw new Error("Missing persisted session file");
-		const lines = readFileSync(sessionFile, "utf8").split("\n");
-		lines[0] = JSON.stringify({ ...JSON.parse(lines[0] ?? "{}"), rlmDepth: invalidDepth });
-		writeFileSync(sessionFile, lines.join("\n"));
-		const reopened = SessionManager.open(sessionFile, join(tempDir, "invalid-depth-sessions"));
+		const headerLines = readFileSync(sessionFile, "utf8").split("\n");
+		headerLines[0] = JSON.stringify({ ...JSON.parse(headerLines[0] ?? "{}"), rlmDepth: persisted });
+		writeFileSync(sessionFile, headerLines.join("\n"));
 		vi.stubEnv("RLM_DEPTH", "1");
 		try {
-			expect(createSession({ maxDepth: 2, sessionManager: reopened }).rlmDepth).toBe(1);
+			const reopened = SessionManager.open(sessionFile, join(tempDir, "depth-sessions"));
+			expect(createSession({ maxDepth: 3, sessionManager: reopened }).rlmDepth).toBe(expected);
 		} finally {
 			vi.unstubAllEnvs();
 		}
@@ -395,130 +538,55 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.runRlmChild("inspect another API", { name: "api-reviewer" })).rejects.toThrow(
 			'Agent name "api-reviewer" is unavailable: an agent of that name already exists at depth 1 under this parent',
 		);
-		await expect(root.runRlmChild("invalid name", { name: "   " })).rejects.toThrow("rlm.run name must not be empty");
+		await expect(root.runRlmChild("invalid name", { name: "   " })).rejects.toThrow(
+			"rlm.spawn name must not be empty",
+		);
 		await expect(root.runRlmChild("reserved name", { name: "all" })).rejects.toThrow(
 			"Broadcast agent messaging is not supported",
 		);
 	});
 
-	it("falls back to listed family metadata when a controller lacks name validation", async () => {
-		const listAgents = vi.fn(() => ({
-			current: { activeSessionId: "parent-active", sessionId: "unrelated-current" },
-			agents: [
-				{
-					activeSessionId: "passive-active",
-					sessionId: "passive-session",
-					sessionName: "passive-worker",
-					runtimeKind: "subagent" as const,
-					cwd: tempDir,
-					isStreaming: false,
-					unfinishedActionCount: 0,
-					parentSessionId: "parent-session",
-					parentSessionPath: parentPath,
-					rlmDepth: 1,
-					status: "idle" as const,
-				},
-				{
-					activeSessionId: "other-active",
-					sessionId: "other-session",
-					sessionName: "other-family-worker",
-					runtimeKind: "subagent" as const,
-					cwd: tempDir,
-					isStreaming: false,
-					unfinishedActionCount: 0,
-					parentSessionId: "other-parent",
-					rlmDepth: 1,
-				},
-			],
-		}));
-		const manager = SessionManager.create(tempDir, join(tempDir, "sessions"));
-		manager.newSession({ id: "parent-session" });
-		const parentPath = manager.getSessionFile();
-		if (!parentPath) throw new Error("Missing parent session path");
+	it("holds a spawn name reservation until admission settles, then frees it", async () => {
+		const releaseAdmission = deferred<void>();
 		const root = createSession({
-			sessionManager: manager,
-			agentMessageController: {
-				listAgents,
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					await releaseAdmission.promise;
+					throw new Error("kernel startup failed");
 				},
+				deleteRlmSubagentRuntime: async () => {},
 			},
 		});
-
-		await expect(root.runRlmChild("duplicate passive", { name: "passive-worker" })).rejects.toThrow(
-			'Agent name "passive-worker" is unavailable',
-		);
-		await expect(root.runRlmChild("different family", { name: "other-family-worker" })).resolves.toMatchObject({
-			name: "other-family-worker",
-		});
-		expect(listAgents).toHaveBeenCalled();
+		const internals = root as unknown as InspectableRlmSession & { _pendingRlmSubagentSessionNames: Set<string> };
+		const unavailable = formatAgentSessionNameUnavailable("slow-worker", root.rlmDepth + 1);
+		const spawned = await root.runRlmChild("slow admitting child", { name: "slow-worker" });
+		expect(internals._pendingRlmSubagentSessionNames.has("slow-worker")).toBe(true);
+		await expect(root.runRlmChild("racing spawn", { name: "slow-worker" })).rejects.toThrow(unavailable);
+		releaseAdmission.resolve();
+		await internals._activeRlmChildRuns.get(spawned.rlm_child_id)!.settlement!.promise;
+		expect(internals._pendingRlmSubagentSessionNames.has("slow-worker")).toBe(false);
+		await expect(root.runRlmChild("respawn while retained", { name: "slow-worker" })).rejects.toThrow(unavailable);
 	});
 
-	it("throws loud ambiguity when a child name equals a sibling session id for send and delete", async () => {
-		const first = createSession({ rlmSessionDir: join(tempDir, "first") });
-		const second = createSession({ rlmSessionDir: join(tempDir, "second") });
-		second.setSessionName(first.sessionId);
+	it("admits a same-name respawn while the deleted child still unwinds", async () => {
+		const unblockUnwind = deferred<void>();
 		const root = createSession();
-		expect(root.registerRlmChildSession("first-child", first)).toBe(true);
-		expect(root.registerRlmChildSession("second-child", second)).toBe(true);
-		const states = new Map<string, ActiveSessionState>([
-			[
-				"first-active",
-				{
-					activeSessionId: "first-active",
-					runtime: { session: first },
-				} as ActiveSessionState,
-			],
-			[
-				"second-active",
-				{
-					activeSessionId: "second-active",
-					runtime: { session: second },
-				} as ActiveSessionState,
-			],
-		]);
-
-		expect(() => resolveActiveSessionState(states, first.sessionId)).toThrow("Ambiguous active session");
-		await expect(root.deleteRlmSubagent(first.sessionId)).rejects.toThrow("is ambiguous");
-	});
-
-	it("reserves a running child's current name after it is renamed", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void release.then(() => {
-					stream.push({
-						type: "done",
-						reason: "stop",
-						message: assistantMessage(`child answer: ${userText(context)}`),
-					});
-				});
-				return stream;
-			},
-		});
-		const runPromise = root.runRlmChild("rename while running", { name: "spawn-worker" });
-		await waitFor(() => childStarted);
-		const running = (await root.listRlmSubagents()).subagents[0];
-		if (!running) {
-			throw new Error("Missing running child");
-		}
-		if (!running.session_id) {
-			throw new Error("Missing running child session ID");
-		}
-		root.getRlmChildSession(running.rlm_child_id)?.setSessionName("renamed-running-worker");
-		expect((await root.listRlmSubagents()).subagents[0]?.session_name).toBe("renamed-running-worker");
-
-		await expect(root.runRlmChild("reuse renamed selector", { name: "renamed-running-worker" })).rejects.toThrow(
-			'Agent name "renamed-running-worker" is unavailable: an agent of that name already exists at depth 1 under this parent',
-		);
-		releaseChild();
-		await runPromise;
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		const firstRun = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(first.rlm_child_id)!;
+		await firstRun.publication!.promise;
+		const firstChild = firstRun.session!;
+		// The blocked dispose holds the unwind open past the receipt.
+		vi.spyOn(firstChild, "disposeAsync").mockImplementation(() => unblockUnwind.promise);
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		const forwarded = (
+			root as unknown as {
+				_createRlmSubagentRuntimeOptions(options: Record<string, unknown>): { ignoreSessionIds?: string[] };
+			}
+		)._createRlmSubagentRuntimeOptions({ id: "probe", prompt: "p", sessionName: "reused-worker", model });
+		// The freed id rides along for the daemon host's own name re-assert.
+		expect(forwarded.ignoreSessionIds).toContain(firstChild.sessionId);
+		await root.runRlmChild("second shard", { name: "reused-worker" });
+		unblockUnwind.resolve();
 	});
 
 	it("makes an externally restored retained child listable and deletable", async () => {
@@ -533,23 +601,8 @@ describe("AgentSession rlm recursion", () => {
 		child.setCurrentRecap("restored recap");
 		const disposeChild = vi.spyOn(child, "disposeAsync");
 		const root = createSession();
-		const childStatuses: string[] = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update" && event.child.id === childId) {
-				childStatuses.push(event.child.status);
-			}
-		});
 
 		expect(root.registerRlmChildSession(childId, child)).toBe(true);
-		expect(root.getRlmChildSnapshots()).toEqual([
-			expect.objectContaining({
-				id: childId,
-				answerPreview: "restored answer",
-				toolUseCount: 1,
-				tokenCount: 10,
-				recap: "restored recap",
-			}),
-		]);
 		expect((await root.listRlmSubagents()).subagents).toEqual([
 			expect.objectContaining({
 				rlm_child_id: childId,
@@ -563,41 +616,6 @@ describe("AgentSession rlm recursion", () => {
 		});
 		expect(disposeChild).toHaveBeenCalledOnce();
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		expect(childStatuses).toEqual(["cancelled"]);
-	});
-
-	it("projects live follow-up activity for a restored session-only child", async () => {
-		const childId = "restored-followup-child";
-		const childDir = join(tempDir, childId);
-		mkdirSync(childDir, { recursive: true });
-		const followUpGate = deferred<void>();
-		let followUpStarted = false;
-		const child = createSession({
-			rlmSessionDir: childDir,
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				followUpStarted = true;
-				void followUpGate.promise.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("follow-up answer") });
-				});
-				return stream;
-			},
-		});
-		const root = createSession();
-		expect(root.registerRlmChildSession(childId, child)).toBe(true);
-
-		const followUp = child.prompt("follow-up work");
-		await waitFor(() => followUpStarted);
-		const busy = root.getRlmChildSnapshots();
-		expect(busy).toEqual([expect.objectContaining({ id: childId, status: "done" })]);
-		expect(busy[0]?.activity).toBeDefined();
-
-		followUpGate.resolve();
-		await followUp;
-		await child.waitForIdle();
-		const idle = root.getRlmChildSnapshots();
-		expect(idle).toEqual([expect.objectContaining({ id: childId, status: "done" })]);
-		expect(idle[0]?.activity).toBeUndefined();
 	});
 
 	it("retries and releases failed retained child cleanup on the next compaction", async () => {
@@ -654,112 +672,6 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("keeps live nested children visible when their direct parent is hidden by deletion", () => {
-		const root = createSession();
-		const rootInternals = root as unknown as InspectableRlmSession;
-		const hiddenParents = [
-			{ id: "deleted-parent", hiding: "deleted" as const },
-			{ id: "deleting-parent", hiding: "deleting" as const },
-			{ id: "detached-parent", hiding: "detached" as const },
-		];
-		const parentInternalsToClear: InspectableRlmSession[] = [];
-
-		for (const [index, { id, hiding }] of hiddenParents.entries()) {
-			const parent = createSession({ rlmSessionDir: join(tempDir, id) });
-			const parentInternals = parent as unknown as InspectableRlmSession;
-			parentInternalsToClear.push(parentInternals);
-			const nestedId = `${id}-live-grandchild`;
-			parentInternals._activeRlmChildRuns.set(nestedId, {
-				id: nestedId,
-				prompt: "still working",
-				sessionName: nestedId,
-				sessionDir: join(tempDir, nestedId),
-				model,
-				abort: () => {},
-				status: index === 1 ? "queued" : "running",
-				settled: false,
-			});
-
-			if (hiding === "detached") {
-				rootInternals._activeRlmChildRuns.set(id, {
-					id,
-					prompt: "hidden parent",
-					sessionName: id,
-					sessionDir: join(tempDir, id),
-					model,
-					abort: () => {},
-					status: "cancelled",
-					settled: false,
-					detachedDeletion: {
-						rlm_child_id: id,
-						active_session_id: null,
-						session_id: null,
-						session_name: id,
-						session_dir: join(tempDir, id),
-						status: "running",
-					},
-					session: parent,
-				});
-				// The same child can be visible in both lifecycle registries while
-				// deletion settles; it must be traversed exactly once and remain hidden.
-				rootInternals._rlmChildSessions.set(id, { session: parent });
-			} else {
-				rootInternals._rlmChildSessions.set(id, { session: parent });
-				if (hiding === "deleted") {
-					rootInternals._deletedRlmChildIds.add(id);
-				} else {
-					rootInternals._deletingRlmChildren.set(id, {
-						subagent: {
-							rlm_child_id: id,
-							active_session_id: null,
-							session_id: null,
-							session_name: id,
-							session_dir: join(tempDir, id),
-							status: "completed",
-						},
-						promise: Promise.resolve({
-							subagent: {
-								rlm_child_id: id,
-								active_session_id: null,
-								session_id: null,
-								session_name: id,
-								session_dir: join(tempDir, id),
-								status: "completed",
-							},
-						}),
-					});
-				}
-			}
-		}
-
-		const snapshots = root.getRlmChildSnapshots();
-		expect(snapshots.map((snapshot) => snapshot.id).sort()).toEqual(
-			hiddenParents.map(({ id }) => `${id}-live-grandchild`).sort(),
-		);
-		expect(snapshots.map((snapshot) => snapshot.status).sort()).toEqual(["queued", "running", "running"]);
-		// These are deliberately minimal lifecycle records; remove them before
-		// fixture teardown asks real runs to settle.
-		rootInternals._activeRlmChildRuns.clear();
-		rootInternals._rlmChildSessions.clear();
-		for (const parentInternals of parentInternalsToClear) parentInternals._activeRlmChildRuns.clear();
-		root.dispose();
-	});
-
-	it("makes an orchestrator-chosen name override a custom runtime's preexisting name", async () => {
-		const hostedChild = createSession();
-		hostedChild.setSessionName("factory-assigned-name");
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-
-		await root.runRlmChild("inspect custom runtime", { name: "orchestrator-name" });
-
-		expect(hostedChild.sessionName).toBe("orchestrator-name");
-	});
-
 	it("runs a child session under a sub directory and returns an RLM-shaped result", async () => {
 		const root = createSession({
 			agentMessageController: {
@@ -770,42 +682,20 @@ describe("AgentSession rlm recursion", () => {
 				sendAgentMessage: vi.fn(),
 			},
 		});
-		const childUpdates: Array<{
-			status: string;
-			label: string;
-			answerPreview?: string;
-			tokenCount?: number;
-			toolUseCount?: number;
-		}> = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				childUpdates.push(event.child);
-			}
-		});
 
 		const result = await root.runRlmChild("summarize shard 1");
 
 		expect(result.rlm_child_id).toBe(basename(result.session_dir));
-		expect(result.session_dir).not.toBeNull();
 		expect(basename(result.session_dir!)).toMatch(/^sub-/);
 		expect(dirname(result.session_dir!)).toBe(root.sessionManager.getSessionArtifactDir());
-		expect(existsSync(result.session_dir!)).toBe(true);
 		await waitFor(() => readdirSync(result.session_dir).some((name) => name.endsWith(".jsonl")));
-		expect(childUpdates[0]?.status).toBe("queued");
-		expect(childUpdates[0]?.label).toBe("summarize shard 1");
-		await waitFor(() => childUpdates.some((update) => update.status === "done"));
-		const doneUpdate = [...childUpdates].reverse().find((update) => update.status === "done");
-		expect(doneUpdate?.answerPreview).toBe("child answer: summarize shard 1");
-		expect(root.getRlmChildSnapshots()).toEqual([
-			expect.objectContaining({
-				id: result.rlm_child_id,
-				status: "done",
-				answerPreview: doneUpdate?.answerPreview,
-				durationMs: expect.any(Number),
-			}),
-		]);
+		await waitFor(() => root.getRlmChildSession(result.rlm_child_id)?.getLastAssistantText() !== undefined);
 		const child = root.getRlmChildSession(result.rlm_child_id);
-		expect(child?.messages[0]).toMatchObject({
+		expect(child?.getLastAssistantText()).toBe("child answer: summarize shard 1");
+		expect(getMessageText(child?.messages[0])).toContain(
+			"The persistent memories produced across this session so far:",
+		);
+		expect(child?.messages[1]).toMatchObject({
 			role: "custom",
 			customType: "agent_message",
 			content: "[task from parent]\n\nsummarize shard 1",
@@ -817,12 +707,37 @@ describe("AgentSession rlm recursion", () => {
 				fromRelationship: "parent",
 			},
 		});
-		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
-		expect(doneUpdate?.tokenCount).toBe(10);
-		expect(doneUpdate?.toolUseCount).toBeUndefined();
 	});
 
-	it("marks an in-cell roled send to the parent as replied", async () => {
+	it("wakes the agent with a follow-up when a detached bash handle completes", async () => {
+		const prompts: string[] = [];
+		const root = createSession({
+			streamFn: (_model, context) => {
+				prompts.push(userText(context));
+				return streamAnswer("checked shell result");
+			},
+		});
+		const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
+		const completed = handlers["bash.completed"];
+		if (!completed) throw new Error("Missing bash.completed host handler");
+
+		await expect(completed({ pid: 42, command: "npm test", exitCode: 1 })).resolves.toEqual({});
+		await root.waitForIdle();
+
+		expect(prompts).toEqual(['[bash-done pid:42 exit:1]\n\nCommand: "npm test"']);
+		expect(root.messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+				details: { pid: 42, command: "npm test", exitCode: 1 },
+			}),
+		);
+	});
+
+	it.each([
+		{ label: "an in-cell roled send", payload: { message: "done", receiver_role: "parent" } },
+		{ label: "a broadcast delivery", payload: { target: "all", message: "done" } },
+	])("marks $label to the parent as replied", async ({ payload }) => {
 		const sendAgentMessage = vi.fn(async () => ({
 			id: "agentmsg-reply",
 			source: "agent_message" as const,
@@ -830,36 +745,29 @@ describe("AgentSession rlm recursion", () => {
 			message: "done",
 			deliveryStatus: "delivered" as const,
 		}));
+		const family = vi.fn(async () => [
+			{
+				relationship: "parent" as const,
+				entry: { id: "parent-session", name: "parent", depth: 0, status: "idle" as const },
+			},
+		]);
 		const child = createSession({
 			depth: 1,
-			agentMessageController: {
-				listAgents: () => ({ agents: [] }),
-				roster: () => ({
-					current: { name: "child", id: "child-session", depth: 1 },
-					entries: [{ relationship: "parent", name: "parent", id: "parent-session", depth: 0, status: "idle" }],
-				}),
-				sendAgentMessage,
-			},
+			agentMessageController: { listAgents: () => ({ agents: [] }), family, sendAgentMessage },
 		});
-		const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
-		const send = handlers["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
+		const send = hostHandler(child, "agent_message.send");
 
 		expect(child.repliedToParentSinceTask).toBe(false);
-		await expect(send({ message: "done", receiver_role: "parent" })).resolves.toMatchObject({
-			message: "done",
-		});
+		await expect(send(payload)).resolves.toBeDefined();
 		expect(sendAgentMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ target: "parent-session", message: "done" }),
 		);
+		expect(family).toHaveBeenCalledTimes(1);
 		expect(child.repliedToParentSinceTask).toBe(true);
 	});
 
 	it("resolves a spawned child handle to its published session before a roled send", async () => {
-		let publishChild: (() => void) | undefined;
-		const publicationGate = new Promise<void>((resolve) => {
-			publishChild = resolve;
-		});
+		const publication = deferred<void>();
 		let publishedChild: AgentSession | undefined;
 		const sendAgentMessage = vi.fn(async (input: { target: string; message: string }) => ({
 			id: "agentmsg-child",
@@ -868,29 +776,30 @@ describe("AgentSession rlm recursion", () => {
 			message: input.message,
 			deliveryStatus: "delivered" as const,
 		}));
-		const roster = vi.fn(() => ({
-			current: { name: "root", id: root.sessionId, depth: 0 },
-			entries: publishedChild
+		const family = vi.fn(async () =>
+			publishedChild
 				? [
 						{
 							relationship: "child" as const,
-							name: publishedChild.sessionName ?? publishedChild.sessionId,
-							id: publishedChild.sessionId,
-							depth: 1,
-							status: "running" as const,
+							entry: {
+								id: publishedChild.sessionId,
+								name: publishedChild.sessionName ?? publishedChild.sessionId,
+								depth: 1,
+								status: "running" as const,
+							},
 						},
 					]
 				: [],
-		}));
+		);
 		const root = createSession({
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
-				roster,
+				family,
 				sendAgentMessage,
 			},
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async (options) => {
-					await publicationGate;
+					await publication.promise;
 					const child = createSession({ rlmSessionDir: options.sessionDir });
 					child.setSessionName(options.sessionName);
 					publishedChild = child;
@@ -901,12 +810,7 @@ describe("AgentSession rlm recursion", () => {
 			},
 		});
 		const spawned = await root.runRlmChild("pending task", { name: "pending-child" });
-		expect(root.getRlmChildSnapshots()).toEqual([
-			expect.objectContaining({ id: spawned.rlm_child_id, status: "queued" }),
-		]);
-		const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
-		const send = handlers["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
+		const send = hostHandler(root, "agent_message.send");
 
 		const pendingSend = send({
 			message: "hello",
@@ -914,230 +818,15 @@ describe("AgentSession rlm recursion", () => {
 			receiver_name: spawned.rlm_child_id,
 		});
 		await sleep(0);
-		expect(roster).not.toHaveBeenCalled();
+		expect(family).not.toHaveBeenCalled();
 		expect(sendAgentMessage).not.toHaveBeenCalled();
-		publishChild?.();
+		publication.resolve();
 
 		await expect(pendingSend).resolves.toMatchObject({ message: "hello" });
-		expect(roster).toHaveBeenCalledTimes(1);
+		expect(family).toHaveBeenCalledTimes(1);
 		expect(sendAgentMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ target: publishedChild?.sessionId, message: "hello" }),
 		);
-	});
-
-	it("delivers an id-addressed send after a completed child durably admits its terminal notice", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "completed-child") });
-		const sendAgentMessage = vi.fn(async (input: { target: string; message: string }) => ({
-			id: "agentmsg-completed-child",
-			source: "agent_message" as const,
-			target: { activeSessionId: "child-active", sessionId: input.target },
-			message: input.message,
-			deliveryStatus: "delivered" as const,
-		}));
-		const root = createSession({
-			agentMessageController: {
-				listAgents: () => ({ agents: [] }),
-				roster: () => ({
-					current: { name: "root", id: root.sessionId, depth: 0 },
-					entries: [
-						{
-							relationship: "child" as const,
-							name: child.sessionName ?? child.sessionId,
-							id: child.sessionId,
-							depth: 1,
-							status: "idle" as const,
-						},
-					],
-				}),
-				sendAgentMessage,
-			},
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: child }),
-				deleteRlmSubagentRuntime: async (_id, session) => session?.disposeAsync(),
-			},
-		});
-		const spawned = await root.runRlmChild("completed task", { name: "completed-worker" });
-		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) === child);
-		const internals = root as unknown as InspectableRlmSession;
-		const send = internals._createKernelHostHandlers()["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
-
-		await expect(
-			send({ message: "follow-up", receiver_role: "child", receiver_name: spawned.rlm_child_id }),
-		).resolves.toMatchObject({ message: "follow-up" });
-		expect(sendAgentMessage).toHaveBeenCalledWith(
-			expect.objectContaining({ target: child.sessionId, message: "follow-up" }),
-		);
-	});
-
-	it("propagates pending child startup failure to an immediate roled send", async () => {
-		let rejectStartup: ((error: Error) => void) | undefined;
-		const startupGate = new Promise<never>((_resolve, reject) => {
-			rejectStartup = reject;
-		});
-		const root = createSession({
-			agentMessageController: {
-				listAgents: () => ({ agents: [] }),
-				roster: () => ({
-					current: { name: "root", id: root.sessionId, depth: 0 },
-					entries: [],
-				}),
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: () => startupGate,
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-		const spawned = await root.runRlmChild("pending task", { name: "failing-child" });
-		const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
-		const send = handlers["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
-
-		const pendingSend = send({ message: "hello", receiver_role: "child", receiver_name: spawned.name });
-		rejectStartup?.(new Error("child startup failed"));
-
-		await expect(pendingSend).rejects.toThrow("child startup failed");
-	});
-
-	it("falls through a retained failed child name to a healthy roster child", async () => {
-		let releaseFailureInjection: () => void = () => {};
-		const failureInjectionGate = new Promise<void>((resolve) => {
-			releaseFailureInjection = resolve;
-		});
-		const sendAgentMessage = vi.fn(async (input: { target: string; message: string }) => ({
-			id: "agentmsg-healthy-child",
-			source: "agent_message" as const,
-			target: { activeSessionId: "healthy-active", sessionId: input.target },
-			message: input.message,
-			deliveryStatus: "delivered" as const,
-		}));
-		const root = createSession({
-			agentMessageController: {
-				listAgents: () => ({ agents: [] }),
-				roster: () => ({
-					current: { name: "root", id: root.sessionId, depth: 0 },
-					entries: [
-						{
-							relationship: "child" as const,
-							name: "shared-child",
-							id: "healthy-child-session",
-							depth: 1,
-							status: "idle" as const,
-						},
-					],
-				}),
-				sendAgentMessage,
-			},
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					throw new Error("child startup failed");
-				},
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-		const promptInjectedMessage = vi.fn(async () => failureInjectionGate);
-		(root as unknown as { _promptInjectedMessage: typeof promptInjectedMessage })._promptInjectedMessage =
-			promptInjectedMessage;
-		await root.runRlmChild("failing task", { name: "shared-child" });
-		await waitFor(() =>
-			[...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()].some(
-				(run) => run.status === "error",
-			),
-		);
-		const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
-		const send = handlers["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
-
-		await expect(
-			send({ message: "hello", receiver_role: "child", receiver_name: "shared-child" }),
-		).resolves.toMatchObject({ message: "hello" });
-		expect(sendAgentMessage).toHaveBeenCalledWith(
-			expect.objectContaining({ target: "healthy-child-session", message: "hello" }),
-		);
-		releaseFailureInjection();
-	});
-
-	it("falls through a delete-before-startup tombstone during a roled send", async () => {
-		let releaseRuntimeCreation: () => void = () => {};
-		const runtimeCreationGate = new Promise<void>((resolve) => {
-			releaseRuntimeCreation = resolve;
-		});
-		let runtimeCreationStarted = false;
-		const hostedChild = createSession();
-		const root = createSession({
-			agentMessageController: {
-				listAgents: () => ({ agents: [] }),
-				roster: () => ({
-					current: { name: "root", id: root.sessionId, depth: 0 },
-					entries: [],
-				}),
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					runtimeCreationStarted = true;
-					await runtimeCreationGate;
-					return { session: hostedChild };
-				},
-				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
-			},
-		});
-		await root.runRlmChild("blocked startup", { name: "deleted-child" });
-		await waitFor(() => runtimeCreationStarted);
-		await root.deleteRlmSubagent("deleted-child");
-		const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
-		const send = handlers["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
-
-		await expect(send({ message: "hello", receiver_role: "child", receiver_name: "deleted-child" })).rejects.toThrow(
-			'No child matches "deleted-child"',
-		);
-		releaseRuntimeCreation();
-		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
-	});
-
-	it("marks a broadcast delivery to the parent as replied without reloading the roster", async () => {
-		const roster = vi.fn(() => ({
-			current: { name: "child", id: "child-session", depth: 1 },
-			entries: [
-				{
-					relationship: "parent" as const,
-					name: "parent",
-					id: "parent-session",
-					depth: 0,
-					status: "idle" as const,
-				},
-			],
-		}));
-		const sendAgentMessage = vi.fn(async () => ({
-			id: "agentmsg-broadcast-reply",
-			source: "agent_message" as const,
-			target: { activeSessionId: "parent-active", sessionId: "parent-session" },
-			message: "status",
-			deliveryStatus: "delivered" as const,
-		}));
-		const child = createSession({
-			depth: 1,
-			agentMessageController: {
-				listAgents: () => ({ agents: [] }),
-				roster,
-				sendAgentMessage,
-			},
-		});
-		const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
-		const send = handlers["agent_message.send"];
-		if (!send) throw new Error("Missing agent_message.send host handler");
-
-		await expect(send({ target: "all", message: "status" })).resolves.toMatchObject({
-			receipts: [{ message: "status" }],
-		});
-		expect(roster).toHaveBeenCalledTimes(1);
-		expect(child.repliedToParentSinceTask).toBe(true);
 	});
 
 	it("routes family messages with sender-perspective labels and resets parent steer reply state", async () => {
@@ -1195,7 +884,9 @@ describe("AgentSession rlm recursion", () => {
 			origin: "agent",
 		});
 		const reply = findLastMessage(parent.messages, isAgentSessionMessage);
-		expect(reply && isAgentSessionMessage(reply) ? reply.content : undefined).toContain("[from child:worker]");
+		expect(reply && isAgentSessionMessage(reply) ? reply.content : undefined).toContain(
+			"[agent-message from child:worker]",
+		);
 
 		await internals.sendAgentSessionMessage({
 			targetSelector: childState.activeSessionId,
@@ -1204,11 +895,16 @@ describe("AgentSession rlm recursion", () => {
 			origin: "agent",
 		});
 		const steer = findLastMessage(child.messages, isAgentSessionMessage);
-		expect(steer && isAgentSessionMessage(steer) ? steer.content : undefined).toContain("[from parent]");
+		expect(steer && isAgentSessionMessage(steer) ? steer.content : undefined).toContain(
+			"[agent-message from parent:",
+		);
 		expect(child.repliedToParentSinceTask).toBe(false);
 	});
 
-	it("resets replied state when a parent message is accepted", async () => {
+	it.each([
+		{ label: "a parent message is accepted", queued: false },
+		{ label: "a parent follow-up is queued", queued: true },
+	])("resets replied state when $label", async ({ queued }) => {
 		const child = createSession({ depth: 1 });
 		(child as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
 		const message = createAgentSessionMessage({
@@ -1219,23 +915,8 @@ describe("AgentSession rlm recursion", () => {
 			target: { activeSessionId: "child-active", sessionId: child.sessionId },
 		});
 
-		await child.acceptAgentMessagePrompt(message.content as string, { customMessage: message });
-
-		expect(child.repliedToParentSinceTask).toBe(false);
-	});
-
-	it("resets replied state when a parent follow-up is queued", async () => {
-		const child = createSession({ depth: 1 });
-		(child as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
-		const message = createAgentSessionMessage({
-			id: "agentmsg-parent-follow-up",
-			source: "agent_message",
-			message: "continue",
-			fromRelationship: "parent",
-			target: { activeSessionId: "child-active", sessionId: child.sessionId },
-		});
-
-		await child.queueAgentMessagePrompt(message.content as string, "followUp", message);
+		if (queued) await child.queueAgentMessagePrompt(message.content as string, "followUp", message);
+		else await child.acceptAgentMessagePrompt(message.content as string, { customMessage: message });
 
 		expect(child.repliedToParentSinceTask).toBe(false);
 	});
@@ -1259,21 +940,11 @@ describe("AgentSession rlm recursion", () => {
 				deleteRlmSubagentRuntime: async () => {},
 			},
 		});
-		const childUpdates: Array<{ status: string; error?: string }> = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				childUpdates.push({ status: event.child.status, error: event.child.error });
-			}
-		});
 
 		const spawned = await root.runRlmChild("start failing child", { name: "failing-worker" });
 		await vi.waitFor(async () => {
 			expect((await root.listRlmSubagents()).subagents).toContainEqual(
-				expect.objectContaining({
-					rlm_child_id: spawned.rlm_child_id,
-					status: "error",
-					error: "kernel startup failed",
-				}),
+				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "error" }),
 			);
 		});
 		await vi.waitFor(() => {
@@ -1288,105 +959,50 @@ describe("AgentSession rlm recursion", () => {
 				expect.objectContaining({ content: expect.stringContaining("kernel startup failed") }),
 			);
 		});
-		// A terminal run that never bound a session leaves no row anywhere: the
-		// terminal update is the cancelled removal signal and snapshots skip the run.
-		expect(childUpdates.at(-1)).toEqual({ status: "cancelled", error: "kernel startup failed" });
-		expect(root.getRlmChildSnapshots()).toEqual([]);
 	});
 
-	it("normalizes and bounds startup failures in the subagent registry", async () => {
-		let attempt = 0;
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					throw new Error(attempt++ === 0 ? "" : "x".repeat(1_000));
-				},
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-
-		await root.runRlmChild("start empty-error child", { name: "empty-error-worker" });
-		await root.runRlmChild("start long-error child", { name: "long-error-worker" });
-		await vi.waitFor(async () => {
-			const subagents = (await root.listRlmSubagents()).subagents;
-			expect(subagents).toContainEqual(
-				expect.objectContaining({
-					status: "error",
-					error: "Subagent failed without an error message",
-				}),
-			);
-			expect(subagents).toContainEqual(
-				expect.objectContaining({
-					session_name: "long-error-worker",
-					status: "error",
-					error: `${"x".repeat(509)}...`,
-				}),
-			);
-		});
-		await vi.waitFor(() => {
-			expect(root.messages).toContainEqual(
-				expect.objectContaining({
-					customType: "rlm_child_failure",
-					content: expect.stringContaining("x".repeat(1_000)),
-				}),
-			);
-		});
-	});
-
-	it("injects exactly one cancellation notice when a child run is cancelled", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("late child answer") });
-				});
-				return stream;
-			},
-		});
-
-		const spawned = await root.runRlmChild("slow child", { name: "cancel-worker" });
-		await waitFor(() => childStarted);
-		expect(root.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
-		releaseChild();
-		await vi.waitFor(() => {
-			const notices = root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			);
-			expect(notices).toHaveLength(1);
-			expect(notices[0]).toMatchObject({
-				content: expect.stringContaining(
-					`RLM child cancel-worker (${spawned.rlm_child_id}) was cancelled: Cancelled by user`,
-				),
+	it.each([
+		{
+			label: "cancellation",
+			cancel: true,
+			expected: {
+				content: "[child-exited: cancelled child:notice-worker]\n\nCancelled by user",
 				details: { kind: "cancelled", reason: "Cancelled by user" },
-			});
-		});
-	});
+			},
+		},
+		{
+			label: "no-reply completion",
+			cancel: false,
+			expected: {
+				content: "[child-exited: no-reply child:notice-worker]\n\nLast assistant text: child answer: notice task",
+				details: { kind: "completed_without_reply", lastAssistantTextPreview: "child answer: notice task" },
+			},
+		},
+	])("injects exactly one $label notice for a child run", async ({ cancel, expected }) => {
+		const { root, releaseChild, hasStarted } = createGatedRoot();
 
-	it("injects exactly one notice with a preview when a child completes without replying", async () => {
-		const root = createSession();
-
-		const spawned = await root.runRlmChild("silent child", { name: "silent-worker" });
-		await vi.waitFor(() => {
-			const notices = root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			);
-			expect(notices).toHaveLength(1);
-			expect(notices[0]).toMatchObject({
-				content: expect.stringContaining(
-					`RLM child silent-worker (${spawned.rlm_child_id}) completed without sending a reply`,
-				),
-				details: {
-					kind: "completed_without_reply",
-					lastAssistantTextPreview: "child answer: silent child",
-				},
-			});
+		const spawned = await root.runRlmChild("notice task", { name: "notice-worker" });
+		await waitFor(hasStarted);
+		const noticeAdmitted = deferred<void>();
+		const unsubscribe = root.subscribe((event) => {
+			if (
+				event.type === "message_start" &&
+				event.message.role === "custom" &&
+				event.message.customType === "rlm_child_terminal_notice"
+			) {
+				noticeAdmitted.resolve();
+			}
 		});
+		try {
+			if (cancel) expect(root.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
+			releaseChild();
+			await noticeAdmitted.promise;
+		} finally {
+			unsubscribe();
+		}
+
+		expect(terminalNotices(root)).toHaveLength(1);
+		expect(terminalNotices(root)[0]).toMatchObject(expected);
 	});
 
 	it("suppresses a done child's unsettled fallback notice at the cancellation cut", async () => {
@@ -1401,11 +1017,34 @@ describe("AgentSession rlm recursion", () => {
 		await root.runRlmChild("silent child at cancellation cut", { name: "suppressed-worker" });
 		await root.waitForRlmQuiescence();
 		expect(suppressed).toBe(true);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
+		expect(terminalNotices(root)).toHaveLength(0);
+	});
+
+	it("skips rlm_child_update re-emission for streamed deltas that change no observable state", async () => {
+		const { root, hostedChild: child, releaseStartup } = createStartupGatedRoot();
+		child.agent.streamFn = () => createAssistantMessageEventStream(); // held open: no terminal event
+		await root.runRlmChild("stream one long answer", { name: "saturating-worker" });
+		releaseStartup();
+		const run = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]!;
+		await run.publication!.promise;
+		const childUpdates: RlmChildAgentSnapshot[] = [];
+		root.subscribe((event) => event.type === "rlm_child_update" && childUpdates.push(event.child));
+		const emit = (child as unknown as { _emit(event: unknown): void })._emit.bind(child);
+		for (const l of [50, 200, 210, 220]) {
+			// Hold the streamed-delta window open on every delta: this case pins the
+			// observable-state dedup, while coalescing inside one window is covered by
+			// the rlm-progress-notes cases.
+			run.lastStreamedUpdateMonotonicAt = performance.now() - RLM_CHILD_UPDATE_MIN_INTERVAL_MS - 1;
+			emit({ type: "message_start", message: assistantMessage("w".repeat(l)) });
+		}
+		// The preview keeps only the 160-char message tail, so both deltas past the cap
+		// reproduce the previous preview byte for byte and emit nothing.
+		expect(childUpdates.map((snapshot) => snapshot.answerPreview)).toEqual([
+			compactRlmText("w".repeat(50)),
+			compactRlmText("w".repeat(160)),
+		]);
+		emit({ type: "agent_end", messages: [] }); // a real change (the activity) emits again
+		expect(childUpdates.at(-1)?.activity).toBeUndefined();
 	});
 
 	it("does not inject a terminal notice when a parent follow-up resets reply state after a reply", async () => {
@@ -1414,10 +1053,9 @@ describe("AgentSession rlm recursion", () => {
 			rlmSessionDir: join(tempDir, "replying-child"),
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
-				roster: () => ({
-					current: { name: "reply-worker", id: child.sessionId, depth: 1 },
-					entries: [{ relationship: "parent", name: "parent", id: "parent-session", depth: 0, status: "idle" }],
-				}),
+				family: async () => [
+					{ relationship: "parent", entry: { id: "parent-session", name: "parent", depth: 0, status: "idle" } },
+				],
 				sendAgentMessage: async () => ({
 					id: "agentmsg-reply-before-follow-up",
 					source: "agent_message",
@@ -1454,113 +1092,64 @@ describe("AgentSession rlm recursion", () => {
 				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
 			);
 		});
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
+		expect(terminalNotices(root)).toHaveLength(0);
 	});
 
 	it("notifies after detached startup deletion cleanup settles", async () => {
-		let releaseRuntimeCreation: () => void = () => {};
-		const runtimeCreationGate = new Promise<void>((resolve) => {
-			releaseRuntimeCreation = resolve;
-		});
-		let runtimeCreationStarted = false;
-		const child = createSession({ rlmSessionDir: join(tempDir, "deleted-child") });
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					runtimeCreationStarted = true;
-					await runtimeCreationGate;
-					return { session: child };
-				},
-				deleteRlmSubagentRuntime: async (_id, session) => session?.disposeAsync(),
-			},
-		});
+		const { root, releaseStartup, hasStarted } = createStartupGatedRoot();
 
 		const spawned = await root.runRlmChild("delete before startup", { name: "deleted-worker" });
-		await waitFor(() => runtimeCreationStarted);
+		await waitFor(hasStarted);
 		await root.deleteRlmSubagent(spawned.rlm_child_id);
-		releaseRuntimeCreation();
+		releaseStartup();
 		await waitFor(() => !(root as unknown as InspectableRlmSession)._activeRlmChildRuns.has(spawned.rlm_child_id));
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toEqual([
+		expect(terminalNotices(root)).toEqual([
 			expect.objectContaining({
 				details: expect.objectContaining({ kind: "cancelled", reason: "Deleted by parent orchestrator" }),
 			}),
 		]);
 	});
 
-	it("fully deletes a settled startup failure and frees its session name", async () => {
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					throw new Error("kernel startup failed");
-				},
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-		const spawned = await root.runRlmChild("start failing child", { name: "reusable-worker" });
-		const internals = root as unknown as InspectableRlmSession;
-		await vi.waitFor(() => expect(internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.settled).toBe(true));
-
-		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).resolves.toMatchObject({
-			subagent: { rlm_child_id: spawned.rlm_child_id, session_name: "reusable-worker" },
-		});
-
-		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		expect(internals._activeRlmChildRuns.has(spawned.rlm_child_id)).toBe(false);
-		await expect(root.runRlmChild("replacement child", { name: "reusable-worker" })).resolves.toMatchObject({
-			name: "reusable-worker",
-		});
-	});
-
-	it("releases a hosted child when its initial task fails", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "host-error-child") });
-		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
+	it.each([
+		{ label: "its initial task fails", failCompletion: false },
+		{ label: "completion persistence fails", failCompletion: true },
+	])("releases a hosted child when $label", async ({ failCompletion }) => {
+		const child = createSession({ rlmSessionDir: join(tempDir, "host-release-child") });
+		const disposeChild = vi.spyOn(child, "disposeAsync");
+		if (!failCompletion) vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
 		const releaseRlmSubagentRuntime = vi.fn(async () => {});
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
+				completeRlmSubagentRuntime: failCompletion ? () => false : undefined,
 				releaseRlmSubagentRuntime,
 				deleteRlmSubagentRuntime: async () => {},
 			},
 		});
 
-		const spawned = await root.runRlmChild("fail hosted child");
-		await vi.waitFor(() => {
-			expect(releaseRlmSubagentRuntime).toHaveBeenCalledWith(
-				expect.objectContaining({ session: child }),
-				expect.objectContaining({ id: spawned.rlm_child_id }),
-				"error",
-			);
-		});
+		const spawned = await root.runRlmChild("release the hosted child");
+		await root.waitForRlmQuiescence();
+		expect(releaseRlmSubagentRuntime).toHaveBeenCalledWith(
+			expect.objectContaining({ session: child }),
+			expect.objectContaining({ id: spawned.rlm_child_id }),
+			"error",
+		);
+		expect(disposeChild).not.toHaveBeenCalled();
+		// A failed completion leaves no run behind; a failed task keeps the settled
+		// error run addressable for deletion.
+		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.size).toBe(failCompletion ? 0 : 1);
+		if (failCompletion) expect(root.getRlmChildSession(spawned.rlm_child_id)).toBeUndefined();
 	});
 
 	it("strong quiescence waits for a gated child bash activity change", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "bash-active-child") });
-		const bashStarted = deferred<void>();
-		const bashCompletion = deferred<void>();
-		const operations: BashOperations = {
-			exec: async () => {
-				bashStarted.resolve();
-				await bashCompletion.promise;
-				return { exitCode: 0 };
-			},
-		};
-		const bash = child.executeBash("gated", undefined, { operations });
-		await bashStarted.promise;
-
-		await expect(child.waitForIdle()).resolves.toBeUndefined();
+		const child = gatedBashChild("bash-active-child");
+		await child.started;
+		await expect(child.session.waitForIdle()).resolves.toBeUndefined();
 		const root = createSession();
-		expect(root.registerRlmChildSession("bash-active-child", child)).toBe(true);
-		const originalHeadlessIdle = child.waitForHeadlessIdle.bind(child);
+		expect(root.registerRlmChildSession("bash-active-child", child.session)).toBe(true);
+		const originalHeadlessIdle = child.session.waitForHeadlessIdle.bind(child.session);
 		let headlessIdleCalls = 0;
-		vi.spyOn(child, "waitForHeadlessIdle").mockImplementation(async () => {
+		vi.spyOn(child.session, "waitForHeadlessIdle").mockImplementation(async () => {
 			headlessIdleCalls++;
 			await originalHeadlessIdle();
 		});
@@ -1576,34 +1165,23 @@ describe("AgentSession rlm recursion", () => {
 		expect(firstBoundary).toBe("timer");
 		expect(headlessIdleCalls).toBe(1);
 
-		bashCompletion.resolve();
-		await bash;
+		child.completion.resolve();
+		await child.bash;
 		await expect(quiescence).resolves.toBeUndefined();
 		expect(headlessIdleCalls).toBe(2);
 	});
 
 	it("rechecks parent self-activity after a child quiescence boundary", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "boundary-active-child") });
-		const childBashStarted = deferred<void>();
-		const childBashCompletion = deferred<void>();
-		const childBash = child.executeBash("child-boundary-gate", undefined, {
-			operations: {
-				exec: async () => {
-					childBashStarted.resolve();
-					await childBashCompletion.promise;
-					return { exitCode: 0 };
-				},
-			},
-		});
-		await childBashStarted.promise;
+		const child = gatedBashChild("boundary-active-child");
+		await child.started;
 		const parentBashStarted = deferred<void>();
 		const parentBashCompletion = deferred<void>();
 		const root = createSession();
-		expect(root.registerRlmChildSession("boundary-active-child", child)).toBe(true);
-		const originalChildQuiescence = child.waitForRlmQuiescence.bind(child);
+		expect(root.registerRlmChildSession("boundary-active-child", child.session)).toBe(true);
+		const originalChildQuiescence = child.session.waitForRlmQuiescence.bind(child.session);
 		const childWaitStarted = deferred<void>();
 		let parentBash: Promise<unknown> | undefined;
-		vi.spyOn(child, "waitForRlmQuiescence").mockImplementation(async (signal) => {
+		vi.spyOn(child.session, "waitForRlmQuiescence").mockImplementation(async (signal) => {
 			childWaitStarted.resolve();
 			await originalChildQuiescence(signal);
 			parentBash = root.executeBash("parent-boundary-gate", undefined, {
@@ -1618,101 +1196,58 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		const quiescence = root.waitForRlmQuiescence();
-		await childWaitStarted.promise;
-		childBashCompletion.resolve();
-		await childBash;
-		const parentBoundaryStarted = await Promise.race([
-			parentBashStarted.promise.then(() => true),
-			sleep(200).then(() => false),
-		]);
-		expect(parentBoundaryStarted).toBe(true);
-		const boundary = await Promise.race([
+		const firstBoundary = Promise.race([
 			quiescence.then(() => "quiesced" as const),
-			sleep(20).then(() => "active" as const),
+			parentBashStarted.promise.then(() => "parent-active" as const),
 		]);
-		expect(boundary).toBe("active");
+		await childWaitStarted.promise;
+		child.completion.resolve();
+		await child.bash;
+		expect(await firstBoundary).toBe("parent-active");
 
 		parentBashCompletion.resolve();
 		await parentBash;
-		const finalBoundary = await Promise.race([
-			quiescence.then(() => "quiesced" as const),
-			sleep(200).then(() => "blocked" as const),
-		]);
-		expect(finalBoundary).toBe("quiesced");
+		await expect(quiescence).resolves.toBeUndefined();
 	});
 
-	it("propagates root quiescence cancellation into a child self-active waiter", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "cancelled-bash-active-child") });
-		const bashStarted = deferred<void>();
-		const bashCompletion = deferred<void>();
-		const operations: BashOperations = {
-			exec: async () => {
-				bashStarted.resolve();
-				await bashCompletion.promise;
-				return { exitCode: 0 };
-			},
-		};
-		const bash = child.executeBash("cancelled-gate", undefined, { operations });
-		await bashStarted.promise;
+	it.each([
+		{ label: "the root aborts", abortRoot: true },
+		{ label: "one child wait fails", abortRoot: false },
+	])("cancels every recursive quiescence waiter when $label", async ({ abortRoot }) => {
+		const childA = gatedBashChild("failing-wait-child");
+		const childB = gatedBashChild("sibling-wait-child");
+		await Promise.all([childA.started, childB.started]);
 		const root = createSession();
-		expect(root.registerRlmChildSession("cancelled-bash-active-child", child)).toBe(true);
+		expect(root.registerRlmChildSession("failing-wait-child", childA.session)).toBe(true);
+		expect(root.registerRlmChildSession("sibling-wait-child", childB.session)).toBe(true);
+		const childAWaitStarted = deferred<void>();
+		const childBWaitStarted = deferred<void>();
+		const originalChildAWait = childA.session.waitForRlmQuiescence.bind(childA.session);
+		const originalChildBWait = childB.session.waitForRlmQuiescence.bind(childB.session);
+		vi.spyOn(childA.session, "waitForRlmQuiescence").mockImplementation(async (signal) => {
+			childAWaitStarted.resolve();
+			return originalChildAWait(signal);
+		});
+		vi.spyOn(childB.session, "waitForRlmQuiescence").mockImplementation(async (signal) => {
+			childBWaitStarted.resolve();
+			return originalChildBWait(signal);
+		});
 
 		const quiescence = root.waitForRlmQuiescence();
-		await vi.waitFor(() => expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1));
-		root.requestAbort();
+		await Promise.all([childAWaitStarted.promise, childBWaitStarted.promise]);
+		expect(quiescenceWaitAborts(childA.session)).toBe(1);
+		expect(quiescenceWaitAborts(childB.session)).toBe(1);
+		if (abortRoot) root.requestAbort();
+		else childA.session.requestAbort();
+
 		await expect(quiescence).rejects.toThrow("RLM quiescence wait cancelled");
-		expect(child.isBashRunning).toBe(true);
-		expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(0);
+		expect(quiescenceWaitAborts(childA.session)).toBe(0);
+		expect(quiescenceWaitAborts(childB.session)).toBe(0);
+		expect(childB.session.isBashRunning).toBe(true);
 
-		bashCompletion.resolve();
-		await bash;
-	});
-
-	it("cancels sibling recursive waiters when one child quiescence wait fails", async () => {
-		const childAStarted = deferred<void>();
-		const childACompletion = deferred<void>();
-		const childA = createSession({ rlmSessionDir: join(tempDir, "failing-wait-child") });
-		const childABash = childA.executeBash("child-a-gate", undefined, {
-			operations: {
-				exec: async () => {
-					childAStarted.resolve();
-					await childACompletion.promise;
-					return { exitCode: 0 };
-				},
-			},
-		});
-		const childBStarted = deferred<void>();
-		const childBCompletion = deferred<void>();
-		const childB = createSession({ rlmSessionDir: join(tempDir, "sibling-wait-child") });
-		const childBBash = childB.executeBash("child-b-gate", undefined, {
-			operations: {
-				exec: async () => {
-					childBStarted.resolve();
-					await childBCompletion.promise;
-					return { exitCode: 0 };
-				},
-			},
-		});
-		await Promise.all([childAStarted.promise, childBStarted.promise]);
-		const root = createSession();
-		expect(root.registerRlmChildSession("failing-wait-child", childA)).toBe(true);
-		expect(root.registerRlmChildSession("sibling-wait-child", childB)).toBe(true);
-
-		const quiescence = root.waitForRlmQuiescence();
-		await vi.waitFor(() => {
-			expect((childA as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
-			expect((childB as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
-		});
-		childA.requestAbort();
-		await expect(quiescence).rejects.toThrow("RLM quiescence wait cancelled");
-		await vi.waitFor(() =>
-			expect((childB as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(0),
-		);
-		expect(childB.isBashRunning).toBe(true);
-
-		childACompletion.resolve();
-		childBCompletion.resolve();
-		await Promise.all([childABash, childBBash]);
+		childA.completion.resolve();
+		childB.completion.resolve();
+		await Promise.all([childA.bash, childB.bash]);
 	});
 
 	it("durably defers a child terminal notice across ACP-style input pause and scheduler suspension", async () => {
@@ -1729,7 +1264,7 @@ describe("AgentSession rlm recursion", () => {
 			rlmSessionDir: join(tempDir, "paused-terminal-child"),
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
-				roster: () => ({ current: { name: "child", id: "child", depth: 1 }, entries: [] }),
+				family: async () => [],
 				sendAgentMessage: synthesizedAgentMessageSend,
 			},
 			streamFn: (_model, context) => {
@@ -1793,20 +1328,12 @@ describe("AgentSession rlm recursion", () => {
 		root.resumeQueuedWork();
 		await expect(root.waitForIdle()).resolves.toBeUndefined();
 		expect(parentNoticeTurns).toBe(0);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
+		expect(terminalNotices(root)).toHaveLength(0);
 
 		inputPause.release();
 		await expect(quiescence).resolves.toBeUndefined();
 		expect(parentNoticeTurns).toBe(1);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(1);
+		expect(terminalNotices(root)).toHaveLength(1);
 
 		let restoredNoticeTurns = 0;
 		const restored = createSession({
@@ -1818,11 +1345,7 @@ describe("AgentSession rlm recursion", () => {
 		restored.restorePendingNextTurnMessages(restartSnapshot);
 		await restored.waitForRlmQuiescence();
 		expect(restoredNoticeTurns).toBe(1);
-		expect(
-			restored.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(1);
+		expect(terminalNotices(restored)).toHaveLength(1);
 		root.dispose();
 	});
 
@@ -1881,67 +1404,7 @@ describe("AgentSession rlm recursion", () => {
 		inputPause.release();
 		await root.waitForRlmQuiescence();
 		expect(parentNoticeTurns).toBe(1);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(1);
-	});
-
-	it("linearizes terminal retention after an update checkpoint snapshot", async () => {
-		const childStarted = deferred<void>();
-		const childCompletion = deferred<void>();
-		const child = createSession({
-			rlmSessionDir: join(tempDir, "update-checkpoint-terminal-child"),
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				childStarted.resolve();
-				void childCompletion.promise.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("child finished for update") });
-				});
-				return stream;
-			},
-		});
-		let parentNoticeTurns = 0;
-		const root = createSession({
-			streamFn: () => {
-				parentNoticeTurns++;
-				return streamAnswer("parent processed update terminal notice");
-			},
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: child }),
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-
-		const spawned = await root.runRlmChild("finish at update snapshot", { name: "update-terminal-worker" });
-		await childStarted.promise;
-		const updatePause = root.acquireQueuedWorkPause();
-		childCompletion.resolve();
-		const internals = root as unknown as InspectableRlmSession;
-		await vi.waitFor(() => expect(internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.status).toBe("done"));
-		await root.waitForSessionInputCheckpoint();
-		const pendingSnapshot = root.getPendingNextTurnMessageSnapshots();
-		const actionSnapshot = root.getSessionActionRecoverySnapshot();
-		expect(pendingSnapshot.filter((message) => message.customType === "rlm_child_terminal_notice")).toHaveLength(0);
-		expect(
-			actionSnapshot.actions.filter(
-				(action) =>
-					action.payload.kind === "turn" &&
-					action.payload.customMessage?.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
-		expect(internals._unsettledRlmChildRuns.size).toBe(1);
-		expect(internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.settled).toBe(false);
-
-		updatePause.release();
-		await root.waitForRlmQuiescence();
-		expect(parentNoticeTurns).toBe(1);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(1);
+		expect(terminalNotices(root)).toHaveLength(1);
 	});
 
 	it("keeps settled error deletion in quiescence through cleanup retry", async () => {
@@ -1973,12 +1436,10 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._rlmChildSessions.has(spawned.rlm_child_id)).toBe(false);
 		expect(internals._unsettledRlmChildRuns.has(run)).toBe(false);
 
-		await expect(root.deleteRlmSubagent("settled-error-worker")).resolves.toMatchObject({
-			subagent: { rlm_child_id: spawned.rlm_child_id },
-		});
-		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).resolves.toMatchObject({
-			subagent: { rlm_child_id: spawned.rlm_child_id },
-		});
+		// Name and id select the same settled run, and concurrent deletes coalesce.
+		await expect(
+			Promise.all([root.deleteRlmSubagent("settled-error-worker"), root.deleteRlmSubagent(spawned.rlm_child_id)]),
+		).resolves.toHaveLength(2);
 		expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce();
 		expect(run.settled).toBe(false);
 		expect(internals._unsettledRlmChildRuns.has(run)).toBe(true);
@@ -2002,9 +1463,6 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.deleteRlmSubagent("settled-error-worker")).resolves.toMatchObject({
 			subagent: { rlm_child_id: spawned.rlm_child_id },
 		});
-		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).resolves.toMatchObject({
-			subagent: { rlm_child_id: spawned.rlm_child_id },
-		});
 		expect(deleteRlmSubagentRuntime).toHaveBeenCalledTimes(2);
 		await sleep(20);
 		expect(quiesced).toBe(false);
@@ -2020,67 +1478,6 @@ describe("AgentSession rlm recursion", () => {
 		).resolves.toMatchObject({
 			name: "settled-error-worker",
 		});
-	});
-
-	it("notifies the runtime host when the initial child task completes", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "host-completion-child") });
-		const completeRlmSubagentRuntime = vi.fn(() => true);
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: child }),
-				completeRlmSubagentRuntime,
-				deleteRlmSubagentRuntime: async (_id, session) => session?.disposeAsync(),
-			},
-		});
-
-		const spawned = await root.runRlmChild("persist completion");
-		await vi.waitFor(() => {
-			expect(completeRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, child);
-		});
-		expect((await root.listRlmSubagents()).subagents).toContainEqual(
-			expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
-		);
-	});
-
-	it("projects retained child follow-up turns into parent child-update activity", async () => {
-		let releaseInitial: () => void = () => {};
-		const initialGate = new Promise<void>((resolve) => {
-			releaseInitial = resolve;
-		});
-		let releaseFollowUp: () => void = () => {};
-		const followUpGate = new Promise<void>((resolve) => {
-			releaseFollowUp = resolve;
-		});
-		const events: Array<{ status: string; activity?: { kind: string } }> = [];
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				void (text === "initial" ? initialGate : followUpGate).then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage(`answer: ${text}`) });
-				});
-				return stream;
-			},
-		});
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				events.push({ status: event.child.status, activity: event.child.activity });
-			}
-		});
-
-		const spawned = await root.runRlmChild("initial");
-		await waitFor(() => events.some((event) => event.status === "running" && event.activity?.kind === "waiting"));
-		releaseInitial();
-		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) !== undefined);
-		await waitFor(() => events.at(-1)?.status === "done" && events.at(-1)?.activity === undefined);
-
-		const child = root.getRlmChildSession(spawned.rlm_child_id);
-		if (!child) throw new Error("Missing retained child session");
-		const followUp = child.prompt("follow-up");
-		await waitFor(() => events.at(-1)?.status === "done" && events.at(-1)?.activity?.kind === "waiting");
-		releaseFollowUp();
-		await followUp;
-		await waitFor(() => events.at(-1)?.status === "done" && events.at(-1)?.activity === undefined);
 	});
 
 	it("lists a completed child with its parent-scoped messaging identity until disposal", async () => {
@@ -2119,15 +1516,12 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		const result = await root.runRlmChild("retained worker");
-		if (!result.session_dir) {
-			throw new Error("Missing child session directory");
-		}
+		if (!result.session_dir) throw new Error("Missing child session directory");
 		daemonChildId = basename(result.session_dir);
 		await waitFor(() => root.getRlmChildSession(daemonChildId)?.getLastAssistantText() !== undefined);
 
-		expect(root.getRlmChildSession(daemonChildId)?.getLastAssistantText()).toBe("child answer: retained worker");
+		// Only the parent's own daemon child contributes the messaging identity.
 		const expectedSessionName = createDefaultRlmSubagentSessionName("retained worker", daemonChildId);
-		expect(root.getRlmChildSession(daemonChildId)?.sessionName).toBe(expectedSessionName);
 		const expectedRegistry = {
 			subagents: [
 				{
@@ -2137,31 +1531,19 @@ describe("AgentSession rlm recursion", () => {
 					session_name: expectedSessionName,
 					session_dir: result.session_dir,
 					status: "completed",
+					answer_preview: "child answer: retained worker",
+					duration_ms: expect.any(Number),
+					label: "retained worker",
+					last_activity_at: expect.any(Number),
+					replied_since_task: false,
 				},
 			],
 		};
 		expect(await root.listRlmSubagents()).toEqual(expectedRegistry);
-		const inspectable = root as unknown as InspectableRlmSession;
-		const conflictingDeletion = {
-			...expectedRegistry.subagents[0],
-			rlm_child_id: "deleting-child",
-			session_name: daemonChildId,
-			status: "completed" as const,
-		};
-		inspectable._deletingRlmChildren.set("deleting-child", {
-			subagent: conflictingDeletion,
-			promise: Promise.resolve({ subagent: conflictingDeletion }),
-		});
-		await expect(root.deleteRlmSubagent(daemonChildId)).rejects.toThrow("is ambiguous");
-		inspectable._deletingRlmChildren.delete("deleting-child");
-
-		const handlers = inspectable._createKernelHostHandlers();
-		const listHandler = handlers["rlm.list_subagents"];
-		const deleteHandler = handlers["rlm.delete_subagent"];
-		if (!listHandler || !deleteHandler) {
-			throw new Error("Missing RLM subagent registry host handlers");
-		}
+		const listHandler = hostHandler(root, "rlm.list_subagents");
+		const deleteHandler = hostHandler(root, "rlm.delete_subagent");
 		await expect(listHandler({})).resolves.toEqual(expectedRegistry);
+
 		await expect(deleteHandler({ target: expectedSessionName })).resolves.toEqual({
 			subagent: expectedRegistry.subagents[0],
 		});
@@ -2282,193 +1664,6 @@ describe("AgentSession rlm recursion", () => {
 		expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce();
 	});
 
-	it("disposes an inline child when setting its session name fails", async () => {
-		const root = createSession();
-		const appendSessionInfo = vi.spyOn(SessionManager.prototype, "appendSessionInfo").mockImplementation(() => {
-			throw new Error("session info failed");
-		});
-		const dispose = vi.spyOn(AgentSession.prototype, "dispose");
-		try {
-			const spawned = await root.runRlmChild("inline naming failure", { name: "bad-name" });
-			expect(spawned.rlm_child_id).toMatch(/^sub-/);
-			await waitFor(() => dispose.mock.calls.length > 0);
-		} finally {
-			appendSessionInfo.mockRestore();
-			dispose.mockRestore();
-		}
-	});
-
-	it("emits updated child session names after a retained child is renamed", async () => {
-		const root = createSession();
-		const events: unknown[] = [];
-		root.subscribe((event) => events.push(event));
-
-		const result = await root.runRlmChild("rename after completion", { name: "original-worker" });
-		if (!result.session_dir) {
-			throw new Error("Missing child session directory");
-		}
-		const childId = basename(result.session_dir);
-		const child = root.getRlmChildSession(childId);
-		if (!child) {
-			throw new Error("Missing retained child session");
-		}
-		const rootInternals = root as unknown as InspectableRlmSession;
-		await waitFor(() => !rootInternals._activeRlmChildRuns.has(childId));
-		const completeRelease = root.releaseRlmChildSession(childId, child);
-		if (!completeRelease) throw new Error("Failed to release retained child");
-
-		child.setCurrentRecap("retained recap");
-		child.setSessionName("renamed-worker");
-
-		const childUpdates = events.filter(
-			(event): event is { type: "rlm_child_update"; child: RlmChildAgentSnapshot } =>
-				typeof event === "object" && event !== null && (event as { type?: string }).type === "rlm_child_update",
-		);
-		expect(childUpdates.at(-1)?.child).toMatchObject({
-			sessionName: "renamed-worker",
-			durationMs: expect.any(Number),
-			tokenCount: 10,
-			recap: "retained recap",
-			repliedSinceTask: false,
-		});
-		expect(root.getRlmChildSnapshots()).toEqual([
-			expect.objectContaining({
-				sessionName: "renamed-worker",
-				durationMs: expect.any(Number),
-				tokenCount: 10,
-				recap: "retained recap",
-			}),
-		]);
-	});
-
-	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		let root: AgentSession;
-		root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-				});
-				return stream;
-			},
-			agentMessageController: {
-				listAgents: () => {
-					const run = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
-					return {
-						current: { activeSessionId: "parent-active", sessionId: root.sessionId },
-						agents: run?.session
-							? [
-									{
-										activeSessionId: "running-active",
-										sessionId: run.session.sessionId,
-										runtimeKind: "subagent" as const,
-										cwd: tempDir,
-										isStreaming: true,
-										unfinishedActionCount: 0,
-										parentActiveSessionId: "parent-active",
-										rlmChildId: run.id,
-										sessionDir: run.sessionDir,
-									},
-								]
-							: [],
-					};
-				},
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
-		});
-
-		const recaps: Array<string | undefined> = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				recaps.push(event.child.recap);
-			}
-		});
-
-		await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
-		const rootRun = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
-		if (!rootRun?.session) {
-			throw new Error("Missing child session on root run");
-		}
-		expect(await root.listRlmSubagents()).toEqual({
-			subagents: [
-				{
-					rlm_child_id: rootRun.id,
-					active_session_id: "running-active",
-					session_id: rootRun.session.sessionId,
-					session_name: createDefaultRlmSubagentSessionName("slow shard", rootRun.id),
-					session_dir: rootRun.sessionDir,
-					status: "running",
-				},
-			],
-		});
-
-		// What the daemon summarizer does for subagents: stash the recap on the session,
-		// which emits recap_update and re-emits the parent's enriched child snapshot.
-		rootRun.session.setCurrentRecap("Summarizing the slow shard");
-		await waitFor(() => recaps.includes("Summarizing the slow shard"));
-
-		releaseChild();
-		await waitFor(() => rootRun.status === "done");
-	});
-
-	it("suppresses repeated child updates whose snapshot did not change", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-				});
-				return stream;
-			},
-		});
-		let updates = 0;
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") updates += 1;
-		});
-
-		await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
-		const run = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
-		if (!run?.emitUpdate || !run.session) throw new Error("Missing child run emit");
-		await waitFor(() => run.activity?.kind === "waiting");
-		const before = updates;
-		run.emitUpdate();
-		run.emitUpdate();
-		expect(updates).toBe(before);
-		run.session.setCurrentRecap("changed recap");
-		await waitFor(() => updates === before + 1);
-
-		releaseChild();
-		await waitFor(() => run.status === "done");
-	});
-
-	it("runs a child agent without requiring ripgrep", async () => {
-		const streamFn = vi.fn((_model, context: Context) => streamAnswer(`child answer: ${userText(context)}`));
-		const root = createSession({ streamFn });
-
-		const result = await root.runRlmChild("summarize shard 1");
-
-		expect(result.rlm_child_id).toMatch(/^sub-/);
-		await waitFor(() => streamFn.mock.calls.length >= 1);
-	});
-
 	it("adds child usage to the parent session aggregate", async () => {
 		const root = createSession();
 		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
@@ -2507,54 +1702,56 @@ describe("AgentSession rlm recursion", () => {
 		expect(attribution.aggregateUsage.cost.total).toBe(10);
 	});
 
-	it("attributes every tool-loop turn in the admitted task to spawn usage", async () => {
-		const tool = {
-			name: "echo",
-			description: "Echo a value",
-			label: "echo",
-			parameters: Type.Object({ value: Type.String() }),
-			execute: async (_toolCallId: string, params: { value: string }) => ({
-				content: [{ type: "text" as const, text: params.value }],
-				details: {},
-			}),
-		};
-		const root = createSession({
-			customTools: [tool],
-			streamFn: (_model, context) => {
-				const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
-				const stream = createAssistantMessageEventStream();
-				queueMicrotask(() => {
-					const message =
-						toolResultCount === 0
-							? {
-									...assistantMessage("", usage(1, 1)),
-									content: [
-										{ type: "toolCall" as const, id: "echo-1", name: "echo", arguments: { value: "ok" } },
-									],
-									stopReason: "toolUse" as const,
-								}
-							: assistantMessage("done", usage(2, 2));
-					stream.push({
-						type: "done",
-						reason: toolResultCount === 0 ? "toolUse" : "stop",
-						message,
-					});
-				});
-				return stream;
-			},
-		});
-		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
-		root.agent.state.messages.push(parentAssistant);
-		root.sessionManager.appendMessage(parentAssistant);
+	it("coalesces the admitted task's tool-loop turns into one flushed spawn-usage attribution", async () => {
+		const root = createToolLoopSession(2, [usage(1, 1), usage(2, 2)]);
 
 		await root.runRlmChild("use a tool");
 		await vi.waitFor(() => {
 			const attributions = root.sessionManager
 				.getEntries()
 				.filter((entry) => entry.type === "child_usage_attributed");
-			expect(attributions).toHaveLength(2);
-			expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
+			expect(attributions).toHaveLength(1);
+			expect(attributions[0]?.origin).toBe("spawn_task");
+			expect(attributions[0]?.childUsage.input).toBe(3);
+			expect(attributions[0]?.childUsage.output).toBe(3);
 		});
+	});
+
+	it("flushes a stale pending usage batch before extending it, bounding crash loss", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			// The batch from the first two completions is older than the staleness
+			// bound when the third lands.
+			const root = createToolLoopSession(3, [usage(1, 1), usage(2, 2), usage(4, 4)], (toolResultCount) => {
+				if (toolResultCount === 2) vi.setSystemTime(Date.now() + 61_000);
+			});
+
+			await root.runRlmChild("use a tool");
+			await vi.waitFor(() => {
+				const attributions = root.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "child_usage_attributed");
+				expect(attributions.map((entry) => [entry.childUsage.input, entry.childUsage.output])).toEqual([
+					[3, 3],
+					[4, 4],
+				]);
+				expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
+				// Each aggregate covers exactly the completions durable with or
+				// before it, so any prefix replays to the exact own spend.
+				expect(attributions.map((entry) => entry.aggregateUsage.input)).toEqual([3, 7]);
+			});
+
+			const sessionFile = root.sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("parent session file was not created");
+			const reloadedAttributions = SessionManager.open(sessionFile, join(tempDir, "sessions"))
+				.getEntries()
+				.filter((entry) => entry.type === "child_usage_attributed");
+			const childTotal = reloadedAttributions.reduce((total, entry) => total + entry.childUsage.input, 0);
+			// Parent own spend is zero here, so the reloaded aggregate must equal the summed child usage.
+			expect(reloadedAttributions.at(-1)?.aggregateUsage.input).toBe(childTotal);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("gets and persists per-chat max-depth changes without transcript messages", async () => {
@@ -2573,70 +1770,6 @@ describe("AgentSession rlm recursion", () => {
 		expect(stateEntries.at(-1)).toMatchObject({ data: { maxDepth: 3 } });
 	});
 
-	it("applies max-depth immediately while a turn streams without aborting or entering the transcript", async () => {
-		let releaseTurn!: () => void;
-		const release = new Promise<void>((resolve) => {
-			releaseTurn = resolve;
-		});
-		let turnStarted = false;
-		const root = createSession({
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				turnStarted = true;
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("finished normally") });
-				});
-				return stream;
-			},
-		});
-
-		const promptPromise = root.prompt("keep streaming");
-		await waitFor(() => turnStarted);
-		const messagesBeforeSet = [...root.messages];
-		await root.setRlmMaxDepth(2);
-		expect(root.rlmMaxDepth).toBe(2);
-		expect(root.messages).toEqual(messagesBeforeSet);
-		expect(root.isStreaming).toBe(true);
-
-		releaseTurn();
-		await promptPromise;
-		await root.agent.waitForIdle();
-		expect(root.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
-	});
-
-	it("uses a max-depth prompt update on the next turn of the active run", async () => {
-		let releaseFirstTurn = () => {};
-		const firstTurnPending = new Promise<void>((resolve) => {
-			releaseFirstTurn = resolve;
-		});
-		const seenSystemPrompts: string[] = [];
-		const root = createSession({
-			streamFn: (_model, context) => {
-				seenSystemPrompts.push(context.systemPrompt ?? "");
-				if (seenSystemPrompts.length === 1) {
-					const stream = createAssistantMessageEventStream();
-					void firstTurnPending.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage("first turn") });
-					});
-					return stream;
-				}
-				return streamAnswer("second turn");
-			},
-		});
-
-		const promptPromise = root.prompt("start");
-		await waitFor(() => seenSystemPrompts.length === 1);
-		expect(seenSystemPrompts[0]!).toContain("A callable `rlm`");
-
-		await root.setRlmMaxDepth(0);
-		await root.steer("continue after max-depth update");
-		releaseFirstTurn();
-		await promptPromise;
-
-		expect(seenSystemPrompts).toHaveLength(2);
-		expect(seenSystemPrompts[1]!).not.toContain("A callable `rlm`");
-	});
-
 	it("rehydrates chat max depth ahead of reconstruction config", async () => {
 		const root = createSession();
 		await root.setRlmMaxDepth(3);
@@ -2647,25 +1780,6 @@ describe("AgentSession rlm recursion", () => {
 		const resumedManager = SessionManager.open(sessionFile, join(tempDir, "sessions"));
 		const resumed = createSession({ sessionManager: resumedManager, maxDepth: 4 });
 		expect(resumed.getRlmMaxDepthStatus()).toEqual({ maxDepth: 3, source: "chat" });
-	});
-
-	it("reloads max depth and its source when navigating to a branch without an override", async () => {
-		vi.stubEnv("RLM_MAX_DEPTH", "0");
-		try {
-			const root = createSession();
-			await root.prompt("baseline branch");
-			await root.agent.waitForIdle();
-			const baselineLeafId = root.sessionManager.getLeafId();
-			if (!baselineLeafId) throw new Error("Missing baseline branch leaf");
-
-			await root.setRlmMaxDepth(2);
-			expect(root.systemPrompt).toContain("A callable `rlm`");
-			await root.navigateTree(baselineLeafId, { summarize: false });
-			expect(root.getRlmMaxDepthStatus()).toEqual({ maxDepth: 0, source: "env" });
-			expect(root.systemPrompt).not.toContain("A callable `rlm`");
-		} finally {
-			vi.unstubAllEnvs();
-		}
 	});
 
 	it("applies --global to this chat and new sessions without changing existing sessions", async () => {
@@ -2684,68 +1798,6 @@ describe("AgentSession rlm recursion", () => {
 		expect(fresh.getRlmMaxDepthStatus()).toEqual({ maxDepth: 4, source: "global" });
 		current.dispose();
 		existing.dispose();
-	});
-
-	it("does not claim a failed global max-depth write was saved", async () => {
-		const globalSettings = JSON.stringify({ rlmMaxDepth: 1 });
-		const storage: SettingsStorage = {
-			withLock(scope, update) {
-				const current = scope === "global" ? globalSettings : undefined;
-				const next = update(current);
-				if (scope === "global" && next !== undefined) {
-					throw new Error("EROFS: read-only file system");
-				}
-			},
-		};
-		const current = createSession({ settingsManager: SettingsManager.fromStorage(storage) });
-
-		const result = await current.setRlmMaxDepth(5, { global: true });
-
-		expect(result).toMatchObject({ maxDepth: 5, source: "chat", globalSaved: false });
-		expect(result.globalError).toContain("EROFS: read-only file system");
-		expect(SettingsManager.fromStorage(storage).getRlmMaxDepth()).toBe(1);
-		expect(globalSettings).toBe(JSON.stringify({ rlmMaxDepth: 1 }));
-	});
-
-	it("does not attribute stale errors to a successful global max-depth write", async () => {
-		const writes: Record<"global" | "project", string | undefined> = {
-			global: JSON.stringify({ rlmMaxDepth: 1 }),
-			project: undefined,
-		};
-		let failGlobal = true;
-		let failProject = true;
-		const storage: SettingsStorage = {
-			withLock(scope, update) {
-				const next = update(writes[scope]);
-				if (scope === "global" && failGlobal && next !== undefined) {
-					throw new Error("stale global failure");
-				}
-				if (scope === "project" && failProject && next !== undefined) {
-					throw new Error("project warning");
-				}
-				writes[scope] = next;
-			},
-		};
-		const settingsManager = SettingsManager.fromStorage(storage);
-		settingsManager.setDefaultModelAndProvider("provider", "model");
-		await settingsManager.flush();
-		settingsManager.setProjectExtensionPaths(["broken-project-extension"]);
-		await settingsManager.flush();
-		// Preserve the queued project diagnostic while recovering the global store.
-		failGlobal = false;
-		failProject = false;
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-		const current = createSession({ settingsManager });
-
-		const result = await current.setRlmMaxDepth(5, { global: true });
-
-		expect(result).toMatchObject({ maxDepth: 5, source: "chat", globalSaved: true });
-		expect(warn).toHaveBeenCalledWith("Warning: Earlier global settings write failed: stale global failure");
-		expect(settingsManager.drainErrors()).toMatchObject([
-			{ scope: "project", error: { message: "project warning" } },
-		]);
-		expect(JSON.parse(writes.global ?? "{}")).toMatchObject({ rlmMaxDepth: 5 });
-		warn.mockRestore();
 	});
 
 	it("rolls back max-depth state when chat persistence fails", async () => {
@@ -2768,55 +1820,6 @@ describe("AgentSession rlm recursion", () => {
 		root.sessionManager.flushNow();
 		expect(readFileSync(root.sessionFile!, "utf8")).not.toContain('"customType":"rlm_max_depth_state"');
 	});
-	it("falls through an invalid global max depth while navigating off a chat override", async () => {
-		const original = createSession();
-		await original.prompt("baseline branch");
-		await original.agent.waitForIdle();
-		const baselineLeafId = original.sessionManager.getLeafId();
-		if (!baselineLeafId) throw new Error("Missing baseline branch leaf");
-		await original.setRlmMaxDepth(2);
-		const sessionFile = original.sessionFile;
-		if (!sessionFile) throw new Error("Missing persisted session file");
-		original.dispose();
-
-		vi.stubEnv("RLM_MAX_DEPTH", "0");
-		try {
-			const resumed = createSession({
-				sessionManager: SessionManager.open(sessionFile, join(tempDir, "sessions")),
-				settingsManager: SettingsManager.inMemory({ rlmMaxDepth: -1 }),
-			});
-			expect(resumed.rlmMaxDepth).toBe(2);
-
-			await expect(resumed.navigateTree(baselineLeafId, { summarize: false })).resolves.toMatchObject({
-				cancelled: false,
-			});
-			expect(resumed.sessionManager.getLeafId()).toBe(baselineLeafId);
-			expect(resumed.rlmMaxDepth).toBe(0);
-			expect(resumed.systemPrompt).not.toContain("A callable `rlm`");
-		} finally {
-			vi.unstubAllEnvs();
-		}
-	});
-
-	it("keeps a spawned child's chat override when reconstructed with its inherited config", async () => {
-		const root = createSession({ maxDepth: 2 });
-		const childResult = await root.runRlmChild("child with a durable override");
-		if (!childResult.session_dir) throw new Error("Missing child session directory");
-		await waitFor(() => root.getRlmChildSession(childResult.rlm_child_id) !== undefined);
-		const child = root.getRlmChildSession(childResult.rlm_child_id);
-		if (!child?.sessionFile) throw new Error("Missing persisted child session");
-		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
-
-		expect(child.getRlmMaxDepthStatus()).toEqual({ maxDepth: 2, source: "inherited" });
-		await child.setRlmMaxDepth(3);
-		const childSessionFile = child.sessionFile;
-		root.dispose();
-
-		const rehydratedManager = SessionManager.open(childSessionFile, join(tempDir, "sessions"));
-		const rehydratedChild = createSession({ sessionManager: rehydratedManager, depth: 1, maxDepth: 2 });
-		expect(rehydratedChild.getRlmMaxDepthStatus()).toEqual({ maxDepth: 3, source: "chat" });
-	});
-
 	it("copies live max depth at spawn, keeps child overrides independent, and lets zero disable root spawning", async () => {
 		const root = createSession();
 		await root.setRlmMaxDepth(2);
@@ -2838,133 +1841,149 @@ describe("AgentSession rlm recursion", () => {
 		expect(grandchild?.rlmMaxDepth).toBe(3);
 
 		await root.setRlmMaxDepth(0);
-		expect(root.systemPrompt).not.toContain("A callable `rlm`");
+		expect(root.systemPrompt).not.toContain("An `rlm` object");
 		await expect(root.runRlmChild("blocked at root")).rejects.toThrow(
 			"RLM recursion depth limit reached (RLM_DEPTH=0, RLM_MAX_DEPTH=0)",
 		);
 		expect(child.rlmMaxDepth).toBe(3);
 	});
 
-	it("lets a stale kernel depth cap defer to the live host gate", async () => {
-		// Resolve the kernel the way the runtime does. The hardcoded
-		// ~/.prime/agent/kernel-venv only exists on machines that still carry a
-		// base venv; a freshly bootstrapped one publishes a generation instead, so
-		// spawnSync found no binary and left status and stderr null - which read as
-		// a pass on the status assertion and an unrelated type error on the next.
-		const python = process.env.PRIME_AGENT_KERNEL_PYTHON ?? (await ensureKernelPython());
-		const runtime = join(process.cwd(), "..", "..", "prime-agent-runtime", "src");
-		const probe = spawnSync(
-			python,
-			["-c", "import asyncio, rlm; rlm.Comm = None; asyncio.run(rlm.run('raised live cap'))"],
-			{
-				env: { ...process.env, PYTHONPATH: runtime, RLM_DEPTH: "1", RLM_MAX_DEPTH: "1" },
-				encoding: "utf8",
-			},
-		);
-
-		// Asserted before the status check: a failed spawn also reports a non-zero
-		// status, so without this the probe never running looks like the probe
-		// failing for the reason under test.
-		expect(probe.error).toBeUndefined();
-		expect(probe.status).not.toBe(0);
-		// Both the legacy Jupyter bridge and upstream's minimal CPython REPL
-		// reject here at the unavailable host transport, after the stale kernel
-		// depth cap has correctly deferred to the live host gate.
-		expect(probe.stderr).toMatch(/Jupyter comm support is unavailable in this kernel|repl runtime is not serving/);
-		expect(probe.stderr).not.toContain("RLM recursion depth limit reached");
-	});
-
-	it("rejects child creation at the configured recursion depth cap", async () => {
-		const root = createSession({ depth: 1, maxDepth: 1 });
-
-		await expect(root.runRlmChild("nested")).rejects.toThrow("RLM recursion depth limit reached");
-	});
-
-	it("rejects unsupported rlm.run kwargs loudly", async () => {
-		const root = createSession();
-
-		await expect(root.runRlmChild("nested", { temperature: 0 })).rejects.toThrow(
-			"Unsupported rlm.run kwargs: temperature",
-		);
-	});
-
-	it("rejects a non-string rlm.run thinking kwarg", async () => {
-		const root = createSession();
-
-		await expect(root.runRlmChild("nested", { thinking: 3 })).rejects.toThrow("rlm.run thinking must be a string");
-	});
-
-	it("rejects an unknown rlm.run thinking level", async () => {
-		const root = createSession();
-		await expect(root.runRlmChild("nested", { thinking: "ultra" })).rejects.toThrow("must be one of");
-	});
-
-	it("cancels active rlm children when the parent session is disposed", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
+	it("creates an independent root session through the explicit daemon host operation", async () => {
+		const createRlmSubagentRuntime = vi.fn(async () => {
+			throw new Error("unexpected child spawn");
 		});
-		let childStarted = false;
+		const createRlmRootSession = vi.fn(async () => ({
+			active_session_id: "root-active",
+			session_id: "root-session",
+			name: "researcher",
+			session_file: join(tempDir, "sessions", "root-session.jsonl"),
+			model: `${model.provider}/${model.id}`,
+		}));
+		const assertSessionNameAvailable = vi.fn();
 		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "slow shard") {
-					childStarted = true;
-					void release.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				}
-				return stream;
+			agentMessageController: {
+				assertSessionNameAvailable,
+				listAgents: async () => ({
+					current: { activeSessionId: "current-root", sessionId: "current-session" },
+					agents: [],
+				}),
+				sendAgentMessage: async () => {
+					throw new Error("unexpected message");
+				},
+			},
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime,
+				createRlmRootSession,
+				deleteRlmSubagentRuntime: vi.fn(async () => {}),
 			},
 		});
 
+		await expect(
+			root.createRlmSession("independent task", {
+				name: "researcher",
+				model: `${model.provider}/${model.id}`,
+				thinking: "off",
+				cwd: "other-project",
+			}),
+		).resolves.toEqual({
+			active_session_id: "root-active",
+			session_id: "root-session",
+			name: "researcher",
+			session_file: join(tempDir, "sessions", "root-session.jsonl"),
+			model: `${model.provider}/${model.id}`,
+		});
+		expect(createRlmSubagentRuntime).not.toHaveBeenCalled();
+		expect(assertSessionNameAvailable).toHaveBeenCalledWith({ name: "researcher", depth: 0 });
+		expect(createRlmRootSession).toHaveBeenCalledWith({
+			prompt: "independent task",
+			sessionName: "researcher",
+			cwd: join(tempDir, "other-project"),
+			model,
+			thinkingLevel: "off",
+		});
+		await expect(root.createRlmSession("task", { cwd: " " })).rejects.toThrow(
+			"rlm.create_session cwd must be a non-empty string",
+		);
+		await expect(root.createRlmSession(" ")).rejects.toThrow("rlm.create_session prompt must not be empty");
+		expect(createRlmRootSession).toHaveBeenCalledOnce();
+	});
+
+	it("keeps top-level session creation unavailable to nested or inline sessions", async () => {
+		const createRlmRootSession = vi.fn();
+		const nested = createSession({
+			depth: 1,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: vi.fn(),
+				createRlmRootSession,
+				deleteRlmSubagentRuntime: vi.fn(async () => {}),
+			},
+		});
+		await expect(nested.createRlmSession("escape to root")).rejects.toThrow("available only from a depth-0 session");
+		expect(createRlmRootSession).not.toHaveBeenCalled();
+		nested.dispose();
+
+		const inline = createSession();
+		await expect(inline.createRlmSession("detached root")).rejects.toThrow(
+			"requires a daemon-backed depth-0 session",
+		);
+	});
+
+	it.each<{ label: string; options: Record<string, unknown>; depth?: number; maxDepth?: number; error: string }>([
+		{
+			label: "the configured depth cap",
+			options: {},
+			depth: 1,
+			maxDepth: 1,
+			error: "RLM recursion depth limit reached",
+		},
+		{ label: "unsupported kwargs", options: { temperature: 0 }, error: "Unsupported rlm.spawn kwargs: temperature" },
+		{ label: "a non-string thinking kwarg", options: { thinking: 3 }, error: "rlm.spawn thinking must be a string" },
+		{ label: "an unknown thinking level", options: { thinking: "ultra" }, error: "must be one of" },
+	])("rejects rlm.spawn for $label", async ({ options, depth, maxDepth, error }) => {
+		const root = createSession({ depth, maxDepth });
+
+		await expect(root.runRlmChild("nested", options)).rejects.toThrow(error);
+	});
+
+	it.each<{
+		label: string;
+		stop: (root: AgentSession) => void | Promise<void>;
+		status: string;
+		error: string | undefined;
+	}>([
+		{
+			label: "the parent session is disposed",
+			stop: (root) => root.dispose(),
+			status: "cancelled",
+			error: "Parent session disposed",
+		},
+		{
+			label: "the parent session is aborted",
+			stop: (root) => root.abort(),
+			status: "cancelled",
+			error: "Parent session aborted",
+		},
+		{
+			label: "only the parent turn is interrupted",
+			stop: (root) => root.requestAbort(),
+			status: "running",
+			error: undefined,
+		},
+	])("leaves an active rlm child $status when $label", async ({ stop, status, error }) => {
+		const { root, releaseChild, hasStarted } = createGatedRoot();
 		const spawned = await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
+		await waitFor(hasStarted);
 		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
 		expect(runs.size).toBe(1);
-		const run = [...runs.values()][0];
+		const run = runs.get(spawned.rlm_child_id);
+		if (!run) throw new Error("Missing child run");
 
-		root.dispose();
+		await stop(root);
 
-		expect(run.status).toBe("cancelled");
-		expect(run.error).toBe("Parent session disposed");
+		expect(run.status).toBe(status);
+		expect(run.error).toBe(error);
 		releaseChild();
-		expect(spawned.rlm_child_id).toBe(run.id);
-	});
-
-	it("cancels active rlm children when the parent session is aborted", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "slow shard") {
-					childStarted = true;
-					void release.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				}
-				return stream;
-			},
-		});
-
-		const spawned = await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
-		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
-		expect(runs.size).toBe(1);
-		const run = [...runs.values()][0];
-
-		await root.abort();
-
-		expect(run.status).toBe("cancelled");
-		expect(run.error).toBe("Parent session aborted");
-		releaseChild();
-		expect(spawned.rlm_child_id).toBe(run.id);
+		if (status === "running") await waitFor(() => run.status === "done");
 	});
 
 	it("does not admit a child prompt when the parent is aborted while resolving the sender", async () => {
@@ -3035,6 +2054,7 @@ describe("AgentSession rlm recursion", () => {
 			abort: () => {},
 			status: "running",
 			settled: false,
+			progressNotes: [],
 		});
 		const root = createSession();
 		const rootInternals = root as unknown as InspectableRlmSession;
@@ -3050,6 +2070,7 @@ describe("AgentSession rlm recursion", () => {
 			publication: deferred(),
 			settlement: deferred(),
 			session: child,
+			progressNotes: [],
 		};
 		rootInternals._activeRlmChildRuns.set(run.id, run);
 		rootInternals._unsettledRlmChildRuns.add(run);
@@ -3106,134 +2127,116 @@ describe("AgentSession rlm recursion", () => {
 		expect(promptAndWait).not.toHaveBeenCalled();
 	});
 
-	it("does not cancel active rlm children when only the parent turn is interrupted", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "slow shard") {
-					childStarted = true;
-					void release.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				}
-				return stream;
-			},
-		});
-
-		await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
-		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
-		expect(runs.size).toBe(1);
-		const run = [...runs.values()][0];
-
-		root.requestAbort();
-
-		expect(run.status).toBe("running");
-		expect(run.error).toBeUndefined();
-		releaseChild();
-		await waitFor(() => run.status === "done");
-	});
-
 	it("cancels a single rlm child run by id and reports unknown ids", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "slow shard") {
-					childStarted = true;
-					void release.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				}
-				return stream;
-			},
-		});
-		const childStatuses: string[] = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				childStatuses.push(event.child.status);
-			}
-		});
-
-		await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
+		const { root, releaseChild, hasStarted } = createGatedRoot();
+		const spawned = await root.runRlmChild("slow shard");
+		await waitFor(hasStarted);
 		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
 		expect(runs.size).toBe(1);
-		const childId = [...runs.keys()][0];
-		if (!childId) {
-			throw new Error("Missing child run id");
-		}
+		const childId = spawned.rlm_child_id;
 		const run = runs.get(childId);
 
 		expect(root.cancelRlmChildRun("unknown-child")).toBe(false);
 		expect(run?.status).toBe("running");
 
+		// Running work retained under the LIVE child: the abort cascade only
+		// reaches active runs, so the cancel walk must descend here itself.
+		await waitFor(() => run?.session !== undefined);
+		const deepHost = createSession({ rlmSessionDir: join(tempDir, "deep-host") });
+		const deepAbort = vi.fn();
+		const deepRun = {
+			id: "deep-1",
+			status: "running",
+			settled: false,
+			abort: deepAbort,
+			publication: { reject: vi.fn() },
+			emitUpdate: vi.fn(),
+		};
+		(deepHost as unknown as { _activeRlmChildRuns: Map<string, typeof deepRun> })._activeRlmChildRuns.set(
+			"deep-1",
+			deepRun,
+		);
+		(run?.session as unknown as { _rlmChildSessions: Map<string, { session: AgentSession }> })._rlmChildSessions.set(
+			"deep-host",
+			{ session: deepHost },
+		);
+
 		expect(root.cancelRlmChildRun(childId)).toBe(true);
 		expect(run?.status).toBe("cancelled");
 		expect(run?.error).toBe("Cancelled by user");
-		// The cancelled update is pushed at cancel time, before the (possibly
-		// stuck) child unwinds; viewers must not keep showing a running child.
-		expect(childStatuses[childStatuses.length - 1]).toBe("cancelled");
+		expect(deepRun.status).toBe("cancelled");
+		expect(deepAbort).toHaveBeenCalled();
 		releaseChild();
 		await waitFor(() => !runs.has(childId));
-		expect(childStatuses[childStatuses.length - 1]).toBe("cancelled");
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 
 		// The run has finished; a second cancel finds nothing to stop.
 		expect(root.cancelRlmChildRun(childId)).toBe(false);
 	});
 
-	it("reports a shared running outcome to concurrent inactive-delete callers", async () => {
-		let runningChecks = 0;
-		const isExternallyRunning = () => ++runningChecks >= 5;
-		const deleteRuntime = vi.fn(async () => {});
-		const root = createSession({
-			agentMessageController: {
-				listAgents: () => ({
-					current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-					agents: [
-						{
-							activeSessionId: "child-active",
-							sessionId: "child-session",
-							sessionName: "worker",
-							runtimeKind: "subagent",
-							cwd: tempDir,
-							isStreaming: false,
-							unfinishedActionCount: 0,
-							parentActiveSessionId: "parent-active",
-							rlmChildId: "child",
-							sessionDir: join(tempDir, "child"),
-						},
-					],
-				}),
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					throw new Error("unexpected hydration");
-				},
-				deleteRlmSubagentRuntime: deleteRuntime,
-			},
-		});
+	it("cancels a deep dual-membership chain in one visit per session", async () => {
+		const levels = 20;
+		const sessions = Array.from({ length: levels + 1 }, (_, level) =>
+			createSession({ rlmSessionDir: join(tempDir, `chain-${level}`) }),
+		);
+		let cancelPrimitiveCalls = 0;
+		let runMapIterations = 0;
+		for (const [level, session] of sessions.entries()) {
+			const target = session as unknown as {
+				_activeRlmChildRuns: Map<string, unknown>;
+				_rlmChildSessions: Map<string, { session: AgentSession }>;
+				_cancelRlmChildRun(run: unknown, reason: string): boolean;
+			};
+			const original = target._cancelRlmChildRun.bind(session);
+			target._cancelRlmChildRun = (run, reason) => {
+				cancelPrimitiveCalls++;
+				return original(run, reason);
+			};
+			const originalValues = target._activeRlmChildRuns.values.bind(target._activeRlmChildRuns);
+			target._activeRlmChildRuns.values = () => {
+				runMapIterations++;
+				return originalValues();
+			};
+			if (level === 0) continue;
+			// A finished intermediate lives in BOTH parent maps until passivation.
+			const parent = sessions[level - 1] as unknown as {
+				_activeRlmChildRuns: Map<string, unknown>;
+				_rlmChildSessions: Map<string, { session: AgentSession }>;
+			};
+			parent._activeRlmChildRuns.set(`chain-${level}`, {
+				id: `chain-${level}`,
+				status: "done",
+				settled: true,
+				session,
+				abort: vi.fn(),
+				publication: { reject: vi.fn() },
+				emitUpdate: vi.fn(),
+			});
+			parent._rlmChildSessions.set(`chain-${level}`, { session });
+		}
+		const leafAbort = vi.fn();
+		const leafRun = {
+			id: "leaf-run",
+			status: "running",
+			settled: false,
+			abort: leafAbort,
+			publication: { reject: vi.fn() },
+			emitUpdate: vi.fn(),
+		};
+		(sessions[levels] as unknown as { _activeRlmChildRuns: Map<string, typeof leafRun> })._activeRlmChildRuns.set(
+			"leaf-run",
+			leafRun,
+		);
 
-		const first = root.deleteInactiveRlmSubagent("child", isExternallyRunning);
-		const second = root.deleteInactiveRlmSubagent("child", isExternallyRunning);
+		expect(sessions[0]!.hasRunningRlmChildren()).toBe(true);
+		expect(runMapIterations).toBeLessThanOrEqual(3 * (levels + 1));
 
-		await expect(Promise.all([first, second])).resolves.toEqual(["running", "running"]);
-		expect(deleteRuntime).not.toHaveBeenCalled();
+		expect(sessions[0]!.cancelRunningRlmDescendants()).toBe(true);
+		expect(leafRun.status).toBe("cancelled");
+		expect(leafAbort).toHaveBeenCalled();
+		// One visit per session, not 2^depth.
+		expect(cancelPrimitiveCalls).toBeLessThanOrEqual(levels + 1);
+		expect(sessions[0]!.hasRunningRlmChildren()).toBe(false);
 	});
 
 	it("deletes only inactive RLM children through the explicit inactive path", async () => {
@@ -3278,32 +2281,6 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.deleteInactiveRlmSubagent(childId)).resolves.toBe("deleted");
 		expect(deleteRuntime).toHaveBeenCalledWith(childId, retainedChild);
 		await expect(root.deleteInactiveRlmSubagent("unknown-child")).resolves.toBe("not_found");
-	});
-
-	it("releases a hosted child when completion persistence fails", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "host-completion-failure-child") });
-		const disposeChild = vi.spyOn(child, "disposeAsync");
-		const releaseRlmSubagentRuntime = vi.fn(async () => {});
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: child }),
-				completeRlmSubagentRuntime: () => false,
-				releaseRlmSubagentRuntime,
-				deleteRlmSubagentRuntime: async () => {},
-			},
-		});
-
-		const spawned = await root.runRlmChild("finish without registry persistence");
-		await vi.waitFor(() => {
-			expect(releaseRlmSubagentRuntime).toHaveBeenCalledWith(
-				expect.objectContaining({ session: child }),
-				expect.objectContaining({ id: spawned.rlm_child_id }),
-				"error",
-			);
-		});
-		expect(disposeChild).not.toHaveBeenCalled();
-		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.size).toBe(0);
-		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBeUndefined();
 	});
 
 	it("aborts an active child tool and settles only after shared runtime cleanup", async () => {
@@ -3380,95 +2357,14 @@ describe("AgentSession rlm recursion", () => {
 		});
 		await sleep(20);
 		expect(quiesced).toBe(false);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
+		expect(terminalNotices(root)).toHaveLength(0);
 
 		releaseCleanup();
 		await quiescence;
 		expect(deleteRuntime).toHaveBeenCalledOnce();
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toEqual([
+		expect(terminalNotices(root)).toEqual([
 			expect.objectContaining({
 				details: expect.objectContaining({ kind: "cancelled", reason: "Deleted by parent orchestrator" }),
-			}),
-		]);
-	});
-
-	it("admits a private durable deletion notice only after runtime cleanup", async () => {
-		let releaseChild: () => void = () => {};
-		const childGate = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		let cleanupSucceeded = false;
-		const sendAgentMessage = vi.fn(async () => {
-			expect(cleanupSucceeded).toBe(true);
-			return {
-				id: "agentmsg-deletion-complete",
-				source: "agent_message" as const,
-				target: { activeSessionId: "parent-active", sessionId: "parent-session" },
-				message: "deleted",
-				deliveryStatus: "delivered" as const,
-			};
-		});
-		const hostedChild = createSession({
-			agentMessageController: {
-				listAgents: () => ({
-					current: { activeSessionId: "child-active", sessionId: "child-session" },
-					agents: [],
-				}),
-				sendAgentMessage,
-			},
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void childGate.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("child stopped") });
-				});
-				return stream;
-			},
-		});
-		vi.spyOn(hostedChild, "abort").mockResolvedValue();
-		let releaseCleanup: () => void = () => {};
-		const cleanupGate = new Promise<void>((resolve) => {
-			releaseCleanup = resolve;
-		});
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
-				deleteRlmSubagentRuntime: () => cleanupGate,
-			},
-		});
-
-		const spawned = await root.runRlmChild("controller ordering", { name: "controller-worker" });
-		await waitFor(() => childStarted);
-		await root.deleteRlmSubagent(spawned.rlm_child_id);
-		releaseChild();
-		await sleep(20);
-		expect(sendAgentMessage).not.toHaveBeenCalled();
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
-
-		cleanupSucceeded = true;
-		releaseCleanup();
-		await root.waitForRlmQuiescence();
-		expect(sendAgentMessage).not.toHaveBeenCalled();
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toEqual([
-			expect.objectContaining({
-				content: expect.stringContaining("was cancelled: Deleted by parent orchestrator"),
 			}),
 		]);
 	});
@@ -3538,87 +2434,24 @@ describe("AgentSession rlm recursion", () => {
 
 		childCompletion.resolve();
 		await quiescence;
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(1);
+		expect(terminalNotices(root)).toHaveLength(1);
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 		await expect(root.runRlmChild("replacement", { name: "retry-worker" })).resolves.toMatchObject({
 			name: "retry-worker",
 		});
 	});
 
-	it("settles a pre-existing deletion cleanup failure during parent disposal", async () => {
-		const { child: hostedChild, completion: childCompletion, hasStarted } = createAbortInsensitiveChild();
-		const disposeHostedChild = vi.spyOn(hostedChild, "disposeAsync");
-		const deleteRuntime = vi.fn(() => Promise.reject(new Error("cleanup failed before dispose")));
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
-				deleteRlmSubagentRuntime: deleteRuntime,
-			},
-		});
-
-		const spawned = await root.runRlmChild("pre-failed cleanup disposal", { name: "pre-failed-worker" });
-		await waitFor(hasStarted);
-		await root.deleteRlmSubagent(spawned.rlm_child_id);
-		const internals = root as unknown as InspectableRlmSession;
-		const run = internals._activeRlmChildRuns.get(spawned.rlm_child_id);
-		if (!run) throw new Error("Missing deleting run");
-		await waitFor(() => internals._rlmChildCleanupFailures.size === 1);
-
-		await root.disposeAsync();
-		expect(deleteRuntime).toHaveBeenCalledOnce();
-		expect(disposeHostedChild).toHaveBeenCalled();
-		expect(internals._activeRlmChildRuns.has(spawned.rlm_child_id)).toBe(false);
-		expect(internals._unsettledRlmChildRuns.has(run)).toBe(false);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
-		childCompletion.resolve();
-	});
-
-	it("settles disposal after cleanup succeeds without waiting for abort-insensitive task unwind", async () => {
-		const { child: hostedChild, completion: childCompletion, hasStarted } = createAbortInsensitiveChild();
-		const cleanup = deferred<void>();
-		const deleteRuntime = vi.fn(() => cleanup.promise);
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
-				deleteRlmSubagentRuntime: deleteRuntime,
-			},
-		});
-
-		const spawned = await root.runRlmChild("successful cleanup disposal", { name: "dispose-success-worker" });
-		await waitFor(hasStarted);
-		await root.deleteRlmSubagent(spawned.rlm_child_id);
-		const internals = root as unknown as InspectableRlmSession;
-		const run = internals._activeRlmChildRuns.get(spawned.rlm_child_id);
-		if (!run) throw new Error("Missing deleting run");
-
-		const disposal = root.disposeAsync();
-		await waitFor(() => internals._disposing);
-		cleanup.resolve();
-		await disposal;
-		expect(deleteRuntime).toHaveBeenCalledOnce();
-		expect(internals._activeRlmChildRuns.has(spawned.rlm_child_id)).toBe(false);
-		expect(internals._unsettledRlmChildRuns.has(run)).toBe(false);
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toHaveLength(0);
-		childCompletion.resolve();
-	});
-
-	it("settles and suppresses notices when deletion cleanup fails during parent disposal", async () => {
+	it.each([
+		{ label: "a pre-existing cleanup failure", mode: "pre-failed" as const },
+		{ label: "cleanup succeeding during disposal", mode: "succeeds" as const },
+		{ label: "cleanup failing during disposal", mode: "fails" as const },
+	])("settles parent disposal with $label and admits no terminal notice", async ({ mode }) => {
 		const { child: hostedChild, completion: childCompletion, hasStarted } = createAbortInsensitiveChild();
 		const disposeHostedChild = vi.spyOn(hostedChild, "disposeAsync");
 		const cleanup = deferred<void>();
-		const deleteRuntime = vi.fn(() => cleanup.promise);
+		const deleteRuntime = vi.fn(() =>
+			mode === "pre-failed" ? Promise.reject(new Error("cleanup failed before dispose")) : cleanup.promise,
+		);
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
@@ -3626,55 +2459,41 @@ describe("AgentSession rlm recursion", () => {
 			},
 		});
 
-		const spawned = await root.runRlmChild("dispose during failed cleanup", { name: "dispose-worker" });
+		const spawned = await root.runRlmChild("disposal cleanup", { name: "dispose-worker" });
 		await waitFor(hasStarted);
 		await root.deleteRlmSubagent(spawned.rlm_child_id);
 		const internals = root as unknown as InspectableRlmSession;
 		const run = internals._activeRlmChildRuns.get(spawned.rlm_child_id);
 		if (!run) throw new Error("Missing deleting run");
 
-		const disposal = root.disposeAsync();
-		await waitFor(() => internals._disposing);
-		cleanup.reject(new Error("cleanup failed during dispose"));
-		childCompletion.resolve();
-		await disposal;
+		if (mode === "pre-failed") {
+			await waitFor(() => internals._rlmChildCleanupFailures.size === 1);
+			await root.disposeAsync();
+		} else {
+			const disposal = root.disposeAsync();
+			await waitFor(() => internals._disposing);
+			if (mode === "succeeds") {
+				// Disposal must not wait for the abort-insensitive child task to unwind.
+				cleanup.resolve();
+			} else {
+				cleanup.reject(new Error("cleanup failed during dispose"));
+				childCompletion.resolve();
+			}
+			await disposal;
+		}
+
 		expect(deleteRuntime).toHaveBeenCalledOnce();
-		expect(disposeHostedChild).toHaveBeenCalled();
+		if (mode !== "succeeds") expect(disposeHostedChild).toHaveBeenCalled();
 		expect(internals._activeRlmChildRuns.has(spawned.rlm_child_id)).toBe(false);
 		expect(internals._unsettledRlmChildRuns.has(run)).toBe(false);
-		expect(
-			root.messages.filter(
-				(message) =>
-					message.role === "custom" &&
-					(message.customType === "rlm_child_failure" || message.customType === "rlm_child_terminal_notice"),
-			),
-		).toHaveLength(0);
+		expect(terminalNotices(root)).toHaveLength(0);
+		if (mode === "fails") expect(failureNotices(root)).toHaveLength(0);
+		childCompletion.resolve();
 	});
 
 	it("keeps deleted live runs in the RLM quiescence barrier until settlement", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const hostedChild = createSession({
-			rlmSessionDir: join(tempDir, "deleted-live-child"),
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("child stopped") });
-				});
-				return stream;
-			},
-		});
-		vi.spyOn(hostedChild, "abort").mockResolvedValue();
+		const { child: hostedChild, completion, hasStarted } = createAbortInsensitiveChild();
 		const root = createSession({
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				stream.push({ type: "done", reason: "stop", message: assistantMessage("parent acknowledged") });
-				return stream;
-			},
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
 				deleteRlmSubagentRuntime: async () => {},
@@ -3682,7 +2501,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		const spawned = await root.runRlmChild("slow child", { name: "deleted-live-worker" });
-		await waitFor(() => childStarted);
+		await waitFor(hasStarted);
 		let quiesced = false;
 		const quiescence = root.waitForRlmQuiescence().then(() => {
 			quiesced = true;
@@ -3691,7 +2510,7 @@ describe("AgentSession rlm recursion", () => {
 		await sleep(20);
 		expect(quiesced).toBe(false);
 
-		releaseChild();
+		completion.resolve();
 		await quiescence;
 		expect(quiesced).toBe(true);
 	});
@@ -3717,15 +2536,16 @@ describe("AgentSession rlm recursion", () => {
 		await root.waitForRlmQuiescence();
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBeUndefined();
-		expect(
-			root.messages.filter(
-				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
-			),
-		).toEqual([expect.objectContaining({ details: expect.objectContaining({ kind: "completed_without_reply" }) })]);
+		expect(terminalNotices(root)).toEqual([
+			expect.objectContaining({ details: expect.objectContaining({ kind: "completed_without_reply" }) }),
+		]);
 		expect(internals._activeRlmChildRuns.has(spawned.rlm_child_id)).toBe(false);
 	});
 
-	it("keeps failed closure retryable without hanging or late resurrection", async () => {
+	it.each([
+		{ label: "a retry succeeds", retry: true },
+		{ label: "the parent tears down first", retry: false },
+	])("keeps failed closure retryable until $label", async ({ retry }) => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "retry-child") });
 		child.setSessionName("release-worker");
 		let attempts = 0;
@@ -3739,33 +2559,22 @@ describe("AgentSession rlm recursion", () => {
 			},
 		});
 		expect(root.registerRlmChildSession("retry-child", child)).toBe(true);
+		const internals = root as unknown as InspectableRlmSession;
+
 		await expect(root.deleteRlmSubagent("release-worker")).rejects.toThrow("close failed");
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		expect((root as unknown as InspectableRlmSession)._rlmChildCleanupFailures.size).toBe(1);
-		await expect(root.deleteRlmSubagent("release-worker")).resolves.toMatchObject({
-			subagent: { rlm_child_id: "retry-child" },
-		});
-		expect((root as unknown as InspectableRlmSession)._rlmChildCleanupFailures.size).toBe(0);
-	});
+		expect(internals._rlmChildCleanupFailures.size).toBe(1);
 
-	it("does not restore failed delete retry state after parent teardown", async () => {
-		const child = createSession({ rlmSessionDir: join(tempDir, "teardown-child") });
-		child.setSessionName("teardown-worker");
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: child }),
-				deleteRlmSubagentRuntime: async () => {
-					throw new Error("close failed during teardown");
-				},
-			},
-		});
-		expect(root.registerRlmChildSession("teardown-child", child)).toBe(true);
-		await expect(root.deleteRlmSubagent("teardown-worker")).rejects.toThrow("close failed during teardown");
-		root.dispose();
-		const internals = root as unknown as InspectableRlmSession;
-		expect(internals._activeRlmChildRuns.size).toBe(0);
-		expect(internals._rlmChildSessions.size).toBe(0);
-		expect(internals._rlmChildUnsubscribes.size).toBe(0);
+		if (retry) {
+			await expect(root.deleteRlmSubagent("release-worker")).resolves.toMatchObject({
+				subagent: { rlm_child_id: "retry-child" },
+			});
+		} else {
+			root.dispose();
+			expect(internals._activeRlmChildRuns.size).toBe(0);
+			expect(internals._rlmChildSessions.size).toBe(0);
+			expect(internals._rlmChildUnsubscribes.size).toBe(0);
+		}
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 	});
 
@@ -3797,32 +2606,17 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	it("reserves a deleted queued child's name until startup settles", async () => {
-		let releaseRuntimeCreation: () => void = () => {};
-		const runtimeCreationGate = new Promise<void>((resolve) => {
-			releaseRuntimeCreation = resolve;
-		});
-		let runtimeCreationStarted = false;
-		const hostedChild = createSession();
+		const { root, hostedChild, releaseStartup, hasStarted } = createStartupGatedRoot();
 		const setSessionName = vi.spyOn(hostedChild, "setSessionName");
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					runtimeCreationStarted = true;
-					await runtimeCreationGate;
-					return { session: hostedChild };
-				},
-				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
-			},
-		});
 		await root.runRlmChild("blocked before runtime creation", { name: "reserved-worker" });
-		await waitFor(() => runtimeCreationStarted);
+		await waitFor(hasStarted);
 
 		await root.deleteRlmSubagent("reserved-worker");
 		await expect(root.runRlmChild("replacement", { name: "reserved-worker" })).rejects.toThrow(
 			"an agent of that name already exists at depth 1 under this parent",
 		);
 
-		releaseRuntimeCreation();
+		releaseStartup();
 		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
 		expect(setSessionName).not.toHaveBeenCalled();
 		await expect(root.runRlmChild("replacement", { name: "reserved-worker" })).resolves.toMatchObject({
@@ -3830,80 +2624,28 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("deletes a queued child without waiting for blocked startup", async () => {
-		let releaseRuntimeCreation: () => void = () => {};
-		const runtimeCreationGate = new Promise<void>((resolve) => {
-			releaseRuntimeCreation = resolve;
-		});
-		let runtimeCreationStarted = false;
-		const hostedChild = createSession();
-		const deleteRuntime = vi.fn(async () => {
-			await hostedChild.disposeAsync();
-		});
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					runtimeCreationStarted = true;
-					await runtimeCreationGate;
-					return { session: hostedChild };
-				},
-				deleteRlmSubagentRuntime: deleteRuntime,
-			},
-		});
-		await root.runRlmChild("blocked before runtime creation", { name: "queued-worker" });
-		await waitFor(() => runtimeCreationStarted);
-		const queued = (await root.listRlmSubagents()).subagents[0];
-		expect(queued).toMatchObject({ session_name: "queued-worker", status: "queued" });
-
-		await expect(root.deleteRlmSubagent("queued-worker")).resolves.toEqual({ subagent: queued });
-		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.size).toBe(1);
-		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-
-		releaseRuntimeCreation();
-		await waitFor(() => deleteRuntime.mock.calls.length === 1);
-		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
-		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-	});
-
 	it("keeps late startup cleanup retryable when release and fallback delete fail", async () => {
-		let releaseRuntimeCreation: () => void = () => {};
-		const runtimeCreationGate = new Promise<void>((resolve) => {
-			releaseRuntimeCreation = resolve;
-		});
-		let runtimeCreationStarted = false;
-		const hostedChild = createSession();
-		const disposeHostedChild = vi.spyOn(hostedChild, "disposeAsync");
 		let deleteAttempts = 0;
-		const deleteRuntime = vi.fn(async () => {
-			deleteAttempts++;
-			if (deleteAttempts === 1) {
-				throw new Error("fallback delete failed");
-			}
-			await hostedChild.disposeAsync();
+		const deleteRuntime = vi.fn(async (_id: string, child?: AgentSession) => {
+			if (++deleteAttempts === 1) throw new Error("fallback delete failed");
+			await child?.disposeAsync();
 		});
-		const releaseRuntime = vi.fn(async () => {
-			throw new Error("cancelled release failed");
-		});
-		const root = createSession({
-			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => {
-					runtimeCreationStarted = true;
-					await runtimeCreationGate;
-					return { session: hostedChild };
-				},
-				deleteRlmSubagentRuntime: deleteRuntime,
-				releaseRlmSubagentRuntime: releaseRuntime,
+		const { root, hostedChild, releaseStartup, hasStarted } = createStartupGatedRoot({
+			deleteRlmSubagentRuntime: deleteRuntime,
+			releaseRlmSubagentRuntime: async () => {
+				throw new Error("cancelled release failed");
 			},
 		});
+		const disposeHostedChild = vi.spyOn(hostedChild, "disposeAsync");
 
 		await root.runRlmChild("delete during runtime creation", { name: "starting-worker" });
-		await waitFor(() => runtimeCreationStarted);
+		await waitFor(hasStarted);
 		const starting = (await root.listRlmSubagents()).subagents[0];
 		expect(starting).toBeDefined();
 
 		await expect(root.deleteRlmSubagent("starting-worker")).resolves.toEqual({ subagent: starting });
 		expect(deleteRuntime).not.toHaveBeenCalled();
-		releaseRuntimeCreation();
+		releaseStartup();
 
 		const internals = root as unknown as InspectableRlmSession;
 		await waitFor(() => deleteRuntime.mock.calls.length === 1);
@@ -3918,73 +2660,31 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 	});
 
-	it("accepts deletion of a running direct child without waiting for task unwind", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				childStarted = true;
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-				});
-				return stream;
-			},
-		});
-
-		await root.runRlmChild("slow named shard", { name: "slow-worker" });
-		await waitFor(() => childStarted);
-		const running = (await root.listRlmSubagents()).subagents[0];
-		if (!running) {
-			throw new Error("Missing running child registry entry");
-		}
-		await expect(root.deleteRlmSubagent("slow-worker")).resolves.toEqual({ subagent: running });
-		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		releaseChild();
-	});
+	/** Root over a gated child that owns a nested grandchild. */
+	async function createNestedTree(gateNested: boolean): Promise<{
+		root: AgentSession;
+		parentRun: InspectableRlmRun;
+		parentSession: AgentSession;
+		nestedId: string;
+		release: (prompt?: string) => void;
+	}> {
+		const gated = gateNested ? ["slow parent", "nested child"] : ["slow parent"];
+		const { root, releaseChild, hasStarted } = createGatedRoot({ maxDepth: 2 }, gated);
+		void root.runRlmChild("slow parent");
+		await waitFor(hasStarted);
+		const parentRun = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
+		if (!parentRun?.session) throw new Error("Missing parent child session");
+		const parentSession = parentRun.session;
+		const nested = await parentSession.runRlmChild("nested child");
+		if (!nested.session_dir) throw new Error("Missing nested child session directory");
+		const nestedId = basename(nested.session_dir);
+		return { root, parentRun, parentSession, nestedId, release: releaseChild };
+	}
 
 	it("deletes an inactive nested RLM child through the root session", async () => {
-		let releaseParent: () => void = () => {};
-		const parentRelease = new Promise<void>((resolve) => {
-			releaseParent = resolve;
-		});
-		let parentStarted = false;
-		const root = createSession({
-			maxDepth: 2,
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				if (text !== "slow parent") {
-					return streamAnswer(`child answer: ${text}`);
-				}
-				const stream = createAssistantMessageEventStream();
-				parentStarted = true;
-				void parentRelease.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("parent done") });
-				});
-				return stream;
-			},
-		});
-
-		const parentPromise = root.runRlmChild("slow parent");
-		await waitFor(() => parentStarted);
-		const parentRun = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
-		if (!parentRun?.session) {
-			throw new Error("Missing parent child session");
-		}
-		const parentSession = parentRun.session;
-		const nestedResult = await parentSession.runRlmChild("nested child");
-		if (!nestedResult.session_dir) {
-			throw new Error("Missing nested child session directory");
-		}
-		const nestedId = basename(nestedResult.session_dir);
+		const { root, parentRun, parentSession, nestedId, release } = await createNestedTree(false);
 		const nestedSession = parentSession.getRlmChildSession(nestedId);
-		if (!nestedSession) {
-			throw new Error("Missing retained nested child session");
-		}
+		if (!nestedSession) throw new Error("Missing retained nested child session");
 		const disposeNested = vi.spyOn(nestedSession, "disposeAsync");
 		await waitFor(() => {
 			const status = (parentSession as unknown as InspectableRlmSession)._activeRlmChildRuns.get(nestedId)?.status;
@@ -3996,74 +2696,26 @@ describe("AgentSession rlm recursion", () => {
 		expect(disposeNested).toHaveBeenCalledOnce();
 		expect(parentRun.status).toBe("running");
 
-		releaseParent();
-		await parentPromise;
+		release();
 		await waitFor(() => {
 			const status = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(parentRun.id)?.status;
 			return status === undefined || status === "done";
 		});
 	});
 
-	it("cancels nested rlm child runs through the root session", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let releaseNested: () => void = () => {};
-		const nestedRelease = new Promise<void>((resolve) => {
-			releaseNested = resolve;
-		});
-		let childStarted = false;
-		let nestedStarted = false;
-		const root = createSession({
-			maxDepth: 2,
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "slow shard") {
-					childStarted = true;
-					void release.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				} else if (text === "nested shard") {
-					nestedStarted = true;
-					void nestedRelease.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				} else {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("cancellation acknowledged") });
-				}
-				return stream;
-			},
-		});
-
-		await root.runRlmChild("slow shard");
-		await waitFor(() => childStarted);
-		const rootRuns = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
-		const rootRun = [...rootRuns.values()][0];
-		if (!rootRun?.session) {
-			throw new Error("Missing child session on root run");
-		}
-
-		const childSession = rootRun.session;
-		const nestedSpawned = await childSession.runRlmChild("nested shard");
-		await waitFor(() => nestedStarted);
-		const nestedRuns = (childSession as unknown as InspectableRlmSession)._activeRlmChildRuns;
-		expect(nestedRuns.size).toBe(1);
-		const nestedId = [...nestedRuns.keys()][0];
-		if (!nestedId) {
-			throw new Error("Missing nested run id");
-		}
+	it("cancels a running nested rlm child through the root session but never deletes it directly", async () => {
+		const { root, parentRun, parentSession, nestedId, release } = await createNestedTree(true);
+		const nestedRuns = (parentSession as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		await waitFor(() => nestedRuns.get(nestedId)?.status === "running");
 
 		await expect(root.deleteRlmSubagent(nestedId)).rejects.toThrow("No direct RLM subagent matches");
 		expect(root.cancelRlmChildRun(nestedId)).toBe(true);
-		releaseNested();
+		release("nested child");
 		await waitFor(() => !nestedRuns.has(nestedId));
-		expect(nestedSpawned.rlm_child_id).toBe(nestedId);
-		expect(rootRun.status).toBe("running");
+		expect(parentRun.status).toBe("running");
 
-		releaseChild();
-		await waitFor(() => rootRun.status === "done");
+		release("slow parent");
+		await waitFor(() => parentRun.status === "done");
 	});
 
 	it("handles rlm calls from asyncio tasks after the scheduling cell is idle", async () => {
@@ -4090,7 +2742,7 @@ import rlm
 
 async def _delayed_rlm():
     await asyncio.sleep(0.05)
-    return await rlm.run("detached child after idle")
+    return await rlm.spawn("detached child after idle", name="detached-worker")
 
 _task = asyncio.create_task(_delayed_rlm())
 print("scheduled")
@@ -4110,6 +2762,51 @@ print(_result.name)
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
+	});
+
+	it("normalizes and bounds startup failures in the subagent registry", async () => {
+		let attempt = 0;
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error(attempt++ === 0 ? "" : "x".repeat(1_000));
+				},
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+
+		await root.runRlmChild("start empty-error child", { name: "empty-error-worker" });
+		await root.runRlmChild("start long-error child", { name: "long-error-worker" });
+		await vi.waitFor(async () => {
+			const subagents = (await root.listRlmSubagents()).subagents;
+			expect(subagents).toContainEqual(
+				expect.objectContaining({
+					status: "error",
+					error: "Subagent failed without an error message",
+				}),
+			);
+			expect(subagents).toContainEqual(
+				expect.objectContaining({
+					session_name: "long-error-worker",
+					status: "error",
+					error: `${"x".repeat(509)}...`,
+				}),
+			);
+		});
+		await vi.waitFor(() => {
+			expect(root.messages).toContainEqual(
+				expect.objectContaining({
+					customType: "rlm_child_failure",
+					content: expect.stringContaining("x".repeat(1_000)),
+				}),
+			);
+		});
+	});
+
+	it("rejects child creation at the configured recursion depth cap", async () => {
+		const root = createSession({ depth: 1, maxDepth: 1 });
+
+		await expect(root.runRlmChild("nested")).rejects.toThrow("RLM recursion depth limit reached");
 	});
 });
 
@@ -4194,46 +2891,33 @@ describe("AgentSession RLM session dir", () => {
 		expect(after).toEqual(before);
 	});
 
-	it("uses the persistent artifact dir and sets RLM_SESSION_DIR for a persisted session", () => {
-		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
-		const root = createSession(sessionManager);
+	it.each([
+		{ label: "a persisted session", subagentDir: undefined },
+		{ label: "a subagent session under a parent-assigned dir", subagentDir: "parent-artifact/sub-abc12345" },
+		{ label: "an ephemeral session without an artifact dir", subagentDir: "ephemeral-rlm" },
+	])("resolves RLM_SESSION_DIR and RLM_HARNESS_STATE_DIR for $label", ({ subagentDir }) => {
+		const ephemeral = subagentDir === "ephemeral-rlm";
+		const rlmSessionDir = subagentDir ? join(tempDir, subagentDir) : undefined;
+		if (rlmSessionDir) mkdirSync(rlmSessionDir, { recursive: true });
+		const sessionManager = ephemeral
+			? SessionManager.inMemory(tempDir)
+			: SessionManager.create(tempDir, rlmSessionDir ?? join(tempDir, "sessions"));
+		const root = createSession(sessionManager, undefined, undefined, false, rlmSessionDir);
 		const inspectable = root as unknown as InspectableRlmDirSession;
 
-		const artifactDir = sessionManager.getSessionArtifactDir();
-		expect(artifactDir).toBeDefined();
-		expect(inspectable._ensureRlmSessionDir()).toBe(artifactDir);
-		expect(inspectable._rlmKernelEnv().RLM_SESSION_DIR).toBe(artifactDir);
-		expect(inspectable._rlmKernelEnv().RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
-		expect(inspectable._rlmKernelEnv().RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
-	});
-
-	it("points RLM_HARNESS_STATE_DIR at the session's own artifact dir for subagent sessions", () => {
 		// Subagent layout: the parent assigns rlmSessionDir, but the child's own
 		// sessionManager persists artifacts (and reads local harness state) elsewhere.
-		const subDir = join(tempDir, "parent-artifact", "sub-abc12345");
-		mkdirSync(subDir, { recursive: true });
-		const sessionManager = SessionManager.create(tempDir, subDir);
-		const root = createSession(sessionManager, undefined, undefined, false, subDir);
-		const inspectable = root as unknown as InspectableRlmDirSession;
-
 		const artifactDir = sessionManager.getSessionArtifactDir();
-		expect(artifactDir).toBeDefined();
-		expect(artifactDir).not.toBe(subDir);
+		const expectedSessionDir = rlmSessionDir ?? artifactDir;
+		if (!ephemeral) expect(artifactDir).toBeDefined();
+		if (!rlmSessionDir) expect(inspectable._ensureRlmSessionDir()).toBe(artifactDir);
 		const env = inspectable._rlmKernelEnv();
-		expect(env.RLM_SESSION_DIR).toBe(subDir);
-		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
+		expect(env.RLM_SESSION_DIR).toBe(expectedSessionDir);
+		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(artifactDir ?? rlmSessionDir!, "harness"));
+		expect(env.RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
 	});
 
-	it("falls back to the rlm session dir for RLM_HARNESS_STATE_DIR without an artifact dir", () => {
-		const ephemeralDir = join(tempDir, "ephemeral-rlm");
-		mkdirSync(ephemeralDir, { recursive: true });
-		const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
-		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-		expect(env.RLM_SESSION_DIR).toBe(ephemeralDir);
-		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(ephemeralDir, "harness"));
-	});
-
-	it("loads the ephemeral RLM harness path into the host system prompt", () => {
+	it("loads the ephemeral RLM harness path into the session-start harness digest", () => {
 		const ephemeralDir = join(tempDir, "ephemeral-rlm");
 		mkdirSync(join(ephemeralDir, "harness"), { recursive: true });
 		writeFileSync(
@@ -4268,75 +2952,143 @@ describe("AgentSession RLM session dir", () => {
 		);
 		const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
 
-		const prompt = root.systemPrompt;
+		const digest = (
+			root as unknown as {
+				_harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string };
+			}
+		)._harnessDigestWithFingerprint().digest;
 
-		expect(prompt).toContain("Ephemeral note");
-		expect(prompt).toContain("Loaded from the RLM session harness path.");
+		expect(root.systemPrompt).not.toContain("Ephemeral note");
+		expect(digest).toContain("Ephemeral note");
+		expect(digest).toContain("Loaded from the RLM session harness path.");
 	});
 
-	it("exports the configured agentDir to the kernel so skills find auth.json", () => {
-		const agentDir = join(tempDir, "custom-agent-dir");
-		const root = createSession(SessionManager.inMemory(tempDir), agentDir);
-		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-		expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBe(agentDir);
-	});
-
-	it("omits the agentDir env var when none is configured", () => {
-		const root = createSession(SessionManager.inMemory(tempDir));
-		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-		expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBeUndefined();
-	});
-
-	it("exports agentDir but skips key injection when no websearch skill is loaded", () => {
-		const agentDir = join(tempDir, "custom-agent-dir");
-		const root = createSession(SessionManager.inMemory(tempDir), agentDir, "stored-key", false);
-		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-		expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBe(agentDir);
-		expect(env.SERPER_API_KEY).toBeUndefined();
-	});
-
-	it("injects the key for a custom websearch skill even when bundled is off", () => {
-		const previous = process.env.SERPER_API_KEY;
-		delete process.env.SERPER_API_KEY;
-		try {
-			// loadWebsearchSkill=true models a --skill/project websearch; the bundled
-			// setting is irrelevant because the gate checks the loaded skill, not settings.
-			const root = createSession(SessionManager.inMemory(tempDir), undefined, "custom-key", true);
-			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-			expect(env.SERPER_API_KEY).toBe("custom-key");
-		} finally {
-			if (previous === undefined) delete process.env.SERPER_API_KEY;
-			else process.env.SERPER_API_KEY = previous;
-		}
-	});
-
-	it("injects a literal stored Serper key into the kernel", () => {
-		const previous = process.env.SERPER_API_KEY;
-		delete process.env.SERPER_API_KEY;
-		try {
-			const root = createSession(SessionManager.inMemory(tempDir), undefined, "literal-serper-key", true);
-			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-			expect(env.SERPER_API_KEY).toBe("literal-serper-key");
-		} finally {
-			if (previous === undefined) delete process.env.SERPER_API_KEY;
-			else process.env.SERPER_API_KEY = previous;
-		}
-	});
-
-	it("resolves an env-var-reference Serper key before injecting it", () => {
+	it.each([
+		{
+			label: "no agent dir and no websearch skill",
+			agentDir: false,
+			serperKey: undefined,
+			websearch: false,
+			key: undefined,
+		},
+		{
+			label: "an agent dir but no websearch skill",
+			agentDir: true,
+			serperKey: "stored-key",
+			websearch: false,
+			key: undefined,
+		},
+		// loadWebsearchSkill models a --skill/project websearch; the bundled setting
+		// is irrelevant because the gate checks the loaded skill, not settings.
+		{
+			label: "a literal key and a loaded websearch skill",
+			agentDir: false,
+			serperKey: "literal-key",
+			websearch: true,
+			key: "literal-key",
+		},
+		{
+			label: "an env-var-reference key",
+			agentDir: false,
+			serperKey: "MY_SERPER_REF",
+			websearch: true,
+			key: "resolved-secret",
+		},
+	])("exports the kernel env for $label", ({ agentDir, serperKey, websearch, key }) => {
 		const previousKey = process.env.SERPER_API_KEY;
 		const previousRef = process.env.MY_SERPER_REF;
 		delete process.env.SERPER_API_KEY;
 		process.env.MY_SERPER_REF = "resolved-secret";
+		const configuredAgentDir = agentDir ? join(tempDir, "custom-agent-dir") : undefined;
 		try {
-			const root = createSession(SessionManager.inMemory(tempDir), undefined, "MY_SERPER_REF", true);
+			const root = createSession(SessionManager.inMemory(tempDir), configuredAgentDir, serperKey, websearch);
 			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
-			expect(env.SERPER_API_KEY).toBe("resolved-secret");
+			expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBe(configuredAgentDir);
+			expect(env.SERPER_API_KEY).toBe(key);
 		} finally {
 			if (previousKey === undefined) delete process.env.SERPER_API_KEY;
 			else process.env.SERPER_API_KEY = previousKey;
 			if (previousRef === undefined) delete process.env.MY_SERPER_REF;
 			else process.env.MY_SERPER_REF = previousRef;
 		}
+	});
+});
+
+describe("#617 subagent terminal agent messages", () => {
+	const recursionHarnesses: Harness[] = [];
+
+	afterEach(() => {
+		for (const harness of recursionHarnesses.splice(0)) {
+			harness.cleanup();
+		}
+	});
+
+	function terminalNotices(messages: readonly AgentMessage[]): AgentMessage[] {
+		return messages.filter(
+			(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+		);
+	}
+
+	/** Synthesized terminal notices must never travel over the agent_message controller. */
+	async function spawnTerminalNoticeChild(options: { serializedRefine?: boolean } = {}) {
+		const sendAgentMessage = vi.fn(async () => {
+			throw new Error("synthesized terminal notices must not use agent_message");
+		});
+		const child = await createHarness({
+			agentMessageController: { listAgents: () => ({ agents: [] }), sendAgentMessage },
+		});
+		recursionHarnesses.push(child);
+		const parent = await createHarness({
+			...options,
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		recursionHarnesses.push(parent);
+		child.setResponses([fauxAssistantMessage("child completed")]);
+		return { parent, child, sendAgentMessage };
+	}
+
+	it("delivers a child completion without a reply through the private typed notice path", async () => {
+		const { parent, sendAgentMessage } = await spawnTerminalNoticeChild();
+
+		const spawned = await parent.session.runRlmChild("finish without replying", { name: "terminal-worker" });
+
+		await waitForHeadlessCompletion(parent.session, { waitForRlmQuiescence: true });
+		expect(terminalNotices(parent.session.messages)).toHaveLength(1);
+		expect(sendAgentMessage).not.toHaveBeenCalled();
+		expect(terminalNotices(parent.session.messages)[0]).toMatchObject({
+			customType: "rlm_child_terminal_notice",
+			details: {
+				kind: "completed_without_reply",
+				childId: spawned.rlm_child_id,
+				sessionName: "terminal-worker",
+			},
+			content: expect.stringContaining("[child-exited: no-reply child:terminal-worker]"),
+		});
+	});
+
+	it("waits for the parent to consume a child terminal notice", async () => {
+		const { parent, sendAgentMessage } = await spawnTerminalNoticeChild({ serializedRefine: true });
+		parent.setResponses([fauxAssistantMessage("parent consumed the child result")]);
+
+		const spawned = await parent.session.runRlmChild("finish without replying", { name: "headless-worker" });
+		await waitForHeadlessCompletion(parent.session, { waitForRlmQuiescence: true });
+
+		expect(sendAgentMessage).not.toHaveBeenCalled();
+		expect(terminalNotices(parent.session.messages)).toEqual([
+			expect.objectContaining({
+				details: expect.objectContaining({
+					kind: "completed_without_reply",
+					childId: spawned.rlm_child_id,
+					sessionName: "headless-worker",
+				}),
+			}),
+		]);
+		expect(getAssistantTexts(parent)).toEqual(["parent consumed the child result"]);
+		expect(parent.session.hasRunningRlmChildren()).toBe(false);
 	});
 });

@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { setLogSink } from "../src/log.js";
-import type { AssistantMessage } from "../src/types.js";
+import { streamOpenAICompletions } from "../src/providers/openai-completions.js";
+import type { AssistantMessage, Context, Model } from "../src/types.js";
 import {
 	classifyStreamFailure,
 	extractStreamFailureInfo,
@@ -9,8 +10,15 @@ import {
 	StreamFailureError,
 	streamFailureFromStopReason,
 } from "../src/utils/stream-failure.js";
+import { getFixtureModel } from "./fixture-models.js";
 
-afterEach(() => setLogSink(undefined));
+const originalFetch = global.fetch;
+
+afterEach(() => {
+	setLogSink(undefined);
+	global.fetch = originalFetch;
+	vi.restoreAllMocks();
+});
 
 function makeOutput(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
 	return {
@@ -38,6 +46,8 @@ describe("classifyStreamFailure", () => {
 		["overloaded_error", undefined, "overloaded"],
 		[undefined, 529, "overloaded"],
 		["rate_limit_error", undefined, "rate_limit"],
+		["usage_limit_reached", undefined, "rate_limit"],
+		["usage_not_included", 403, "rate_limit"],
 		[undefined, 429, "rate_limit"],
 		["refusal", undefined, "refusal"],
 		["sensitive", undefined, "safety"],
@@ -46,6 +56,10 @@ describe("classifyStreamFailure", () => {
 		["content_filter", undefined, "safety"],
 		["guardrail_intervened", undefined, "safety"],
 		["authentication_error", undefined, "auth"],
+		[undefined, 401, "auth"],
+		["permission_error", 403, "permission"],
+		["PermissionDeniedError", 403, "permission"],
+		[undefined, 403, "permission"],
 		["invalid_request_error", undefined, "invalid_request"],
 		["api_error", undefined, "server_error"],
 		[undefined, 503, "server_error"],
@@ -102,9 +116,39 @@ describe("extractStreamFailureInfo", () => {
 		expect(extractStreamFailureInfo(awsError)).toMatchObject({ requestId: "aws_req" });
 	});
 
+	test.each([
+		["Headers seconds", new Headers({ "retry-after": "120" }), 120000],
+		["retry-after-ms precedence", { "retry-after-ms": "1500", "retry-after": "2" }, 1500],
+		["record with mixed case", { "Retry-After": "120" }, 120000],
+	] as const)("extracts the server-requested retry delay: %s", (_name, headers, expected) => {
+		const error = Object.assign(new Error("429"), { status: 429, headers });
+		expect(extractStreamFailureInfo(error)).toMatchObject({ kind: "rate_limit", retryAfterMs: expected });
+	});
+
+	test("parses an HTTP-date Retry-After relative to now", () => {
+		const withDate = Object.assign(new Error("429"), {
+			status: 429,
+			headers: new Headers({ "retry-after": new Date(Date.now() + 60000).toUTCString() }),
+		});
+		const dateMs = extractStreamFailureInfo(withDate).retryAfterMs;
+		expect(dateMs).toBeGreaterThan(0);
+		expect(dateMs).toBeLessThanOrEqual(60000);
+	});
+
 	test("falls back to classifying the message text", () => {
 		expect(extractStreamFailureInfo(new Error("provider overloaded, retry later")).kind).toBe("overloaded");
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");
+	});
+
+	test.each([
+		["Unauthorized: authentication failed", undefined, "unknown"],
+		["permission denied by policy", undefined, "unknown"],
+		["upstream authentication failed", 500, "server_error"],
+		["Unauthorized", 401, "auth"],
+		["permission denied", 403, "permission"],
+	] as const)("auth/permission need more than message text: %s / %s -> %s", (message, status, expected) => {
+		// Without a structured error type, only the status may decide auth or permission.
+		expect(extractStreamFailureInfo(Object.assign(new Error(message), { status })).kind).toBe(expected);
 	});
 });
 
@@ -167,5 +211,44 @@ describe("recordStreamFailure", () => {
 		recordStreamFailure(model, output, new Error("Request was aborted"));
 		expect(output.diagnostics).toBeUndefined();
 		expect(logged).toEqual([]);
+	});
+});
+
+describe("provider retry ownership", () => {
+	const retryContext: Context = { messages: [{ role: "user", content: "hi", timestamp: 1 }] };
+
+	function completionsModel(): Model<"openai-completions"> {
+		const { compat: _compat, ...baseModel } = getFixtureModel<"openai-responses">("openai", "gpt-4o-mini");
+		return { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
+	}
+
+	test.each([
+		[
+			"makes exactly one request on a 500 and records a structured stream failure",
+			{ type: "server_error", message: "boom" },
+			{ status: 500 },
+			{ kind: "server_error", status: 500 },
+		],
+		[
+			"surfaces the server-requested Retry-After delay on rate limits",
+			{ type: "rate_limit_error", message: "slow down" },
+			{ status: 429, headers: { "retry-after": "30" } },
+			{ kind: "rate_limit", status: 429, retryAfterMs: 30000 },
+		],
+	] as const)("%s", async (_name, errorBody, init, expectedDetails) => {
+		const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: errorBody }), init));
+		global.fetch = fetchMock as typeof fetch;
+
+		let failed: AssistantMessage | undefined;
+		for await (const event of streamOpenAICompletions(completionsModel(), retryContext, { apiKey: "test-key" })) {
+			if (event.type === "error") {
+				failed = event.error;
+				break;
+			}
+		}
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(failed?.stopReason).toBe("error");
+		expect(failed?.diagnostics?.[0]).toMatchObject({ type: "provider_stream_failure", details: expectedDetails });
 	});
 });

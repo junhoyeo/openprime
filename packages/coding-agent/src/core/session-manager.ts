@@ -3,23 +3,24 @@ import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent,
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
-	chmodSync,
 	chownSync,
+	closeSync,
 	existsSync,
+	fstatSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
-	realpathSync,
-	renameSync,
-	rmSync,
+	readSync,
 	statSync,
-	writeFileSync,
+	writeSync,
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
+import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
+import { readBytesSync, readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
@@ -27,8 +28,16 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "./messages.js";
-import { cloneUsage } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+	subtractAssistantUsage,
+} from "./usage.js";
 
 export const CURRENT_SESSION_VERSION = 3;
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
@@ -52,15 +61,6 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"compaction",
 	"branch_summary",
 ]);
-
-function realpathIfPresent(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return path;
-		throw error;
-	}
-}
 
 function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: number } | undefined {
 	try {
@@ -129,6 +129,11 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	details?: T;
 	fromHook?: boolean;
 	customInstructions?: string;
+	usage?: Usage;
+	/** Harness digest snapshot taken at compaction time; rendered before the summary in LLM context. */
+	harnessDigest?: string;
+	/** Fingerprint of the harness state behind `harnessDigest` at compaction time; lets cold boundaries skip re-delivery. */
+	harnessStateFingerprint?: string;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -137,6 +142,7 @@ export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 	summary: string;
 	details?: T;
 	fromHook?: boolean;
+	usage?: Usage;
 }
 
 export interface CustomEntry<T = unknown> extends SessionEntryBase {
@@ -180,7 +186,7 @@ export interface SessionStateEntry extends SessionEntryBase {
 	state: SessionState;
 }
 
-export type AgentTaskState = "needs_input" | "completed";
+export type AgentTaskState = "needs_input" | "completed" | "error";
 
 export interface AgentStatus {
 	summary: string;
@@ -241,12 +247,19 @@ export interface SessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+export interface SessionModelRef {
+	provider: string;
+	modelId: string;
+}
+
 export interface SessionInfo {
 	path: string;
 	id: string;
 	cwd: string;
 	name?: string;
 	state?: SessionState;
+	/** Last model the session ran with, from model_change entries and assistant messages. */
+	model?: SessionModelRef;
 	parentSessionPath?: string;
 	rlmDepth: number;
 	created: Date;
@@ -255,6 +268,7 @@ export interface SessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentStatus;
+	usage?: SessionUsageSummary;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -291,6 +305,18 @@ function createUniqueSessionFileTarget(sessionDir: string): { sessionId: string;
 		}
 	}
 	throw new Error("Unable to create a unique session file");
+}
+
+// writeSync may return a short count without throwing; a torn line would
+// corrupt the forked JSONL on reopen, so loop until the whole buffer lands.
+function writeAllSync(descriptor: number, data: string, path: string): void {
+	const bytes = Buffer.from(data, "utf8");
+	let offset = 0;
+	while (offset < bytes.length) {
+		const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+		if (written <= 0) throw new Error(`Short write persisting ${path}`);
+		offset += written;
+	}
 }
 
 export function getSessionArtifactsRoot(sessionDir: string): string {
@@ -470,6 +496,30 @@ export function buildSessionContext(
 		}
 	}
 
+	// Harness digests are regenerable snapshots of persistent state, so only the
+	// newest one belongs in the built context: older digest custom messages are
+	// skipped at assembly time, and a compaction-entry snapshot yields to any
+	// digest appended after the compaction. Persisted entries keep every copy;
+	// the newest digest is authoritative and is re-delivered at cold boundaries.
+	let newestDigestEntryId: string | undefined;
+	let newestDigestIdx = -1;
+	for (let i = path.length - 1; i >= 0; i--) {
+		const entry = path[i];
+		if (entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+			newestDigestEntryId = entry.id;
+			newestDigestIdx = i;
+			break;
+		}
+	}
+
+	const compactionIdx = compaction ? path.findIndex((e) => e.type === "compaction" && e.id === compaction.id) : -1;
+	// True when the compaction snapshot is the newest digest in context, so every
+	// digest custom message is older and skipped entirely.
+	const snapshotOutranksDigest =
+		compaction?.harnessDigest !== undefined && (newestDigestIdx === -1 || newestDigestIdx < compactionIdx);
+	const keepDigestEntryId = snapshotOutranksDigest ? undefined : newestDigestEntryId;
+	const summaryHarnessDigest = newestDigestIdx > compactionIdx ? undefined : compaction?.harnessDigest;
+
 	// Build messages and collect corresponding entries
 	// When there's a compaction, model context remains summary-first while the
 	// summary records where clients should present it among retained messages.
@@ -479,6 +529,9 @@ export function buildSessionContext(
 		if (entry.type === "message") {
 			target.push(entry.message);
 		} else if (entry.type === "custom_message") {
+			if (entry.customType === HARNESS_DIGEST_CUSTOM_TYPE && entry.id !== keepDigestEntryId) {
+				return;
+			}
 			target.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
 			);
@@ -488,8 +541,6 @@ export function buildSessionContext(
 	};
 
 	if (compaction) {
-		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
-
 		// Collect kept messages (before compaction, starting from firstKeptEntryId).
 		// The context remains summary-first for the model; retainedMessageCount records
 		// the exact chronological presentation boundary for clients.
@@ -512,6 +563,8 @@ export function buildSessionContext(
 				compaction.timestamp,
 				compaction.customInstructions,
 				retainedMessages.length,
+				summaryHarnessDigest,
+				summaryHarnessDigest === undefined ? undefined : compaction.harnessStateFingerprint,
 			),
 			...retainedMessages,
 		);
@@ -578,6 +631,125 @@ async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]>
 	return entries;
 }
 
+// Crash damage (torn tail, zero-filled append) poisons the NEXT append into the
+// same physical line, so the file is repaired once at open, not tolerated in memory.
+const REPAIR_SUSPICION_WINDOW_BYTES = 1024 * 1024;
+
+// A bounded tail read gates the full repair scan: clean opens stay O(window).
+function tailLooksDamaged(targetPath: string): boolean {
+	let descriptor: number;
+	try {
+		descriptor = openSync(targetPath, "r");
+	} catch {
+		return false;
+	}
+	try {
+		const size = fstatSync(descriptor).size;
+		if (size === 0) return false;
+		const windowBytes = Math.min(size, REPAIR_SUSPICION_WINDOW_BYTES);
+		const window = Buffer.allocUnsafe(windowBytes);
+		readSync(descriptor, window, 0, windowBytes, size - windowBytes);
+		if (window.includes(0)) return true;
+		if (window[windowBytes - 1] !== 0x0a) return true;
+		const previousNewline = window.lastIndexOf(0x0a, windowBytes - 2);
+		// No boundary inside the window: the final line exceeds it; scan to be sure.
+		if (previousNewline === -1 && windowBytes < size) return true;
+		const lastLine = window.subarray(previousNewline + 1, windowBytes - 1);
+		// A blank final line is benign (the loader skips it) and appends stay safe.
+		return lastLine.length > 0 && !parsesAsJson(lastLine);
+	} catch {
+		return true;
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+function repairJsonlDamage(filePath: string): void {
+	const targetPath = realpathIfPresentSync(filePath);
+	if (!tailLooksDamaged(targetPath)) return;
+	let buffer: Buffer;
+	let snapshot: { size: number; mtimeMs: number };
+	try {
+		buffer = readFileSync(targetPath);
+		const measured = statSync(targetPath);
+		snapshot = { size: measured.size, mtimeMs: measured.mtimeMs };
+	} catch {
+		return;
+	}
+	if (buffer.length === 0 || snapshot.size !== buffer.length) return;
+	const keptLines: Buffer[] = [];
+	let recoveredNulLines = 0;
+	let droppedLines = 0;
+	let repairedTail = false;
+	let dirty = false;
+	let start = 0;
+	while (start < buffer.length) {
+		let end = buffer.indexOf(0x0a, start);
+		const terminated = end !== -1;
+		if (!terminated) end = buffer.length;
+		let lineStart = start;
+		while (lineStart < end && buffer[lineStart] === 0) lineStart++;
+		const line = buffer.subarray(lineStart, end);
+		if (lineStart > start) {
+			dirty = true;
+			if (line.length > 0 && parsesAsJson(line)) {
+				keptLines.push(line);
+				recoveredNulLines++;
+			} else {
+				droppedLines++;
+			}
+		} else if (!terminated) {
+			// An unterminated tail merges with the next append: re-terminate or truncate.
+			dirty = true;
+			if (line.length > 0 && parsesAsJson(line)) {
+				keptLines.push(line);
+				repairedTail = true;
+			} else {
+				droppedLines++;
+			}
+		} else if (end + 1 >= buffer.length && line.length > 0 && !parsesAsJson(line)) {
+			dirty = true;
+			droppedLines++;
+		} else {
+			keptLines.push(line);
+		}
+		start = end + 1;
+	}
+	if (!dirty) return;
+	const metadata = statMetadataIfPresent(targetPath);
+	const content = keptLines.length > 0 ? `${keptLines.map((kept) => kept.toString("utf8")).join("\n")}\n` : "";
+	try {
+		writeFileAtomicSync(targetPath, content, {
+			...(metadata === undefined ? {} : { mode: metadata.mode }),
+			beforeRename: (tempPath) => {
+				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
+				// A concurrent appender wins; skipping the repair is safe (next open retries).
+				const current = statSync(targetPath);
+				if (current.size !== snapshot.size || current.mtimeMs !== snapshot.mtimeMs) {
+					throw new RepairSupersededError();
+				}
+			},
+		});
+	} catch (error) {
+		if (error instanceof RepairSupersededError) return;
+		throw error;
+	}
+	console.error(
+		`Repaired crash damage in ${targetPath}: recovered ${recoveredNulLines} zero-filled line(s), dropped ${droppedLines} unrecoverable line(s)${repairedTail ? ", restored the trailing newline" : ""}`,
+	);
+}
+
+class RepairSupersededError extends Error {}
+
+function parsesAsJson(line: Buffer): boolean {
+	try {
+		JSON.parse(line.toString("utf8"));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 	if (entries.length === 0) return entries;
 	const header = entries[0];
@@ -591,6 +763,11 @@ function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(filePath)) return [];
 	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath)));
+}
+
+// Buffer variant for callers that must verify the byte count they read (parse caches).
+export function loadEntriesFromBuffer(buffer: Buffer): FileEntry[] {
+	return finalizeLoadedEntries(parseEntriesFromBuffer(buffer));
 }
 
 // Async loader for the daemon: reads off the event loop and yields while parsing so a
@@ -617,6 +794,213 @@ export async function loadEntriesFromFileAsync(
 		}
 	}
 	return finalizeLoadedEntries(entries);
+}
+
+// --- Append-only metadata writes for closed sessions -------------------------
+//
+// Catalog metadata operations (rename, archive, mark_interrupted) append a
+// single entry to a file no live session holds. Opening a SessionManager for
+// that parses and indexes the entire transcript — an O(session) stall and a
+// memory spike proportional to session size for every routine UI action. The
+// fast path below reads only a leading header window and a bounded tail window
+// instead, and falls back to a full open whenever those two windows cannot place
+// the entry (a file version this build does not write, a header beyond the
+// window, or a tail too large to resolve the leaf).
+
+const APPEND_HEADER_WINDOW_BYTES = 64 * 1024;
+const APPEND_TAIL_WINDOW_BYTES = 256 * 1024;
+
+/** Ids and timestamps shared by live appends and the append-only fast path. */
+interface AppendEntrySeed {
+	leafId: string | null;
+	newId(): string;
+	timestamp: string;
+}
+
+function buildSessionInfoEntry(name: string, seed: AppendEntrySeed): SessionInfoEntry {
+	return {
+		type: "session_info",
+		id: seed.newId(),
+		parentId: seed.leafId,
+		timestamp: seed.timestamp,
+		name: name.trim(),
+	};
+}
+
+function buildSessionStateEntry(state: SessionState, seed: AppendEntrySeed): SessionStateEntry {
+	return {
+		type: "session_state",
+		id: seed.newId(),
+		parentId: seed.leafId,
+		timestamp: seed.timestamp,
+		state: { status: state.status },
+	};
+}
+
+function buildCustomMessageEntry<T>(
+	customType: string,
+	content: string | (TextContent | ImageContent)[],
+	display: boolean,
+	details: T | undefined,
+	seed: AppendEntrySeed,
+): CustomMessageEntry<T> {
+	return {
+		type: "custom_message",
+		customType,
+		content,
+		display,
+		details,
+		id: seed.newId(),
+		parentId: seed.leafId,
+		timestamp: seed.timestamp,
+	};
+}
+
+/**
+ * First line that parses as JSON in the leading window, mirroring how the
+ * loader skips malformed or blank leading lines. Returns "window-truncated"
+ * when the window held no parseable line but stopped before the end of the
+ * file: a longer leading line may hide the header past it, and only a full
+ * load can tell.
+ */
+function readFirstParseableLine(
+	filePath: string,
+): { type?: unknown; id?: unknown; version?: unknown } | "window-truncated" | undefined {
+	const buffer = readBytesSync(filePath, 0, APPEND_HEADER_WINDOW_BYTES);
+	let start = 0;
+	while (start < buffer.length) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = buffer.length;
+		const line = buffer.subarray(start, end);
+		if (line.length > 0) {
+			try {
+				return JSON.parse(line.toString("utf8")) as { type?: unknown; id?: unknown; version?: unknown };
+			} catch {
+				// Skip malformed or blank lines like appendEntryFromBuffer.
+			}
+		}
+		start = end + 1;
+	}
+	// A window shorter than the cap means the read reached EOF, so the file
+	// really has no parseable leading line.
+	return buffer.length < APPEND_HEADER_WINDOW_BYTES ? undefined : "window-truncated";
+}
+
+/**
+ * Reads a bounded tail window and returns the id of the file's current leaf
+ * entry: the last line that parses as a non-session entry, like _buildIndex
+ * computes on a full load. Returns null for a legacy leaf without an id or a
+ * file without entries, and undefined when the window is too small to decide —
+ * the caller then falls back to a full load.
+ */
+function readTailLeafId(filePath: string, fileSize: number): string | null | undefined {
+	const windowBytes = Math.min(fileSize, APPEND_TAIL_WINDOW_BYTES);
+	const buffer = readBytesSync(filePath, fileSize - windowBytes, fileSize);
+	const lines: Buffer[] = [];
+	let start = 0;
+	while (start < buffer.length) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = buffer.length;
+		lines.push(buffer.subarray(start, end));
+		start = end + 1;
+	}
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i]!;
+		if (line.length === 0) continue;
+		let parsed: { type?: unknown; id?: unknown };
+		try {
+			parsed = JSON.parse(line.toString("utf8")) as { type?: unknown; id?: unknown };
+		} catch {
+			continue;
+		}
+		if (parsed.type === "session") continue;
+		return typeof parsed.id === "string" ? parsed.id : null;
+	}
+	return windowBytes === fileSize ? null : undefined;
+}
+
+/**
+ * Appends one metadata entry to an existing session file without parsing the
+ * transcript. Repairs crash damage like a full open would, validates the
+ * session header, then appends the entry in one line. Throws when the file is
+ * missing or its header is invalid; returns undefined whenever only a full open
+ * can place the entry (an older or newer version, a header beyond the window,
+ * or a tail too large to resolve the leaf), so the caller can fall back.
+ */
+function appendEntryToExistingFile(
+	sessionFile: string,
+	buildEntry: (seed: AppendEntrySeed) => SessionEntry,
+): string | undefined {
+	const targetPath = resolve(sessionFile);
+	if (!existsSync(targetPath)) {
+		throw new Error(`Cannot append to missing session file: ${sessionFile}`);
+	}
+	repairJsonlDamage(targetPath);
+	const header = readFirstParseableLine(targetPath);
+	if (header === "window-truncated") {
+		return undefined;
+	}
+	if (!header || header.type !== "session" || typeof header.id !== "string") {
+		throw new Error(`Session file has no valid session header: ${sessionFile}`);
+	}
+	// Append directly only to a file this build writes: a v1/v2 file needs the
+	// migration a full open performs and may not carry the ids an appended
+	// parentId chains to, and a future version may change the entry shape.
+	if (header.version !== CURRENT_SESSION_VERSION) {
+		return undefined;
+	}
+	const leafId = readTailLeafId(targetPath, statSync(targetPath).size);
+	if (leafId === undefined) {
+		return undefined;
+	}
+	// generateId checks the in-memory entry index, which only a full parse can
+	// build; without it, take generateId's guaranteed-unique fallback form. A
+	// duplicate short id would cycle the leaf-to-root walk in buildSessionContext.
+	const entry = buildEntry({ leafId, newId: () => randomUUID(), timestamp: new Date().toISOString() });
+	mkdirSync(dirname(targetPath), { recursive: true });
+	appendFileSync(targetPath, `${JSON.stringify(entry)}\n`);
+	return entry.id;
+}
+
+/**
+ * Appends a rename (session_info) entry to a closed session file without a
+ * full transcript parse; falls back to opening a SessionManager when only a
+ * full open can place the entry.
+ */
+export function appendSessionInfoToExistingFile(sessionFile: string, name: string): string {
+	const fastId = appendEntryToExistingFile(sessionFile, (seed) => buildSessionInfoEntry(name, seed));
+	return fastId ?? SessionManager.open(sessionFile).appendSessionInfo(name);
+}
+
+/**
+ * Appends a lifecycle (session_state) entry to a closed session file without a
+ * full transcript parse; falls back like appendSessionInfoToExistingFile.
+ */
+export function appendSessionStateToExistingFile(sessionFile: string, state: SessionState): string {
+	const fastId = appendEntryToExistingFile(sessionFile, (seed) => buildSessionStateEntry(state, seed));
+	return fastId ?? SessionManager.open(sessionFile).appendSessionState(state);
+}
+
+/**
+ * Appends a custom message entry to a closed session file without a full
+ * transcript parse; falls back like appendSessionInfoToExistingFile. Unlike a
+ * live append, this writes even when the file has no assistant entry yet:
+ * SessionManager._persist suppresses custom entries until then, which would
+ * drop the notice on the floor for a session whose first reply never landed.
+ * A session that falls back to a full open keeps the full-open behavior: with
+ * no assistant entry, _persist drops the entry and nothing is appended.
+ */
+export function appendCustomMessageToExistingFile<T = unknown>(
+	sessionFile: string,
+	customType: string,
+	content: string | (TextContent | ImageContent)[],
+	display: boolean,
+	details?: T,
+): string {
+	const fastId = appendEntryToExistingFile(sessionFile, (seed) =>
+		buildCustomMessageEntry(customType, content, display, details, seed),
+	);
+	return fastId ?? SessionManager.open(sessionFile).appendCustomMessageEntry(customType, content, display, details);
 }
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {
@@ -917,138 +1301,390 @@ function extractOversizedMessageSummary(line: string): {
 	};
 }
 
-interface SessionInfoCacheEntry {
-	size: number;
-	mtimeMs: number;
-	info: SessionInfo | null;
+interface SessionScanAccumulator {
+	header?: SessionHeader;
+	model?: SessionModelRef;
+	/** The first parsed entry was not a session header; appends cannot repair this. */
+	invalid: boolean;
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	name?: string;
+	state?: SessionState;
+	agentStatus?: AgentStatus;
+	lastActivityTime?: number;
+	// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
+	assistantUsageById: Map<string, Usage>;
+	attributedChildUsage: Usage;
+	summarizationUsage: Usage;
 }
 
-// Session files are append-only, so an unchanged (size, mtimeMs) means identical
-// content: cache list metadata and rescan only files that changed.
-const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+interface SessionScanState {
+	fileSize: number;
+	mtimeMs: number;
+	/** Identity of the scanned file: a rename rewrite replaces the inode and invalidates the resume state. */
+	dev: number;
+	ino: number;
+	/** Bytes consumed as complete newline-terminated lines; the resume point for the next scan. */
+	offset: number;
+	/** Last bytes of the consumed prefix; a resume only proceeds while the file still starts with them. */
+	tail: Buffer;
+	acc: SessionScanAccumulator;
+	info: SessionInfo | null;
+	/** Usage entries counted against the retained bound at the last store. */
+	accountedUsageEntries: number;
+}
 
-export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+const SESSION_SCAN_RESUME_TAIL_BYTES = 16;
+const NEWLINE_BUFFER = Buffer.from("\n");
+// Memory/performance budget: whole-state LRU eviction can force a full catalog rescan every refresh.
+// Keep large families (~2k sessions, 150k usage entries) and growth headroom resident.
+const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES = 400_000;
+
+// Session files are append-only between whole-file rewrites, so scans resume
+// from the last consumed byte offset; rewrites are detected by shrink,
+// same-size mtime change, replaced inode, or a changed prefix tail. In-place
+// interior edits that defeat all four are outside the writer model.
+const sessionScanStates = new Map<string, SessionScanState>();
+// Scans of a path run one at a time; a later caller chains its own pass (its
+// stat sees every prior append) instead of joining an earlier scan's result.
+const sessionScanQueue = new Map<string, Promise<SessionInfo | null>>();
+
+export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	const previous = sessionScanQueue.get(filePath);
+	const scan = previous
+		? previous.then(
+				() => scanSessionInfo(filePath),
+				() => scanSessionInfo(filePath),
+			)
+		: scanSessionInfo(filePath);
+	sessionScanQueue.set(filePath, scan);
+	void scan.finally(() => {
+		if (sessionScanQueue.get(filePath) === scan) sessionScanQueue.delete(filePath);
+	});
+	return scan;
+}
+
+let retainedUsageEntries = 0;
+
+function dropSessionScanState(filePath: string): void {
+	const state = sessionScanStates.get(filePath);
+	if (!state) return;
+	retainedUsageEntries -= state.accountedUsageEntries;
+	sessionScanStates.delete(filePath);
+}
+
+/** Refresh LRU recency and enforce the retained-usage bound. */
+function storeSessionScanState(filePath: string, state: SessionScanState): void {
+	dropSessionScanState(filePath);
+	state.accountedUsageEntries = state.acc.assistantUsageById.size;
+	retainedUsageEntries += state.accountedUsageEntries;
+	sessionScanStates.set(filePath, state);
+	for (const key of sessionScanStates.keys()) {
+		if (retainedUsageEntries <= SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES) break;
+		dropSessionScanState(key);
+	}
+}
+
+function createSessionScanAccumulator(): SessionScanAccumulator {
+	return {
+		invalid: false,
+		messageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+		assistantUsageById: new Map<string, Usage>(),
+		attributedChildUsage: emptyUsage(),
+		summarizationUsage: emptyUsage(),
+	};
+}
+
+function scannedPrefixIntact(filePath: string, state: SessionScanState): boolean {
+	if (state.offset === 0) return true;
+	try {
+		const start = Math.max(0, state.offset - SESSION_SCAN_RESUME_TAIL_BYTES);
+		return readBytesSync(filePath, start, state.offset).equals(state.tail);
+	} catch {
+		return false;
+	}
+}
+
+/** Last bytes of the consumed prefix after appending one line and its newline, copied out of the stream chunk. */
+function advanceScanTail(tail: Buffer, line: Buffer): Buffer {
+	if (line.length >= SESSION_SCAN_RESUME_TAIL_BYTES - 1) {
+		return Buffer.concat([line.subarray(line.length - (SESSION_SCAN_RESUME_TAIL_BYTES - 1)), NEWLINE_BUFFER]);
+	}
+	const combined = Buffer.concat([tail, line, NEWLINE_BUFFER]);
+	return combined.length <= SESSION_SCAN_RESUME_TAIL_BYTES
+		? combined
+		: Buffer.from(combined.subarray(combined.length - SESSION_SCAN_RESUME_TAIL_BYTES));
+}
+
+async function scanSessionInfo(filePath: string, retryOnReplacement = true): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		stats = await stat(filePath);
 	} catch {
+		dropSessionScanState(filePath);
 		return null;
 	}
-	const cached = sessionInfoCache.get(filePath);
-	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
-		return cached.info;
+	const previous = sessionScanStates.get(filePath);
+	const sameFile = previous !== undefined && previous.dev === stats.dev && previous.ino === stats.ino;
+	if (sameFile && previous.fileSize === stats.size && previous.mtimeMs === stats.mtimeMs) {
+		storeSessionScanState(filePath, previous);
+		return previous.info;
 	}
-	const info = await scanSessionInfo(filePath, stats);
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
-	return info;
+	const resume = sameFile && stats.size > previous.fileSize && scannedPrefixIntact(filePath, previous);
+	const state: SessionScanState = resume
+		? previous
+		: {
+				fileSize: 0,
+				mtimeMs: 0,
+				dev: stats.dev,
+				ino: stats.ino,
+				offset: 0,
+				tail: Buffer.alloc(0),
+				acc: createSessionScanAccumulator(),
+				info: null,
+				accountedUsageEntries: 0,
+			};
+	try {
+		const tornTail = await scanSessionLines(filePath, state, stats.size);
+		state.info = snapshotSessionInfo(state.acc, tornTail, filePath, stats);
+	} catch {
+		dropSessionScanState(filePath);
+		return null;
+	}
+	// A rename rewrite racing the scan can mix two files' bytes into one
+	// accumulator: a changed inode afterwards discards the state and rescans.
+	let after: Awaited<ReturnType<typeof stat>> | undefined;
+	try {
+		after = await stat(filePath);
+	} catch {
+		after = undefined;
+	}
+	if (!after || after.dev !== stats.dev || after.ino !== stats.ino) {
+		dropSessionScanState(filePath);
+		return retryOnReplacement ? scanSessionInfo(filePath, false) : null;
+	}
+	state.fileSize = stats.size;
+	state.mtimeMs = stats.mtimeMs;
+	storeSessionScanState(filePath, state);
+	return state.info;
 }
 
-async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
-	try {
-		let header: SessionHeader | undefined;
-		let messageCount = 0;
-		let firstMessage = "";
-		let allMessagesText = "";
-		let name: string | undefined;
-		let state: SessionState | undefined;
-		let agentStatus: AgentStatus | undefined;
-		let lastActivityTime: number | undefined;
+/**
+ * Fold the complete lines in [state.offset, size) into the accumulator. An
+ * unterminated final line may be an in-progress append: it is returned for
+ * snapshot-only folding, never consumed into the resumable accumulator.
+ */
+async function scanSessionLines(filePath: string, state: SessionScanState, size: number): Promise<Buffer | undefined> {
+	if (state.acc.invalid || state.offset >= size) return undefined;
+	for await (const lineBuffer of readLinesAsBuffers(filePath, { start: state.offset, end: size - 1 })) {
+		const lineEnd = state.offset + lineBuffer.length;
+		if (lineEnd >= size) return lineBuffer;
+		foldSessionScanLine(state.acc, lineBuffer);
+		state.tail = advanceScanTail(state.tail, lineBuffer);
+		state.offset = lineEnd + 1;
+		if (state.acc.invalid) break;
+	}
+	return undefined;
+}
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
-			const line = lineBuffer.toString("utf8");
-			if (!line.trim()) continue;
+// Entry headers are serialized before any payload, so a message entry's own
+// type key and its message role both land in the first few hundred bytes.
+const SESSION_LIST_HEADER_PREFIX_MAX_CHARS = 512;
+const SESSION_LIST_MESSAGE_TYPE_HEADER = '"type":"message"';
+const SESSION_LIST_MESSAGE_ROLE_HEADER = '"message":{"role":"';
+const SESSION_LIST_USER_ROLE = 'user"';
+const SESSION_LIST_ASSISTANT_ROLE = 'assistant"';
 
-			// Large tool-result entries can be many MB. They do not carry the
-			// session-list metadata we need, and parsing them during every refresh
-			// can exhaust the daemon heap.
-			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
-				if (looksLikeMessageEntry(line)) {
-					messageCount++;
-					const summary = extractOversizedMessageSummary(line);
-					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
-						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
-					}
-					if (summary.role === "user" && !firstMessage) {
-						firstMessage = summary.textPreview || "(large message)";
-					}
-				}
-				continue;
+/**
+ * Return true when a line's serialized header proves the entry is a message
+ * whose role can only contribute its message count.
+ *
+ * Tool results (and extension message roles) carry no usage, model, name, state,
+ * activity timestamp, or search text, yet records commit them verbatim: they are
+ * the largest single share of the bytes a cold catalog scan parses for nothing.
+ * Counting them from the header also spares the oversize branch its preview
+ * scans for multi-megabyte tool results.
+ *
+ * `"` is escaped inside a JSON string, so a header that matches here can only be
+ * structural. Every layout the file writer does not produce — spacing, another
+ * key order, a nested container before the role marker, a role that runs past the
+ * prefix — falls through to the full parse.
+ */
+function isCountOnlyMessageLine(line: string): boolean {
+	// Only the entry header decides this, and the header always fits in the
+	// prefix: bounding the search keeps a file written in another layout
+	// (spacing, a different key order) from paying a full scan per line.
+	const prefix =
+		line.length > SESSION_LIST_HEADER_PREFIX_MAX_CHARS ? line.slice(0, SESSION_LIST_HEADER_PREFIX_MAX_CHARS) : line;
+	const typeIndex = prefix.indexOf(SESSION_LIST_MESSAGE_TYPE_HEADER);
+	if (typeIndex < 0) return false;
+	const roleMarkerIndex = prefix.indexOf(SESSION_LIST_MESSAGE_ROLE_HEADER, typeIndex);
+	if (roleMarkerIndex < 0) return false;
+	// The role marker carries the message object's own brace, so any earlier
+	// container belongs to another object: an entry that nests a payload before
+	// its type key, or one that quotes this header before its own message key.
+	// Either way the role found below is not the entry's message role.
+	const containerIndex = prefix.indexOf("{", 1);
+	if (containerIndex >= 0 && containerIndex < roleMarkerIndex) return false;
+	const roleIndex = roleMarkerIndex + SESSION_LIST_MESSAGE_ROLE_HEADER.length;
+	// A role that reaches past the prefix cannot be compared, so it takes the full parse.
+	if (roleIndex + SESSION_LIST_ASSISTANT_ROLE.length > prefix.length) return false;
+	return (
+		!prefix.startsWith(SESSION_LIST_USER_ROLE, roleIndex) &&
+		!prefix.startsWith(SESSION_LIST_ASSISTANT_ROLE, roleIndex)
+	);
+}
+
+function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): void {
+	const line = lineBuffer.toString("utf8");
+	if (!line.trim()) return;
+
+	// Guarded on the header so damaged-file detection still sees the first entry parsed.
+	if (acc.header !== undefined && isCountOnlyMessageLine(line)) {
+		acc.messageCount++;
+		return;
+	}
+
+	// Large tool-result entries can be many MB. They do not carry the
+	// session-list metadata we need, and parsing them during every refresh
+	// can exhaust the daemon heap.
+	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+		if (looksLikeMessageEntry(line)) {
+			acc.messageCount++;
+			const summary = extractOversizedMessageSummary(line);
+			if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
+				acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, summary.timestamp);
 			}
-
-			const trimmed = line.trim();
-			let entry: FileEntry;
-			try {
-				entry = JSON.parse(trimmed) as FileEntry;
-			} catch {
-				continue;
-			}
-
-			if (entry.type === "session_info") {
-				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
-			}
-			if (entry.type === "session_state") {
-				const stateEntry = entry as SessionStateEntry;
-				const status = normalizeSessionStateStatus(stateEntry.state?.status);
-				if (status) {
-					state = { status };
-				}
-			}
-			// Keep the latest recap/verdict so off-daemon sessions don't all show as
-			// unjudged in the agents view. Append-only, so last seen wins.
-			if (entry.type === "agent_status") {
-				agentStatus = (entry as AgentStatusEntry).status;
-			}
-
-			if (!header) {
-				if (entry.type !== "session") {
-					return null;
-				}
-				header = entry as SessionHeader;
-			}
-
-			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const message = (entry as SessionMessageEntry).message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
+			if (summary.role === "user" && !acc.firstMessage) {
+				acc.firstMessage = summary.textPreview || "(large message)";
 			}
 		}
-
-		if (!header) return null;
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const rlmDepth = resolveSessionRlmDepth(header, filePath);
-		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
-
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
-			name,
-			state,
-			parentSessionPath,
-			rlmDepth,
-			created: new Date(header.timestamp),
-			modified,
-			messageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText,
-			agentStatus,
-		};
-	} catch {
-		return null;
+		return;
 	}
+
+	const trimmed = line.trim();
+	let entry: FileEntry;
+	try {
+		entry = JSON.parse(trimmed) as FileEntry;
+	} catch {
+		return;
+	}
+
+	if (entry.type === "session_info") {
+		const infoEntry = entry as SessionInfoEntry;
+		acc.name = infoEntry.name?.trim() || undefined;
+	}
+	if (entry.type === "session_state") {
+		const stateEntry = entry as SessionStateEntry;
+		const status = normalizeSessionStateStatus(stateEntry.state?.status);
+		if (status) {
+			acc.state = { status };
+		}
+	}
+	// Keep the latest recap/verdict so off-daemon sessions don't all show as
+	// unjudged in the agents view. Append-only, so last seen wins.
+	if (entry.type === "agent_status") {
+		acc.agentStatus = (entry as AgentStatusEntry).status;
+	}
+	if (entry.type === "model_change") {
+		const modelEntry = entry as ModelChangeEntry;
+		acc.model = { provider: modelEntry.provider, modelId: modelEntry.modelId };
+	}
+	if (entry.type === "child_usage_attributed") {
+		const attribution = entry as ChildUsageAttributionEntry;
+		if (acc.assistantUsageById.has(attribution.targetId)) {
+			acc.assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
+			addAssistantUsage(acc.attributedChildUsage, attribution.childUsage);
+		}
+	}
+	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
+		if (summarizationUsage) addAssistantUsage(acc.summarizationUsage, summarizationUsage);
+	}
+	if (!acc.header) {
+		if (entry.type !== "session") {
+			acc.invalid = true;
+			return;
+		}
+		acc.header = entry as SessionHeader;
+	}
+
+	acc.lastActivityTime = updateLastActivityTime(acc.lastActivityTime, entry);
+
+	if (entry.type !== "message") return;
+	acc.messageCount++;
+
+	const message = (entry as SessionMessageEntry).message;
+	if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
+		acc.assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
+	}
+	if (message.role === "assistant") {
+		const assistant = message as { provider?: string; model?: string };
+		if (typeof assistant.provider === "string" && typeof assistant.model === "string") {
+			acc.model = { provider: assistant.provider, modelId: assistant.model };
+		}
+	}
+	if (!isMessageWithContent(message)) return;
+	if (message.role !== "user" && message.role !== "assistant") return;
+
+	const textContent = extractTextContent(message);
+	if (!textContent) return;
+
+	acc.allMessagesText = appendCappedSearchText(acc.allMessagesText, textContent);
+	if (!acc.firstMessage && message.role === "user") {
+		acc.firstMessage = textContent;
+	}
+}
+
+function snapshotSessionInfo(
+	persistent: SessionScanAccumulator,
+	tornTail: Buffer | undefined,
+	filePath: string,
+	stats: Awaited<ReturnType<typeof stat>>,
+): SessionInfo | null {
+	let acc = persistent;
+	if (tornTail !== undefined && tornTail.length > 0 && !acc.invalid) {
+		acc = {
+			...persistent,
+			assistantUsageById: new Map(persistent.assistantUsageById),
+			attributedChildUsage: cloneUsage(persistent.attributedChildUsage),
+			summarizationUsage: cloneUsage(persistent.summarizationUsage),
+		};
+		foldSessionScanLine(acc, tornTail);
+	}
+	if (acc.invalid || !acc.header) return null;
+	const usageTotal = emptyUsage();
+	for (const usage of acc.assistantUsageById.values()) {
+		addAssistantUsage(usageTotal, usage);
+	}
+	addAssistantUsage(usageTotal, acc.summarizationUsage);
+	subtractAssistantUsage(usageTotal, acc.attributedChildUsage);
+	const header = acc.header;
+	const cwd = typeof header.cwd === "string" ? header.cwd : "";
+	const parentSessionPath = header.parentSession;
+	const rlmDepth = resolveSessionRlmDepth(header, filePath);
+	const modified = getSessionModifiedDateFromLastActivity(acc.lastActivityTime, header, stats.mtime);
+
+	return {
+		path: filePath,
+		id: header.id,
+		cwd,
+		name: acc.name,
+		state: acc.state,
+		model: acc.model,
+		parentSessionPath,
+		rlmDepth,
+		created: new Date(header.timestamp),
+		modified,
+		messageCount: acc.messageCount,
+		firstMessage: acc.firstMessage || "(no messages)",
+		allMessagesText: acc.allMessagesText,
+		agentStatus: acc.agentStatus,
+		usage: sessionUsageSummaryFrom(usageTotal),
+	};
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1067,6 +1703,9 @@ async function listSessionsFromDir(
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
+		for (const key of sessionScanStates.keys()) {
+			if (dirname(key) === dir) dropSessionScanState(key);
+		}
 		return sessions;
 	}
 
@@ -1076,9 +1715,9 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		const present = new Set(files);
-		for (const key of sessionInfoCache.keys()) {
+		for (const key of sessionScanStates.keys()) {
 			if (dirname(key) === dir && !present.has(key)) {
-				sessionInfoCache.delete(key);
+				dropSessionScanState(key);
 			}
 		}
 
@@ -1106,11 +1745,21 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	// Flip-once cache for the no-assistant guard in _persist: true from the first
+	// assistant message on. Refreshed on every fileEntries reassignment; hot
+	// appends only ever set it to true, keeping _persist O(1).
+	private hasAssistantEntry = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	// Cache of the live leaf's branch path, so the per-turn compaction check and the
+	// context-usage state build get an O(1) lookup instead of a leaf-to-root walk.
+	// Appends extend the cached array in place; every other leafId write drops the
+	// cache. The array is handed out as-is, so callers must treat it as read-only
+	// and must not hold it across an append.
+	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 
 	private constructor(
@@ -1142,7 +1791,9 @@ export class SessionManager {
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
+			if (this.persist && preloadedEntries === undefined) repairJsonlDamage(this.sessionFile);
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
+			this._refreshHasAssistantEntry();
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
@@ -1220,10 +1871,12 @@ export class SessionManager {
 			git,
 		};
 		this.fileEntries = [header];
+		this.hasAssistantEntry = false;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.leafBranchCache = null;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -1232,11 +1885,19 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	// Cold-path recompute of the flip-once has-assistant cache. Hot appends keep
+	// it O(1) in _appendEntry; every fileEntries reassignment (open, branch,
+	// rollback) refreshes it here.
+	private _refreshHasAssistantEntry(): void {
+		this.hasAssistantEntry = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+	}
+
 	private _buildIndex(): void {
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.leafBranchCache = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
@@ -1256,21 +1917,16 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		const targetPath = realpathIfPresent(this.sessionFile);
+		const targetPath = realpathIfPresentSync(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
-		const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
-		try {
-			const metadata = statMetadataIfPresent(targetPath);
-			writeFileSync(tempPath, content, metadata === undefined ? undefined : { mode: metadata.mode });
-			if (metadata !== undefined) {
-				chownSync(tempPath, metadata.uid, metadata.gid);
-				chmodSync(tempPath, metadata.mode);
-			}
-			renameSync(tempPath, targetPath);
-		} finally {
-			rmSync(tempPath, { force: true });
-		}
+		const metadata = statMetadataIfPresent(targetPath);
+		writeFileAtomicSync(targetPath, content, {
+			...(metadata === undefined ? {} : { mode: metadata.mode }),
+			beforeRename: (tempPath) => {
+				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
+			},
+		});
 		this._notifyPersistListeners();
 	}
 
@@ -1341,6 +1997,7 @@ export class SessionManager {
 			git,
 		};
 		this.fileEntries = [header, ...this.getEntries()];
+		this._refreshHasAssistantEntry();
 		this._rewriteFile();
 		this.flushed = true;
 		return this.sessionFile;
@@ -1367,13 +2024,16 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
-		if (!hasAssistant && !shouldPersistWithoutAssistant) {
+		if (!this.hasAssistantEntry && !shouldPersistWithoutAssistant) {
 			this.flushed = false;
 			return;
 		}
 
+		// The existsSync check is what lets the next append recover from the session
+		// file being deleted underneath a live session: without it appendFileSync
+		// would recreate a headerless stub (pinned by session-state.test.ts's
+		// "rewrites the full session if the session file disappears after flushing").
 		if (!this.flushed || !existsSync(this.sessionFile)) {
 			this._rewriteFile();
 			this.flushed = true;
@@ -1384,11 +2044,37 @@ export class SessionManager {
 		}
 	}
 
+	private appendEntrySeed(): AppendEntrySeed {
+		return {
+			leafId: this.leafId,
+			newId: () => generateId(this.byId),
+			timestamp: new Date().toISOString(),
+		};
+	}
+
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			this.hasAssistantEntry = true;
+		}
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+		// After _persist: a throwing persist rolls the append back, and the cache must
+		// not grow past a leaf that never survived it.
+		this._extendLeafBranchCache(entry);
+	}
+
+	// Appends only ever extend the live branch path, so the leaf branch cache grows
+	// in place. Anything other than a straight append off the cached leaf drops it.
+	private _extendLeafBranchCache(entry: SessionEntry): void {
+		const cache = this.leafBranchCache;
+		if (cache && cache.leafId === entry.parentId) {
+			cache.leafId = entry.id;
+			cache.entries.push(entry);
+		} else {
+			this.leafBranchCache = null;
+		}
 	}
 
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
@@ -1447,6 +2133,9 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		customInstructions?: string,
+		usage?: Usage,
+		harnessDigest?: string,
+		harnessStateFingerprint?: string,
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1459,6 +2148,9 @@ export class SessionManager {
 			details,
 			fromHook,
 			customInstructions,
+			usage,
+			harnessDigest,
+			harnessStateFingerprint,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1508,25 +2200,13 @@ export class SessionManager {
 	}
 
 	appendSessionInfo(name: string): string {
-		const entry: SessionInfoEntry = {
-			type: "session_info",
-			id: generateId(this.byId),
-			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
-			name: name.trim(),
-		};
+		const entry = buildSessionInfoEntry(name, this.appendEntrySeed());
 		this._appendEntry(entry);
 		return entry.id;
 	}
 
 	appendSessionState(state: SessionState): string {
-		const entry: SessionStateEntry = {
-			type: "session_state",
-			id: generateId(this.byId),
-			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
-			state: { status: state.status },
-		};
+		const entry = buildSessionStateEntry(state, this.appendEntrySeed());
 		this._appendEntry(entry);
 		return entry.id;
 	}
@@ -1648,16 +2328,13 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 	): string {
-		const entry: CustomMessageEntry<T> = {
-			type: "custom_message",
+		const entry: CustomMessageEntry<T> = buildCustomMessageEntry(
 			customType,
 			content,
 			display,
 			details,
-			id: generateId(this.byId),
-			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
-		};
+			this.appendEntrySeed(),
+		);
 		this._appendEntry(entry);
 		return entry.id;
 	}
@@ -1684,9 +2361,18 @@ export class SessionManager {
 		} catch (error) {
 			// The append indexes the entry before persisting it; undo exactly that.
 			if (this.leafId !== null && this.leafId !== previousLeafId) {
-				this.byId.delete(this.leafId);
+				const rolledBackId = this.leafId;
+				this.byId.delete(rolledBackId);
 				this.fileEntries.pop();
+				this._refreshHasAssistantEntry();
+				// A cache extended by the append is live, so drop the rolled-back entry from
+				// the array a caller may already hold before invalidating the cache.
+				const cache = this.leafBranchCache;
+				if (cache && cache.entries[cache.entries.length - 1]?.id === rolledBackId) {
+					cache.entries.pop();
+				}
 				this.leafId = previousLeafId;
+				this.leafBranchCache = null;
 				// The failed append may have left a torn line on disk. Restore the file
 				// from the rolled-back entries now; if that also fails (e.g. the disk is
 				// still full), fall back to forcing the next persist to rewrite.
@@ -1750,7 +2436,18 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Entries on the active branch, root to leaf. A leaf read returns the live
+	 * leaf-branch cache: treat the result as read-only and do not hold it across
+	 * appends.
+	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		// Leaf-path reads are the per-turn hot path (compaction checks, context
+		// usage); a read for another entry walks the chain instead.
+		const isLeafPath = fromId === undefined || fromId === this.leafId;
+		if (isLeafPath && this.leafBranchCache?.leafId === this.leafId) {
+			return this.leafBranchCache.entries;
+		}
 		// push+reverse, not unshift-per-entry: unshift is O(n), which makes this O(n^2) on long sessions.
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
@@ -1760,6 +2457,9 @@ export class SessionManager {
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
+		if (isLeafPath) {
+			this.leafBranchCache = { leafId: this.leafId, entries: path };
+		}
 		return path;
 	}
 
@@ -1830,17 +2530,26 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.leafBranchCache = null;
 	}
 
 	resetLeaf(): void {
 		this.leafId = null;
+		this.leafBranchCache = null;
 	}
 
-	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromHook?: boolean): string {
+	branchWithSummary(
+		branchFromId: string | null,
+		summary: string,
+		details?: unknown,
+		fromHook?: boolean,
+		usage?: Usage,
+	): string {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.leafBranchCache = null;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
@@ -1850,6 +2559,7 @@ export class SessionManager {
 			summary,
 			details,
 			fromHook,
+			usage,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1909,6 +2619,7 @@ export class SessionManager {
 			}
 
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			this._refreshHasAssistantEntry();
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
@@ -1918,8 +2629,7 @@ export class SessionManager {
 			// first assistant response, matching the newSession() contract
 			// and avoiding the duplicate-header bug when _persist()'s
 			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			if (this.hasAssistantEntry) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
@@ -1944,6 +2654,7 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+		this._refreshHasAssistantEntry();
 		this.sessionId = newSessionId;
 		this._buildIndex();
 		return undefined;
@@ -1985,6 +2696,7 @@ export class SessionManager {
 		if (!existsSync(path)) {
 			return SessionManager.open(path, sessionDir, cwdOverride);
 		}
+		repairJsonlDamage(path);
 		const entries = await loadEntriesFromFileAsync(path);
 		if (entries.length === 0) {
 			return SessionManager.open(path, sessionDir, cwdOverride);
@@ -2039,24 +2751,34 @@ export class SessionManager {
 			rlmDepth: resolveSessionRlmDepth(sourceHeader, sourcePath),
 			git: captureGitContext(targetCwd) ?? undefined,
 		};
-		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);
+		// The whole fork flows through one descriptor: one openSync, one
+		// writeAllSync per line, one closeSync. writeAllSync loops past short
+		// counts so every JSONL line lands whole, and "w" creates the target
+		// fresh because createUniqueSessionFileTarget guarantees it does not
+		// exist yet.
+		const descriptor = openSync(newSessionFile, "w");
+		try {
+			writeAllSync(descriptor, `${JSON.stringify(newHeader)}\n`, newSessionFile);
 
-		// Drop the source's git_state entries (re-linking children): they describe the source repo,
-		// so the fork would otherwise report the source's git instead of its own target context.
-		const droppedParent = new Map<string, string | null>();
-		for (const entry of sourceEntries) {
-			if (entry.type === "git_state") droppedParent.set(entry.id, entry.parentId);
-		}
-		const liveParent = (parentId: string | null): string | null => {
-			let pid = parentId;
-			while (pid !== null && droppedParent.has(pid)) pid = droppedParent.get(pid) ?? null;
-			return pid;
-		};
-		for (const entry of sourceEntries) {
-			if (entry.type === "session" || entry.type === "git_state") continue;
-			const parentId = liveParent(entry.parentId);
-			const out = parentId === entry.parentId ? entry : { ...entry, parentId };
-			appendFileSync(newSessionFile, `${JSON.stringify(out)}\n`);
+			// Drop the source's git_state entries (re-linking children): they describe the source repo,
+			// so the fork would otherwise report the source's git instead of its own target context.
+			const droppedParent = new Map<string, string | null>();
+			for (const entry of sourceEntries) {
+				if (entry.type === "git_state") droppedParent.set(entry.id, entry.parentId);
+			}
+			const liveParent = (parentId: string | null): string | null => {
+				let pid = parentId;
+				while (pid !== null && droppedParent.has(pid)) pid = droppedParent.get(pid) ?? null;
+				return pid;
+			};
+			for (const entry of sourceEntries) {
+				if (entry.type === "session" || entry.type === "git_state") continue;
+				const parentId = liveParent(entry.parentId);
+				const out = parentId === entry.parentId ? entry : { ...entry, parentId };
+				writeAllSync(descriptor, `${JSON.stringify(out)}\n`, newSessionFile);
+			}
+		} finally {
+			closeSync(descriptor);
 		}
 
 		return new SessionManager(targetCwd, dir, newSessionFile, true);

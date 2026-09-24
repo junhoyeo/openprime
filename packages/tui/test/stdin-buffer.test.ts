@@ -1,6 +1,10 @@
 import assert from "node:assert";
 import { beforeEach, describe, it } from "node:test";
+import { isMouseSequence, isWheelDown, isWheelUp, parseSgrMouseEvent } from "../src/mouse.js";
 import { StdinBuffer } from "../src/stdin-buffer.js";
+import { getCellDimensions, resetCapabilitiesCache, setCellDimensions } from "../src/terminal-image.js";
+import { type Component, TUI } from "../src/tui.js";
+import { VirtualTerminal } from "./virtual-terminal.js";
 
 describe("StdinBuffer", () => {
 	let buffer: StdinBuffer;
@@ -391,6 +395,97 @@ describe("StdinBuffer", () => {
 		});
 	});
 
+	describe("Raw Multiline Paste", () => {
+		let emittedPaste: string[];
+
+		beforeEach(() => {
+			buffer = new StdinBuffer({ timeout: 10 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => emittedSequences.push(sequence));
+			buffer.on("paste", (data) => emittedPaste.push(data));
+		});
+
+		for (const [name, input] of [
+			["CRLF", "line1\r\nline2"],
+			["LF", "line1\nline2"],
+			["CR", "line1\rline2"],
+			["blank lines", "line1\r\n\r\nline2"],
+			["mixed line endings", "a\rb\nc"],
+			["Unicode", "Hello 世界\n🎉"],
+		] as const) {
+			it(`emits ${name} text in one raw chunk as paste`, () => {
+				processInput(input);
+				assert.deepStrictEqual(emittedPaste, [input]);
+				assert.deepStrictEqual(emittedSequences, []);
+			});
+		}
+
+		for (const input of ["hello\r", "hello\n", "hello\r\n", "\rhello"] as const) {
+			it(`preserves text and Enter regardless of chunk boundary: ${JSON.stringify(input)}`, () => {
+				for (let split = 0; split <= input.length; split++) {
+					buffer.clear();
+					emittedSequences.length = 0;
+					emittedPaste.length = 0;
+					if (split > 0) processInput(input.slice(0, split));
+					if (split < input.length) processInput(input.slice(split));
+					assert.deepStrictEqual(emittedPaste, []);
+					assert.deepStrictEqual(emittedSequences, [...input]);
+				}
+			});
+		}
+
+		it("clears pending Kitty duplicate suppression after raw paste", () => {
+			processInput("\x1b[97u");
+			processInput("a\nb");
+			processInput("a");
+			assert.deepStrictEqual(emittedPaste, ["a\nb"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b[97u", "a"]);
+			assert.strictEqual(buffer.getBuffer(), "");
+		});
+
+		it("emits multiline Buffer input as paste", () => {
+			processInput(Buffer.from("line1\r\nline2"));
+			assert.deepStrictEqual(emittedPaste, ["line1\r\nline2"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		for (const input of ["\r", "\n", "\r\n", "\r\r\r"] as const) {
+			it(`keeps linebreak-only chunk ${JSON.stringify(input)} as key data`, () => {
+				processInput(input);
+				assert.deepStrictEqual(emittedPaste, []);
+				assert.deepStrictEqual(emittedSequences, [...input]);
+			});
+		}
+
+		it("does not disturb bracketed paste", () => {
+			processInput("\x1b[200~pasted\r\ntext\x1b[201~");
+			assert.deepStrictEqual(emittedPaste, ["pasted\r\ntext"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("keeps escape-containing chunks on the escape parser path", () => {
+			processInput("a\x1b[Aline1\r\nline2");
+			assert.deepStrictEqual(emittedPaste, []);
+			assert.deepStrictEqual(emittedSequences, [
+				"a",
+				"\x1b[A",
+				"l",
+				"i",
+				"n",
+				"e",
+				"1",
+				"\r",
+				"\n",
+				"l",
+				"i",
+				"n",
+				"e",
+				"2",
+			]);
+		});
+	});
+
 	describe("Destroy", () => {
 		it("should clear buffer on destroy", () => {
 			processInput("\x1b[<35");
@@ -407,6 +502,145 @@ describe("StdinBuffer", () => {
 			await wait(15);
 
 			assert.deepStrictEqual(emittedSequences, []);
+		});
+	});
+});
+
+describe("SGR mouse reports", () => {
+	const cases: Array<{
+		sequence: string;
+		expected: ReturnType<typeof parseSgrMouseEvent>;
+		wheel?: "up" | "down";
+	}> = [
+		{
+			sequence: "\x1b[<64;10;5M",
+			expected: { button: 64, x: 10, y: 5, press: true, motion: false, shift: false, alt: false, ctrl: false },
+			wheel: "up",
+		},
+		{
+			sequence: "\x1b[<65;1;1M",
+			expected: { button: 65, x: 1, y: 1, press: true, motion: false, shift: false, alt: false, ctrl: false },
+			wheel: "down",
+		},
+		{
+			// button 84 = wheel up (64) + shift (4) + ctrl (16); modifier bits are stripped from the button
+			sequence: "\x1b[<84;3;7M",
+			expected: { button: 64, x: 3, y: 7, press: true, motion: false, shift: true, alt: false, ctrl: true },
+			wheel: "up",
+		},
+		{
+			sequence: "\x1b[<0;5;5M",
+			expected: { button: 0, x: 5, y: 5, press: true, motion: false, shift: false, alt: false, ctrl: false },
+		},
+		{
+			sequence: "\x1b[<0;5;5m",
+			expected: { button: 0, x: 5, y: 5, press: false, motion: false, shift: false, alt: false, ctrl: false },
+		},
+		{
+			// motion bit (32) is reported separately from the button
+			sequence: "\x1b[<32;5;5M",
+			expected: { button: 0, x: 5, y: 5, press: true, motion: true, shift: false, alt: false, ctrl: false },
+		},
+		{ sequence: "\x1b[A", expected: null },
+		{ sequence: "a", expected: null },
+		{ sequence: "\x1b[<64;10M", expected: null },
+	];
+
+	for (const testCase of cases) {
+		it(`parses ${JSON.stringify(testCase.sequence)}`, () => {
+			const event = parseSgrMouseEvent(testCase.sequence);
+			assert.deepStrictEqual(event, testCase.expected);
+			if (event) {
+				assert.strictEqual(isWheelUp(event), testCase.wheel === "up");
+				assert.strictEqual(isWheelDown(event), testCase.wheel === "down");
+			}
+		});
+	}
+
+	it("matches SGR and legacy mouse reports", () => {
+		assert.strictEqual(isMouseSequence("\x1b[<64;10;5M"), true);
+		assert.strictEqual(isMouseSequence("\x1b[M   "), true);
+		assert.strictEqual(isMouseSequence("\x1b[A"), false);
+	});
+
+	for (const [name, chunks, expected] of [
+		["an SGR report split across chunks", ["\x1b", "[<64", ";20;5M"], "\x1b[<64;20;5M"],
+		["a DECRPM mouse-probe response split across chunks", ["\x1b[?1006;", "2$y"], "\x1b[?1006;2$y"],
+	] as const) {
+		it(`assembles ${name}`, () => {
+			const buffer = new StdinBuffer({ timeout: 10 });
+			const received: string[] = [];
+			buffer.on("data", (sequence) => received.push(sequence));
+			try {
+				for (const chunk of chunks) buffer.process(chunk);
+				assert.deepStrictEqual(received, [expected]);
+			} finally {
+				buffer.destroy();
+			}
+		});
+	}
+});
+
+describe("TUI cell size replies", () => {
+	class InputRecorder implements Component {
+		readonly inputs: string[] = [];
+
+		render(): string[] {
+			return [""];
+		}
+
+		handleInput(data: string): void {
+			this.inputs.push(data);
+		}
+
+		invalidate(): void {}
+	}
+
+	function withImageTerminal(fn: (terminal: VirtualTerminal, recorder: InputRecorder) => void): void {
+		const saved = {
+			TERM_PROGRAM: process.env.TERM_PROGRAM,
+			TERM: process.env.TERM,
+			GHOSTTY_RESOURCES_DIR: process.env.GHOSTTY_RESOURCES_DIR,
+		};
+		process.env.TERM_PROGRAM = "ghostty";
+		delete process.env.TERM;
+		delete process.env.GHOSTTY_RESOURCES_DIR;
+		resetCapabilitiesCache();
+		setCellDimensions({ widthPx: 9, heightPx: 18 });
+
+		const terminal = new VirtualTerminal(80, 24);
+		const tui = new TUI(terminal);
+		const recorder = new InputRecorder();
+		tui.setFocus(recorder);
+		tui.start();
+		try {
+			fn(terminal, recorder);
+		} finally {
+			tui.stop();
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	}
+
+	it("forwards a bare escape even though a cell size query was sent at startup", () => {
+		withImageTerminal((terminal, recorder) => {
+			terminal.sendInput("\x1b");
+			assert.deepStrictEqual(recorder.inputs, ["\x1b"]);
+		});
+	});
+
+	it("consumes a cell size reply without swallowing later user input", () => {
+		withImageTerminal((terminal, recorder) => {
+			terminal.sendInput("\x1b[6;20;10t");
+			assert.deepStrictEqual(recorder.inputs, []);
+			assert.deepStrictEqual(getCellDimensions(), { widthPx: 10, heightPx: 20 });
+
+			terminal.sendInput("q");
+			assert.deepStrictEqual(recorder.inputs, ["q"]);
 		});
 	});
 });

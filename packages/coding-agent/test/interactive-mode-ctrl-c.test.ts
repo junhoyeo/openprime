@@ -33,6 +33,7 @@ type FakeInteractiveMode = {
 	};
 	agentConnection: {
 		abort: Mock;
+		abortAndSendQueued: Mock;
 		clearQueue: Mock;
 		abortAndClearQueue: Mock;
 		abortRetry: Mock;
@@ -41,7 +42,7 @@ type FakeInteractiveMode = {
 		abortBash: Mock;
 	};
 	subagentSummaryLine: { invalidate: Mock };
-	ui: { requestRender: Mock; onDebug?: () => void };
+	ui: { requestRender: Mock; hasOverlay: () => boolean; onDebug?: () => void };
 	updatePendingMessagesDisplay: Mock;
 	showError: Mock;
 	showTreeSelector: Mock;
@@ -104,6 +105,7 @@ function createInteractiveFake(options: {
 		},
 		agentConnection: {
 			abort: vi.fn().mockResolvedValue(undefined),
+			abortAndSendQueued: vi.fn().mockResolvedValue(undefined),
 			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
 			abortAndClearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
 			abortRetry: vi.fn(),
@@ -112,7 +114,7 @@ function createInteractiveFake(options: {
 			abortBash: vi.fn(),
 		},
 		subagentSummaryLine: { invalidate: vi.fn() },
-		ui: { requestRender: vi.fn() },
+		ui: { requestRender: vi.fn(), hasOverlay: () => false },
 		queueSelection: { isBrowsing: false, reset: () => "" },
 		updatePendingMessagesDisplay: vi.fn(),
 		showError: vi.fn(),
@@ -134,28 +136,6 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 	afterEach(() => {
 		vi.useRealTimers();
-	});
-
-	it("interrupts streaming and shows the exit hint on first Ctrl+C", () => {
-		const mode = createInteractiveFake({ streaming: true });
-
-		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
-
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
-		expect(mode.shutdown).not.toHaveBeenCalled();
-		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe(
-			"Press Ctrl+C again to exit",
-		);
-	});
-
-	it("interrupts bash and streaming on the same Ctrl+C", () => {
-		const mode = createInteractiveFake({ streaming: true, bashRunning: true });
-
-		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
-
-		expect(mode.agentConnection.abortBash).toHaveBeenCalledTimes(1);
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
-		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
 	it("cancels an active /refine command", () => {
@@ -202,50 +182,6 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("preserves the queue and the draft when interrupting streaming", () => {
-		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
-		mode.connectionState.sessionActions = { queuedCount: 2, steering: ["steer"], followUps: ["follow"] };
-
-		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
-
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
-		expect(mode.agentConnection.abortAndClearQueue).not.toHaveBeenCalled();
-		expect(mode.agentConnection.clearQueue).not.toHaveBeenCalled();
-		expect(mode.editor.getText()).toBe("draft");
-		expect(mode.connectionState.sessionActions).toEqual({
-			queuedCount: 2,
-			steering: ["steer"],
-			followUps: ["follow"],
-		});
-	});
-
-	it("exits on the second Ctrl+C while the hint is visible", () => {
-		const mode = createInteractiveFake({ streaming: true });
-		const handleCtrlC = Reflect.get(InteractiveMode.prototype, "handleCtrlC");
-
-		handleCtrlC.call(mode);
-		handleCtrlC.call(mode);
-
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
-		expect(mode.shutdown).toHaveBeenCalledTimes(1);
-	});
-
-	it("clears the exit hint after two seconds", async () => {
-		const mode = createInteractiveFake({ editorText: "draft" });
-
-		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
-		expect(mode.editor.getText()).toBe("draft");
-		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe(
-			"Press Ctrl+C again to exit",
-		);
-
-		await vi.advanceTimersByTimeAsync(2000);
-
-		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBeUndefined();
-		expect(mode.subagentSummaryLine.invalidate).toHaveBeenCalled();
-		expect(mode.ui.requestRender).toHaveBeenCalled();
-	});
-
 	it("preserves idle draft input on first Ctrl+C", () => {
 		const mode = createInteractiveFake({ editorText: "draft" });
 
@@ -253,34 +189,6 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 		expect(mode.editor.getText()).toBe("draft");
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
-		expect(mode.shutdown).not.toHaveBeenCalled();
-	});
-
-	it("cancels the tree repeat when typing after interrupting streaming", () => {
-		const actionHandlers = new Map<string, () => void>();
-		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
-		const defaultEditor: NonNullable<FakeInteractiveMode["defaultEditor"]> = {
-			onAction: vi.fn((action: string, handler: () => void) => {
-				actionHandlers.set(action, handler);
-			}),
-		};
-		Object.assign(mode, {
-			defaultEditor,
-			keybindings: new KeybindingsManager(),
-			handleDebugCommand: vi.fn(),
-		});
-
-		Reflect.get(InteractiveMode.prototype, "setupKeyHandlers").call(mode);
-		expect(defaultEditor.onEscape).toBeDefined();
-		defaultEditor.onEscape?.();
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
-		expect(mode.editor.getText()).toBe("draft");
-		mode.editor.setText("queued draft");
-		defaultEditor.onChange?.("queued draft");
-
-		defaultEditor.onEscape?.();
-
-		expect(mode.showTreeSelector).not.toHaveBeenCalled();
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 

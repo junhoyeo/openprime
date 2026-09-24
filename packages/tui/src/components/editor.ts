@@ -1,4 +1,5 @@
 import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.js";
+import type { ClickPosition, ClickRegion } from "../click-regions.js";
 import type { EditorPasteSnapshot } from "../editor-component.js";
 import { getKeybindings } from "../keybindings.js";
 import { decodePrintableKey, matchesKey } from "../keys.js";
@@ -217,6 +218,10 @@ interface LayoutLine {
 	text: string;
 	hasCursor: boolean;
 	cursorPos?: number;
+	/** Logical source line index this layout line renders. */
+	sourceLine: number;
+	/** Start offset of this layout line's text within the source line. */
+	sourceStart: number;
 }
 
 export interface EditorTheme {
@@ -261,6 +266,16 @@ export class Editor implements Component, Focusable {
 	private lastWidth: number = 80;
 
 	private scrollOffset: number = 0;
+
+	// Layout snapshot from the last render, the authority for click mapping.
+	private clickLayout: {
+		width: number;
+		paddingX: number;
+		promptPrefixWidth: number;
+		layoutLines: LayoutLine[];
+		scrollOffset: number;
+		visibleCount: number;
+	} | null = null;
 
 	public borderColor: (str: string) => string;
 	public backgroundColor: ((str: string) => string) | undefined;
@@ -385,6 +400,8 @@ export class Editor implements Component, Focusable {
 		_layoutLineIndex: number,
 		_lineText: string,
 		_cursorCol: number | undefined,
+		_sourceLine?: number,
+		_sourceStart?: number,
 	): string {
 		return displayText;
 	}
@@ -544,6 +561,14 @@ export class Editor implements Component, Focusable {
 		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScrollOffset));
 
 		const visibleLines = layoutLines.slice(this.scrollOffset, this.scrollOffset + maxVisibleLines);
+		this.clickLayout = {
+			width,
+			paddingX,
+			promptPrefixWidth,
+			layoutLines,
+			scrollOffset: this.scrollOffset,
+			visibleCount: visibleLines.length,
+		};
 
 		const result: string[] = [];
 		const leftPadding = " ".repeat(paddingX);
@@ -612,6 +637,8 @@ export class Editor implements Component, Focusable {
 				absoluteLineIndex,
 				layoutLine.text,
 				layoutLine.hasCursor ? layoutLine.cursorPos : undefined,
+				layoutLine.sourceLine,
+				layoutLine.sourceStart,
 			);
 
 			const padding = " ".repeat(Math.max(0, inputWidth - lineVisibleWidth));
@@ -638,6 +665,81 @@ export class Editor implements Component, Focusable {
 		}
 
 		return result;
+	}
+
+	/**
+	 * Rows a subclass inserts between the top border and the first content
+	 * line (e.g. a header block), so click regions match the final output.
+	 */
+	protected getContentLineOffset(): number {
+		return 0;
+	}
+
+	/** One region covering the visible content rows; the layout maps clicks. */
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		const layout = this.clickLayout;
+		if (!layout || layout.visibleCount === 0 || layout.width <= 0) return [];
+		return [
+			{
+				line: 1 + this.getContentLineOffset(),
+				col: 0,
+				width: layout.width,
+				height: layout.visibleCount,
+				onClick: (position) => this.placeCursorFromClick(position),
+			},
+		];
+	}
+
+	/** Focus the editor and place the cursor at the clicked cell of the last layout. */
+	private placeCursorFromClick(position: ClickPosition): void {
+		const layout = this.clickLayout;
+		if (!layout) return;
+		const layoutLine = layout.layoutLines[layout.scrollOffset + position.row];
+		if (!layoutLine) return;
+		// Column relative to the start of the line's text.
+		const rel = Math.max(0, position.col - (layout.paddingX + layout.promptPrefixWidth));
+		// Walk the source line's marker-aware graphemes covering this visual
+		// chunk, so an atomic marker force-split across wrapped rows keeps its
+		// boundaries. A click past the midpoint of a segment (wide cell,
+		// paste/image marker) lands after it, before it otherwise.
+		const sourceLine = this.state.lines[layoutLine.sourceLine] || "";
+		const from = layoutLine.sourceStart;
+		const to = from + layoutLine.text.length;
+		let chunkCol = 0;
+		let placed = to;
+		for (const seg of this.segment(sourceLine)) {
+			const segEnd = seg.index + seg.segment.length;
+			if (segEnd <= from) continue;
+			if (seg.index >= to) break;
+			const sliceStart = Math.max(seg.index, from);
+			const inChunkWidth = visibleWidth(sourceLine.slice(sliceStart, Math.min(segEnd, to)));
+			if (chunkCol + inChunkWidth > rel) {
+				const withinSegment =
+					(sliceStart > seg.index ? visibleWidth(sourceLine.slice(seg.index, sliceStart)) : 0) + (rel - chunkCol);
+				placed = 2 * withinSegment >= visibleWidth(seg.segment) ? segEnd : seg.index;
+				break;
+			}
+			chunkCol += inChunkWidth;
+		}
+		// A click past the chunk's text (right padding) leaves the chunk-end
+		// offset, which can sit inside a marker split across rows.
+		placed = this.snapCursorOffset(sourceLine, placed);
+		this.tui.setFocus(this);
+		this.lastAction = null;
+		this.state.cursorLine = layoutLine.sourceLine;
+		this.setCursorCol(placed);
+	}
+
+	/** Snap an offset sitting inside an atomic segment to its nearest boundary. */
+	private snapCursorOffset(line: string, offset: number): number {
+		for (const seg of this.segment(line)) {
+			const segEnd = seg.index + seg.segment.length;
+			if (seg.index >= offset) break;
+			if (offset < segEnd) {
+				return 2 * (offset - seg.index) >= seg.segment.length ? segEnd : seg.index;
+			}
+		}
+		return offset;
 	}
 
 	private renderAutocompleteOverlay(width: number): string[] {
@@ -745,14 +847,7 @@ export class Editor implements Component, Focusable {
 			if (kb.matches(data, "tui.select.confirm")) {
 				const selected = this.autocompleteList.getSelectedItem();
 				if (selected && this.autocompleteProvider) {
-					const slashContext = this.getCurrentSlashCommandContext();
-					const isSlashCommandCompletion =
-						this.autocompleteKind === "slash-command" ||
-						(this.autocompleteKind === undefined &&
-							this.autocompleteState === "regular" &&
-							this.autocompletePrefix.startsWith("/"));
-					const shouldSubmitSlashCommand =
-						isSlashCommandCompletion && slashContext?.kind === "name" && slashContext.isAtPromptStart;
+					const isTypedExactSlashCommand = this.isSlashNameCompletionAtPromptStart();
 					this.pushUndoSnapshot();
 					this.lastAction = null;
 					const result = this.autocompleteProvider.applyCompletion(
@@ -762,21 +857,20 @@ export class Editor implements Component, Focusable {
 						selected,
 						this.autocompletePrefix,
 					);
+					const completedExistingText =
+						result.lines.length === this.state.lines.length &&
+						result.lines.every((line, index) => line === this.state.lines[index]);
 					this.state.lines = result.lines;
 					this.state.cursorLine = result.cursorLine;
 					this.setCursorCol(result.cursorCol);
+					this.cancelAutocomplete();
 
-					if (isSlashCommandCompletion) {
-						this.cancelAutocomplete();
-						if (!shouldSubmitSlashCommand || selected.takesArgument) {
-							if (this.onChange) this.onChange(this.getText());
-							return;
-						}
-					} else {
-						this.cancelAutocomplete();
+					if (!isTypedExactSlashCommand || !completedExistingText) {
 						if (this.onChange) this.onChange(this.getText());
 						return;
 					}
+					// The typed command already matches the selection: fall through so
+					// Enter submits instead of swallowing the key on a no-op completion.
 				}
 			}
 		}
@@ -943,6 +1037,8 @@ export class Editor implements Component, Focusable {
 				text: "",
 				hasCursor: true,
 				cursorPos: 0,
+				sourceLine: 0,
+				sourceStart: 0,
 			});
 			return layoutLines;
 		}
@@ -959,6 +1055,8 @@ export class Editor implements Component, Focusable {
 					text: "",
 					hasCursor: isCurrentLine,
 					cursorPos: isCurrentLine ? 0 : undefined,
+					sourceLine: i,
+					sourceStart: hiddenPrefixLength,
 				});
 				continue;
 			}
@@ -969,11 +1067,15 @@ export class Editor implements Component, Focusable {
 						text: displayLine,
 						hasCursor: true,
 						cursorPos: Math.max(0, this.state.cursorCol - hiddenPrefixLength),
+						sourceLine: i,
+						sourceStart: hiddenPrefixLength,
 					});
 				} else {
 					layoutLines.push({
 						text: displayLine,
 						hasCursor: false,
+						sourceLine: i,
+						sourceStart: hiddenPrefixLength,
 					});
 				}
 			} else {
@@ -1011,11 +1113,15 @@ export class Editor implements Component, Focusable {
 							text: chunk.text,
 							hasCursor: true,
 							cursorPos: adjustedCursorPos,
+							sourceLine: i,
+							sourceStart: hiddenPrefixLength + chunk.startIndex,
 						});
 					} else {
 						layoutLines.push({
 							text: chunk.text,
 							hasCursor: false,
+							sourceLine: i,
+							sourceStart: hiddenPrefixLength + chunk.startIndex,
 						});
 					}
 				}
@@ -2118,6 +2224,17 @@ export class Editor implements Component, Focusable {
 
 	private getCurrentSlashCommandContext(): SlashCommandContext | null {
 		return getSlashCommandContext(this.state.lines, this.state.cursorLine, this.state.cursorCol);
+	}
+
+	/** True when the active autocomplete completes a slash command name at the prompt start. */
+	private isSlashNameCompletionAtPromptStart(): boolean {
+		const slashContext = this.getCurrentSlashCommandContext();
+		const isSlashCommandCompletion =
+			this.autocompleteKind === "slash-command" ||
+			(this.autocompleteKind === undefined &&
+				this.autocompleteState === "regular" &&
+				this.autocompletePrefix.startsWith("/"));
+		return isSlashCommandCompletion && slashContext?.kind === "name" && slashContext.isAtPromptStart;
 	}
 
 	/**

@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
@@ -48,10 +49,13 @@ except Exception as _prime_agent_rlm_error:
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
 
-        async def run(self, prompt, **kwargs):
+        async def spawn(self, prompt, **kwargs):
             self._raise_missing()
 
         async def find_models(self, query="", limit=8):
+            self._raise_missing()
+
+        async def create_session(self, prompt, **kwargs):
             self._raise_missing()
 
         async def list_subagents(self):
@@ -60,14 +64,43 @@ except Exception as _prime_agent_rlm_error:
         async def delete_subagent(self, target):
             self._raise_missing()
 
-        async def __call__(self, prompt, **kwargs):
-            return await self.run(prompt, **kwargs)
-
     rlm = _PrimeAgentMissingRlm()
 
     def bash(command):
         rlm._raise_missing()
 `.trim();
+
+/**
+ * Line the runtime bootstrap prints (once, after the skill import loop) when
+ * one or more pre-imported Python skills failed to import. The host scans the
+ * bootstrap cell's stdout for this marker so unavailable skills reach the
+ * model instead of failing only on first call.
+ */
+export const PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER = "__PRIME_AGENT_PYTHON_SKILL_IMPORT_ERRORS__";
+
+/** Map of skill import name -> import error, parsed from a bootstrap cell's stdout. */
+export type UnavailablePythonSkills = Record<string, string>;
+
+/** Extract the unavailable-skill report a bootstrap cell printed, or undefined. */
+export function parseUnavailablePythonSkills(stdout: string): UnavailablePythonSkills | undefined {
+	const at = stdout.indexOf(PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER);
+	if (at < 0) return undefined;
+	const raw = stdout.slice(at + PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER.length).trim();
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+	const errors: UnavailablePythonSkills = {};
+	for (const [name, error] of Object.entries(parsed)) {
+		if (typeof error === "string" && error.length > 0) {
+			errors[name] = error;
+		}
+	}
+	return Object.keys(errors).length > 0 ? errors : undefined;
+}
 
 export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
 	const baseCode = [RLM_BOOTSTRAP_HEADER_CODE, RLM_BOOTSTRAP_RUNTIME_CODE].join("\n\n");
@@ -135,11 +168,23 @@ for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
             _prime_agent_importlib.import_module(_prime_agent_skill_name)
         )
     except Exception as _prime_agent_skill_error:
-        _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = str(_prime_agent_skill_error)
+        # An exception with an empty message would otherwise be dropped by the
+        # host-side parser; fall back to the exception type name.
+        _prime_agent_skill_error_text = (
+            str(_prime_agent_skill_error) or type(_prime_agent_skill_error).__name__
+        )
+        _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = _prime_agent_skill_error_text
         globals()[_prime_agent_skill_name] = _PrimeAgentUnavailableSkill(
             _prime_agent_skill_name,
-            str(_prime_agent_skill_error),
+            _prime_agent_skill_error_text,
         )
+
+if _PRIME_AGENT_SKILL_IMPORT_ERRORS:
+    import json as _prime_agent_json
+    print(
+        "${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}"
+        + _prime_agent_json.dumps(_PRIME_AGENT_SKILL_IMPORT_ERRORS)
+    )
 `.trim();
 }
 
@@ -294,6 +339,14 @@ export interface IpythonToolOptions {
 	 * (some names restored or some failed), so the session can tell the model.
 	 */
 	onRestore?: (result: RestoreResult) => void;
+	/**
+	 * Fires once per kernel start when installed Python skills failed to import
+	 * into the kernel (skill import name -> import error), so the session can tell
+	 * the model before it wastes turns calling them.
+	 */
+	onUnavailableSkills?: (errors: UnavailablePythonSkills) => void;
+	/** Fires when the kernel's last live background bash() handle settles, so owed continuations can resume. */
+	onBackgroundWorkSettled?: () => void;
 	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
@@ -390,6 +443,11 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
+		// Only a terminally dead kernel drops the memo; a repairing manager (idle/starting) recovers itself.
+		if (this.startedManager?.isDefunct) {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
+		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
@@ -471,14 +529,17 @@ export class IpythonKernelProvisioner {
 				},
 				sessionId: this.options?.sessionId,
 				hostHandlers: this.options?.hostHandlers,
+				onBackgroundWorkSettled: this.options?.onBackgroundWorkSettled,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
 				snapshot: snapshotDir
 					? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
 					: undefined,
+				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
 			});
 			let pendingRestore: RestoreResult | undefined;
+			let snapshotExisted = false;
 			try {
 				// Emitted synchronously (before the permit await) so a listener attaching
 				// mid-flight can replay the current stage.
@@ -499,7 +560,7 @@ export class IpythonKernelProvisioner {
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
 				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+					snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring Python state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
 					if (snapshotExisted) {
@@ -513,6 +574,15 @@ export class IpythonKernelProvisioner {
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the Python kernel:\n${details}`);
+				}
+				if (snapshotExisted) {
+					m.markRestoredNamespaceFresh();
+				}
+				// Broken skills stay importable-looking placeholders; report them so the
+				// model learns before its first call, not from the placeholder's error.
+				const unavailableSkills = parseUnavailablePythonSkills(bootstrap.stdout);
+				if (unavailableSkills) {
+					this.options?.onUnavailableSkills?.(unavailableSkills);
 				}
 			} catch (error) {
 				// Never leak the kernel process if startup fails after spawn — and never

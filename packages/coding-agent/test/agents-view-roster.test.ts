@@ -187,6 +187,7 @@ describe("agents-view roster store", () => {
 			localAttachments: getLocalAttachmentTracker(client as unknown as DaemonTransportClient),
 			pendingBindingCatchupSnapshots: new Map(),
 			pendingBindingCatchupFailures: new Map(),
+			pendingBindingSessionEvents: new Map(),
 			requestData: vi.fn(async () => ({ id: "root-active", sessionId: "root", activeSessionId: "root-active" })),
 		}) as DaemonAgentConnection;
 
@@ -410,6 +411,7 @@ describe("subscriber push transitions", () => {
 			clients: new Set([subscriber]),
 			pendingRosterChanged: new Set(),
 			publishedRosterIds: new Set(),
+			publishedRosterJson: new Map(),
 			pendingRosterRemoved: new Set(),
 			rosterPushScheduled: false,
 			persistWorker: vi.fn(),
@@ -422,7 +424,7 @@ describe("subscriber push transitions", () => {
 			workerRosterEntries(worker: unknown): AgentRosterEntry[];
 			sweepRosterStaleness(now?: number): void;
 			promoteOwnedWorker(client: object, worker: unknown): Promise<void>;
-			roster(): { delete(agentId: string): void };
+			roster(): { delete(agentId: string): void; get(agentId: string): AgentRosterEntry | undefined };
 		};
 		const settle = async () => {
 			await new Promise((resolve) => setImmediate(resolve));
@@ -554,13 +556,12 @@ describe("subscriber push transitions", () => {
 			worker,
 			Buffer.from(JSON.stringify({ type: "roster_delta", entries: [], snapshot: true })),
 		);
-		await vi.waitFor(() => expect(pushes.length).toBeGreaterThan(0));
+		// The apply reseeds the deleted row byte-identically within one flush: no broadcast.
+		await (worker as { rosterApplyChain?: Promise<void> }).rosterApplyChain;
 		await settle();
 
-		expect(pushes.some((push) => push.removed?.includes(childEntry.agentId))).toBe(false);
-		expect(
-			pushes.flatMap((push) => push.changed).find((entry) => entry.agentId === childEntry.agentId),
-		).toBeDefined();
+		expect(pushes).toEqual([]);
+		expect(supervisor.roster().get(childEntry.agentId)).toMatchObject({ agentId: childEntry.agentId });
 	});
 
 	it("sends one drain resync per loss gap even when the write reports backpressure", async () => {

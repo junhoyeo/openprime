@@ -6,7 +6,11 @@ import type {
 	MessageParam,
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages.js";
-import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
+import {
+	type AnthropicCacheCreationUsage,
+	getAnthropicCacheWriteCost,
+	hasStandardAnthropicCachePricing,
+} from "../cache-pricing.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
@@ -31,7 +35,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
-import { applyOpencodeZenHeaders, opencodePublicApiKey } from "../utils/opencode-headers.js";
+import { opencodePublicApiKey } from "../utils/opencode-headers.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	classifyStreamFailure,
@@ -45,6 +49,7 @@ import {
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -78,7 +83,9 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
-const claudeCodeVersion = "2.1.257";
+// The API gates newer models on the claimed client version (e.g. claude-opus-5.5
+// requires >= 2.280), so keep this at or above the latest released Claude Code.
+const claudeCodeVersion = "2.1.281";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -504,6 +511,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					options?.headers,
 					copilotDynamicHeaders,
+					options?.sessionId,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -522,7 +530,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -696,6 +703,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					if (event.usage.cache_creation_input_tokens != null) {
 						output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
 					}
+					// The SDK's MessageDeltaUsage type omits cache_creation, but the wire carries it.
+					const deltaCacheCreation = (event.usage as { cache_creation?: AnthropicCacheCreationUsage | null })
+						.cache_creation;
+					if (cacheControl && usesAnthropicCachePricing && deltaCacheCreation) {
+						cacheWriteCost = getAnthropicCacheWriteCost(
+							model.cost.input,
+							cacheControl.ttl === "1h" ? "1h" : "5m",
+							deltaCacheCreation,
+						);
+					}
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 					calculateCost(
@@ -734,11 +751,17 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 };
 
 /**
- * Fable/Mythos models think every turn and reject an explicit
- * `thinking: {type: "disabled"}` (and any sampling params) with a 400.
+ * Fable/Mythos models — and Claude Opus 5.5 — think every turn and reject an
+ * explicit `thinking: {type: "disabled"}` (and any sampling params) with a 400.
  */
 function isAlwaysOnAdaptiveThinkingModel(modelId: string): boolean {
-	return modelId.includes("fable-5") || modelId.includes("mythos-5") || modelId.includes("mythos-preview");
+	return (
+		modelId.includes("fable-5") ||
+		modelId.includes("mythos-5") ||
+		modelId.includes("mythos-preview") ||
+		modelId.includes("opus-5-5") ||
+		modelId.includes("opus-5.5")
+	);
 }
 
 /**
@@ -848,6 +871,7 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
+	sessionId?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
@@ -862,6 +886,7 @@ function createClient(
 
 	if (model.provider === "cloudflare-ai-gateway") {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: null,
 			baseURL: resolveCloudflareBaseUrl(model),
@@ -885,6 +910,7 @@ function createClient(
 
 	if (model.provider === "github-copilot") {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -906,6 +932,7 @@ function createClient(
 
 	if (isOAuthToken(apiKey)) {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -926,24 +953,25 @@ function createClient(
 		return { client, isOAuthToken: true };
 	}
 
-	const defaultHeaders =
-		model.provider === "opencode" || model.provider === "opencode-go"
-			? applyOpencodeZenHeaders({ ...model.headers, ...optionsHeaders })
-			: undefined;
-
 	const client = new Anthropic({
+		maxRetries: 0,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders: mergeHeaders(
-			{
-				accept: "application/json",
-				"anthropic-dangerous-direct-browser-access": "true",
-				...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
-			},
-			model.headers,
-			optionsHeaders,
-			defaultHeaders,
+		defaultHeaders: withOpenCodeHeaders(
+			model.provider,
+			sessionId,
+			mergeHeaders(
+				{
+					accept: "application/json",
+					"anthropic-dangerous-direct-browser-access": "true",
+					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
+				},
+				// Zen's zero-cost tier gates on the OpenCode CLI identity, which the
+				// catalog entry carries in model.headers; withOpenCodeHeaders keeps it.
+				model.headers,
+				optionsHeaders,
+			),
 		),
 	});
 

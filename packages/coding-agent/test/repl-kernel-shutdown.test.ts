@@ -17,9 +17,17 @@ type ShutdownInternals = {
 		signalCode: NodeJS.Signals | null;
 		kill: (signal?: NodeJS.Signals | number) => boolean;
 		pid?: number;
-		stdin: { destroyed: boolean; destroy: () => void };
+		stdin: {
+			destroyed: boolean;
+			destroy: () => void;
+			on: (event: string, listener: (...args: unknown[]) => void) => void;
+		};
 		stdout?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
-		stderr?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
+		stderr?: {
+			destroy: () => void;
+			on: (event: string, listener: (...args: unknown[]) => void) => void;
+			once: (event: string, listener: (...args: unknown[]) => void) => void;
+		};
 	};
 };
 
@@ -42,9 +50,9 @@ function configuredManager(
 		signalCode: null,
 		kill: vi.fn(() => true),
 		pid: undefined,
-		stdin: { destroyed: false, destroy: vi.fn() },
+		stdin: { destroyed: false, destroy: vi.fn(), on: vi.fn() },
 		stdout: { destroy: vi.fn(), on: vi.fn() },
-		stderr: { destroy: vi.fn(), on: vi.fn() },
+		stderr: { destroy: vi.fn(), on: vi.fn(), once: vi.fn() },
 	});
 	Object.assign(internals, {
 		state: "running",
@@ -271,6 +279,23 @@ describe("ReplKernelManager graceful shutdown", () => {
 		await manager.restart();
 
 		expect(start).not.toHaveBeenCalled();
+	});
+
+	it("kill() destroys stderr only while the child has not exited", async () => {
+		// Alive child: it may ignore the signal and never emit 'exit', so the
+		// post-exit drain would never bound the pipe — teardown must.
+		const alive = configuredManager(() => {});
+		const aliveChild = alive.internals.child;
+		await alive.manager.kill();
+		expect(aliveChild.stderr?.destroy).toHaveBeenCalledTimes(1);
+
+		// Exited child: the post-exit drain owns the stream; destroying it in
+		// teardown would drop the kernel's buffered last words.
+		const exited = configuredManager(() => {});
+		const exitedChild = exited.internals.child;
+		exitedChild.exitCode = 42;
+		await exited.manager.kill();
+		expect(exitedChild.stderr?.destroy).not.toHaveBeenCalled();
 	});
 
 	it("waits for the matching shutdown done and removes its waiter", async () => {

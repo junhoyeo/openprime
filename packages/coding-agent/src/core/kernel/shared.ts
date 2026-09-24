@@ -7,6 +7,8 @@ export const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS = 5000;
 export const KERNEL_SHUTDOWN_TIMEOUT_MS = 5000;
 export const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
 export const SNAPSHOT_EXECUTION_TIMEOUT_MS = 5000;
+/** Restore deserializes everything a snapshot serializes: bound like the repair step. */
+export const RESTORE_EXECUTION_TIMEOUT_MS = 30_000;
 export const KERNEL_ABORT_GRACE_MS = 1000;
 export const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 export const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
@@ -51,11 +53,15 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	hostHandlers?: HostRequestHandlers;
+	/** Fires when the last live background bash() handle settles (its activity track empties or the kernel tears down). */
+	onBackgroundWorkSettled?: () => void;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;
 	/** Runtime bootstrap re-run on a protocol-repaired kernel so live handles (rlm, bash, skills) exist again. */
 	bootstrapCode?: string;
+	/** File receiving the kernel process's stderr, rotated once at each spawn. */
+	stderrLogPath?: string;
 }
 
 export interface KernelStartOptions {
@@ -84,6 +90,9 @@ export const ATTACHMENT_DISPLAY_MIME = "application/vnd.prime-agent.attachment+j
 
 /** MIME tag the `agent-message` skill emits after sending a message. */
 export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json";
+
+/** Internal lifetime notices, consumed before user display rendering. */
+export const BASH_ACTIVITY_DISPLAY_MIME = "application/vnd.prime-agent.bash-activity+json";
 
 /**
  * Hard ceiling on a single attachment's base64 payload, a defensive guard
@@ -278,6 +287,9 @@ export interface KernelShutdownOptions {
 export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
+	readonly hasBackgroundWork: boolean;
+	/** Terminal: the kernel died or was torn down; only a fresh manager can serve again. */
+	readonly isDefunct: boolean;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
 	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;

@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Transport } from "@earendil-works/pi-ai";
+import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
 import {
 	Container,
 	type SelectItem,
@@ -19,6 +19,13 @@ const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	minPrimaryColumnWidth: 12,
 	maxPrimaryColumnWidth: 32,
 };
+
+const SERVICE_TIER_OPTIONS: SelectItem[] = [
+	{ value: "default", label: "default", description: "Standard processing" },
+	{ value: "flex", label: "flex", description: "Cheaper, slower, may hit capacity limits" },
+	{ value: "priority", label: "priority", description: "Faster, more expensive (fast mode)" },
+	{ value: "auto", label: "auto", description: "Provider picks the tier" },
+];
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -41,11 +48,11 @@ export interface SettingsConfig {
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
 	transport: Transport;
+	defaultServiceTier: Exclude<ServiceTier, null>;
 	thinkingLevel: ThinkingLevel;
 	availableThinkingLevels: ThinkingLevel[];
 	currentTheme: string;
 	availableThemes: string[];
-	hideThinkingBlock: boolean;
 	mermaidRenderingMode: MermaidRenderingMode;
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
@@ -69,10 +76,10 @@ export interface SettingsCallbacks {
 	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
+	onDefaultServiceTierChange: (serviceTier: Exclude<ServiceTier, null>) => void;
 	onThinkingLevelChange: (level: ThinkingLevel) => void;
 	onThemeChange: (theme: string) => void;
 	onThemePreview?: (theme: string) => void;
-	onHideThinkingBlockChange: (hidden: boolean) => void;
 	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
@@ -142,7 +149,7 @@ class SelectSubmenu extends Container {
 	) {
 		super();
 
-		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+		this.addChild(new Text(theme.fg("accent", title), 0, 0));
 
 		if (description) {
 			this.addChild(new Spacer(1));
@@ -238,11 +245,19 @@ export class SettingsSelectorComponent extends Container {
 				values: ["sse", "websocket", "websocket-cached", "auto"],
 			},
 			{
-				id: "hide-thinking",
-				label: "Hide thinking",
-				description: "Hide thinking blocks in assistant responses",
-				currentValue: config.hideThinkingBlock ? "true" : "false",
-				values: ["true", "false"],
+				id: "default-service-tier",
+				label: "Default service tier",
+				description: "Service tier for new sessions; applies to the current session when the model supports it",
+				currentValue: config.defaultServiceTier,
+				submenu: (currentValue, done) =>
+					new SelectSubmenu(
+						"Default Service Tier",
+						"Service tier for new sessions; applies to the current session when the model supports it",
+						SERVICE_TIER_OPTIONS,
+						currentValue,
+						(value) => done(value),
+						() => done(),
+					),
 			},
 			{
 				id: "mermaid-rendering",
@@ -478,8 +493,8 @@ export class SettingsSelectorComponent extends Container {
 					case "transport":
 						callbacks.onTransportChange(newValue as Transport);
 						break;
-					case "hide-thinking":
-						callbacks.onHideThinkingBlockChange(newValue === "true");
+					case "default-service-tier":
+						callbacks.onDefaultServiceTierChange(newValue as Exclude<ServiceTier, null>);
 						break;
 					case "mermaid-rendering":
 						callbacks.onMermaidRenderingModeChange(newValue as MermaidRenderingMode);
