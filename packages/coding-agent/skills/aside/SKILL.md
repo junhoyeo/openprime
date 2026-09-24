@@ -122,7 +122,9 @@ Prefer `models.json` over `settings.json`/`credentials.json` for this: the daemo
 `aside.models()` lists configured `provider/model` ids and `aside.providers()` maps
 provider ids to base URLs. If a provider's `baseUrl` points at this machine (loopback),
 `health()` probes its `/health` endpoint — but only when such a provider is actually
-configured, so a plain install still reports healthy.
+configured, so a plain install still reports healthy. All three read the default
+account (`~/.aside/u/0`); pass `account="u1"` to read the account your browser
+calls target instead.
 
 ## Troubleshooting
 

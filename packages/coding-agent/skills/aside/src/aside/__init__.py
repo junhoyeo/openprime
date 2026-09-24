@@ -40,12 +40,25 @@ from typing import Any
 __all__ = [
     "run", "agent", "repl", "read", "screenshot", "tabs", "health", "models",
     "providers", "AsideError", "AsideNotRunning", "AsideReplError", "AsideTimeout",
-    "CONFIG_DIR",
+    "CONFIG_DIR", "config_dir",
 ]
 
-# Aside's per-account config dir. `models.json` there declares custom providers and
-# is hot-reloaded, so edits apply without restarting the app.
+# Aside's per-account config dir for the default account. `models.json` there
+# declares custom providers and is hot-reloaded, so edits apply without
+# restarting the app. Other accounts live beside it as `~/.aside/u/<n>`; pass
+# `account="u1"` to the config readers below to target one of them.
 CONFIG_DIR = Path(os.environ.get("ASIDE_CONFIG_DIR") or (Path.home() / ".aside" / "u" / "0"))
+
+
+def config_dir(account: str | None = None) -> Path:
+    """Config dir for an Aside account: `CONFIG_DIR` for the default, else
+    `~/.aside/u/<n>` for `account="u<n>"` (a bare number is accepted too)."""
+    if not account:
+        return CONFIG_DIR
+    slot = account[1:] if account.startswith("u") else account
+    if not slot.isdigit():
+        raise AsideError(f"invalid Aside account id {account!r}; expected e.g. 'u1'")
+    return CONFIG_DIR.parent / slot
 
 # Hosts treated as "a gateway running on this machine" when probing provider health.
 _LOOPBACK = ("127.0.0.1", "localhost", "0.0.0.0", "::1")
@@ -322,8 +335,8 @@ console.log("B64:" + buf.toString('base64'));
     return str(dest)
 
 
-def _read_providers() -> dict:
-    cfg = CONFIG_DIR / "models.json"
+def _read_providers(account: str | None = None) -> dict:
+    cfg = config_dir(account) / "models.json"
     if not cfg.exists():
         return {}
     try:
@@ -332,25 +345,25 @@ def _read_providers() -> dict:
         return {}
 
 
-def providers() -> dict[str, str]:
-    """Custom providers declared in `models.json`, as {provider_id: baseUrl}."""
-    return {pid: (prov.get("baseUrl") or "") for pid, prov in _read_providers().items()}
+def providers(*, account: str | None = None) -> dict[str, str]:
+    """Custom providers declared in the account's `models.json`, as {provider_id: baseUrl}."""
+    return {pid: (prov.get("baseUrl") or "") for pid, prov in _read_providers(account).items()}
 
 
-def models() -> list[str]:
-    """List custom `provider/model` ids configured in Aside's `models.json`.
+def models(*, account: str | None = None) -> list[str]:
+    """List custom `provider/model` ids configured in the account's `models.json`.
 
     Returns [] when no custom providers are configured - the built-in providers
     picked in Aside's settings still work, they just are not listed here.
     """
     return [
         f"{pid}/{m.get('id')}"
-        for pid, prov in _read_providers().items()
+        for pid, prov in _read_providers(account).items()
         for m in (prov.get("models") or [])
     ]
 
 
-async def health(*, timeout: float = 15.0) -> dict:
+async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
     """Diagnose the whole chain before blaming a task: CLI, app, custom providers.
 
     Run this first whenever an aside call fails. Returns a dict with an `ok` flag
@@ -365,7 +378,8 @@ async def health(*, timeout: float = 15.0) -> dict:
         return {"ok": False, "cli": None, "summary": str(exc)}
 
     report["app_running"] = await asyncio.to_thread(_app_running)
-    report["models"] = models()
+    report["account"] = account or "u0"
+    report["models"] = models(account=account)
 
     def _probe(base: str) -> str:
         try:
@@ -374,7 +388,7 @@ async def health(*, timeout: float = 15.0) -> dict:
         except Exception as exc:  # noqa: BLE001
             return f"unreachable: {exc}"
 
-    local = {pid: url for pid, url in providers().items()
+    local = {pid: url for pid, url in providers(account=account).items()
              if any(h in url for h in _LOOPBACK)}
     report["local_providers"] = {}
     for pid, url in local.items():
