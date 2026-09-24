@@ -3,7 +3,6 @@ import type { Api, KnownProvider, Model, ModelThinkingLevel, OpenAIResponsesComp
 
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 
-// Initialize registry from MODELS on module load
 for (const [provider, models] of Object.entries(MODELS)) {
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
@@ -40,23 +39,25 @@ export function getModels<TProvider extends KnownProvider>(
  * Whether the model can serve requests at OpenAI Fast (`service_tier: "priority"`).
  *
  * Only the Responses APIs send `service_tier`, so no other API can opt in. A
- * `openai-responses` model declares support through `compat.supportsFastMode`,
- * which is how a proxy or gateway that forwards `service_tier` to a
- * ChatGPT-authenticated upstream exposes Fast mode. Built-in ChatGPT models are
- * recognized by provider and model id.
+ * `openai-responses` model with explicit compatibility metadata opts in through
+ * `compat.supportsFastMode`; this lets a proxy or gateway advertise support and
+ * lets an override opt out. Catalog OpenAI models without an override are
+ * recognized by provider and model id for ChatGPT or API-key authentication.
  */
 export function supportsFastMode<TApi extends Api>(model: Model<TApi>): boolean {
-	if (model.api === "openai-responses") {
-		return (model.compat as OpenAIResponsesCompat | undefined)?.supportsFastMode === true;
+	if (model.api === "openai-responses" && model.compat !== undefined) {
+		return (model.compat as OpenAIResponsesCompat).supportsFastMode === true;
 	}
+	const eligibleId =
+		model.id === "gpt-5.4" ||
+		model.id === "gpt-5.5" ||
+		model.id === "gpt-5.6" ||
+		model.id.startsWith("gpt-5.6-") ||
+		model.id === "gpt-6-astra";
 	return (
-		model.provider === "openai-codex" &&
-		model.api === "openai-codex-responses" &&
-		(model.id === "gpt-5.4" ||
-			model.id === "gpt-5.5" ||
-			model.id === "gpt-5.6" ||
-			model.id.startsWith("gpt-5.6-") ||
-			model.id === "gpt-6-astra")
+		eligibleId &&
+		((model.provider === "openai-codex" && model.api === "openai-codex-responses") ||
+			(model.provider === "openai" && model.api === "openai-responses"))
 	);
 }
 
@@ -111,10 +112,6 @@ export function clampThinkingLevel<TApi extends Api>(
 	return availableLevels[0] ?? "off";
 }
 
-/**
- * Check if two models are equal by comparing both their id and provider.
- * Returns false if either model is null or undefined.
- */
 export function modelsAreEqual<TApi extends Api>(
 	a: Model<TApi> | null | undefined,
 	b: Model<TApi> | null | undefined,

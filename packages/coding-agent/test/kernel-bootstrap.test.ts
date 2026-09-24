@@ -81,8 +81,7 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 	writeFileSync(
 		join(venv, ".bootstrap-version"),
 		`${JSON.stringify({
-			schema: 8,
-			ipykernel: "ipykernel",
+			schema: 9,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -173,7 +172,7 @@ function installFakeUv(): string {
 			"#!/bin/sh",
 			'if [ "$1" = "-c" ]; then',
 			'  case "$2" in',
-			'    "import ipykernel"|"import rlm") exit 0 ;;',
+			'    "import rlm") exit 0 ;;',
 			...extraImportCases,
 			'    *"_harness_methods"*) exit 0 ;;',
 			"    *) exit 1 ;;",
@@ -268,7 +267,7 @@ describe("kernel bootstrap", () => {
 		const python = join(venv, "bin", "python");
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 		mkdirSync(join(venv, "bin"), { recursive: true });
-		writeFakePython(python, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeFileSync(join(venv, ".bootstrap-version"), '{"schema":1}\n');
 
 		await expect(ensureKernelPython()).rejects.toThrow(/will not replace it/);
@@ -280,7 +279,7 @@ describe("kernel bootstrap", () => {
 		const python = join(venv, "bin", "python");
 		const resultPath = join(tempDir, "legacy-python.txt");
 		mkdirSync(join(venv, "bin"), { recursive: true });
-		writeFakePython(python, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeBootstrapVersion(venv);
 
 		const child = spawnBootstrapSubprocess(resultPath);
@@ -289,7 +288,7 @@ describe("kernel bootstrap", () => {
 		expect(existsSync(`${venv}.generations`)).toBe(false);
 	});
 
-	it("bootstraps a missing venv with uv, ipykernel, prime-agent-runtime, and default extra packages", async () => {
+	it("bootstraps a missing venv with uv, prime-agent-runtime, and default extra packages", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		process.env.PRIME_AGENT_KERNEL_VENV_ROOT = venv;
@@ -302,7 +301,7 @@ describe("kernel bootstrap", () => {
 		expect(log).toContain("python install 3.11");
 		expect(log).toContain(`venv ${installedVenv} --python 3.11 --seed`);
 		expect(log).toContain("pip install --python");
-		expect(log).toContain("ipykernel");
+		expect(log).not.toContain("ipykernel");
 		expect(log).toContain("prime-agent-runtime");
 		expect(log).toContain("dill");
 		for (const uvArg of DEFAULT_RLM_EXTRA_UV_ARGS) {
@@ -310,8 +309,7 @@ describe("kernel bootstrap", () => {
 		}
 		const version = JSON.parse(readFileSync(join(installedVenv, ".bootstrap-version"), "utf8"));
 		expect(version).toEqual({
-			schema: 8,
-			ipykernel: "ipykernel",
+			schema: 9,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -457,7 +455,7 @@ dependencies = ["httpx"]
 	it("redacts bootstrap credentials without crossing stderr lines", async () => {
 		installFakeUv();
 		process.env.PRIME_AGENT_KERNEL_VENV_ROOT = join(tempDir, "kernel-venv");
-		process.env.UV_FAIL_ARG = "ipykernel";
+		process.env.UV_FAIL_ARG = "dill";
 		process.env.UV_FAIL_STDERR = [
 			"Authorization: Basic QWxpY2U6c3VwZXItc2VjcmV0",
 			"client_secret=oauth-client-secret refresh_token=oauth-refresh-token",
@@ -489,7 +487,7 @@ dependencies = ["httpx"]
 	it("bounds a long bootstrap stderr tail independently of redaction coverage", async () => {
 		installFakeUv();
 		process.env.PRIME_AGENT_KERNEL_VENV_ROOT = join(tempDir, "kernel-venv");
-		process.env.UV_FAIL_ARG = "ipykernel";
+		process.env.UV_FAIL_ARG = "dill";
 		process.env.UV_FAIL_STDERR = [
 			"Authorization: Basic raw-secret-before-tail",
 			...Array.from({ length: 40 }, (_, index) => `diagnostic ${index + 1} ${"z".repeat(120)}`),
@@ -632,7 +630,7 @@ dependencies = ["httpx"]
 		const second = spawnBootstrapSubprocess(secondResult, skill);
 		await waitForFileText(startedFile, (text) => text.trim().length > 0);
 
-		await expect(execFileAsync(firstPython, ["-c", "import ipykernel"])).resolves.toMatchObject({ stdout: "" });
+		await expect(execFileAsync(firstPython, ["-c", "import rlm"])).resolves.toMatchObject({ stdout: "" });
 		rmSync(blockFile);
 		await waitForChild(second);
 		expect(readFileSync(secondResult, "utf8")).not.toBe(firstPython);
@@ -769,7 +767,7 @@ dependencies = ["httpx"]
 	it("reuses a current warm venv without invoking uv", async () => {
 		const baseVenv = join(tempDir, "kernel-venv");
 		const { python, venv } = await createWarmVenv(baseVenv);
-		writeFakePython(python, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeBootstrapVersion(venv);
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
@@ -779,12 +777,11 @@ dependencies = ["httpx"]
 		const logPath = installFakeUv();
 		const baseVenv = join(tempDir, "kernel-venv");
 		const { python: stalePython, venv: staleVenv } = await createWarmVenv(baseVenv);
-		writeFakePython(stalePython, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(stalePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeFileSync(
 			join(staleVenv, ".bootstrap-version"),
 			`${JSON.stringify({
-				schema: 8,
-				ipykernel: "ipykernel",
+				schema: 9,
 				runtime: "sha256:stale",
 				snapshot: "dill",
 				extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -807,12 +804,11 @@ dependencies = ["httpx"]
 		const baseVenv = join(tempDir, "kernel-venv");
 		const pythonSkill = createPythonSkill();
 		const { python: legacyPython, venv: legacyVenv } = await createWarmVenv(baseVenv);
-		writeFakePython(legacyPython, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(legacyPython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeFileSync(
 			join(legacyVenv, ".bootstrap-version"),
 			`${JSON.stringify({
 				schema: 4,
-				ipykernel: "ipykernel",
 				runtime: "prime-agent-runtime",
 				extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 				pythonSkills: [
@@ -835,7 +831,7 @@ dependencies = ["httpx"]
 		installFakeUv();
 		const baseVenv = join(tempDir, "kernel-venv");
 		const { python: stalePython, venv: staleVenv } = await createWarmVenv(baseVenv);
-		writeFakePython(stalePython, ["ipykernel"]);
+		writeFakePython(stalePython, []);
 		writeBootstrapVersion(staleVenv);
 
 		const replacementPython = await ensureKernelPython();
@@ -858,7 +854,7 @@ dependencies = ["httpx"]
 
 	it("uses PRIME_AGENT_KERNEL_PYTHON as an override contract", async () => {
 		const overridePython = join(tempDir, "override-python");
-		writeFakePython(overridePython, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).resolves.toBe(overridePython);
@@ -867,7 +863,7 @@ dependencies = ["httpx"]
 	it("allows PRIME_AGENT_KERNEL_PYTHON missing Python skill imports", async () => {
 		const overridePython = join(tempDir, "override-python");
 		const pythonSkill = createPythonSkill();
-		writeFakePython(overridePython, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(overridePython);
@@ -875,11 +871,7 @@ dependencies = ["httpx"]
 
 	it("rejects PRIME_AGENT_KERNEL_PYTHON missing default extra packages", async () => {
 		const overridePython = join(tempDir, "override-python");
-		writeFakePython(overridePython, [
-			"ipykernel",
-			"rlm",
-			...DEFAULT_RLM_EXTRA_IMPORT_NAMES.filter((name) => name !== "yaml"),
-		]);
+		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES.filter((name) => name !== "yaml")]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).rejects.toThrow(/default Python packages \(yaml \(PyYAML\)\)/);
@@ -887,7 +879,7 @@ dependencies = ["httpx"]
 
 	it("rejects PRIME_AGENT_KERNEL_PYTHON with a stale rlm runtime", async () => {
 		const overridePython = join(tempDir, "override-python");
-		writeFakePython(overridePython, ["ipykernel"]);
+		writeFakePython(overridePython, []);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.run/);
@@ -901,7 +893,7 @@ dependencies = ["httpx"]
 				"#!/bin/sh",
 				'if [ "$1" = "-c" ]; then',
 				'  case "$2" in',
-				'    "import ipykernel"|"import rlm") exit 0 ;;',
+				'    "import rlm") exit 0 ;;',
 				'    *"_harness_methods"*) exit 1 ;;',
 				"    *\"assert not hasattr(rlm.rlm, 'background')\"*) exit 0 ;;",
 				"    *) exit 1 ;;",
@@ -921,6 +913,6 @@ dependencies = ["httpx"]
 		writeFakePython(overridePython, []);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
-		await expect(ensureKernelPython()).rejects.toThrow(/missing ipykernel/);
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.run/);
 	});
 });

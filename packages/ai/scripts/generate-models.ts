@@ -5,6 +5,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { getAnthropicCacheCosts } from "../src/cache-pricing.js";
+import { getOpenRouterReasoningCapabilities } from "../src/openrouter-reasoning.js";
 import {
 	CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL,
 	CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL,
@@ -88,6 +89,7 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	medium: null,
 	high: "high",
 	xhigh: "max",
+	max: null,
 } as const;
 
 const KIMI_K3_THINKING_LEVEL_MAP = {
@@ -157,6 +159,9 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"qwen/qwen3-30b-a3b-instruct-2507": { contextWindow: 262144 },
 	// OpenRouter has no max_completion_tokens for the rest of these.
 	"moonshotai/kimi-k2.5": { maxTokens: 65535 },
+	"minimax/minimax-m2.7": { maxTokens: 131072 },
+	// models.dev (moonshotai + openrouter) both list output = context for k2.6.
+	"moonshotai/kimi-k2.6": { maxTokens: 262144 },
 	"moonshotai/kimi-k3": { maxTokens: 1048576 },
 	"openai/gpt-4.1": { maxTokens: 32768 },
 	"openai/gpt-5-nano": { maxTokens: 128000 },
@@ -227,7 +232,8 @@ function isPrimeInferenceRawVariant(modelId: string): boolean {
 }
 
 function isPrimeInferencePrivateModel(modelId: string): boolean {
-	return modelId.toLowerCase().startsWith("internal/");
+	const id = modelId.toLowerCase();
+	return id.startsWith("internal/") || id.startsWith("dev/");
 }
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
@@ -328,7 +334,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		mergeThinkingLevelMap(model, DEEPSEEK_V4_THINKING_LEVEL_MAP);
 	}
 	const kimiK3Id = model.id.toLowerCase();
-	if (/^k3(-|$)/.test(kimiK3Id) || /(^|\/)kimi-k3(-|$)/.test(kimiK3Id)) {
+	if (!model.thinkingLevelMap && (/^k3(-|$)/.test(kimiK3Id) || /(^|\/)kimi-k3(-|$)/.test(kimiK3Id))) {
 		mergeThinkingLevelMap(model, KIMI_K3_THINKING_LEVEL_MAP);
 	}
 	if (isGoogleThinkingApi(model) && isGemini3ProModel(model.id)) {
@@ -597,6 +603,8 @@ interface PrimeInferenceOpenRouterMetadata {
 	maxTokens?: number;
 	vision: boolean;
 	reasoning: boolean;
+	thinkingLevelMap?: Model<"openai-completions">["thinkingLevelMap"];
+	supportsReasoningEffort?: boolean;
 }
 
 function buildPrimeInferenceOpenRouterIndex(catalog: unknown[]): Map<string, PrimeInferenceOpenRouterMetadata> {
@@ -609,6 +617,7 @@ function buildPrimeInferenceOpenRouterIndex(catalog: unknown[]): Map<string, Pri
 		const architecture = isRecord(item.architecture) ? item.architecture : {};
 		const modalities = Array.isArray(architecture.input_modalities) ? architecture.input_modalities : [];
 		const supportedParameters = Array.isArray(item.supported_parameters) ? item.supported_parameters : [];
+		const reasoningCapabilities = getOpenRouterReasoningCapabilities(item);
 		index.set(item.id.toLowerCase(), {
 			contextWindow: getOptionalNumber(item.context_length) ?? getOptionalNumber(topProvider.context_length),
 			maxTokens: getOptionalNumber(topProvider.max_completion_tokens),
@@ -617,6 +626,12 @@ function buildPrimeInferenceOpenRouterIndex(catalog: unknown[]): Map<string, Pri
 			// `reasoning` object over-reports (e.g. qwen3-max carries one despite
 			// not accepting reasoning params).
 			reasoning: supportedParameters.includes("reasoning"),
+			...(reasoningCapabilities?.thinkingLevelMap
+				? { thinkingLevelMap: reasoningCapabilities.thinkingLevelMap }
+				: {}),
+			...(reasoningCapabilities?.supportsReasoningEffort === false
+				? { supportsReasoningEffort: false }
+				: {}),
 		});
 	}
 	return index;
@@ -697,6 +712,7 @@ function createPrimeInferenceModel(
 		entry.maxTokens ?? override?.maxTokens ?? openRouter?.maxTokens ?? PRIME_INFERENCE_DEFAULT_MAX_TOKENS,
 		contextWindow,
 	);
+	const compat = getPrimeInferenceCompat(entry.id);
 	return {
 		id: entry.id,
 		...(PRIME_INFERENCE_FEATURED_MODELS.has(entry.id.toLowerCase()) ? { featured: true } : {}),
@@ -705,6 +721,7 @@ function createPrimeInferenceModel(
 		provider: "prime-inference",
 		baseUrl: PRIME_INFERENCE_BASE_URL,
 		reasoning: isPrimeInferenceReasoningModel(entry.id, entry.reasoning ?? openRouter?.reasoning),
+		...(openRouter?.thinkingLevelMap ? { thinkingLevelMap: openRouter.thinkingLevelMap } : {}),
 		input: vision ? ["text", "image"] : ["text"],
 		cost: {
 			input: entry.input,
@@ -713,7 +730,15 @@ function createPrimeInferenceModel(
 		},
 		contextWindow,
 		maxTokens,
-		compat: getPrimeInferenceCompat(entry.id),
+		compat: {
+			...compat,
+			...(openRouter?.supportsReasoningEffort === false
+				? {
+						supportsReasoningEffort: false,
+						...(!compat.thinkingFormat ? { thinkingFormat: "openrouter" as const } : {}),
+					}
+				: {}),
+		},
 	};
 }
 
@@ -757,6 +782,7 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 			const outputCost = Math.max(0, parseFloat(model.pricing?.completion || "0")) * 1_000_000;
 			const cacheReadCost = Math.max(0, parseFloat(model.pricing?.input_cache_read || "0")) * 1_000_000;
 			const cacheWriteCost = Math.max(0, parseFloat(model.pricing?.input_cache_write || "0")) * 1_000_000;
+			const reasoningCapabilities = getOpenRouterReasoningCapabilities(model);
 
 			const normalizedModel: Model<any> = {
 				id: modelKey,
@@ -765,6 +791,12 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 				baseUrl: "https://openrouter.ai/api/v1",
 				provider,
 				reasoning: model.supported_parameters?.includes("reasoning") || false,
+				...(reasoningCapabilities?.thinkingLevelMap
+					? { thinkingLevelMap: reasoningCapabilities.thinkingLevelMap }
+					: {}),
+				...(reasoningCapabilities?.supportsReasoningEffort === false
+					? { compat: { supportsReasoningEffort: false } }
+					: {}),
 				input,
 				cost: {
 					input: inputCost,
@@ -1298,11 +1330,11 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				// OpenCode Go endpoint behaviour. models.dev reports these models
 				// as @ai-sdk/anthropic, but the OpenCode Go endpoints either don't
 				// accept Anthropic SDK auth (MiniMax M2.7) or are served through
-				// the OpenAI-compatible /v1/chat/completions path (Qwen 3.5/3.6).
+				// the OpenAI-compatible /v1/chat/completions path (Qwen routes).
 				// Switch them to openai-completions so requests use Bearer auth
 				// and the standard /v1/chat/completions endpoint.
 				if (variant.provider === "opencode-go") {
-					if (modelId === "minimax-m2.7") {
+					if (modelId === "minimax-m2.7" || (npm === "@ai-sdk/anthropic" && modelId.startsWith("qwen"))) {
 						api = "openai-completions";
 						baseUrl = `${variant.basePath}/v1`;
 					}

@@ -72,9 +72,14 @@ function reusedPidWorker(bystander: ChildProcess, descriptorOverrides: object = 
 }
 
 function identityHarness(workers: Map<string, object>): IdentityHarness {
+	// This harness bypasses the constructor, so class field initialisers never run. Upstream's
+	// stopWorker path now reaches invalidateWorkerSessionInputPauses, which iterates this map, so
+	// the fixture has to provide it — guarding the production code instead would hide a real
+	// undefined from every other caller.
 	return Object.assign(Object.create(DaemonSupervisor.prototype), {
 		workers,
 		shuttingDown: true,
+		sessionInputPauses: new Map(),
 		assertRecoveryAllowed: vi.fn(async () => undefined),
 		persistWorker: vi.fn(),
 		deleteWorkerDescriptor: vi.fn(),

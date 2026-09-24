@@ -284,7 +284,6 @@ describe("InteractiveMode /effort", () => {
 			expect(patch.serviceTier).toBe("priority");
 			expect(patch.availableThinkingLevels).toContain("high");
 			expect(patch.availableThinkingLevels.length).toBeGreaterThan(1);
-			// Provider rebuild keeps the /effort argument hint in sync with the model.
 			expect(setupAutocompleteProvider).toHaveBeenCalledTimes(1);
 		});
 	});
@@ -408,7 +407,7 @@ describe("InteractiveMode /effort", () => {
 
 			expect(context.agentConnection.setServiceTier).not.toHaveBeenCalled();
 			expect(context.showStatus).toHaveBeenCalledWith(
-				"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT authentication, or an openai-responses model with compat.supportsFastMode in models.json",
+				"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json",
 			);
 		});
 
