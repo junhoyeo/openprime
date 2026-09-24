@@ -934,11 +934,13 @@ describe("ENG-4509 side questions", () => {
 			},
 		};
 		const abortSideQuestionsFor = vi.fn();
+		const releaseMatching = vi.fn();
 		const fakeThis = Object.assign(Object.create(AgentDaemon.prototype), {
 			abortSideQuestionsFor,
 			options: { worker: false },
 			summarizer: { forget: vi.fn(), seed: vi.fn() },
 			rebindCronJobsToState: vi.fn(),
+			sideQuestionPanes: { releaseMatching },
 		});
 		const refreshReplacedSessionState = (
 			AgentDaemon.prototype as unknown as {
@@ -951,6 +953,9 @@ describe("ENG-4509 side questions", () => {
 		expect(abortSideQuestionsFor).toHaveBeenCalledTimes(2);
 		expect(abortSideQuestionsFor).toHaveBeenNthCalledWith(1, clients[0], "session-1");
 		expect(abortSideQuestionsFor).toHaveBeenNthCalledWith(2, clients[1], "session-1");
+		// Side-conversation recorders are bound to the replaced runtime; leaving
+		// them behind would append a follow-up to the previous session.
+		expect(releaseMatching).toHaveBeenCalledWith("session-1:");
 	});
 
 	it("limits daemon side questions to one run per client and session", () => {
@@ -1066,6 +1071,7 @@ describe("ENG-4509 side questions", () => {
 			activeSideQuestionId: undefined,
 			sideQuestionEvent: firstTurn,
 			sideQuestionTurns: [firstTurn],
+			sideQuestionPaneId: "pane-1",
 			sideQuestionComponent: { addTurn },
 			agentConnection: { startSideQuestion },
 			ui: { requestRender: vi.fn() },
@@ -1080,9 +1086,14 @@ describe("ENG-4509 side questions", () => {
 		await handleSideQuestion.call(fakeThis, "And a follow-up?");
 
 		expect(addTurn).toHaveBeenCalledTimes(1);
-		expect(startSideQuestion).toHaveBeenCalledWith(expect.any(String), "And a follow-up?", [
-			{ question: "First?", answer: "First answer" },
-		]);
+		// The pane id is stable across turns: storage groups a whole side
+		// conversation into one transcript by it.
+		expect(startSideQuestion).toHaveBeenCalledWith(
+			expect.any(String),
+			"And a follow-up?",
+			[{ question: "First?", answer: "First answer" }],
+			"pane-1",
+		);
 		expect(fakeThis.sideQuestionTurns).toHaveLength(2);
 		expect(fakeThis.activeSideQuestionId).toBe(fakeThis.sideQuestionTurns[1].id);
 	});

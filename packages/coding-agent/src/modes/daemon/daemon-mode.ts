@@ -64,7 +64,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -108,6 +108,12 @@ import {
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import {
+	createSideQuestionPaneId,
+	createSideQuestionStore,
+	SideQuestionPaneRegistry,
+	type SideQuestionRecorder,
+} from "../../core/side-question-store.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -115,7 +121,11 @@ import {
 	createAgentConnectionState,
 } from "../agent-connection/snapshot.js";
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
-import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import type {
+	AgentConnectionHeartbeat,
+	AgentConnectionRlmChildAgentSnapshot,
+	AgentConnectionSideQuestionTurn,
+} from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
@@ -514,6 +524,7 @@ export class AgentDaemon {
 			reasonUpgrade?: Promise<void>;
 		}
 	>();
+	private readonly sideQuestionPanes = new SideQuestionPaneRegistry();
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{
@@ -1507,6 +1518,9 @@ export class AgentDaemon {
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}
+		// The runtime behind every open pane was replaced, so its recorders must
+		// not outlive it and append a follow-up to the previous session.
+		this.sideQuestionPanes.releaseMatching(`${state.activeSessionId}:`);
 		this.summarizer.forget(state.activeSessionId);
 		state.summaryState = undefined;
 		state.runtime.session.setCurrentRecap(undefined);
@@ -4358,6 +4372,7 @@ export class AgentDaemon {
 					{
 						getCompactionSettings: () => state.runtime.session.settingsManager.getCompactionSettings(),
 						getRequestAuth: (model) => state.runtime.session.getRequestAuth(model),
+						recorder: this.resolveSideQuestionRecorder(client, state, command.previousTurns, command.paneId),
 					},
 				);
 				this.sideQuestionRuns.set(command.sideQuestionId, {
@@ -6362,6 +6377,7 @@ export class AgentDaemon {
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}
+		this.sideQuestionPanes.releaseMatching(`${state.activeSessionId}:`);
 		const existingClose = this.closingSessions.get(state.activeSessionId);
 		if (existingClose) {
 			const requestedReason = this.isStrongerCloseReason(reason, existingClose.reason)
@@ -7238,7 +7254,47 @@ export class AgentDaemon {
 		return accepted;
 	}
 
+	/**
+	 * One pane, one transcript.
+	 *
+	 * A client-supplied pane id is authoritative and deliberately excludes the
+	 * client id: a reconnect hands the same pane to a new socket, and keying on
+	 * the socket would split one visible conversation across two transcripts.
+	 * Older clients send no pane id, so they fall back to a per-client scope
+	 * plus "a question with no prior turns opens a new pane".
+	 */
+	private resolveSideQuestionRecorder(
+		client: DaemonSocketClient,
+		state: { activeSessionId: string; runtime: { session: AgentSession } },
+		previousTurns: AgentConnectionSideQuestionTurn[] | undefined,
+		paneId: string | undefined,
+	): SideQuestionRecorder | undefined {
+		const session = state.runtime.session;
+		const model = session.agent.state.model;
+		if (!model) {
+			return undefined;
+		}
+		return this.sideQuestionPanes.resolve(
+			paneId ? `${state.activeSessionId}:${paneId}` : `${client.id}:${state.activeSessionId}`,
+			paneId !== undefined || (previousTurns?.length ?? 0) > 0,
+			() =>
+				createSideQuestionStore({
+					parent: session.sessionManager,
+					model,
+					btwId: createSideQuestionPaneId(),
+					onError: (error) =>
+						this.log(
+							`side question storage disabled for ${state.activeSessionId}: ${error instanceof Error ? error.message : String(error)}`,
+						),
+				}),
+		);
+	}
+
 	private abortSideQuestionsFor(client: DaemonSocketClient, activeSessionId: string): void {
+		// Only the legacy per-client scope is dropped here. Pane-id keys survive:
+		// this also runs on plain socket cleanup, and a reconnecting client keeps
+		// the same open pane, which must stay one transcript.
+		this.sideQuestionPanes.release(`${client.id}:${activeSessionId}`);
 		for (const [id, entry] of this.sideQuestionRuns) {
 			if (entry.client !== client || entry.activeSessionId !== activeSessionId) {
 				continue;

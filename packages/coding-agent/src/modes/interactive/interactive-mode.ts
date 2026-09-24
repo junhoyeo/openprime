@@ -992,6 +992,12 @@ export class InteractiveMode {
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
 	private sideQuestionTurns: AgentConnectionSideQuestionEvent[] = [];
+	/**
+	 * Stable identity of the open pane, sent with every turn so storage keeps one
+	 * conversation in one transcript even across a daemon reconnect. Cleared with
+	 * the pane, so the next `/btw` starts a new record.
+	 */
+	private sideQuestionPaneId: string | undefined;
 	private activeSideQuestionId: string | undefined;
 	// Set while a ! bash command runs inside the side conversation: its
 	// BashExecutionComponent renders inside the pane instead of the main chat.
@@ -4557,6 +4563,7 @@ export class InteractiveMode {
 		this.activeSideQuestionId = event.id;
 		this.sideQuestionEvent = event;
 		this.sideQuestionTurns.push(event);
+		this.sideQuestionPaneId ??= randomUUID();
 		if (this.sideQuestionComponent) {
 			this.sideQuestionComponent.addTurn(event);
 		} else {
@@ -4571,6 +4578,7 @@ export class InteractiveMode {
 				event.id,
 				question,
 				previousTurns.length > 0 ? previousTurns : undefined,
+				this.sideQuestionPaneId,
 			);
 		} catch (error) {
 			this.handleSideQuestionEvent({
@@ -4649,6 +4657,7 @@ export class InteractiveMode {
 		}
 		this.sideQuestionEvent = undefined;
 		this.sideQuestionTurns = [];
+		this.sideQuestionPaneId = undefined;
 		this.sideQuestionComponent = undefined;
 		this.sideQuestionContainer.clear();
 		if (this.isInitialized) {

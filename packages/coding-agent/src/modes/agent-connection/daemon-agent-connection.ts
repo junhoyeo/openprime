@@ -1785,6 +1785,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		id: string,
 		question: string,
 		previousTurns?: AgentConnectionSideQuestionTurn[],
+		paneId?: string,
 	): Promise<void> {
 		if (previousTurns?.length && !this.client.supportsServerCapability("side_question_transcript")) {
 			// An older daemon would silently ignore previousTurns and answer the
@@ -1793,6 +1794,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				"the daemon is running an older build without side-conversation follow-ups; restart the daemon and try again",
 			);
 		}
+		// Pane identity is optional daemon metadata, so an older daemon must keep
+		// answering rather than fail: omit the field and let storage fall back to
+		// its previousTurns heuristic. side_question_transcript predates pane ids
+		// and does not imply them, so it cannot stand in for this check.
+		const paneIdSupported = this.client.supportsServerCapability("side_question_pane_id");
 		this.activeSideQuestionIds.add(id);
 		try {
 			await this.requestOk({
@@ -1801,6 +1807,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				sideQuestionId: id,
 				question,
 				previousTurns,
+				...(paneIdSupported && paneId !== undefined ? { paneId } : {}),
 			});
 		} catch (error) {
 			this.activeSideQuestionIds.delete(id);
