@@ -539,7 +539,9 @@ export function startSideQuestion(
 					if (!last) {
 						throw new Error(sideAgent.state.errorMessage || "Side question produced no assistant message");
 					}
-					return last;
+					// An overflow is not a provider hiccup: the compaction-and-retry flow
+					// below owns it, so it must not be re-sent unchanged.
+					return isContextOverflow(last, model.contextWindow) ? { ...last, stopReason: "stop" } : last;
 				},
 				{ policy: retry, signal: runAbort.signal },
 			);

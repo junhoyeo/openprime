@@ -11478,7 +11478,15 @@ export class AgentSession {
 				session_id: daemonChild?.sessionId ?? run.session?.sessionId ?? null,
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
-				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
+				status:
+					run.status === "queued"
+						? "queued"
+						: run.status === "done"
+							? "completed"
+							: run.status === "error"
+								? "error"
+								: "running",
+				...(run.error !== undefined ? { error: normalizeRlmChildError(run.error) } : {}),
 				...this._rlmRegistryExtrasFromSnapshot(this._rlmChildSnapshotForRun(run)),
 			});
 			recorded.add(run.id);

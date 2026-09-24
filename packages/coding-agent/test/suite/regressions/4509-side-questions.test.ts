@@ -17,6 +17,11 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 import { getEditorTheme, initTheme, theme } from "../../../src/modes/interactive/theme/theme.js";
 import { createHarness, getMessageText } from "../harness.js";
 
+/** The session's harness digest rides along in the cloned context; these tests assert on the conversation proper. */
+function withoutHarnessDigest(texts: string[]): string[] {
+	return texts.filter((text) => !text.startsWith("[harness-digest]"));
+}
+
 type Host = Record<string, unknown>;
 
 function interactiveHost(overrides: Host): Host {
@@ -104,8 +109,9 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 			harness.setResponses([
 				(context, options) => {
 					expect(context.systemPrompt).toBe(systemPromptBefore);
-					expect(context.tools).toEqual([]);
-					expect(context.messages.map(getMessageText)).toEqual([
+					// Session tools stay declared (cache prefix) but are blocked in beforeToolCall.
+					expect(context.tools).toEqual(harness.session.agent.state.tools);
+					expect(withoutHarnessDigest(context.messages.map(getMessageText))).toEqual([
 						"The project codename is kestrel.",
 						"The codename is kestrel.",
 						expect.stringContaining("What is the project codename?"),
@@ -144,7 +150,7 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 
 			harness.setResponses([
 				(context) => {
-					const texts = context.messages.map(getMessageText);
+					const texts = withoutHarnessDigest(context.messages.map(getMessageText));
 					expect(texts).toEqual([
 						"Main context message.",
 						"main answer",
@@ -152,10 +158,11 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 						"first side answer",
 						expect.stringContaining("Second side question?"),
 					]);
-					expect(context.tools).toEqual([]);
+					// Session tools stay declared (cache prefix) but are blocked in beforeToolCall.
+					expect(context.tools).toEqual(harness.session.agent.state.tools);
 					// Each turn carries the instruction so compaction cannot discard it.
-					expect(texts[2]).toContain("Answer this side question");
-					expect(texts[4]).toContain("Answer this side question");
+					expect(texts[2]).toContain("The user asked this via `/btw`");
+					expect(texts[4]).toContain("The user asked this via `/btw`");
 					return fauxAssistantMessage("second side answer");
 				},
 			]);
@@ -191,7 +198,7 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 			const messagesBefore = structuredClone(harness.session.messages);
 			harness.setResponses([
 				(context) => {
-					expect(context.messages.map(getMessageText)).toEqual([
+					expect(withoutHarnessDigest(context.messages.map(getMessageText))).toEqual([
 						"small main context",
 						"small main answer",
 						expect.stringContaining("What is still in context?"),
@@ -233,7 +240,7 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 			];
 			harness.setResponses([
 				(context) => {
-					expect(context.messages.map(getMessageText)).toEqual([
+					expect(withoutHarnessDigest(context.messages.map(getMessageText))).toEqual([
 						"large context remains verbatim",
 						"large answer remains verbatim",
 						expect.stringContaining("Do not compact this side question"),
@@ -459,7 +466,8 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 					expect(options.headers).toMatchObject({ "x-side-summary": "present" });
 					return fauxAssistantMessage(`summary checkpoint ${summaryCalls}`);
 				}
-				expect(context.tools).toEqual([]);
+				// Session tools stay declared (cache prefix) but are blocked in beforeToolCall.
+				expect(context.tools).toEqual(harness.session.agent.state.tools);
 				return fauxAssistantMessage("compacted answer");
 			};
 			harness.setResponses(Array.from({ length: 12 }, () => response));
@@ -683,7 +691,7 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 					expect(context.messages.map(getMessageText).join("\n")).toContain("CORRECTION_B");
 					return fauxAssistantMessage("SUMMARY_OF_B");
 				}
-				const texts = context.messages.map(getMessageText);
+				const texts = withoutHarnessDigest(context.messages.map(getMessageText));
 				const protectedIndex = texts.findIndex((text) => text.includes("PROTECTED_IMAGE_A"));
 				const summaryIndex = texts.findIndex((text) => text.includes("SUMMARY_OF_B"));
 				const retainedIndex = texts.findIndex((text) => text.includes("RETAINED_C"));
@@ -822,7 +830,8 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 					summaryCalls++;
 					return fauxAssistantMessage("main-context summary: the chosen color was ultraviolet");
 				}
-				expect(context.tools).toEqual([]);
+				// Session tools stay declared (cache prefix) but are blocked in beforeToolCall.
+				expect(context.tools).toEqual(harness.session.agent.state.tools);
 				return fauxAssistantMessage("because it was visible");
 			};
 			harness.setResponses(Array.from({ length: 12 }, () => response));
@@ -858,8 +867,9 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 					return fauxAssistantMessage("main complete");
 				},
 				(context) => {
-					expect(context.tools).toEqual([]);
-					expect(context.messages.map(getMessageText)).toEqual([
+					// Session tools stay declared (cache prefix) but are blocked in beforeToolCall.
+					expect(context.tools).toEqual(harness.session.agent.state.tools);
+					expect(withoutHarnessDigest(context.messages.map(getMessageText))).toEqual([
 						"Run the main task.",
 						expect.stringContaining("Can I ask this concurrently?"),
 					]);

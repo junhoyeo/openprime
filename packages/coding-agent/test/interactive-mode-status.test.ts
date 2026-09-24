@@ -1387,6 +1387,31 @@ describe("InteractiveMode Fast mode concurrency", () => {
 		return context;
 	}
 
+	test.each([
+		["GPT-5.5", testModel("openai-codex", "gpt-5.5", "openai-codex-responses")],
+		["GPT-6 Astra", testModel("openai-codex", "gpt-6-astra", "openai-codex-responses")],
+	])("enables Fast mode for %s", async (_name, model) => {
+		const context = makeFastContext(model);
+
+		fastInteractiveModePrototype.handleFastCommand.call(context);
+		await context.serviceTierChangeQueue;
+
+		expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
+		expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "priority" });
+		expect(context.showStatus).toHaveBeenCalledWith("Fast mode: on");
+	});
+
+	test("reports unsupported models without changing the service tier", () => {
+		const context = makeFastContext(testModel("anthropic", "claude-fable-5", "anthropic-messages"));
+
+		fastInteractiveModePrototype.handleFastCommand.call(context);
+
+		expect(context.agentConnection.setServiceTier).not.toHaveBeenCalled();
+		expect(context.showStatus).toHaveBeenCalledWith(
+			"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json",
+		);
+	});
+
 	test("serializes rapid toggles and applies both results in order", async () => {
 		const context = makeFastContext();
 		const firstToggle = createDeferred<void>();

@@ -174,7 +174,11 @@ describe("provider authentication failures preserve configured credentials", () 
 
 	it("preserves credentials when a later retry failure is not authentication-related", async () => {
 		const harness = await createHarness({
-			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			// The provider wait would otherwise keep pinging the 500s past the quick
+			// retries; this regression is about credentials, not the wait policy.
+			settings: {
+				retry: { enabled: true, maxRetries: 2, baseDelayMs: 1, provider: { waitForUsage: { enabled: false } } },
+			},
 		});
 		harnesses.push(harness);
 		harness.setResponses([provider401Message(), provider500Message(), provider500Message()]);
@@ -184,6 +188,7 @@ describe("provider authentication failures preserve configured credentials", () 
 		expect(harness.faux.state.callCount).toBe(3);
 		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1, 2]);
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
+		expect(harness.eventsOfType("auth_stale")).toHaveLength(0);
 		expect(harness.authStorage.hasAuth(harness.getModel().provider)).toBe(true);
 		await expect(harness.authStorage.getApiKey(harness.getModel().provider)).resolves.toBe("faux-key");
 

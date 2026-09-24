@@ -279,13 +279,14 @@ describe("ModelRegistry", () => {
 				openai: {
 					baseUrl: "http://127.0.0.1:8787/v1",
 					modelOverrides: {
-						"gpt-5.5": { compat: { supportsFastMode: true } },
+						// gpt-4 is the openai transport template in the bundled catalog.
+						"gpt-4": { compat: { supportsFastMode: true } },
 					},
 				},
 			});
 
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-			const model = registry.find("openai", "gpt-5.5");
+			const model = registry.find("openai", "gpt-4");
 
 			expect(registry.getError()).toBeUndefined();
 			expect((model?.compat as OpenAIResponsesCompat | undefined)?.supportsFastMode).toBe(true);
