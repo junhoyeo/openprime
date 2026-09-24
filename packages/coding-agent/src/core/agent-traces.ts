@@ -11,7 +11,7 @@ import {
 	PRIME_INFERENCE_PROVIDER_ID,
 	resolvePrimeAgentTracesBaseUrl,
 } from "./prime-inference-auth.js";
-import type { SessionHeader, SessionManager } from "./session-manager.js";
+import { getSessionArtifactsRoot, type SessionHeader, type SessionManager } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 
 const MAX_TRACE_BYTES = 20 * 1024 * 1024;
@@ -541,7 +541,7 @@ async function findSessionFilesUnder(root: string, files: Set<string>): Promise<
 
 export async function findAgentTraceFiles(sessionDir: string = getSessionsDir()): Promise<string[]> {
 	const files = new Set<string>();
-	const roots = new Set([resolve(sessionDir), resolve(dirname(sessionDir), "session-artifacts")]);
+	const roots = new Set([resolve(sessionDir), resolve(getSessionArtifactsRoot(sessionDir))]);
 	await Promise.all([...roots].map((root) => findSessionFilesUnder(root, files)));
 	return [...files].sort();
 }
@@ -866,6 +866,7 @@ class AgentTraceUploadController {
 
 	schedule = (): void => {
 		this.pending = true;
+		pendingUploadControllers.add(this);
 		if (this.timeout) {
 			clearTimeout(this.timeout);
 		}
@@ -908,6 +909,9 @@ class AgentTraceUploadController {
 			return await this.flushPromise;
 		} finally {
 			this.flushPromise = undefined;
+			if (!this.pending) {
+				pendingUploadControllers.delete(this);
+			}
 		}
 	}
 
@@ -948,6 +952,8 @@ class AgentTraceUploadController {
 }
 
 const traceUploadControllers = new WeakMap<SessionManager, AgentTraceUploadController>();
+// Disposal never awaits uploads; exit paths drain this set instead.
+const pendingUploadControllers = new Set<AgentTraceUploadController>();
 
 export function installAgentTraceUpload(sessionManager: SessionManager, options: AgentTraceUploadInstallOptions): void {
 	let controller = traceUploadControllers.get(sessionManager);
@@ -965,4 +971,18 @@ export async function flushAgentTraceUpload(
 	sessionManager: SessionManager,
 ): Promise<AgentTraceUploadResult | undefined> {
 	return traceUploadControllers.get(sessionManager)?.flush();
+}
+
+/** Exit barrier: drains every scheduled or in-flight trace upload. */
+export async function flushAllPendingAgentTraceUploads(): Promise<void> {
+	await Promise.allSettled([...pendingUploadControllers].map((controller) => controller.flush()));
+}
+
+/** Log a detached (fire-and-forget) flush rejection; upload outcomes themselves are already logged per attempt. */
+export function logDetachedAgentTraceFlushFailure(sessionFile: string | undefined, error: unknown): void {
+	const suffix = sessionFile ? ` [${sessionFile}]` : "";
+	appendRotatingLog(
+		getAgentTracesLogPath(),
+		`[${new Date().toISOString()}] detached flush failed: ${describeError(error)}${suffix}`,
+	);
 }

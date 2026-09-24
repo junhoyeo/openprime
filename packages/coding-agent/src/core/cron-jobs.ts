@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
+import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type AgentCronJobStatus = "active" | "paused" | "completed" | "cancelled";
 export type AgentCronScheduleKind = "once" | "cron" | "interval";
@@ -914,9 +915,7 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 	const jobsByArtifact = new Map<string, AgentCronJob[]>();
 	for (const job of jobs) {
 		const artifactPath = join(
-			dirname(dirname(resolve(job.sessionFile))),
-			"session-artifacts",
-			job.sessionId,
+			getSessionArtifactPathForFile(resolve(job.sessionFile), job.sessionId),
 			SESSION_SCHEDULED_JOBS_FILENAME,
 		);
 		const grouped = jobsByArtifact.get(artifactPath) ?? [];
@@ -1500,15 +1499,26 @@ function withCronJobsStateLocks<T>(paths: readonly string[], action: () => T): T
 		for (const path of [...new Set(paths)].sort()) {
 			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 			let release: (() => void) | undefined;
+			let lockCompromised = false;
 			for (let attempt = 0; attempt < 100; attempt++) {
 				try {
 					release = lockSync(path, {
 						realpath: false,
 						lockfilePath: `${path}.lock`,
 						stale: 30_000,
+						onCompromised: () => {
+							lockCompromised = true;
+						},
 					});
+					if (lockCompromised) {
+						release();
+						throw new Error(`Cron jobs lock compromised: ${path}`);
+					}
 					break;
 				} catch (error) {
+					if (lockCompromised) {
+						throw new Error(`Cron jobs lock compromised: ${path}`);
+					}
 					if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === 99) {
 						throw error;
 					}

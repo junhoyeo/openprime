@@ -193,7 +193,7 @@ describe("agents view state", () => {
 		expect(rows.map((row) => row.section)).toEqual(["running", "running", "running", "idle"]);
 	});
 
-	test("keeps row order stable when modification times and daemon input order change", () => {
+	test("keeps row order stable when activity and modification times and daemon input order change", () => {
 		const older = makeSummary({
 			id: "older",
 			sessionId: "older",
@@ -201,6 +201,7 @@ describe("agents view state", () => {
 			activity: "working",
 			created: "2026-01-01T00:00:00Z",
 			modified: "2026-01-04T00:00:00Z",
+			lastActivityAt: "2026-01-04T00:00:00Z",
 		});
 		const newer = makeSummary({
 			id: "newer",
@@ -209,12 +210,13 @@ describe("agents view state", () => {
 			activity: "working",
 			created: "2026-01-02T00:00:00Z",
 			modified: "2026-01-03T00:00:00Z",
+			lastActivityAt: "2026-01-03T00:00:00Z",
 		});
 
 		const initialOrder = buildAgentsViewRows([older, newer]).map((row) => row.summary.sessionId);
 		const refreshedOrder = buildAgentsViewRows([
-			{ ...newer, modified: "2026-01-05T00:00:00Z" },
-			{ ...older, modified: "2026-01-06T00:00:00Z" },
+			{ ...newer, modified: "2026-01-05T00:00:00Z", lastActivityAt: "2026-01-05T00:00:00Z" },
+			{ ...older, modified: "2026-01-06T00:00:00Z", lastActivityAt: "2026-01-06T00:00:00Z" },
 		]).map((row) => row.summary.sessionId);
 
 		expect(initialOrder).toEqual(["newer", "older"]);
@@ -229,6 +231,52 @@ describe("agents view state", () => {
 		]);
 
 		expect(rows.map((row) => row.summary.sessionId)).toEqual(["alpha", "beta-1", "beta-2"]);
+	});
+
+	test("sorts idle rows by last message activity, newest first", () => {
+		const rows = buildAgentsViewRows([
+			makeSummary({
+				id: "created-newest",
+				sessionId: "created-newest",
+				sessionName: "created newest",
+				activity: "idle",
+				created: "2026-01-03T00:00:00Z",
+				lastActivityAt: "2026-01-01T00:00:00Z",
+			}),
+			makeSummary({
+				id: "middle",
+				sessionId: "middle",
+				sessionName: "middle",
+				activity: "idle",
+				created: "2026-01-02T00:00:00Z",
+				lastActivityAt: "2026-01-02T00:00:00Z",
+			}),
+			makeSummary({
+				id: "active-newest",
+				sessionId: "active-newest",
+				sessionName: "active newest",
+				activity: "idle",
+				created: "2026-01-01T00:00:00Z",
+				lastActivityAt: "2026-01-03T00:00:00Z",
+			}),
+			makeSummary({
+				id: "running-oldest",
+				sessionId: "running-oldest",
+				sessionName: "running oldest",
+				activity: "working",
+				isStreaming: true,
+				created: "2025-12-31T00:00:00Z",
+				lastActivityAt: "2025-12-31T00:00:00Z",
+			}),
+		]);
+
+		expect(rows.map((row) => row.summary.sessionId)).toEqual([
+			"running-oldest",
+			"active-newest",
+			"middle",
+			"created-newest",
+		]);
+		expect(rows.map((row) => row.section)).toEqual(["running", "idle", "idle", "idle"]);
 	});
 
 	test("summarizes subagents on their parent and omits subagent rows", () => {
@@ -766,6 +814,15 @@ describe("agents view state", () => {
 		expect(shouldShowAgentsViewSession(inactiveSleep)).toBe(false);
 		expect(shouldShowAgentsViewSession(makeSummary({ lifecycle: "live", activity: "idle" }))).toBe(true);
 		expect(shouldShowAgentsViewSession(makeSummary({ lifecycle: "live", activity: "idle" }), true)).toBe(false);
+	});
+
+	test("keeps sessions of non-ready workers visible and labels them with the worker state", () => {
+		for (const workerState of ["starting", "recovering", "stopping", "failed"] as const) {
+			const summary = makeSummary({ lifecycle: "live", workerState });
+			expect(shouldShowAgentsViewSession(summary), workerState).toBe(true);
+			expect(buildAgentsViewRows([summary])[0]?.statusLabel, workerState).toBe(workerState);
+		}
+		expect(buildAgentsViewRows([makeSummary({ workerState: "ready" })])[0]?.statusLabel).toBe("needs input");
 	});
 
 	test("does not override saved session cwd when reopening inactive agents", () => {
@@ -1327,11 +1384,10 @@ describe("agents view state", () => {
 			expect(resolveAgentsViewScopeFrames([], frames)).toEqual({ frames: [], droppedFrames: 2 });
 		});
 
-		test("settles vanished scopes only after both catalog attempts finish", () => {
-			expect(shouldApplyScopeResolution(0, false, false)).toBe(true);
-			expect(shouldApplyScopeResolution(1, true, false)).toBe(false);
-			expect(shouldApplyScopeResolution(1, false, true)).toBe(false);
-			expect(shouldApplyScopeResolution(1, true, true)).toBe(true);
+		test("settles vanished scopes only after the saved catalog attempt finishes", () => {
+			expect(shouldApplyScopeResolution(0, false)).toBe(true);
+			expect(shouldApplyScopeResolution(1, false)).toBe(false);
+			expect(shouldApplyScopeResolution(1, true)).toBe(true);
 		});
 	});
 
@@ -1379,12 +1435,17 @@ describe("agents view state", () => {
 						id: "saved-child",
 						path: "/tmp/project/saved-child.jsonl",
 						parentSessionPath: "/tmp/project/missing-parent.jsonl",
+						modified: new Date("2026-01-04T00:00:00Z"),
 					}),
 				],
 			);
 
 			expect(buildAgentsViewRows([child!])).toMatchObject([
-				{ kind: "agent", depth: 0, summary: { sessionId: "saved-child" } },
+				{
+					kind: "agent",
+					depth: 0,
+					summary: { sessionId: "saved-child", lastActivityAt: "2026-01-04T00:00:00.000Z" },
+				},
 			]);
 		});
 

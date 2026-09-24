@@ -1,0 +1,1 @@
+- Added durable `/btw` side-conversation storage: each pane is recorded as a linked sub-session under `session-artifacts/<parent>/btw-<id>/`, with a single `custom` pointer entry in the parent, so side questions and the tokens they spend are no longer discarded when the pane closes. Side questions still never enter the main session context.

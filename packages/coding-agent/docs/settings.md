@@ -17,7 +17,7 @@ Edit directly or use `/settings` for common options.
 |---------|------|---------|-------------|
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
-| `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` |
+| `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
@@ -140,9 +140,12 @@ prime-agent --offline
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry on transient errors |
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
+| `retry.maxBackoffMs` | number | `60000` | Ceiling for the agent-level backoff delay (60s) |
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
 | `retry.provider.maxRetries` | number | SDK default | Provider/SDK retry attempts |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
+
+The agent-level delay is `baseDelayMs * 2 ** (attempt - 1)` clamped to `retry.maxBackoffMs`, so a large `maxRetries` keeps polling on a bounded interval instead of sleeping for days. With the defaults plus `maxRetries: 30`, the delays are 2s, 4s, 8s, 16s, 32s, then 60s for each of the remaining 25 attempts, about 26 minutes of retrying in total. Set `maxBackoffMs` to `0` to disable the cap and grow the delay without limit.
 
 When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap.
 
@@ -152,6 +155,7 @@ When a provider requests a retry delay longer than `retry.provider.maxRetryDelay
     "enabled": true,
     "maxRetries": 3,
     "baseDelayMs": 2000,
+    "maxBackoffMs": 60000,
     "provider": {
       "timeoutMs": 3600000,
       "maxRetries": 0,

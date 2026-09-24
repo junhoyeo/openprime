@@ -122,6 +122,55 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
+	it("caps exponential backoff at maxBackoffMs", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 5, baseDelayMs: 1, maxBackoffMs: 4 } },
+		});
+		harnesses.push(harness);
+		const delays: number[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") delays.push(event.delayMs);
+		});
+
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("recovered"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(delays).toEqual([1, 2, 4, 4, 4]);
+		expect(harness.faux.state.callCount).toBe(6);
+	});
+
+	it("grows backoff without a ceiling when maxBackoffMs is 0", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 4, baseDelayMs: 1, maxBackoffMs: 0 } },
+		});
+		harnesses.push(harness);
+		const delays: number[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") delays.push(event.delayMs);
+		});
+
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("recovered"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(delays).toEqual([1, 2, 4, 8]);
+		expect(harness.faux.state.callCount).toBe(5);
+	});
+
 	it("prompt waits for retry completion even when assistant message_end handling is delayed", async () => {
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },

@@ -110,17 +110,17 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-type ProcessQuery = (command: string, args: string[]) => string;
+interface ProcessQueryOptions {
+	env?: NodeJS.ProcessEnv;
+}
 
-function runProcessQuery(command: string, args: string[]): string {
+type ProcessQuery = (command: string, args: string[], options?: ProcessQueryOptions) => string;
+
+function runProcessQuery(command: string, args: string[], options?: ProcessQueryOptions): string {
 	return execFileSync(command, args, {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
-		// The portable start-time listing renders a local-time timestamp:
-		// without pinning the timezone and locale, the SAME process yields a
-		// different identity when the supervisor restarts under a different
-		// TZ/locale, and the mismatch is then read as PID reuse.
-		env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+		env: options?.env,
 	});
 }
 
@@ -163,6 +163,21 @@ export function compareProcessStartIds(
 	return recorded.slice(0, recordedSeparator) === observed.slice(0, observedSeparator) ? "mismatch" : "unverifiable";
 }
 
+export function getPsProcessStartId(pid: number, query: ProcessQuery = runProcessQuery): string | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) {
+		return undefined;
+	}
+	try {
+		// `lstart` is rendered in the subprocess timezone and locale, so pin both for a durable identity.
+		const startTime = query("ps", ["-p", String(pid), "-o", "lstart="], {
+			env: { ...process.env, LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
+		}).trim();
+		return startTime ? `ps:${startTime}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function getProcessStartId(pid: number): string | undefined {
 	if (!Number.isInteger(pid) || pid <= 0) {
 		return undefined;
@@ -181,15 +196,12 @@ export function getProcessStartId(pid: number): string | undefined {
 	} catch {
 		// Fall through to the portable process listing used on macOS and BSD.
 	}
-	try {
-		const startTime = runProcessQuery("ps", ["-p", String(pid), "-o", "lstart="]).trim();
-		// ps2: marks the timezone/locale-pinned rendering. Comparisons across
-		// formats (a legacy ps: token recorded by an older build) cannot prove
-		// PID reuse and must degrade to unverifiable instead of mismatch.
-		return startTime ? `ps2:${startTime}` : undefined;
-	} catch {
-		return undefined;
-	}
+	const portableStartId = getPsProcessStartId(pid);
+	// ps2: marks the timezone/locale-pinned rendering. getPsProcessStartId
+	// retains upstream's public ps: shape for deterministic callers, while
+	// persisted process identities must distinguish this rendering from legacy
+	// unpinned ps: tokens so a format migration cannot look like PID reuse.
+	return portableStartId ? `ps2:${portableStartId.slice("ps:".length)}` : undefined;
 }
 
 let currentProcessStartId: string | undefined;
@@ -216,12 +228,16 @@ function isLeaseOwnerAlive(owner: SessionLeaseOwner): boolean {
 
 function withLeaseGuard<T>(directory: string, action: () => T): T {
 	let release: (() => void) | undefined;
+	let guardCompromised = false;
 	for (let attempt = 0; attempt < 100; attempt++) {
 		try {
 			release = lockSync(directory, {
 				realpath: false,
 				lockfilePath: `${directory}.guard`,
 				stale: 5000,
+				onCompromised: () => {
+					guardCompromised = true;
+				},
 			});
 			break;
 		} catch (error) {
@@ -237,10 +253,24 @@ function withLeaseGuard<T>(directory: string, action: () => T): T {
 	if (!release) {
 		throw new Error(`Could not coordinate session lease: ${directory}`);
 	}
+	const assertGuardHeld = () => {
+		if (guardCompromised) throw new Error(`Session lease guard was compromised: ${directory}`);
+	};
 	try {
-		return action();
+		assertGuardHeld();
+		const result = action();
+		assertGuardHeld();
+		return result;
 	} finally {
-		release();
+		if (guardCompromised) {
+			try {
+				release();
+			} catch {
+				// The compromised guard no longer owns a lock that can be safely released.
+			}
+		} else {
+			release();
+		}
 	}
 }
 
