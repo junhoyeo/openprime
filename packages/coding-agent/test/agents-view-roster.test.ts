@@ -187,6 +187,7 @@ describe("agents-view roster store", () => {
 			localAttachments: getLocalAttachmentTracker(client as unknown as DaemonTransportClient),
 			pendingBindingCatchupSnapshots: new Map(),
 			pendingBindingCatchupFailures: new Map(),
+			pendingBindingSessionEvents: new Map(),
 			requestData: vi.fn(async () => ({ id: "root-active", sessionId: "root", activeSessionId: "root-active" })),
 		}) as DaemonAgentConnection;
 

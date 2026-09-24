@@ -3504,16 +3504,20 @@ describe("DaemonAgentConnection", () => {
 		});
 		// The user resumes a transcript whose recorded directory is missing,
 		// selecting a fallback cwd - the switch only succeeds because of it.
-		await connection.switchSession("/tmp/session-b.jsonl", { cwdOverride: "/tmp/fallback-b" });
+		// Since upstream v0.9.6 the switch awaits the replacement the daemon
+		// streams for it, so the replacement is emitted while the switch is in
+		// flight (the wire order) instead of after it resolves.
+		const switched = connection.switchSession("/tmp/session-b.jsonl", { cwdOverride: "/tmp/fallback-b" });
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.some((request) => request.type === "switch_session")).toBe(true),
+		);
 		fakeClient.emitMessage({
 			type: "session_replaced",
 			activeSessionId: "active-1",
 			state: createConnectionState("active-1", "session-b"),
 			messages: [],
 		});
-		await vi.waitFor(() =>
-			expect(fakeClient.requests.some((request) => request.type === "switch_session")).toBe(true),
-		);
+		await switched;
 		fakeClient.deadActiveSessionIds.add("active-1");
 
 		await connection.prompt("continue");
@@ -6203,6 +6207,18 @@ describe("DaemonAgentConnection deferred session events", () => {
 				emitSequencedSessionEvent(fakeClient, "active-1", sequence);
 			const request = fakeClient.request.bind(fakeClient);
 			vi.spyOn(fakeClient, "request").mockImplementation(async (command, ...options) => {
+				// This fork attaches a live cross-worker target directly instead of
+				// sending protocol `reattach` (reattach's socket-wide source detach
+				// deafens sibling watchers on the shared supervisor socket). The
+				// target attach stands in for upstream's reattach response, and only
+				// the SOURCE session's overflow-recovery attach is gated.
+				if (command.type === "attach" && command.activeSessionId === "active-2")
+					return {
+						type: "response",
+						command: command.type,
+						success: true,
+						data: createAttachResult("active-2", undefined, undefined, 1),
+					};
 				if (command.type === "attach" && change === "streamed replacement") {
 					const result = createAttachResult("active-1", undefined, undefined, 1013);
 					result.snapshotStream = { id: "old-recovery", messageCount: 0, targetChunkBytes: 512 * 1024 };
@@ -6229,13 +6245,6 @@ describe("DaemonAgentConnection deferred session events", () => {
 							activeSessionId: "active-2",
 							sessionPath: "/tmp/target.jsonl",
 						},
-					};
-				if (command.type === "reattach")
-					return {
-						type: "response",
-						command: command.type,
-						success: true,
-						data: createAttachResult("active-2", undefined, undefined, 1),
 					};
 				return request(command, ...options);
 			});
@@ -6877,7 +6886,12 @@ describe("DaemonAgentConnection deferred session events", () => {
 							sessionPath: "/tmp/target.jsonl",
 						},
 					};
-				if (command.type === "reattach") {
+				// This fork attaches the live cross-worker target directly rather than
+				// sending protocol `reattach`, so the target's own attach is where the
+				// daemon starts streaming its events: the sequence-2 event crosses the
+				// wire while that attach is still in flight, exactly as upstream's
+				// reattach response does.
+				if (command.type === "attach" && command.activeSessionId === "active-2") {
 					emitSequencedSessionEvent(fakeClient, "active-2", 2);
 					return {
 						type: "response",
