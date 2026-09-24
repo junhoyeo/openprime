@@ -306,6 +306,9 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.execute_bash).toEqual({ minProtocol: 7 });
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_event).toEqual({ minProtocol: 7 });
 		expect(oldClientSideQuestion).not.toHaveProperty("previousTurns");
+		// A capable daemon must still accept a command with no pane id: pane
+		// grouping is optional metadata, not a precondition for answering.
+		expect(oldClientSideQuestion).not.toHaveProperty("paneId");
 		expect(oldClientBash).not.toHaveProperty("transient");
 		expect(oldClientBash).not.toHaveProperty("runId");
 		expect(oldDaemonBashStart.event).not.toHaveProperty("transient");
@@ -313,7 +316,7 @@ describe("daemon protocol helpers", () => {
 		expect(oldDaemonBashEnd.event).not.toHaveProperty("transient");
 		expect(oldDaemonBashEnd.event).not.toHaveProperty("runId");
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
-			expect.arrayContaining(["side_question_transcript", "transient_bash"]),
+			expect.arrayContaining(["side_question_transcript", "transient_bash", "side_question_pane_id"]),
 		);
 	});
 
