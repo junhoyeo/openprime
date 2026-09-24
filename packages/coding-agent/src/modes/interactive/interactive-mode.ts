@@ -1873,6 +1873,8 @@ export class InteractiveMode {
 		await this.rebindCurrentSession();
 
 		await this.renderInitialMessages();
+		// Attaching to a session running /refine must show its loader (fork-only command).
+		if (!this.isShuttingDown) this.syncWorkingLoader();
 		if (rgResult.status === "unavailable") {
 			this.showWarning(formatMissingRipgrepMessage(rgResult));
 		}
@@ -7393,8 +7395,6 @@ export class InteractiveMode {
 			this.seedSubagentSummary(snapshot.children);
 			this.applyConnectionStateSnapshot(state);
 			this.restoreTurnStartFromMessages(context.messages);
-			// Attaching to a session running /refine must show its loader (fork-only command).
-			this.syncWorkingLoader();
 			await this.renderSessionContext(context, {
 				clearChat: true,
 				updateFooter: true,

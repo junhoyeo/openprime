@@ -463,7 +463,11 @@ describe("AgentSession semantic edges", () => {
 
 		await root.prompt("parent turn");
 		await root.runRlmChild("doomed child");
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
+		await waitForAsync(async () => {
+			// This fork reports a child as "queued" before its runtime exists.
+			const status = (await root.listRlmSubagents()).subagents[0]?.status;
+			return status !== undefined && status !== "queued" && status !== "running";
+		});
 
 		const child = state.child;
 		if (!child) throw new Error("Missing child session");
@@ -492,7 +496,11 @@ describe("AgentSession semantic edges", () => {
 
 		await root.prompt("parent turn");
 		await root.runRlmChild("doomed child");
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
+		await waitForAsync(async () => {
+			// This fork reports a child as "queued" before its runtime exists.
+			const status = (await root.listRlmSubagents()).subagents[0]?.status;
+			return status !== undefined && status !== "queued" && status !== "running";
+		});
 
 		expect(state.child).toBeDefined();
 		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
