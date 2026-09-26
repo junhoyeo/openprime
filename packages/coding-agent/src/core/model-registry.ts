@@ -11,6 +11,7 @@ import {
 	type Context,
 	getModels,
 	getProviders,
+	isOpencodePublicModel,
 	type KnownProvider,
 	type Model,
 	type OAuthProviderInterface,
@@ -1223,13 +1224,17 @@ export class ModelRegistry {
 		};
 	}
 
-	/** `assumeAuthConfigured` validates an explicit stale-provider selection BEFORE the clear commits. */
+	/**
+	 * Validates an explicit selection, so it accepts every model
+	 * isExplicitlySelectable() accepts (including keyless zero-cost Zen models).
+	 * `assumeAuthConfigured` validates an explicit stale-provider selection BEFORE the clear commits.
+	 */
 	async canUseModel(model: Model<Api>, options?: { assumeAuthConfigured?: boolean }): Promise<boolean> {
 		if (options?.assumeAuthConfigured) {
 			// Must be side-effect-free: a keyless refresh would drop the cached entitlements it needs.
 			return !isPrivatePrimeInferenceModel(model) || this.isAuthorizedPrivatePrimeInferenceModel(model);
 		}
-		if (!this.hasConfiguredAuth(model)) {
+		if (!this.isExplicitlySelectable(model)) {
 			return false;
 		}
 		if (!isPrivatePrimeInferenceModel(model)) {
@@ -1315,6 +1320,23 @@ export class ModelRegistry {
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
 		return this.authStorage.hasAuth(model.provider) || this.hasConfiguredProviderRequestAuth(model.provider);
+	}
+
+	/**
+	 * Can this model serve requests when the user picks it by name?
+	 *
+	 * Wider than hasConfiguredAuth() by exactly one case: zero-cost OpenCode Zen
+	 * models authenticate with OpenCode's own `public` key (see
+	 * getApiKeyAndHeaders), so `--model opencode/<id>`, `/model <id>` and a
+	 * set_model command must be allowed to commit without a stored credential.
+	 *
+	 * Use this ONLY at explicit-selection gates. Automatic discovery (getAvailable,
+	 * /model cycling, subagent model lists, backup-model resolution, session
+	 * restore) keeps asking hasConfiguredAuth(), so free Zen models never appear
+	 * unasked for users who never configured OpenCode.
+	 */
+	isExplicitlySelectable(model: Model<Api>): boolean {
+		return this.hasConfiguredAuth(model) || isOpencodePublicModel(model);
 	}
 
 	private fingerprintProviderRequestAuthSource(source: ProviderRequestAuthSource["source"], material: string): string {

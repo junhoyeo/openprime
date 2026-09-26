@@ -2694,7 +2694,10 @@ export class AgentSession {
 		if (!this.model) {
 			throw new Error(formatNoModelSelectedMessage());
 		}
-		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
+		// The session model got here through an explicit selection, so the run gate has
+		// to accept everything that selection accepted: a keyless zero-cost Zen model
+		// authenticates with OpenCode's public key in getApiKeyAndHeaders().
+		if (!this._modelRegistry.isExplicitlySelectable(this.model)) {
 			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 			if (isOAuth) {
 				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
@@ -8338,12 +8341,16 @@ export class AgentSession {
 	}
 
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
-		// Explicit selection recovers from a stale-auth lockout, but only a fully
+		// An explicit switch: isExplicitlySelectable() also admits zero-cost OpenCode
+		// Zen models, which authenticate with OpenCode's public key and are therefore
+		// usable without a stored credential even though hasConfiguredAuth() (and so
+		// /model cycling and subagent discovery) still excludes them.
+		// Explicit selection also recovers from a stale-auth lockout, but only a fully
 		// validated switch commits the clear (single owner): failed selections never unlock.
 		const staleOnly =
-			!this._modelRegistry.hasConfiguredAuth(model) &&
+			!this._modelRegistry.isExplicitlySelectable(model) &&
 			this._modelRegistry.getProviderAuthStatus(model.provider).source === "stale";
-		if (!staleOnly && !this._modelRegistry.hasConfiguredAuth(model)) {
+		if (!staleOnly && !this._modelRegistry.isExplicitlySelectable(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 		if (!(await this._modelRegistry.canUseModel(model, { assumeAuthConfigured: staleOnly }))) {
@@ -8351,7 +8358,7 @@ export class AgentSession {
 		}
 		if (staleOnly) {
 			this._modelRegistry.clearProviderAuthStale(model.provider);
-			if (!this._modelRegistry.hasConfiguredAuth(model)) {
+			if (!this._modelRegistry.isExplicitlySelectable(model)) {
 				throw new Error(`No API key for ${model.provider}/${model.id}`);
 			}
 		}
@@ -10633,7 +10640,8 @@ export class AgentSession {
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {
-					if (!this.modelRegistry.hasConfiguredAuth(model)) return false;
+					// Explicit selection by an extension: same admission rule as /model.
+					if (!this.modelRegistry.isExplicitlySelectable(model)) return false;
 					await this.setModel(model);
 					return true;
 				},
@@ -12537,6 +12545,24 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Resolve a fully qualified `provider/id` reference against the whole catalog,
+	 * admitting only models an explicit selection may use without a stored
+	 * credential. Discovery lists are unaffected.
+	 */
+	private _findExplicitlySelectableRlmModel(normalizedReference: string): Model<Api> | undefined {
+		const slashIndex = normalizedReference.indexOf("/");
+		if (slashIndex <= 0) return undefined;
+		const catalogEntry = this._modelRegistry
+			.getAll()
+			.find((candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference);
+		if (!catalogEntry) return undefined;
+		// find() re-resolves the entry against the current auth (e.g. xAI subscription).
+		const registered = this._modelRegistry.find(catalogEntry.provider, catalogEntry.id) ?? catalogEntry;
+		if (this._modelRegistry.hasConfiguredAuth(registered)) return undefined;
+		return this._modelRegistry.isExplicitlySelectable(registered) ? registered : undefined;
+	}
+
 	async findRlmModels(query: string, limit: number): Promise<RlmFindModelsResult> {
 		return {
 			models: findRlmModelMatches(query, await this._authenticatedRlmModels(), limit),
@@ -12579,7 +12605,13 @@ export class AgentSession {
 		const model =
 			candidates.find(
 				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
-			) ?? findUniqueRlmShortFormModelMatch(reference, candidates, parentModel);
+			) ??
+			findUniqueRlmShortFormModelMatch(reference, candidates, parentModel) ??
+			// A fully qualified reference is an explicit selection, so it also resolves a
+			// model the discovery catalog deliberately omits: zero-cost OpenCode Zen
+			// models carry no stored credential and stay out of find_models() and the
+			// short-form search, but `rlm.spawn(..., model="opencode/<id>")` selects one.
+			this._findExplicitlySelectableRlmModel(normalizedReference);
 		if (!model) {
 			throw new Error(formatRlmModelUnavailableError(reference, target, candidates));
 		}

@@ -5263,14 +5263,19 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const availableModels = await session.modelRegistry.refreshAvailableModels();
+				const registeredModel = session.modelRegistry.find(command.provider, command.modelId);
 				const model =
 					availableModels.find(
 						(candidate) => candidate.provider === command.provider && candidate.id === command.modelId,
 					) ??
 					// Stale-auth providers are excluded from the available list; the lookup
-					// never mutates stale state (session.setModel owns the clear).
-					(session.modelRegistry.getProviderAuthStatus(command.provider).source === "stale"
-						? session.modelRegistry.find(command.provider, command.modelId)
+					// never mutates stale state (session.setModel owns the clear). Zero-cost
+					// OpenCode Zen models are excluded too (they carry no stored credential),
+					// but an explicit set_model still selects them: session.setModel admits
+					// them through isExplicitlySelectable().
+					(session.modelRegistry.getProviderAuthStatus(command.provider).source === "stale" ||
+					(registeredModel && session.modelRegistry.isExplicitlySelectable(registeredModel))
+						? registeredModel
 						: undefined);
 				if (!model) {
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);

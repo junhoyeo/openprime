@@ -8629,8 +8629,14 @@ export class InteractiveMode {
 		return false;
 	}
 
+	/**
+	 * Gates whether an explicit `/model <ref>` or picker selection has to run a
+	 * login flow first. isExplicitlySelectable() lets a zero-cost OpenCode Zen
+	 * model through without a stored credential; the picker's own configured
+	 * badge and ordering still follow hasConfiguredAuth().
+	 */
 	private isModelProviderConfigured(model: AgentConnectionModel): boolean {
-		return this.connectionConfiguredProviders.has(model.provider) || this.modelRegistry.hasConfiguredAuth(model);
+		return this.connectionConfiguredProviders.has(model.provider) || this.modelRegistry.isExplicitlySelectable(model);
 	}
 
 	private applyConnectionModelCatalog(catalog: AgentConnectionModelCatalog): void {
