@@ -5263,20 +5263,24 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const availableModels = await session.modelRegistry.refreshAvailableModels();
-				const registeredModel = session.modelRegistry.find(command.provider, command.modelId);
+				// Stale-auth providers are excluded from the available list; the lookup
+				// never mutates stale state (session.setModel owns the clear). Zero-cost
+				// OpenCode Zen models are excluded too (they carry no stored credential),
+				// but an explicit set_model still selects them: session.setModel admits
+				// them through isExplicitlySelectable(). Only evaluated when the available
+				// list misses, so a hit costs no extra registry work.
+				const findSelectableModel = (): Model<Api> | undefined => {
+					const registeredModel = session.modelRegistry.find(command.provider, command.modelId);
+					if (!registeredModel) return undefined;
+					return session.modelRegistry.getProviderAuthStatus(command.provider).source === "stale" ||
+						session.modelRegistry.isExplicitlySelectable(registeredModel)
+						? registeredModel
+						: undefined;
+				};
 				const model =
 					availableModels.find(
 						(candidate) => candidate.provider === command.provider && candidate.id === command.modelId,
-					) ??
-					// Stale-auth providers are excluded from the available list; the lookup
-					// never mutates stale state (session.setModel owns the clear). Zero-cost
-					// OpenCode Zen models are excluded too (they carry no stored credential),
-					// but an explicit set_model still selects them: session.setModel admits
-					// them through isExplicitlySelectable().
-					(session.modelRegistry.getProviderAuthStatus(command.provider).source === "stale" ||
-					(registeredModel && session.modelRegistry.isExplicitlySelectable(registeredModel))
-						? registeredModel
-						: undefined);
+					) ?? findSelectableModel();
 				if (!model) {
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 				}
