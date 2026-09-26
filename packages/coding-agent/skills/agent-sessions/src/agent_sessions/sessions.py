@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
+from urllib.parse import unquote
 
 HOME = Path.home()
 
@@ -38,6 +39,13 @@ HARNESS_GLOBS: dict[str, list[str]] = {
     # `*/*.jsonl` matters: it excludes the sibling `<cwd>/extensions/goal/*.history.jsonl`
     # files, which are extension state and not transcripts.
     "senpi": [".senpi/agent/sessions/*/*.jsonl"],
+    # Grok Build: ~/.grok/sessions/<url-encoded-cwd>/<uuid>/updates.jsonl (the
+    # $GROK_HOME/sessions/... override is not resolved here, matching how this
+    # reader also ignores CODEX_HOME/JCODE_HOME for other harnesses). The
+    # sibling chat_history.jsonl, events.jsonl, summary.json, usage.json,
+    # recap_requests/, terminal/ and rewind_points.jsonl in the same directory
+    # are state, not transcript.
+    "grok": [".grok/sessions/*/*/updates.jsonl"],
 }
 
 HARNESSES = tuple(HARNESS_GLOBS)
@@ -797,6 +805,152 @@ def _parse_prime(path: Path, records: Iterable[dict[str, Any]], session: Session
                 )
 
 
+def _grok_cwd_from_dir(name: str) -> str:
+    """`%2FUsers%2Fjunhoyeo%2Ftokscale-io` -> `/Users/junhoyeo/tokscale-io`."""
+    return unquote(name)
+
+
+def _grok_sidecar(path: Path) -> dict[str, str]:
+    """`summary.json` beside `updates.jsonl`: cwd/title/started the stream itself
+    does not restate on every line. Small (a few KB), so read whole rather than
+    bounded like Kiro's megabyte sidecar."""
+    fields: dict[str, str] = {}
+    try:
+        data = json.loads(path.with_name("summary.json").read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return fields
+    info = data.get("info") or {}
+    if info.get("id"):
+        fields["session_id"] = info["id"]
+    if info.get("cwd"):
+        fields["cwd"] = info["cwd"]
+    title = data.get("generated_title") or data.get("session_summary") or ""
+    if title:
+        fields["title"] = title
+    if data.get("created_at"):
+        fields["started"] = data["created_at"]
+    return fields
+
+
+def _grok_tool_name(update: dict[str, Any]) -> str:
+    """Tool name of a `tool_call` update.
+
+    `update.title` is the label Grok shows and equals the tool name on 1452 of
+    1487 real calls; the 35 exceptions are prose labels like `Web search:`. The
+    canonical id lives in the update's *own* `_meta["x.ai/tool"].name` (the
+    envelope-level `params._meta` never carries it), so prefer that and fall
+    back to the title."""
+    meta = update.get("_meta") or {}
+    tool = meta.get("x.ai/tool") or {}
+    name = tool.get("name") if isinstance(tool, dict) else ""
+    return str(name or update.get("title") or "")
+
+
+def _grok_timestamp(record: dict[str, Any], meta: dict[str, Any]) -> str:
+    """Prefer the per-chunk `agentTimestampMs`; fall back to the envelope's
+    epoch-second `timestamp`."""
+    raw = meta.get("agentTimestampMs")
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw / 1000, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+    raw = record.get("timestamp")
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+    return ""
+
+
+def _parse_grok(path: Path, records: Iterable[dict[str, Any]], session: Session) -> None:
+    """Grok Build: ~/.grok/sessions/<url-encoded-cwd>/<uuid>/updates.jsonl.
+
+    Every line is an ACP `session/update` envelope: `{timestamp, method,
+    params: {sessionId, update, _meta}}`. Despite the `_chunk` suffix, each
+    `user_message_chunk` / `agent_thought_chunk` / `agent_message_chunk` update
+    already carries a whole segment of text (a full reasoning burst or
+    message), not a character-by-character delta, so one update maps to one
+    event. `tool_call` and `tool_call_update` share a `toolCallId`: the first
+    `tool_call_update` for a call is an in-progress status label (`status` is
+    `null`) and is skipped; only the terminal `completed`/`failed` update
+    carries the real output, and the gap between its `agentTimestampMs` and
+    the initiating `tool_call`'s gives a real `duration_ms`, like Prime's tool
+    wall time. `plan`, `session_recap`, `background_tasks`,
+    `task_backgrounded`, `task_completed` and `turn_completed` (token usage)
+    are bookkeeping and are skipped.
+    """
+    index = 0
+    meta_info = _grok_sidecar(path)
+    session.session_id = meta_info.get("session_id") or path.parent.name
+    session.cwd = meta_info.get("cwd") or _grok_cwd_from_dir(path.parents[1].name)
+    session.title = meta_info.get("title", "")
+    session.started = meta_info.get("started", "")
+
+    tool_names: dict[str, str] = {}
+    tool_started_ms: dict[str, float] = {}
+    for record in records:
+        params = record.get("params") or {}
+        update = params.get("update") or {}
+        su = update.get("sessionUpdate")
+        if not su:
+            continue
+        meta = params.get("_meta") or {}
+        stamp = _grok_timestamp(record, meta)
+        if su == "user_message_chunk":
+            text = _squeeze(_flatten_text(update.get("content")))
+            if text:
+                index += 1
+                session.events.append(Event(index, "user", text, timestamp=stamp))
+        elif su == "agent_thought_chunk":
+            text = _squeeze(_flatten_text(update.get("content")))
+            if text:
+                index += 1
+                session.events.append(Event(index, "reasoning", text, timestamp=stamp))
+        elif su == "agent_message_chunk":
+            text = _squeeze(_flatten_text(update.get("content")))
+            if text:
+                index += 1
+                session.events.append(Event(index, "assistant", text, timestamp=stamp))
+        elif su == "tool_call":
+            call_id = update.get("toolCallId", "")
+            name = _grok_tool_name(update)
+            tool_names[call_id] = name
+            start_ms = meta.get("agentTimestampMs")
+            if isinstance(start_ms, (int, float)):
+                tool_started_ms[call_id] = start_ms
+            index += 1
+            session.events.append(
+                Event(
+                    index,
+                    "tool_call",
+                    _squeeze(json.dumps(update.get("rawInput", {}), ensure_ascii=False)),
+                    name=name,
+                    timestamp=stamp,
+                )
+            )
+        elif su == "tool_call_update":
+            status = update.get("status")
+            content = update.get("content")
+            if status not in {"completed", "failed"} or not content:
+                continue  # in-progress status label, not the terminal output
+            call_id = update.get("toolCallId", "")
+            name = tool_names.get(call_id, "")
+            if status == "failed":
+                name = f"{name}:error" if name else "error"
+            duration = None
+            end_ms = meta.get("agentTimestampMs")
+            start_ms = tool_started_ms.get(call_id)
+            if isinstance(start_ms, (int, float)) and isinstance(end_ms, (int, float)):
+                duration = int(end_ms - start_ms)
+            index += 1
+            session.events.append(
+                Event(
+                    index,
+                    "tool_result",
+                    _squeeze(_flatten_text(content)),
+                    name=name,
+                    timestamp=stamp,
+                    duration_ms=duration,
+                )
+            )
+
+
 PARSERS: dict[str, Callable[[Path, Iterable[dict[str, Any]], Session], None]] = {
     "codex": _parse_codex,
     "claude": _parse_claude,
@@ -805,6 +959,7 @@ PARSERS: dict[str, Callable[[Path, Iterable[dict[str, Any]], Session], None]] = 
     "kiro-cli": _parse_kiro,
     "prime": _parse_prime,
     "senpi": _parse_prime,
+    "grok": _parse_grok,
 }
 
 
@@ -871,6 +1026,11 @@ def _cheap_metadata(harness: str, path: Path) -> tuple[str, str, str]:
             cwd = _kimi_project(path.parents[3].name)
             if path.parents[0].name != "main":
                 title = f"sub-agent {path.parents[0].name}"
+        elif harness == "grok":
+            meta = _grok_sidecar(path)
+            session_id = meta.get("session_id") or path.parent.name
+            cwd = meta.get("cwd") or _grok_cwd_from_dir(path.parents[1].name)
+            title = meta.get("title", "")
         else:
             session_id = path.parent.name
             cwd = path.parents[1].name
@@ -889,7 +1049,7 @@ def find_sessions(
     """Discover recent agent session transcripts, newest first.
 
     harness: "all" or a comma list of codex, claude, kimi, kimi-code, kiro-cli,
-             prime.
+             prime, senpi, grok.
     project: substring matched against the session cwd / stored project path.
     days:    only sessions modified within this many days.
     """

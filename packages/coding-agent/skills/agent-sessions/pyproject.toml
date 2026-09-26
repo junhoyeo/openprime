@@ -1,7 +1,7 @@
 [project]
 name = "prime-agent-skill-agent-sessions"
 version = "0.1.0"
-description = "Read Codex CLI, Claude Code, Kimi, Kiro CLI, Prime Agent, and Senpi session transcripts from disk."
+description = "Read Codex CLI, Claude Code, Kimi, Kiro CLI, Prime Agent, Senpi, and Grok Build session transcripts from disk."
 requires-python = ">=3.10"
 dependencies = []
 

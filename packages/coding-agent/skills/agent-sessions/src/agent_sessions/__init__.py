@@ -77,7 +77,7 @@ async def run(
       session:  path, session id, or id prefix. Scopes grep to one transcript,
                 and selects which transcript `show` renders.
       harness:  "all" or comma list of codex, claude, kimi, kimi-code, kiro-cli,
-                prime.
+                prime, senpi, grok.
       project:  substring filter on the session cwd / project path.
       kinds:    all, chat, user, assistant, reasoning, tools, tool_call, system.
                 Defaults to "all" for grep and "chat" for show.
