@@ -1217,6 +1217,39 @@ describe("ModelRegistry", () => {
 		const auth = await registry.getApiKeyAndHeaders(model!);
 		expect(auth).toMatchObject({ ok: true, apiKey: "public" });
 	});
+
+	test("isExplicitlySelectable admits a keyless zero-cost OpenCode model and nothing else", async () => {
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const freeZenModel = registry.find("opencode", "union-alpha");
+		expect(freeZenModel).toBeDefined();
+		expect(registry.isExplicitlySelectable(freeZenModel!)).toBe(true);
+		// canUseModel() is the setModel() availability gate, so it follows.
+		await expect(registry.canUseModel(freeZenModel!)).resolves.toBe(true);
+
+		// A paid OpenCode model still needs a credential.
+		const paidOpencodeModel = registry
+			.getAll()
+			.find((candidate) => candidate.provider === "opencode" && candidate.cost.input > 0);
+		expect(paidOpencodeModel).toBeDefined();
+		expect(registry.isExplicitlySelectable(paidOpencodeModel!)).toBe(false);
+		await expect(registry.canUseModel(paidOpencodeModel!)).resolves.toBe(false);
+
+		// A zero-cost model on another provider is not covered by the Zen fallback.
+		const otherFreeModel = registry
+			.getAll()
+			.find(
+				(candidate) =>
+					candidate.provider !== "opencode" && candidate.provider !== "opencode-go" && candidate.cost.input === 0,
+			);
+		expect(otherFreeModel).toBeDefined();
+		expect(registry.isExplicitlySelectable(otherFreeModel!)).toBe(false);
+
+		// A configured credential keeps every model of that provider selectable.
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const anthropicModel = registry.getAll().find((candidate) => candidate.provider === "anthropic");
+		expect(anthropicModel).toBeDefined();
+		expect(registry.isExplicitlySelectable(anthropicModel!)).toBe(true);
+	});
 });
 
 describe("subagent Prime Inference discovery", () => {
