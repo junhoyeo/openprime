@@ -179,3 +179,57 @@ Mapping to normalized events:
 Not mapped: token usage/cost (`message.usage`, `child_usage_attributed`),
 `agent_status` task-state transitions, `details.diffs`, and image payloads
 (rendered as `[image <mime>]`). Prime tool output retains raw ANSI escapes.
+
+## Grok Build — `~/.grok/sessions/<url-encoded-cwd>/<uuid>/updates.jsonl`
+
+The directory name is the cwd with every `/` percent-encoded (`%2F`), decoded with
+`urllib.parse.unquote`; not reversible in general (a literal `%2F` in a path would
+collide), but real paths never contain one. Sibling files in the same `<uuid>/`
+directory: `chat_history.jsonl` (a cleaner but timestamp-less replay of the same
+turns, not read by this parser), `events.jsonl`, `summary.json` (small — `info.{id,cwd}`,
+`generated_title`, `session_summary`, `created_at`), `usage.json` (token/cost
+totals per turn), `recap_requests/`, `terminal/` (background-task output logs),
+`rewind_points.jsonl`, and various `.lock` files — all state, not transcript.
+
+Every line is one ACP (`session/update`) envelope:
+`{timestamp (epoch seconds), method, params: {sessionId, update, _meta}}`. `_meta`
+sits beside `update`, not inside it, and carries `agentTimestampMs` (epoch ms,
+preferred over the envelope's second-resolution `timestamp`), `promptId`,
+`totalTokens`, `chunkId`. `update.sessionUpdate` values seen:
+
+- `user_message_chunk` / `agent_thought_chunk` / `agent_message_chunk` —
+  `content: {type: text, text}`. Despite the name, each chunk already holds a
+  complete segment (verified: a 33-thought-chunk turn is 33 distinct completed
+  bursts of reasoning between tool calls, not one thought streamed character by
+  character), so each maps to one `user` / `reasoning` / `assistant` event.
+- `tool_call` — `toolCallId`, `rawInput` (the call arguments), and two name
+  sources: the update's own `_meta["x.ai/tool"].name` (the canonical tool id;
+  the envelope-level `params._meta` never carries it) and `title`, the label
+  Grok shows. `title` equals the tool name on 1452 of 1487 real calls, but the
+  remaining 35 are prose (`Web search:`), so the parser prefers the meta name
+  and falls back to `title`.
+- `tool_call_update` — `toolCallId`, `status` (`null` while running, then
+  `completed` or `failed`), `content: [{type: content, content: {type: text,
+  text}}]`. The first update for a call is a `null`-status progress label (a
+  short human description, e.g. "List installed skill directories") with no
+  useful output; only the terminal `completed`/`failed` update carries the real
+  result, so the parser skips every non-terminal one. `duration_ms` is the gap
+  between this update's `agentTimestampMs` and the initiating `tool_call`'s.
+- `plan`, `session_recap`, `background_tasks`, `task_backgrounded`,
+  `task_completed`, `turn_completed` (per-turn token usage) — bookkeeping,
+  skipped like Prime's `agent_status`.
+
+Mapping to normalized events:
+
+| record | event |
+|---|---|
+| `summary.json` `info.cwd` / `generated_title` / `created_at` | session `cwd`, `title`, `started` |
+| `user_message_chunk` | `user` |
+| `agent_thought_chunk` | `reasoning` |
+| `agent_message_chunk` | `assistant` |
+| `tool_call` | `tool_call`, name = `_meta["x.ai/tool"].name`, else `title` |
+| `tool_call_update`, status `completed`/`failed` with content | `tool_result`, name = tool name (`name:error` when failed), `duration_ms` from the paired `tool_call` |
+
+Not mapped: `chat_history.jsonl` (a redundant, timestamp-less view of the same
+turns), `usage.json`, `plan`/`session_recap`/background-task bookkeeping, and the
+`null`-status progress label on each tool call.
