@@ -1,0 +1,1 @@
+- Fixed restoring a Python kernel snapshot truncating files whose closed `open(path, "w")` handle was still bound in the namespace; restored file handles now come back closed without reopening their paths ([#31](https://github.com/junhoyeo/openprime/issues/31)).

@@ -965,6 +965,41 @@ def _revive_with_live_globals(
     return rebound
 
 
+_STD_STREAMS = {"<stdin>": "__stdin__", "<stdout>": "__stdout__", "<stderr>": "__stderr__"}
+_SNAPSHOT_UNPICKLER: Any = None
+
+
+def _revive_file_handle(name: Any, mode: Any, *_saved: Any) -> Any:
+    """Restore-time stand-in for dill's _create_filehandle, which reopens the
+    saved path with the saved mode: a restored `with open(path, "w") as f`
+    handle truncated that file to zero bytes (#31). The handle comes back
+    closed with its name and mode, and the saved path is never opened."""
+    stream = _STD_STREAMS.get(name)
+    if stream is not None:
+        return getattr(sys, stream)
+    handle = open(os.devnull, str(mode).replace("x", "w"))
+    buffer = getattr(handle, "buffer", handle)
+    getattr(buffer, "raw", buffer).name = name
+    handle.close()
+    return handle
+
+
+def _snapshot_loads(dill: Any, source: Any) -> Any:
+    """dill.load for snapshot data, with file handles revived by _revive_file_handle."""
+    global _SNAPSHOT_UNPICKLER
+    if _SNAPSHOT_UNPICKLER is None:
+
+        class SnapshotUnpickler(dill.Unpickler):
+            def find_class(self, module: str, name: str) -> Any:
+                if name == "_create_filehandle" and module in ("dill._dill", "dill.dill"):
+                    return _revive_file_handle
+                return super().find_class(module, name)
+
+        _SNAPSHOT_UNPICKLER = SnapshotUnpickler
+    stream = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
+    return _SNAPSHOT_UNPICKLER(stream).load()
+
+
 def _restore_state(
     ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
@@ -981,7 +1016,7 @@ def _restore_state(
             else:
                 # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
                 fh.seek(0)
-                payload = dill.load(fh)
+                payload = _snapshot_loads(dill, fh)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
@@ -993,7 +1028,7 @@ def _restore_state(
         if name in _RESTORE_SKIP:
             continue
         try:
-            staged[name] = dill.loads(blob)
+            staged[name] = _snapshot_loads(dill, blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     # Revive every staged name before parking: a failure must never abort the

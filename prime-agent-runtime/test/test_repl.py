@@ -731,6 +731,16 @@ class ReplTest(unittest.TestCase):
         self._snapshot_restore("ct", code, self.enterContext(tempfile.TemporaryDirectory()))
         self.assertEqual(one(self.repl.execute("ct4", "G = 2\n(callbacks[0](), handlers['read'](), pair[0]())"), "result")["text"], "(2, 2, 2)")
 
+    def test_restore_never_reopens_saved_file_handles_issue_31(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        draft, log = os.path.join(tmp, "draft.md"), os.path.join(tmp, "gone.log")
+        code = f"import os\nwith open({draft!r}, 'w') as f:\n    f.write('draft')\nlogs = [open({log!r}, 'a')]\nlogs[0].close()\nos.remove({log!r})"
+        self._snapshot_restore("fh", code, tmp)
+        with open(draft) as fh:
+            self.assertEqual((fh.read(), os.path.exists(log)), ("draft", False))
+        probe = "(f.closed, f.name.endswith('draft.md'), f.mode, logs[0].closed)"
+        self.assertEqual(one(self.repl.execute("fh4", probe), "result")["text"], "(True, True, 'w', True)")
+
     def test_snapshot_prune_oversized(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "kernel-state.dill")
@@ -2086,26 +2096,24 @@ class RestoreApplyShieldTest(unittest.TestCase):
                 signal.raise_signal(signal.SIGINT)
 
     def test_sigint_during_staging_leaves_namespace_unchanged(self):
-        import dill
+        from rlm import repl
 
-        from rlm.repl import _restore_state
-
-        real_loads = dill.loads
+        real_loads = repl._snapshot_loads
         calls = {"n": 0}
 
-        def loads_then_sigint(blob):
+        def loads_then_sigint(dill, blob):
             calls["n"] += 1
             if calls["n"] == 2:
                 # Synchronous SIGINT mid-deserialize: nothing may have touched ns yet.
                 signal.raise_signal(signal.SIGINT)
-            return real_loads(blob)
+            return real_loads(dill, blob)
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_snapshot(tmp, {"a": 1, "b": 2})
             ns = {"a": "old", "unrelated": "keep"}
-            with mock.patch.object(dill, "loads", loads_then_sigint):
+            with mock.patch.object(repl, "_snapshot_loads", loads_then_sigint):
                 with self.assertRaises(KeyboardInterrupt):
-                    _restore_state(ns, path)
+                    repl._restore_state(ns, path)
         # The old namespace is byte-identical: no partial old/new mixture.
         self.assertEqual(ns, {"a": "old", "unrelated": "keep"})
 
