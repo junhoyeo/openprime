@@ -1,13 +1,13 @@
 ---
 name: agent-sessions
-description: Grep and read local coding-agent session transcripts - Codex CLI (~/.codex/sessions), Claude Code (~/.claude/projects), Kimi CLI (~/.kimi/sessions), Kimi Code (~/.kimi-code/sessions), Kiro CLI (~/.kiro/sessions/cli), Senpi (~/.senpi/agent/sessions), Grok Build (~/.grok/sessions), and Prime Agent itself (~/.prime/agent/sessions and its sub-agent artifacts). Use when the user asks what a previous or concurrent agent session was doing, to resume or pick up context from another harness, to audit what Prime Agent itself ran (IPython code, tool durations), to find which session touched a file, repo, error, or topic, or to summarize a rollout/wire/context JSONL transcript.
+description: Grep and read local coding-agent session transcripts - Codex CLI (~/.codex/sessions), Claude Code (~/.claude/projects), Kimi CLI (~/.kimi/sessions), Kimi Code (~/.kimi-code/sessions), Kiro CLI (~/.kiro/sessions/cli), Senpi (~/.senpi/agent/sessions), Grok Build (~/.grok/sessions), Prime Agent itself (~/.prime/agent/sessions and its sub-agent artifacts), and Aside chats and saved text artifacts (~/.aside/u/*/sessions). Use when the user asks what a previous or concurrent agent session was doing, to resume or pick up context from another harness, to audit what Prime Agent itself ran (IPython code, tool durations), to find which session touched a file, repo, error, or topic, or to summarize a rollout/wire/context JSONL transcript.
 ---
 
 # Agent Sessions
 
-Ripgrep for the JSONL transcripts that coding agents leave on this machine.
+Ripgrep for local agent transcripts and Aside text artifacts.
 Every harness is parsed into the same event stream, so one pattern searches user
-turns, assistant replies, reasoning, tool calls, and tool output alike.
+turns, assistant replies, reasoning, tool calls, tool output, and saved text alike.
 Transcripts are **read-only evidence** — never edit or delete them.
 
 | Harness | Location | File |
@@ -20,6 +20,7 @@ Transcripts are **read-only evidence** — never edit or delete them.
 | `prime` | `~/.prime/agent/sessions/` and `~/.prime/agent/session-artifacts/<parent>/sub-<child>/` | `<uuid>.jsonl` |
 | `senpi` | `~/.senpi/agent/sessions/<flattened-cwd>/` | `<ISO-ts>_<uuid>.jsonl` |
 | `grok` | `~/.grok/sessions/<url-encoded-cwd>/<uuid>/` | `updates.jsonl` (+ `summary.json` sidecar) |
+| `aside` | `~/.aside/u/<profile>/sessions/<date>_<id>/` | `messages.jsonl` and `artifacts/**/*` (supported text files) |
 
 Prime Agent's own transcripts are indexed too, so this skill can audit the
 harness it runs in: the `tool_call` text is the exact IPython source that was
@@ -66,9 +67,44 @@ Shell form (flags only — the CLI takes no positional arguments):
 `session` accepts a full path, a session id, or an id prefix (a transcript whose
 own filename carries the id wins over one that only mentions it in a parent
 directory). `harness` accepts `all` or a comma list of `codex, claude, kimi,
-kimi-code, kiro-cli, prime, senpi, grok`. `kinds` is one of `all,
-chat, user, assistant, reasoning, tools, tool_call, system` (grep defaults to
-`all`, show to `chat`).
+kimi-code, kiro-cli, prime, senpi, grok, aside`. `kinds` is one of `all,
+chat, user, assistant, reasoning, tools, tool_call, system, artifact` (grep defaults to
+`all`, show to `chat`, or `artifact` when reading an artifact file).
+
+## Searching Aside chats and saved artifacts
+
+Aside is included in `harness="all"`. Use `harness="aside"` to search only Aside:
+
+```python
+print(await agent_sessions("grep", "개인투자조합", harness="aside"))
+# A session id/prefix includes the chat and its text artifacts.
+print(await agent_sessions("grep", "개인투자조합", session="TySYMMEDeQXWTWLR", harness="aside"))
+# A directory scopes grep recursively, including artifact-only sessions.
+print(await agent_sessions("grep", "개인투자조합", session=
+    "~/.aside/u/0/sessions/2026-10-21_TySYMMEDeQXWTWLR/artifacts/lecture-transcripts"))
+# A file path scopes grep/show to that exact file. Use a path returned by grep:
+print(await agent_sessions("show", session=artifact_path, around=42, context=3))
+```
+
+Each artifact is a separate searchable source with its owning session id.
+Artifact event indices are **physical file line numbers**, including blank lines
+in the numbering. `kinds="artifact"` excludes chat events. `show` by session id
+prefers `messages.jsonl`; `show` by artifact path shows the file's text.
+
+Supported artifacts: `.txt`, `.md`, `.markdown`, `.vtt`, `.srt`, `.json`, `.jsonl`,
+`.csv`, `.tsv`, `.log`, `.html`, `.htm`, `.xml`, `.yaml`, `.yml`, `.py`, `.js`,
+`.mjs`, `.cjs`, `.ts`, `.tsx`, `.jsx`, `.css`, `.sh`, `.sql` (case-insensitive).
+They are read as UTF-8 text lines, not rendered HTML or parsed JSON. Paired TXT/VTT
+transcripts can both match. Symlinks, files with NUL bytes in the first 8 KiB,
+other extensions, and files outside `artifacts/` (such as `tmp/`) are excluded.
+No PDF extraction, OCR, or audio/video transcription is performed.
+
+Optional metadata comes from a read-only query of the profile's `state.db`.
+If unavailable, the directory suffix supplies the id, the first user message
+supplies the chat title, and the session directory is the fallback cwd.
+`project=` matches cwd or source path; `days=` uses each source file's mtime.
+Normal grep result limits still apply; scope to a session or directory for older
+artifacts that fall outside the default newest-200-source scan.
 
 ## Auditing Prime Agent itself
 
@@ -106,7 +142,7 @@ hits = grep_sessions("playwright", project="my-app", days=2)
 
 `load_session` normalizes every harness into `Session.events`, a list of
 `Event(index, kind, text, name, timestamp, duration_ms)` with `kind` in
-`user, assistant, reasoning, tool_call, tool_result, system`. `duration_ms` is
+`user, assistant, reasoning, tool_call, tool_result, system, artifact`. `duration_ms` is
 `None` unless the harness records tool wall time (Prime does; Grok Build gets it
 from the gap between a tool call and its terminal update).
 

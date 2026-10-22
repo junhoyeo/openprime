@@ -1,4 +1,4 @@
-"""Read and grep Codex CLI, Claude Code, Kimi, Kiro CLI, and Prime Agent session transcripts.
+"""Read and grep coding-agent transcripts and Aside text artifacts.
 
 Entrypoint: ``run`` (exposed as ``await agent_sessions(...)``).
 Structured helpers: ``find_sessions``, ``load_session``, ``grep_sessions``,
@@ -74,13 +74,14 @@ async def run(
     Args
       pattern:  regex (smart-case: lowercase pattern => case-insensitive).
                 Use fixed=True for a literal search.
-      session:  path, session id, or id prefix. Scopes grep to one transcript,
-                and selects which transcript `show` renders.
+      session:  path, session id, or id prefix. Aside ids scope grep to the chat
+                and its text artifacts; an Aside directory scopes grep recursively.
+                A file path scopes grep/show to that source.
       harness:  "all" or comma list of codex, claude, kimi, kimi-code, kiro-cli,
-                prime, senpi, grok.
+                prime, senpi, grok, aside.
       project:  substring filter on the session cwd / project path.
-      kinds:    all, chat, user, assistant, reasoning, tools, tool_call, system.
-                Defaults to "all" for grep and "chat" for show.
+      kinds:    all, chat, user, assistant, reasoning, tools, tool_call, system, artifact.
+                Defaults to "all" for grep, "chat" for show ("artifact" for text files).
       limit:    sessions for list/grep, events for show (0 = sensible default).
       days:     only consider sessions modified within this many days.
       context:  neighbouring events to include around each grep hit, or the
@@ -130,7 +131,7 @@ async def run(
         parsed = load_session(target, harness=harness)
         return _render_session(
             parsed,
-            kinds=kinds or "chat",
+            kinds=kinds or ("artifact" if parsed.source == "artifact" else "chat"),
             limit=limit or (0 if around is not None else 40),
             event_chars=event_chars,
             max_chars=max_chars,

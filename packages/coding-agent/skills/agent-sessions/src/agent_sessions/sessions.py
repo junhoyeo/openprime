@@ -1,10 +1,11 @@
-"""Cross-harness agent session transcript reader (Codex, Claude Code, Kimi, Kiro, Prime)."""
+"""Cross-harness agent transcript and Aside text-artifact reader."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +47,10 @@ HARNESS_GLOBS: dict[str, list[str]] = {
     # recap_requests/, terminal/ and rewind_points.jsonl in the same directory
     # are state, not transcript.
     "grok": [".grok/sessions/*/*/updates.jsonl"],
+    "aside": [
+        ".aside/u/*/sessions/*/messages.jsonl",
+        ".aside/u/*/sessions/*/artifacts/**/*",
+    ],
 }
 
 HARNESSES = tuple(HARNESS_GLOBS)
@@ -67,7 +72,7 @@ class SessionError(RuntimeError):
 @dataclass
 class Event:
     index: int
-    kind: str  # user | assistant | reasoning | tool_call | tool_result | system | meta
+    kind: str  # user | assistant | reasoning | tool_call | tool_result | system | artifact | meta
     text: str = ""
     name: str = ""
     timestamp: str = ""
@@ -148,7 +153,42 @@ _GLOB_REGEXES: dict[str, list[re.Pattern[str]]] = {
 }
 
 
+_ASIDE_TEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".vtt", ".srt", ".json", ".jsonl", ".csv", ".tsv",
+    ".log", ".html", ".htm", ".xml", ".yaml", ".yml", ".py", ".js", ".mjs",
+    ".cjs", ".ts", ".tsx", ".jsx", ".css", ".sh", ".sql",
+}
+
+
+def _aside_root(path: Path) -> Path | None:
+    for parent in (path, *path.parents):
+        parts = parent.parts
+        if len(parts) >= 5 and parts[-5] == ".aside" and parts[-4] == "u" and parts[-2] == "sessions":
+            return parent
+    return None
+
+
 def _is_transcript(path: Path) -> bool:
+    root = _aside_root(path)
+    if root is not None:
+        relative = path.relative_to(root)
+        if ".." in path.parts:
+            return False
+        for part in (path, *path.parents):
+            if part.is_symlink():
+                return False
+            if part == root.parents[3]:  # stop at .aside, not a system /var -> /private/var link
+                break
+        if relative == Path("messages.jsonl"):
+            return path.is_file()
+        if (not path.is_file() or not relative.parts or relative.parts[0] != "artifacts"
+                or path.suffix.lower() not in _ASIDE_TEXT_SUFFIXES):
+            return False
+        try:
+            with path.open("rb") as handle:
+                return b"\0" not in handle.read(8192)
+        except OSError:
+            return False
     return path.name not in _NON_TRANSCRIPTS
 
 
@@ -951,6 +991,99 @@ def _parse_grok(path: Path, records: Iterable[dict[str, Any]], session: Session)
             )
 
 
+def _aside_identity(path: Path) -> tuple[Path, str]:
+    root = _aside_root(path)
+    if root is None:
+        raise SessionError(f"not an Aside session path: {path}")
+    return root, root.name.split("_", 1)[-1]
+
+
+def _aside_metadata(root: Path, session_id: str) -> dict[str, str]:
+    database = root.parent.parent / "state.db"
+    try:
+        connection = sqlite3.connect(f"{database.absolute().as_uri()}?mode=ro", uri=True, timeout=0.05)
+        try:
+            row = connection.execute(
+                "SELECT cwd, title, created_at, parent_id FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return {}
+    if not row:
+        return {}
+    cwd, title, created, parent = row
+    started = ""
+    if isinstance(created, (int, float)):
+        try:
+            started = datetime.fromtimestamp(created, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+        except (ValueError, OverflowError, OSError):
+            pass
+    return {"cwd": cwd or "", "title": title or "", "started": started, "parent_id": parent or ""}
+
+
+def _parse_aside(path: Path, records: Iterable[dict[str, Any]], session: Session) -> None:
+    root, session.session_id = _aside_identity(path)
+    meta = _aside_metadata(root, session.session_id)
+    session.cwd = meta.get("cwd") or str(root)
+    session.title = meta.get("title", "")
+    session.started = meta.get("started", "")
+    session.parent_id = meta.get("parent_id", "")
+    if path != root / "messages.jsonl":
+        session.source = "artifact"
+        session.title = path.relative_to(root).as_posix()
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle, 1):
+                text = line.rstrip("\r\n")
+                if text.strip():
+                    session.events.append(Event(line_number, "artifact", text))
+        return
+
+    for record in records:
+        role = record.get("role")
+        stamp = _prime_timestamp(record)
+        if not session.started and stamp:
+            session.started = stamp
+        content = record.get("content")
+        if role in {"user", "steering", "system", "system-message", "compaction"}:
+            text = _prime_content_text(record.get("summary") if role == "compaction" else content)
+            if text:
+                kind = "user" if role in {"user", "steering"} else "system"
+                name = role if role in {"steering", "compaction"} else ""
+                session.events.append(Event(len(session.events) + 1, kind, text, name, stamp))
+                if role == "user" and not session.title:
+                    session.title = _clip(text.replace("\n", " "), 120)
+        elif role == "toolResult":
+            details = record.get("details")
+            timing = record.get("timing")
+            details = details if isinstance(details, dict) else {}
+            timing = timing if isinstance(timing, dict) else {}
+            duration = next((value for value in (
+                record.get("durationMs"), timing.get("durationMs"), details.get("elapsedMs"),
+            ) if isinstance(value, (int, float))), None)
+            name = record.get("toolName", "")
+            if record.get("isError"):
+                name += ":error"
+            text = _prime_content_text(content) or str(record.get("errorMessage") or "")
+            session.events.append(Event(len(session.events) + 1, "tool_result", text, name, stamp,
+                                        int(duration) if duration is not None else None))
+        elif role == "assistant":
+            blocks = content if isinstance(content, list) else [{"type": "text", "text": _flatten_text(content)}]
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "toolCall":
+                    kind, text, name = "tool_call", _prime_tool_call_text(block), block.get("name", "")
+                elif btype in {"text", "thinking"}:
+                    kind = "reasoning" if btype == "thinking" else "assistant"
+                    text, name = _squeeze(block.get(btype) or ""), ""
+                else:
+                    continue
+                if text:
+                    session.events.append(Event(len(session.events) + 1, kind, text, name, stamp))
+
+
 PARSERS: dict[str, Callable[[Path, Iterable[dict[str, Any]], Session], None]] = {
     "codex": _parse_codex,
     "claude": _parse_claude,
@@ -960,6 +1093,7 @@ PARSERS: dict[str, Callable[[Path, Iterable[dict[str, Any]], Session], None]] = 
     "prime": _parse_prime,
     "senpi": _parse_prime,
     "grok": _parse_grok,
+    "aside": _parse_aside,
 }
 
 
@@ -1026,6 +1160,18 @@ def _cheap_metadata(harness: str, path: Path) -> tuple[str, str, str]:
             cwd = _kimi_project(path.parents[3].name)
             if path.parents[0].name != "main":
                 title = f"sub-agent {path.parents[0].name}"
+        elif harness == "aside":
+            root, session_id = _aside_identity(path)
+            meta = _aside_metadata(root, session_id)
+            cwd, title = meta.get("cwd") or str(root), meta.get("title", "")
+            if path != root / "messages.jsonl":
+                title = path.relative_to(root).as_posix()
+            elif not title:
+                for record in _read_jsonl(path, limit=12):
+                    if record.get("role") == "user":
+                        title = _clip(_prime_content_text(record.get("content")).replace("\n", " "), 120)
+                        if title:
+                            break
         elif harness == "grok":
             meta = _grok_sidecar(path)
             session_id = meta.get("session_id") or path.parent.name
@@ -1049,7 +1195,7 @@ def find_sessions(
     """Discover recent agent session transcripts, newest first.
 
     harness: "all" or a comma list of codex, claude, kimi, kimi-code, kiro-cli,
-             prime, senpi, grok.
+             prime, senpi, grok, aside.
     project: substring matched against the session cwd / stored project path.
     days:    only sessions modified within this many days.
     """
@@ -1105,8 +1251,12 @@ def find_sessions(
 
 def resolve_session(target: str | Path, harness: str = "all") -> tuple[str, Path]:
     """Resolve a path, session id, or id prefix to (harness, path)."""
-    candidate = Path(str(target)).expanduser()
+    candidate = Path(str(target)).expanduser().absolute()
+    if candidate.is_dir() and _aside_root(candidate) == candidate:
+        candidate = candidate / "messages.jsonl"
     if candidate.is_file():
+        if _aside_root(candidate) is not None and not _is_transcript(candidate):
+            raise SessionError(f"unsupported Aside source: {candidate}")
         # match on the full home-relative shape so ~/.kimi-code is not mistaken
         # for ~/.kimi
         name = _harness_for_path(candidate)
@@ -1130,6 +1280,14 @@ def resolve_session(target: str | Path, harness: str = "all") -> tuple[str, Path
             # session-artifacts/<parent-id>/)
             stem = path.stem.lower()
             rank = 0 if stem == token else (1 if stem.startswith(token) else 2)
+            if name == "aside":
+                root, session_id = _aside_identity(path)
+                if token not in root.name.lower() and candidate != root:
+                    continue  # artifact filenames must not steal another session's id
+                identity = session_id.lower()
+                rank = 0 if token in {identity, root.name.lower()} else (1 if identity.startswith(token) else 2)
+                if path != root / "messages.jsonl":
+                    rank += 3  # an id selects the chat, not its newest artifact
             try:
                 matches.append((rank, path.stat().st_mtime, name, path))
             except OSError:
@@ -1147,6 +1305,7 @@ _CACHE_LIMIT = 12
 def load_session(target: str | Path, harness: str = "all", use_cache: bool = True) -> Session:
     """Parse a transcript into a normalized Session with events (memoized)."""
     name, path = resolve_session(target, harness=harness)
+    use_cache = use_cache and name != "aside"
     try:
         stat = path.stat()
     except OSError as error:
@@ -1174,6 +1333,7 @@ KIND_ALIASES = {
     "tools": {"tool_call", "tool_result"},
     "tool_call": {"tool_call"},
     "system": {"system"},
+    "artifact": {"artifact"},
 }
 
 
@@ -1498,6 +1658,26 @@ def _match_window(text: str, match: re.Match[str], width: int) -> str:
     return ("…" if start else "") + window.strip() + ("…" if end < len(text) else "")
 
 
+def _grep_paths(target: str | Path, harness: str) -> list[dict[str, str]]:
+    candidate = Path(str(target)).expanduser().absolute()
+    root = _aside_root(candidate)
+    if candidate.is_dir() and root is not None:
+        directory = candidate
+    else:
+        name, path = resolve_session(target, harness=harness)
+        if name != "aside" or candidate.is_file():
+            return [{"path": str(path)}]
+        root, _ = _aside_identity(path)
+        directory = root
+    relative = directory.relative_to(root)
+    if ".." in directory.parts or (relative.parts and relative.parts[0] != "artifacts"):
+        raise SessionError(f"not an Aside artifact directory: {directory}")
+    patterns = ("messages.jsonl", "artifacts/**/*") if directory == root else ("**/*",)
+    paths = [path for pattern in patterns for path in directory.glob(pattern) if _is_transcript(path)]
+    paths.sort(key=lambda path: (path != root / "messages.jsonl", str(path)))
+    return [{"path": str(path)} for path in paths]
+
+
 def grep_sessions(
     pattern: str,
     harness: str = "all",
@@ -1520,7 +1700,7 @@ def grep_sessions(
     terms = _prefilter_terms(pattern, fixed)
 
     if session is not None:
-        candidates = [{"path": str(resolve_session(session, harness=harness)[1])}]
+        candidates = _grep_paths(session, harness)
     else:
         candidates = find_sessions(harness=harness, project=project, days=days, limit=max_sessions)
 

@@ -1,0 +1,1 @@
+- Added Aside chat and saved text-artifact search to the `agent-sessions` skill, including session-scoped grep and artifact line navigation.

@@ -233,3 +233,38 @@ Mapping to normalized events:
 Not mapped: `chat_history.jsonl` (a redundant, timestamp-less view of the same
 turns), `usage.json`, `plan`/`session_recap`/background-task bookkeeping, and the
 `null`-status progress label on each tool call.
+
+## Aside — `~/.aside/u/<profile>/sessions/<date>_<id>/`
+
+`messages.jsonl` holds plain messages, not Prime's `{type, message}` envelopes.
+The top-level `role` selects the event. Timestamps are epoch milliseconds.
+
+- `user`: string or text-block `content` becomes a `user` event.
+- `assistant`: `text`, `thinking`, and `toolCall` blocks map to `assistant`,
+  `reasoning`, and `tool_call`. String content is also supported. Tool arguments
+  use the same code-first representation as Prime; opaque signatures are ignored.
+- `toolResult`: text/image blocks, `toolName`, `isError`, optional `errorMessage`.
+  Duration comes from `durationMs`, then `timing.durationMs`, then
+  `details.elapsedMs`. Images become placeholders, never base64 prose.
+- `steering`: `user` event named `steering`. A later user record can repeat it.
+- `system-message` / `system`: `system` events.
+- `compaction`: `summary` becomes a `system` event named `compaction`.
+- `turn-lifecycle`, `user-message-metadata`, and unknown roles are skipped.
+  Malformed/in-progress JSONL lines are skipped by the shared reader.
+
+Session metadata is optional: the profile's SQLite `state.db` has a `sessions`
+table keyed by id, with `cwd`, `title`, `created_at` (epoch seconds), and
+`parent_id`. The reader uses `mode=ro`, a short lock timeout, and a parameterized
+single-row query. It can read committed WAL changes; absent/unreadable databases
+or unsupported schemas fall back to directory/message metadata. Aside sessions
+bypass the file-only parse cache so database changes do not leave metadata stale.
+
+Artifacts are discovered independently of `messages.jsonl`; sessions without a
+chat file can still hold useful files. Only supported text extensions below
+`artifacts/` are indexed, never `tmp/` or sibling database/cache files. Each file
+is a separate `Session` with `source="artifact"`, the owning session id/cwd, and
+the artifact-relative path as its title. Nonblank lines become `artifact` events;
+indices preserve physical line numbers. An id-scoped grep expands to both chat
+and artifacts; an explicit file path stays file-scoped. A session-directory or
+artifact-directory path scopes grep to that subtree. See the skill guide for the
+extension allowlist and binary/symlink exclusions.
