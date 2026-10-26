@@ -114,20 +114,39 @@ type Normalizer<'a> = dyn Fn(&str, &Model, &AssistantMessage) -> Option<String> 
 fn append_real_tool_result(
     result: &mut Vec<Message>,
     pending_tool_calls: &[ToolCall],
-    existing_tool_result_ids: &mut HashSet<String>,
+    accepted_tool_results: &mut HashMap<String, ToolResultMessage>,
+    ambiguous_tool_calls: &mut HashSet<(String, String)>,
     message: &Message,
 ) -> bool {
     let Message::ToolResult(tool_result) = message else {
         return false;
     };
-    if !pending_tool_calls
-        .iter()
-        .any(|tool_call| tool_call.id == tool_result.tool_call_id)
-        || existing_tool_result_ids.contains(&tool_result.tool_call_id)
-    {
+    let Some(tool_call) = pending_tool_calls.iter().find(|tool_call| {
+        tool_call.id == tool_result.tool_call_id
+            && (tool_result.tool_name.is_empty()
+                || tool_call.name.is_empty()
+                || tool_call.name == tool_result.tool_name)
+    }) else {
+        return false;
+    };
+    let ownership = (tool_call.id.clone(), tool_call.name.clone());
+    if ambiguous_tool_calls.contains(&ownership) {
         return false;
     }
-    existing_tool_result_ids.insert(tool_result.tool_call_id.clone());
+    if let Some(previous) = accepted_tool_results.get(&tool_result.tool_call_id) {
+        if previous == tool_result {
+            return false;
+        }
+        if let Some(index) = result.iter().rposition(
+            |message| matches!(message, Message::ToolResult(candidate) if candidate == previous),
+        ) {
+            result.remove(index);
+        }
+        accepted_tool_results.remove(&tool_result.tool_call_id);
+        ambiguous_tool_calls.insert(ownership);
+        return false;
+    }
+    accepted_tool_results.insert(tool_result.tool_call_id.clone(), tool_result.clone());
     result.push(message.clone());
     true
 }
@@ -245,7 +264,11 @@ pub fn transform_messages_with_normalizer(
     let mut result: Vec<Message> = Vec::new();
     let mut consumed_tool_result_indexes: HashSet<usize> = HashSet::new();
     let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
-    let mut existing_tool_result_ids: HashSet<String> = HashSet::new();
+    let mut accepted_tool_results: HashMap<String, ToolResultMessage> = HashMap::new();
+    let mut ambiguous_tool_calls: HashSet<(String, String)> = HashSet::new();
+    // Only unresolved calls poison an exact id+name reuse in the next epoch. A completed epoch may
+    // legitimately reuse both. Persisted synthetic results make a repaired transcript idempotent.
+    let mut unresolved_tool_calls: HashSet<(String, String)> = HashSet::new();
     // Epoch millis fit u64 for ~584 million years; the u128 duration's millis are the timestamp's convention.
     #[allow(clippy::cast_possible_truncation)]
     let now = std::time::SystemTime::now()
@@ -253,9 +276,14 @@ pub fn transform_messages_with_normalizer(
         .map_or(0, |d| d.as_millis() as u64);
 
     let insert_synthetic_tool_results =
-        |result: &mut Vec<Message>, pending: &mut Vec<ToolCall>, existing: &mut HashSet<String>| {
+        |result: &mut Vec<Message>,
+         pending: &mut Vec<ToolCall>,
+         accepted: &mut HashMap<String, ToolResultMessage>,
+         ambiguous: &mut HashSet<(String, String)>,
+         unresolved: &mut HashSet<(String, String)>| {
             for tool_call in pending.drain(..) {
-                if !existing.contains(&tool_call.id) {
+                if !accepted.contains_key(&tool_call.id) {
+                    unresolved.insert((tool_call.id.clone(), tool_call.name.clone()));
                     result.push(Message::ToolResult(ToolResultMessage {
                         tool_call_id: tool_call.id.clone(),
                         tool_name: tool_call.name.clone(),
@@ -271,7 +299,8 @@ pub fn transform_messages_with_normalizer(
                     }));
                 }
             }
-            existing.clear();
+            accepted.clear();
+            ambiguous.clear();
         };
 
     for (index, msg) in transformed.iter().enumerate() {
@@ -282,7 +311,9 @@ pub fn transform_messages_with_normalizer(
             insert_synthetic_tool_results(
                 &mut result,
                 &mut pending_tool_calls,
-                &mut existing_tool_result_ids,
+                &mut accepted_tool_results,
+                &mut ambiguous_tool_calls,
+                &mut unresolved_tool_calls,
             );
             continue;
         };
@@ -291,7 +322,9 @@ pub fn transform_messages_with_normalizer(
                 insert_synthetic_tool_results(
                     &mut result,
                     &mut pending_tool_calls,
-                    &mut existing_tool_result_ids,
+                    &mut accepted_tool_results,
+                    &mut ambiguous_tool_calls,
+                    &mut unresolved_tool_calls,
                 );
 
                 // Skip errored/aborted assistant messages entirely. These are incomplete turns that
@@ -312,8 +345,16 @@ pub fn transform_messages_with_normalizer(
                     })
                     .collect();
                 if !tool_calls.is_empty() {
+                    ambiguous_tool_calls = tool_calls
+                        .iter()
+                        .filter(|tool_call| {
+                            unresolved_tool_calls
+                                .contains(&(tool_call.id.clone(), tool_call.name.clone()))
+                        })
+                        .map(|tool_call| (tool_call.id.clone(), tool_call.name.clone()))
+                        .collect();
                     pending_tool_calls = tool_calls;
-                    existing_tool_result_ids.clear();
+                    accepted_tool_results.clear();
                 }
                 result.push(msg.clone());
             }
@@ -322,7 +363,8 @@ pub fn transform_messages_with_normalizer(
                 append_real_tool_result(
                     &mut result,
                     &pending_tool_calls,
-                    &mut existing_tool_result_ids,
+                    &mut accepted_tool_results,
+                    &mut ambiguous_tool_calls,
                     msg,
                 );
             }
@@ -338,7 +380,8 @@ pub fn transform_messages_with_normalizer(
                         if append_real_tool_result(
                             &mut result,
                             &pending_tool_calls,
-                            &mut existing_tool_result_ids,
+                            &mut accepted_tool_results,
+                            &mut ambiguous_tool_calls,
                             later,
                         ) {
                             consumed_tool_result_indexes.insert(lookahead);
@@ -348,7 +391,9 @@ pub fn transform_messages_with_normalizer(
                 insert_synthetic_tool_results(
                     &mut result,
                     &mut pending_tool_calls,
-                    &mut existing_tool_result_ids,
+                    &mut accepted_tool_results,
+                    &mut ambiguous_tool_calls,
+                    &mut unresolved_tool_calls,
                 );
                 result.push(msg.clone());
             }
@@ -358,7 +403,9 @@ pub fn transform_messages_with_normalizer(
     insert_synthetic_tool_results(
         &mut result,
         &mut pending_tool_calls,
-        &mut existing_tool_result_ids,
+        &mut accepted_tool_results,
+        &mut ambiguous_tool_calls,
+        &mut unresolved_tool_calls,
     );
 
     result
@@ -601,13 +648,13 @@ mod tests {
         assert!(matches!(
             &repaired[1],
             Message::ToolResult(result)
-                if result.tool_call_id == "call-2"
-                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "two")
+                if result.tool_call_id == "call-1"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
         ));
         assert!(matches!(
             &repaired[2],
             Message::ToolResult(result)
-                if result.tool_call_id == "call-1"
+                if result.tool_call_id == "call-2"
                     && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
         ));
         assert!(!repaired.iter().any(|message| matches!(
@@ -618,6 +665,134 @@ mod tests {
         assert_eq!(
             transform_messages_with_normalizer(&repaired, &test_model(), &|_, _, _| None),
             repaired
+        );
+    }
+
+    #[test]
+    fn a_reused_call_id_does_not_accept_a_late_result_from_the_prior_epoch() {
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![tool_call("call-reused", "first-tool")],
+                StopReason::ToolUse,
+            )),
+            user("interrupt"),
+            Message::Assistant(assistant(
+                vec![tool_call("call-reused", "second-tool")],
+                StopReason::ToolUse,
+            )),
+            tool_result("call-reused", "first-tool", "late-first-result"),
+            tool_result("call-reused", "second-tool", "real-second-result"),
+        ];
+
+        let transformed =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        assert_eq!(transformed.len(), 5);
+        assert!(matches!(
+            &transformed[1],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-reused"
+                    && result.tool_name == "first-tool"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
+        ));
+        assert!(matches!(
+            &transformed[4],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-reused"
+                    && result.tool_name == "second-tool"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "real-second-result")
+        ));
+        assert!(!transformed.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "late-first-result")
+        )));
+    }
+
+    #[test]
+    fn same_name_reuse_after_an_unresolved_epoch_fails_closed_and_is_idempotent() {
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![tool_call("call-reused", "same-tool")],
+                StopReason::ToolUse,
+            )),
+            user("interrupt"),
+            Message::Assistant(assistant(
+                vec![tool_call("call-reused", "same-tool")],
+                StopReason::ToolUse,
+            )),
+            tool_result("call-reused", "same-tool", "late-first-result"),
+            tool_result("call-reused", "same-tool", "claimed-second-result"),
+        ];
+
+        let repaired =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        assert_eq!(repaired.len(), 5);
+        let results = repaired
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| matches!(
+            &result.content[0],
+            UserOrToolContent::Text(text) if text.text == "No result provided"
+        )));
+        assert_eq!(
+            transform_messages_with_normalizer(&repaired, &test_model(), &|_, _, _| None),
+            repaired
+        );
+    }
+
+    #[test]
+    fn exact_retransmission_dedupes_but_conflicting_duplicates_fail_closed() {
+        let assistant = Message::Assistant(assistant(
+            vec![tool_call("call-1", "bash")],
+            StopReason::ToolUse,
+        ));
+        let exact = tool_result("call-1", "bash", "same");
+        let retransmitted = vec![assistant.clone(), exact.clone(), exact.clone()];
+        assert_eq!(
+            transform_messages_with_normalizer(&retransmitted, &test_model(), &|_, _, _| None),
+            vec![assistant.clone(), exact]
+        );
+
+        let conflicting = vec![
+            assistant.clone(),
+            tool_result("call-1", "bash", "first"),
+            tool_result("call-1", "bash", "second"),
+        ];
+        let repaired =
+            transform_messages_with_normalizer(&conflicting, &test_model(), &|_, _, _| None);
+        assert_eq!(repaired.len(), 2);
+        assert!(matches!(
+            &repaired[1],
+            Message::ToolResult(result)
+                if matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
+        ));
+    }
+
+    #[test]
+    fn completed_epochs_may_legitimately_reuse_the_same_id_and_name() {
+        let first = tool_result("call-reused", "same-tool", "first");
+        let second = tool_result("call-reused", "same-tool", "second");
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![tool_call("call-reused", "same-tool")],
+                StopReason::ToolUse,
+            )),
+            first.clone(),
+            user("next"),
+            Message::Assistant(assistant(
+                vec![tool_call("call-reused", "same-tool")],
+                StopReason::ToolUse,
+            )),
+            second.clone(),
+        ];
+        assert_eq!(
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None),
+            messages
         );
     }
 
