@@ -71,6 +71,72 @@ fn available_filters_by_configured_auth() {
     }));
 }
 
+#[tokio::test]
+async fn keyless_free_zen_is_explicitly_selectable_but_not_discoverable() {
+    let mut registry = ModelRegistry::in_memory(auth_without_env(&serde_json::json!({})));
+    let free_zen = registry
+        .get_all()
+        .iter()
+        .find(|model| pa_ai::models::is_opencode_public_model(model))
+        .expect("compiled catalog has a free Zen model")
+        .clone();
+
+    assert!(!registry.has_configured_auth(&free_zen));
+    assert!(registry.is_explicitly_selectable(&free_zen));
+    assert!(!registry
+        .get_available()
+        .iter()
+        .any(|model| { model.provider == free_zen.provider && model.id == free_zen.id }));
+    assert!(!registry
+        .get_rlm_searchable_models()
+        .iter()
+        .any(|model| { model.provider == free_zen.provider && model.id == free_zen.id }));
+    assert_eq!(
+        registry
+            .resolve_set_model_selection(&free_zen.provider, &free_zen.id)
+            .unwrap(),
+        &free_zen
+    );
+    assert!(registry.can_use_model(&free_zen, false).await);
+    let resolved = registry.get_api_key_and_headers(&free_zen, None);
+    assert!(resolved.ok);
+    assert_eq!(
+        resolved.api_key.as_deref(),
+        Some(pa_ai::models::OPENCODE_PUBLIC_API_KEY)
+    );
+}
+
+#[test]
+fn explicit_zen_selection_does_not_admit_paid_or_unrelated_free_models() {
+    let registry = ModelRegistry::in_memory(auth_without_env(&serde_json::json!({})));
+    let mut paid_zen = model("paid", "opencode");
+    paid_zen.cost.input = 1.0.into();
+    assert!(!registry.is_explicitly_selectable(&paid_zen));
+
+    let unrelated_free = model("free", "unconfigured-gateway");
+    assert!(!registry.is_explicitly_selectable(&unrelated_free));
+
+    let configured = ModelRegistry::in_memory(auth_without_env(&serde_json::json!({
+        "anthropic": { "type": "api_key", "key": "configured-test-key" }
+    })));
+    assert!(configured.is_explicitly_selectable(&model("paid", "anthropic")));
+}
+
+#[test]
+fn configured_zen_key_wins_over_the_public_fallback() {
+    let mut registry = ModelRegistry::in_memory(auth_without_env(&serde_json::json!({
+        "opencode": { "type": "api_key", "key": "configured-zen-key" }
+    })));
+    let free_zen = registry
+        .get_all()
+        .iter()
+        .find(|model| pa_ai::models::is_opencode_public_model(model))
+        .unwrap()
+        .clone();
+    let resolved = registry.get_api_key_and_headers(&free_zen, None);
+    assert_eq!(resolved.api_key.as_deref(), Some("configured-zen-key"));
+}
+
 #[test]
 fn rlm_searchable_models_gate_one_stale_provider_across_its_models() {
     // The per-provider status memo must answer every model of a provider

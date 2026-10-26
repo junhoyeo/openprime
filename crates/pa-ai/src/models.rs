@@ -10,6 +10,24 @@ pub use pa_types::ai::thinking_levels::{
 
 use crate::types::{Model, Usage, UsageCost};
 
+/// OpenCode's public credential for free Zen models. These models remain out of automatic model
+/// discovery unless the provider has configured auth; the fallback applies only after a user
+/// explicitly selects one.
+pub const OPENCODE_PUBLIC_API_KEY: &str = "public";
+
+/// Whether `model` is a zero-cost model on an OpenCode Zen provider.
+#[must_use]
+pub fn is_opencode_public_model(model: &Model) -> bool {
+    matches!(model.provider.as_str(), "opencode" | "opencode-go")
+        && model.cost.input.as_f64() == 0.0
+}
+
+/// Prefer a configured key, otherwise use OpenCode's public credential for a free Zen model.
+#[must_use]
+pub fn opencode_public_api_key(model: &Model, configured: Option<String>) -> Option<String> {
+    configured.or_else(|| is_opencode_public_model(model).then(|| OPENCODE_PUBLIC_API_KEY.into()))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CostOverrides {
     pub cache_write: Option<f64>,
@@ -79,6 +97,40 @@ mod tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[test]
+    fn public_opencode_key_applies_only_to_zero_cost_zen_models() {
+        let free_zen = Model {
+            provider: "opencode".into(),
+            ..model(false, None)
+        };
+        assert!(is_opencode_public_model(&free_zen));
+        assert_eq!(
+            opencode_public_api_key(&free_zen, None).as_deref(),
+            Some(OPENCODE_PUBLIC_API_KEY)
+        );
+        assert_eq!(
+            opencode_public_api_key(&free_zen, Some("configured".into())).as_deref(),
+            Some("configured")
+        );
+
+        let paid_zen = Model {
+            cost: ModelCost {
+                input: JsNumber::from(1.0),
+                ..free_zen.cost.clone()
+            },
+            ..free_zen.clone()
+        };
+        assert!(!is_opencode_public_model(&paid_zen));
+        assert_eq!(opencode_public_api_key(&paid_zen, None), None);
+
+        let unrelated_free = Model {
+            provider: "gateway".into(),
+            ..free_zen
+        };
+        assert!(!is_opencode_public_model(&unrelated_free));
+        assert_eq!(opencode_public_api_key(&unrelated_free, None), None);
     }
 
     #[test]
