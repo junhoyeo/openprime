@@ -1,0 +1,123 @@
+# Legacy commit mapping
+
+This file is the human-readable view of [`legacy-commit-map.json`](legacy-commit-map.json).
+The JSON file is authoritative and machine-readable. Every legacy non-merge commit is listed.
+`BLOCKED` means that source-level equivalence or a tested port has not yet been proved; it does not mean obsolete.
+
+## Source pins
+
+- Upstream Rust: `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`
+- Legacy fork `develop`: `703367badf5c84e48e8c8cd986fbcda882b6378c`
+- Legacy fork `main`: `e260085dd8f742e0def3d871860c9a888b114851`
+- Inventory: 99 non-merge commits in `legacyMain..legacyDevelop`, oldest first
+
+## Pull requests
+
+| PR | Surface | Status | Evidence |
+| --- | --- | --- | --- |
+| #32 | kernel restoration file-handle safety | BLOCKED | worker verification pending |
+| #33 | agent-sessions Unicode and Aside transcript indexing | BLOCKED | worker port and install-layout verification pending |
+
+## Commits
+
+| # | Legacy commit | Date | Subject | Status | Evidence / rationale |
+| ---: | --- | --- | --- | --- | --- |
+| 1 | `2ac5eed4249acca319009e37870749c4e8b473e2` | 2026-08-09 | fix(coding-agent): show progress while refine runs | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 2 | `3f747ebbe16d94fe4341f4e204d1befc178fd72c` | 2026-08-09 | docs(coding-agent): note refine progress feedback | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 3 | `0401ba71dc1ae6800801aabec199181a508e5a75` | 2026-08-09 | fix(coding-agent): reconcile refine loader on attach | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 4 | `502e7a496c9c6923063a30067fd5215443c62659` | 2026-08-09 | fix(coding-agent): revive archived sessions on prompt instead of dead-ending | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 5 | `966c11aa77a73ffd8634f063d8de1d49477b72f7` | 2026-08-09 | fix(coding-agent): harden session revival for telemetry, late rebinds, and failed snapshot streams | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 6 | `4d987e7008fff296f5c547f23cba948b1634a3dd` | 2026-08-09 | fix(coding-agent): discard a late revived snapshot when the binding moves mid-stream | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 7 | `3201db6436272687236b1d52658444da115a1fb6` | 2026-08-09 | fix(coding-agent): discard late revived snapshots superseded by a concurrent switch | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 8 | `a59f857cd9767ec2bd1605ee1454c90c9af3b6e8` | 2026-08-09 | fix(coding-agent): admit only snapshot transfer frames for pending binding targets | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 9 | `6470a60e7f3ec2ed7e1bf26b56ed230ae51297ca` | 2026-08-09 | fix(coding-agent): do not revive an archived session for a cancelled prompt | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 10 | `df0cf07528372237c70129205eb75695df18a0e8` | 2026-08-09 | fix(coding-agent): apply catch-up resyncs buffered while a revived binding was pending | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 11 | `b06797e3218a8c45963cdb81ff8996830b6ee3d7` | 2026-08-09 | fix(coding-agent): stop treating a reused worker pid as the worker, and keep one failed worker from failing global heartbeats_list | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 12 | `50b835d4985c79597bddb0959e9205377311bef0` | 2026-08-09 | fix(coding-agent): skip terminal snapshot recovery for pending transition targets | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 13 | `fed4fd4c7624a33459a0cd62d8d4919977f87e35` | 2026-08-09 | fix(coding-agent): guard adoption pre-kill and revalidate process identity at each stop-path signal | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 14 | `8109307ac3bbbb898f6e21a2ace2ed69d9ea46f6` | 2026-08-09 | fix(coding-agent): re-read state when a pending catch-up failed before publication | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 15 | `ba1ad540dd9e8f73f4aa632a9e1bf4ee86dd31cc` | 2026-08-09 | fix(coding-agent): drop a buffered catch-up superseded by a newer failed one | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 16 | `0d2e4ed73222f1cb940558f77cdeed5413b5d670` | 2026-08-09 | fix(coding-agent): keep a newer catch-up applied during the attach snapshot await | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 17 | `324f9b63749ccfc71a1ab6d890b21d4d12226992` | 2026-08-09 | fix(coding-agent): keep the revived session attached when a switch published the same binding | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 18 | `b66ce86d3f3c57d532c36f025e3bfd6cb53548f0` | 2026-08-09 | fix(coding-agent): preserve live-event invalidation across the attach snapshot await | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 19 | `5a19fe961441376cbb87a5800e19e0ea400b191a` | 2026-08-09 | fix(coding-agent): verify the transcript identity before retrying a revived prompt | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 20 | `ec5e6766e57ee41ace0c9b31d0457b9f93b1d519` | 2026-08-09 | fix(coding-agent): only detach a revived session this revival actually attached | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 21 | `38b69af3a15f2ff66b3b0f55e2bfc66d210df858` | 2026-08-09 | fix(coding-agent): suppress the revival resync when the transcript identity moved | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 22 | `60afe1a781cf9e37466bf65c78eeb6138d41da8f` | 2026-08-09 | fix(coding-agent): report attach ownership so cleanup cannot detach a sibling's entry | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 23 | `37d7a7d7ea7ec24c09ab320a2cba809f379088a1` | 2026-08-09 | fix(coding-agent): version the attach ownership field and identity-guard background resyncs | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 24 | `e32bce3840f0e234062f717f95bf518936a3e162` | 2026-08-09 | fix(coding-agent): recreate revived sessions with the invocation's launch context | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 25 | `837be68249a6e6d631c7bc50ca0814b0cbbb13d1` | 2026-08-09 | fix(coding-agent): give agents-view chat connections their revive config | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 26 | `c5e9a2a5f74713244e93132192e61e35f748bdea` | 2026-08-09 | fix(coding-agent): negotiate attach ownership and keep revive cwd per transcript | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 27 | `ae2db8c32cf9619d0a40f6509a97beee79572f4c` | 2026-08-09 | fix(coding-agent): capture the revived identity from the attach response, not post-stream state | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 28 | `48fae2a5a2fdb43e800a9bcd9943d1311b67f997` | 2026-08-10 | fix(coding-agent): revive a switched transcript with its selected fallback cwd | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 29 | `8436157579b3458ac19b0dae475fd9209c98b252` | 2026-08-10 | fix(coding-agent): carry the resume's config into the reply delivery connection | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 30 | `33db789918541865157bf1ad31f92123e1165dbb` | 2026-08-10 | test(coding-agent): add issue #1045 regression tests to suite/regressions | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 31 | `0807e4a69721b1f768132e5bd4474822b72b5308` | 2026-08-10 | test(coding-agent): remove standalone stop-identity tests | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 32 | `50ffa44c24414458516153aba6f60dafe183bb39` | 2026-08-10 | test(coding-agent): remove heartbeats regression test | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 33 | `9aca6ba2a1b5a27cab3a66bb43fa5d4f9ba70734` | 2026-08-10 | fix(coding-agent): restore queued prompts after canceling refine | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 34 | `6f0b233ddc1a38d336f092b224c3dada6f67ed32` | 2026-08-10 | test(coding-agent): update refine cancel test for queue restoration | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 35 | `7dc2817dc1a4e28566533f3900af3b887e1b3789` | 2026-08-10 | fix(coding-agent): refuse to signal when process identity is unverifiable | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 36 | `aa3ae8fc06d4b790d3f8e527c14e6037cc35bdac` | 2026-08-10 | fix(coding-agent): keep unverifiable workers tracked during stop | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 37 | `b2bb37bb273d14a41a52440ffa989a01960dadce` | 2026-08-10 | fix(coding-agent): retain the fallback cwd across the reattach switch path | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 38 | `c3adf81be0d994b613830a29b9ce8e3cea33da71` | 2026-08-10 | fix(coding-agent): treat a fileless first attach as foreign to every transcript | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 39 | `1ca7353702fb954aaa401c96424bedc9bae52740` | 2026-08-10 | fix(coding-agent): preserve the fileless transcript marker across reconnects | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 40 | `43556ee4f9ddbcf7956164443877eb8c71fd8a0b` | 2026-08-10 | fix(coding-agent): pin the portable process start id to an invariant rendering | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 41 | `adde4cc6b080316fa21463311af133759ef3a1da` | 2026-08-10 | feat(rlm): report queued state and startup failures | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 42 | `07af2c24b6abe327d1822b0664e1e76c6e2fbfd9` | 2026-08-10 | fix(coding-agent): preserve live identities across token formats | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 43 | `b24bd42f6d44a0e985cfb9852ca18996a86c7fe0` | 2026-08-10 | fix(coding-agent): preserve live identities across token formats | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 44 | `d5bc1eedca9a324c46684e61565f9bb4fa15c6a5` | 2026-08-10 | fix(coding-agent): preserve legacy sibling attachments during revival | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 45 | `4fa2ead9703978cdf8a77a7c94ac335404cbc5f0` | 2026-08-10 | fix(ai): repair interrupted tool result ordering | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 46 | `4dcace9c88d98f24460211ed506da715c51502b8` | 2026-08-10 | test(ai): assert tool results stay anchored to their tool call | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 47 | `6da4f31a6c34baf44f6e604840ad0ccdb661fdc2` | 2026-08-11 | fix(kernel): isolate bootstrap environments and surface stderr | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 48 | `632dd62f6cd8356b57bb40a77396f430830d9b73` | 2026-08-11 | fix(kernel): bound bootstrap generation retention | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 49 | `2f2cdfb1e1b0b4ff171ff68d46dc6897d53abedf` | 2026-08-11 | fix(kernel): reclaim dead bootstrap generations | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 50 | `9e06acc6993ef1ffc82ebc946d322cc0a6dc5cf2` | 2026-08-11 | fix(kernel): publish generation leases atomically | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 51 | `b3e91c3d65518d69fc8f44f831204a47ed274707` | 2026-08-11 | fix(kernel): redact OAuth bootstrap credentials | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 52 | `cc4f35b8d1a426be5a2956538dfaaa66f65288ba` | 2026-08-11 | fix(kernel): close generation liveness gaps | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 53 | `8a681bfd112b12b6ef5e3a00709a3e9c09d6cc76` | 2026-08-12 | fix(kernel): clear pre-created venv target during bootstrap | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 54 | `d16a6d94bb638292c3e83d94ffe3df3a3e8fcd3b` | 2026-08-12 | fix(build): stop evicting bundle chunks that live sessions still import | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 55 | `8cfa9331619ef01a43c6bd1cf552141cceb9dfa5` | 2026-08-12 | build(ai): stop regenerating the model catalog during build | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 56 | `6ba3841c3cb8db2880ac2918681128495f5d814b` | 2026-08-12 | test(ai): repoint direct Google live tests to gemini-2.5-flash | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 57 | `23b34f058c392f7dc00b04d56d32114b870c5a39` | 2026-08-12 | chore(ai): regenerate model catalog snapshot | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 58 | `0b5676b6498cf0ecb89dbffc530b2f67545b8f18` | 2026-08-12 | fix(coding-agent): restore fork behaviours dropped by the upstream merge | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 59 | `ecb6288b88494e38f2e291da0f7a6a74c0c37472` | 2026-08-14 | fix(coding-agent): auto-compact btw context | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 60 | `d13151be6a8368cdcd4e27a4d85436c02d3fdb71` | 2026-08-14 | fix(coding-agent): honor hooks during btw compaction | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 61 | `bd15cf317348b8e963463e3f774f0e7e12d8766f` | 2026-08-14 | feat(ai): let openai-responses models declare Fast mode support | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 62 | `41f5a313d7bf248c6f4d10787cf54d19a924287c` | 2026-08-14 | feat(coding-agent): honor compat.supportsFastMode from models.json | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 63 | `4f60d6426661c077c63b409a9efb1e867b8ad8e7` | 2026-08-14 | docs(coding-agent): describe how Fast mode pricing resolves | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 64 | `a4599defb520a68c5445f8d6f63ef935b7858432` | 2026-08-15 | fix(coding-agent): settle btw panes reliably | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 65 | `934108148442f27dc764f4b3b219fe65ff6bd802` | 2026-08-16 | fix(runtime): read tool schemas from mcp SDK 2.x input_schema (#9) | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 66 | `91a6463434aabb20c5d89a342f2e09c49b3a87b1` | 2026-08-17 | ci: run the workflow on develop | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 67 | `d3572635dfa7a710a56f556bbc064e7bd7f26bf7` | 2026-08-18 | fix(kernel): empty the venv target instead of asking uv to clear it | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 68 | `cec974ddbddfafda20b8c7f0de452dab87a82de6` | 2026-08-17 | fix(coding-agent): give feature-hint mocks the required sessionActions | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 69 | `6865437be45315a882a8298abc34d9cbfce411f9` | 2026-08-17 | test(coding-agent): match the extended Fast mode requirement message | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 70 | `d3f48ca26340baf26309621b0966d7178723fec3` | 2026-08-17 | test(coding-agent): assert the resume guarantee, not the reattach wire sequence | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 71 | `660476b2485e01ebce78fe3a4ba574d017ed0723` | 2026-08-18 | test(coding-agent): resolve the depth-cap probe kernel the way the runtime does | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 72 | `a4ca8cbd8ccd5b44718e9ea8eee184cdcb13e9be` | 2026-08-16 | feat(btw): persist side conversations as linked sub-sessions | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 73 | `1bfc4904b1fa778296fe1135f26557d6a528b9e7` | 2026-08-17 | fix(coding-agent): capability-gate side-question pane ids on the daemon wire | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 74 | `6567e228f01d14ab68307093151c2551ab541245` | 2026-08-17 | fix(coding-agent): persist the side-question pointer and its full spend | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 75 | `eac7f200b6c85de7970bd747dda61f0a982a368e` | 2026-08-19 | feat(coding-agent): cap agent-level retry backoff with retry.maxBackoffMs | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 76 | `6c4da7150f7cc484966bdf1be673df66920867b8` | 2026-09-01 | feat(skills): bundle agent-sessions as a built-in skill | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 77 | `d2b5c9569dac87ed79e9a0c0cf30df1e91e4f6e0` | 2026-09-01 | feat(skills): bundle aside browser automation as a built-in skill | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 78 | `ee7c91d058b23d289212a70953028cbd7972cc1a` | 2026-09-03 | feat(agent-sessions): index Senpi transcripts as a seventh harness | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 79 | `0e87bcc3e83378193b58ba0e7aa2ab2d62f1c784` | 2026-09-07 | feat(ai): add GPT-6 Astra with Fast mode | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 80 | `8b5ec62f8d33ca1609b4e704d40f5586ee76ebd0` | 2026-09-10 | fix(coding-agent): preserve credentials after gateway auth failures | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 81 | `3dd5fe46af5f867267d990c2e7e313408d1364fe` | 2026-09-24 | feat(ai): add Claude Opus 5.5 to the model catalog | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 82 | `a2c88fa285e0739c67aa0e8195177c071e355dd8` | 2026-09-17 | feat(ai): add OpenCode Zen union-alpha to the model catalog | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 83 | `e61a6ff412d8e1b6151ff6e36509898c4c776a09` | 2026-09-17 | feat(ai): send OpenCode CLI identity for zero-cost Zen models | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 84 | `3555298ecc960f44f8f72afb3bade60b6989e31c` | 2026-09-24 | fix(coding-agent): keep zero-cost OpenCode models out of the available list | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 85 | `8453b5e46d927dbf1837f8cb55416a287d9fda51` | 2026-09-24 | fix(agent-sessions): probe only mandatory literals, count every hit, elide Kiro redactedContent | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 86 | `3a537a23f2750ad221c21b136eab8455db4b3705` | 2026-09-24 | fix(aside): read models.json from the selected account | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 87 | `76a8053d7032db50f176433e3315c950ee6e909f` | 2026-09-24 | docs(coding-agent): changelog fragment for the bundled aside and agent-sessions skills | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 88 | `2151c02717ea54bbdd085e7abf85d7b45ef2220b` | 2026-09-24 | test(runtime): run the bundled aside and agent-sessions skill suites in CI | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 89 | `9320cf4642896386dfabe134239d5fa695ed0677` | 2026-09-24 | fix(coding-agent): reconcile fork tests and helpers with upstream v0.9.6 | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 90 | `69bea2c159eea0107bfecc01b2fb9ebf80c11517` | 2026-09-24 | test(ai): drop supports-xhigh, which asserted static catalog entries upstream now serves remotely | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 91 | `da68b19032079233205afdc831f31122a4d501d1` | 2026-09-24 | fix(coding-agent): reconcile upstream v0.9.6 deferred-session-event semantics with attachLiveSession | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 92 | `92e926c4597a90af867a8beb6a2dcc9b58282bec` | 2026-09-24 | fix(coding-agent): reconcile remaining fork tests with upstream v0.9.6 | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 93 | `eeddaf136e22ea5caf1baafa12d020f40fe90c31` | 2026-09-24 | fix(coding-agent): settle the last upstream-v0.9.6 test conflicts | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 94 | `daa6b089fe5a9108d9ca43336991c95f4e8f9980` | 2026-09-24 | fix(coding-agent): keep fork-only compiled models with the packaged catalog | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 95 | `3307acb13ea32f64b8c65a5c37892793830c5337` | 2026-09-26 | feat(agent-sessions): index Grok Build transcripts | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 96 | `e29b02f94f466bf4b01c204bee281479a6ceb0dc` | 2026-09-26 | fix(models): let an explicitly selected zero-cost Zen model run without a credential | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 97 | `bf9f9899d04763c4a9d5a66eb9c3f9d49b7fd22f` | 2026-09-26 | test(models): pin explicit selection of a keyless zero-cost Zen model | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 98 | `c9e679576470170db4ce10d2777b9607476eaf8f` | 2026-09-26 | docs(changes): add zen public model explicit selection fragment | **BLOCKED** | Source-level audit pending; subject is not evidence. |
+| 99 | `d7f04a0fcc0a10c1ebe517b9edada547c50f24d6` | 2026-09-26 | fix(daemon): only look up a registered model when set_model misses the available list | **BLOCKED** | Source-level audit pending; subject is not evidence. |
