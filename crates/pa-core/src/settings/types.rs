@@ -171,6 +171,8 @@ pub struct RetrySettings {
     pub enabled: Option<bool>,
     pub max_retries: Option<u64>,
     pub base_delay_ms: Option<u64>,
+    /// Ceiling for the agent-level exponential backoff (default 60000ms); 0 disables the ceiling.
+    pub max_backoff_ms: Option<u64>,
     pub failover: Option<RetryFailoverSettings>,
     pub provider: Option<ProviderRetrySettings>,
 }

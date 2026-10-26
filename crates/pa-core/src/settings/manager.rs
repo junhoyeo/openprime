@@ -693,6 +693,21 @@ impl SettingsManager {
     pub fn get_provider_retry_policy(
         &self,
     ) -> crate::session_engine::provider_retry::ProviderRetryPolicy {
+        let max_backoff_ms = self
+            .merged
+            .retry
+            .as_ref()
+            .and_then(|retry| retry.max_backoff_ms)
+            .map_or(
+                crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY.max_delay_ms,
+                |configured| {
+                    if configured == 0 {
+                        crate::session_engine::provider_retry::UNBOUNDED_BACKOFF_MS
+                    } else {
+                        configured
+                    }
+                },
+            );
         crate::session_engine::provider_retry::ProviderRetryPolicy {
             enabled: self
                 .merged
@@ -729,7 +744,7 @@ impl SettingsManager {
                     crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY
                         .max_retry_delay_ms,
                 ),
-            max_delay_ms: crate::session_engine::provider_retry::UNBOUNDED_BACKOFF_MS,
+            max_delay_ms: max_backoff_ms,
         }
     }
 
