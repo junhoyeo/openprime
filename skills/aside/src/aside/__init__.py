@@ -32,11 +32,11 @@ import json as _json
 import os
 import re
 import shutil
+import stat
+import ssl
 import subprocess
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -66,15 +66,12 @@ def config_dir(account: str | None = None) -> Path:
 # Hosts treated as "a gateway running on this machine" when probing provider health.
 _LOCALHOST = "localhost"
 
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Keep a configured loopback health check on its validated origin."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
 DEFAULT_REPL_TIMEOUT = 120.0
 DEFAULT_AGENT_TIMEOUT = 900.0
+_MAX_MODELS_JSON_BYTES = 1 << 20
+_MAX_HEALTH_BODY_BYTES = 200
+_MAX_HEALTH_HEADER_BYTES = 16 << 10
+_MAX_HEALTH_PROBES = 16
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FOOTER = re.compile(r"^\[(ok|error)\s*\|\s*(\d+)ms\]\s*$")
@@ -345,15 +342,66 @@ console.log("B64:" + buf.toString('base64'));
     return str(dest)
 
 
+def _provider_origin(base_url: str) -> urllib.parse.SplitResult | None:
+    """Parse one credential-free HTTP(S) origin, without paths or query data."""
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    try:
+        if ipaddress.ip_address(parsed.hostname).is_unspecified:
+            return None
+    except ValueError:
+        pass
+    return parsed
+
+
 def _provider_config(account: str | None = None) -> tuple[dict[str, dict[str, Any]], str | None]:
     """Validated non-secret fields from one account's optional models.json."""
     cfg = config_dir(account) / "models.json"
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
-        document = _json.loads(cfg.read_text(encoding="utf-8"))
+        file_descriptor = os.open(cfg, flags)
     except FileNotFoundError:
         return {}, None
     except OSError:
         return {}, "models.json could not be read"
+    try:
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return {}, "models.json must be a regular file"
+        if metadata.st_size > _MAX_MODELS_JSON_BYTES:
+            return {}, "models.json is too large"
+        with os.fdopen(file_descriptor, "rb") as handle:
+            file_descriptor = -1
+            raw = handle.read(_MAX_MODELS_JSON_BYTES + 1)
+    except OSError:
+        return {}, "models.json could not be read"
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+    if len(raw) > _MAX_MODELS_JSON_BYTES:
+        return {}, "models.json is too large"
+    try:
+        document = _json.loads(raw.decode("utf-8"))
+    except RecursionError:
+        return {}, "models.json nesting is too deep"
     except (UnicodeError, ValueError):
         return {}, "models.json is not valid UTF-8 JSON"
     if not isinstance(document, dict):
@@ -369,7 +417,7 @@ def _provider_config(account: str | None = None) -> tuple[dict[str, dict[str, An
             invalid = True
             continue
         base_url = raw_provider.get("baseUrl", "")
-        if not isinstance(base_url, str):
+        if not isinstance(base_url, str) or (base_url and _provider_origin(base_url) is None):
             invalid = True
             base_url = ""
         raw_models = raw_provider.get("models", [])
@@ -410,26 +458,119 @@ def models(*, account: str | None = None) -> list[str]:
 
 
 def _loopback_origin(base_url: str) -> str | None:
-    try:
-        parsed = urllib.parse.urlsplit(base_url)
-        _ = parsed.port  # reject malformed ports before any request
-    except (TypeError, ValueError):
+    parsed = _provider_origin(base_url)
+    if parsed is None:
         return None
     try:
-        is_loopback = parsed.hostname == _LOCALHOST or ipaddress.ip_address(parsed.hostname or "").is_loopback
+        is_loopback = parsed.hostname == _LOCALHOST or ipaddress.ip_address(parsed.hostname).is_loopback
     except ValueError:
         is_loopback = False
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not is_loopback
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
-        return None
-    return base_url.rstrip("/")
+    return base_url.rstrip("/") if is_loopback else None
+
+
+async def _probe_health(base_url: str) -> dict[str, Any]:
+    """One cancellable, proxy-free HTTP(S) health request to a validated local origin."""
+    parsed = _provider_origin(base_url)
+    if parsed is None or parsed.hostname is None:
+        return {"ok": False, "status": "invalid local provider origin"}
+    tls = parsed.scheme == "https"
+    port = parsed.port or (443 if tls else 80)
+    ssl_context = ssl.create_default_context() if tls else None
+    writer = None
+    try:
+        reader, writer = await asyncio.open_connection(
+            parsed.hostname,
+            port,
+            ssl=ssl_context,
+            server_hostname=parsed.hostname if tls else None,
+            limit=_MAX_HEALTH_HEADER_BYTES,
+        )
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        if port != (443 if tls else 80):
+            host = f"{host}:{port}"
+        request = (
+            "GET /health HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Accept: application/json\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        writer.write(request)
+        await writer.drain()
+
+        header_bytes = 0
+
+        async def read_header_line() -> bytes:
+            nonlocal header_bytes
+            line = await reader.readline()
+            header_bytes += len(line)
+            if not line or header_bytes > _MAX_HEALTH_HEADER_BYTES:
+                raise ValueError("invalid health headers")
+            return line
+
+        status_line = (await read_header_line()).decode("ascii", "strict").rstrip("\r\n")
+        parts = status_line.split(" ", 2)
+        if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+            raise ValueError("invalid health status")
+        status_code = int(parts[1])
+        headers: dict[str, str] = {}
+        while True:
+            line = await read_header_line()
+            if line in {b"\r\n", b"\n"}:
+                break
+            name, separator, value = line.partition(b":")
+            if not separator:
+                raise ValueError("invalid health header")
+            headers[name.decode("ascii", "strict").lower()] = value.decode(
+                "iso-8859-1"
+            ).strip()
+
+        if 300 <= status_code < 400:
+            return {"ok": False, "status": "redirect refused"}
+        if status_code != 200:
+            return {"ok": False, "status": f"HTTP {status_code}"}
+
+        body = bytearray()
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            while True:
+                size_line = (await read_header_line()).split(b";", 1)[0].strip()
+                size = int(size_line, 16)
+                if size == 0:
+                    break
+                if len(body) + size > _MAX_HEALTH_BODY_BYTES:
+                    return {"ok": False, "status": "response too large"}
+                body.extend(await reader.readexactly(size))
+                if await reader.readexactly(2) != b"\r\n":
+                    raise ValueError("invalid health chunk")
+        elif "content-length" in headers:
+            size = int(headers["content-length"])
+            if size < 0:
+                raise ValueError("invalid health length")
+            if size > _MAX_HEALTH_BODY_BYTES:
+                return {"ok": False, "status": "response too large"}
+            body.extend(await reader.readexactly(size))
+        else:
+            while len(body) <= _MAX_HEALTH_BODY_BYTES:
+                chunk = await reader.read(_MAX_HEALTH_BODY_BYTES + 1 - len(body))
+                if not chunk:
+                    break
+                body.extend(chunk)
+            if len(body) > _MAX_HEALTH_BODY_BYTES:
+                return {"ok": False, "status": "response too large"}
+
+        try:
+            payload = _json.loads(bytes(body).decode("utf-8"))
+        except (RecursionError, UnicodeError, ValueError):
+            return {"ok": False, "status": "invalid health response"}
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            return {"ok": False, "status": "health response did not report ok"}
+        return {"ok": True, "status": "ok"}
+    except (OSError, ssl.SSLError):
+        return {"ok": False, "status": "unreachable"}
+    except (asyncio.IncompleteReadError, UnicodeError, ValueError):
+        return {"ok": False, "status": "invalid health response"}
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
@@ -456,44 +597,35 @@ async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
     if config_error:
         report["config_error"] = config_error
 
-    def _probe(base_url: str) -> dict[str, Any]:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-        try:
-            with opener.open(f"{base_url}/health", timeout=timeout) as response:
-                status = getattr(response, "status", 200)
-                body = response.read(201)
-        except urllib.error.HTTPError as exc:
-            exc.close()
-            status = "redirect refused" if 300 <= exc.code < 400 else f"HTTP {exc.code}"
-            return {"ok": False, "status": status}
-        except Exception:  # network and TLS errors are diagnostics, never fatal
-            return {"ok": False, "status": "unreachable"}
-        if status != 200:
-            return {"ok": False, "status": f"HTTP {status}"}
-        if len(body) > 200:
-            return {"ok": False, "status": "response too large"}
-        try:
-            payload = _json.loads(body.decode("utf-8"))
-        except (UnicodeError, ValueError):
-            return {"ok": False, "status": "invalid health response"}
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
-            return {"ok": False, "status": "health response did not report ok"}
-        return {"ok": True, "status": "ok"}
-
     local = {}
-    if config_error is None:
-        for provider_id, provider in configured.items():
-            origin = _loopback_origin(provider["baseUrl"])
-            if origin is not None:
-                local[provider_id] = origin
+    for provider_id, provider in configured.items():
+        origin = _loopback_origin(provider["baseUrl"])
+        if origin is not None:
+            local[provider_id] = origin
     report["local_providers"] = {}
     budget = max(float(timeout), 0.001)
-    for provider_id, origin in local.items():
-        try:
-            result = await asyncio.wait_for(asyncio.to_thread(_probe, origin), timeout=budget)
-        except asyncio.TimeoutError:
-            result = {"ok": False, "status": "timed out"}
-        report["local_providers"][provider_id] = {"baseUrl": origin, **result}
+    selected = list(local.items())[:_MAX_HEALTH_PROBES]
+    overflow = list(local.items())[_MAX_HEALTH_PROBES:]
+    tasks = {
+        provider_id: asyncio.create_task(_probe_health(origin))
+        for provider_id, origin in selected
+    }
+    if tasks:
+        done, pending = await asyncio.wait(tasks.values(), timeout=budget)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for provider_id, origin in selected:
+            task = tasks[provider_id]
+            result = task.result() if task in done else {"ok": False, "status": "timed out"}
+            report["local_providers"][provider_id] = {"baseUrl": origin, **result}
+    for provider_id, origin in overflow:
+        report["local_providers"][provider_id] = {
+            "baseUrl": origin,
+            "ok": False,
+            "status": "probe limit exceeded",
+        }
 
     problems = []
     if not report["app_running"]:

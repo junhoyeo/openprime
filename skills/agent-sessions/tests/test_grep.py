@@ -183,6 +183,14 @@ class AsideTest(unittest.TestCase):
             with self.subTest(fixed=fixed):
                 self.assertEqual(sessions.grep_sessions("École", session=lowercase, fixed=fixed), [])
                 self.assertEqual(len(sessions.grep_sessions("école", session=lowercase, fixed=fixed)), 1)
+        unicode_fold = self.artifacts / "unicode-fold.txt"
+        unicode_fold.write_text("Kilo ſfoo ıfoo İfoo", encoding="utf-8")
+        for query in ("kilo", "sfoo", "ifoo"):
+            for fixed in (False, True):
+                with self.subTest(query=query, fixed=fixed):
+                    self.assertEqual(len(sessions.grep_sessions(query, session=unicode_fold, fixed=fixed)), 1)
+        self.assertEqual(sessions.grep_sessions("Kilo", session=unicode_fold), [])
+        self.assertEqual(sessions.grep_sessions("Kilo", session=unicode_fold, fixed=True), [])
 
     def test_artifact_names_cannot_shadow_session_ids(self) -> None:
         other = self.home / ".aside/u/1/sessions/2026-10-20_Other/artifacts"
