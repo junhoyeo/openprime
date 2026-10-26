@@ -1,6 +1,7 @@
 # Python-Backed Skills
 
-A Python-backed skill is a regular markdown skill that also ships a Python package. Prime Agent installs the package editable into the kernel venv (`~/.prime/agent/kernel-venv` by default, `PRIME_AGENT_KERNEL_VENV` to override) and exposes it in the persistent Python kernel, so the agent can call it directly instead of shelling out.
+A Python-backed skill is a regular markdown skill that also ships a Python package. Prime Agent installs the package editable into the managed kernel environment and exposes it in the persistent Python kernel, so the agent can call it directly instead of shelling out. A fully current legacy `~/.prime/agent/kernel-venv` remains readable; new managed environments are published as leased generations under `~/.prime/agent/kernel-venv.generations`. `PRIME_AGENT_KERNEL_VENV` remains an exact path and is never replaced when it already exists but is stale.
+Inactive generations are retained on disk instead of being deleted automatically because path-based recursive cleanup cannot be made race-free. Do not remove generation directories while Prime Agent sessions may still be active.
 
 ## Detection Contract
 
@@ -116,7 +117,7 @@ Omit `[project.scripts]` when a CLI is not needed.
 
 - Declare every third-party package `run()` imports in `dependencies` — `pyproject.toml` is the source of truth. The one exception is `prime-agent-runtime` (see above).
 - These are already in the kernel venv, so depending on them is free: `requests`, `httpx`, `pyyaml`, `tomli`, `python-dotenv`, `pandas`, `numpy`, `scipy`, `beautifulsoup4`, `lxml`, `pydantic`, `tyro`.
-- The install is editable and keyed on a hash of `pyproject.toml`: editing Python source takes effect on the next kernel start with no reinstall; editing `pyproject.toml` triggers a reinstall automatically.
+- The install is editable and the managed generation identity includes a hash of `pyproject.toml`: editing Python source takes effect on the next kernel start with no reinstall; editing `pyproject.toml` publishes a new generation without mutating environments used by active kernels.
 - If the user sets `PRIME_AGENT_KERNEL_PYTHON`, Prime Agent installs nothing — skills whose imports are missing there are disabled with a warning.
 
 A Python skill runs inside the agent's kernel, so it can itself spawn recursive sub-agents with `import rlm` and `await rlm.spawn("subtask", name="worker")` — useful for skills that delegate open-ended work.

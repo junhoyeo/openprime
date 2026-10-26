@@ -19,7 +19,7 @@ fn failing_kernel() -> (
     std::fs::write(
         &python,
         format!(
-            "#!/bin/sh\nprintf x >> '{}'\nsleep 0.3\nexit 37\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"-c\" ]; then exit 0; fi\nprintf x >> '{}'\nsleep 0.3\nexit 37\n",
             count.display()
         ),
     )

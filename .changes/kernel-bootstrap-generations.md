@@ -1,0 +1,1 @@
+- Python kernel setup now publishes leased immutable virtual-environment generations without replacing active or caller-owned environments, retains inactive generations instead of unsafe recursive cleanup, and exposes only bounded credential-redacted bootstrap failures.

@@ -57,8 +57,10 @@ except Exception as _prime_agent_rlm_error:
         def _raise_missing(self):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this kernel. "
-                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
-                "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
+                "Stop Prime Agent sessions, then restart or update Prime Agent so it can select "
+                "a current managed generation under ~/.prime/agent/kernel-venv.generations. "
+                "If PRIME_AGENT_KERNEL_VENV names a stale environment, choose a new unused path "
+                "instead, or set PRIME_AGENT_KERNEL_PYTHON to a current kernel environment. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
 
@@ -202,6 +204,8 @@ mod tests {
     fn bootstrap_code_without_skills_binds_rlm() {
         let code = build_rlm_bootstrap_code(&[], false);
         assert!(code.contains("import rlm as _prime_agent_rlm_module"));
+        assert!(code.contains("~/.prime/agent/kernel-venv.generations"));
+        assert!(code.contains("Stop Prime Agent sessions"));
         assert!(!code.contains("_PrimeAgentUnavailableSkill"));
     }
 

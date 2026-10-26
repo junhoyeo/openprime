@@ -104,7 +104,10 @@ impl Inner {
         options: &KernelStartOptions,
     ) -> anyhow::Result<std::path::PathBuf> {
         if let Some(python) = &self.options.python {
-            return Ok(python.clone());
+            // Resolve before `Command::current_dir` changes the child cwd.
+            return Ok(crate::kernel::bootstrap::venv::expand_home(
+                &python.to_string_lossy(),
+            ));
         }
         if let Some(cached) = lock(&self.resolved_python).clone() {
             return Ok(cached);
@@ -162,9 +165,41 @@ impl Inner {
         if lock(&self.guarded).state == KernelState::Shutdown {
             return Err(anyhow!("Kernel was disposed during startup"));
         }
-
         let env = kernel_spawn_env(&self.options.env);
         let cwd = self.options.cwd.clone();
+        if !crate::kernel::bootstrap::venv::spawn_environment_ready(
+            &python.to_string_lossy(),
+            &env,
+            cwd.as_deref(),
+        ) {
+            live_kernels::remove(self);
+            let mut g = lock(&self.guarded);
+            if g.state != KernelState::Shutdown {
+                g.state = KernelState::Idle;
+            }
+            return Err(anyhow!(
+                "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
+                python.display()
+            ));
+        }
+        // Bridge resolver ownership to the child-PID lease. If this host
+        // crashes after exec but before child publication, the durable handoff
+        // record remains conservative instead of making the generation GC-able.
+        let environment_handoff =
+            match crate::kernel::bootstrap::begin_kernel_lease_handoff(&python) {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    live_kernels::remove(self);
+                    let mut g = lock(&self.guarded);
+                    if g.state != KernelState::Shutdown {
+                        g.state = KernelState::Idle;
+                    }
+                    return Err(anyhow!(
+                        "failed to protect the kernel environment before spawn: {error:#}"
+                    ));
+                }
+            };
+
         let mut command = tokio::process::Command::new(&python);
         command
             .args(["-m", "rlm.repl"])
@@ -178,9 +213,12 @@ impl Inner {
             command.current_dir(cwd);
         }
         command.env_clear().envs(env);
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                if let Some(handoff) = environment_handoff {
+                    handoff.release(); // no child was spawned
+                }
                 // Fail a pending start promptly instead of riding out the ready timeout. The
                 // interpreter itself failed to launch, so the memoized runtime-ready result
                 // is stale.
@@ -201,15 +239,61 @@ impl Inner {
                 ));
             }
         };
-        let pid = child.id().map_or(-1, |p| p as i32);
+        let child_pid = child.id();
+        let pid = child_pid.map_or(-1, |value| value as i32);
         orphan_journal::record_orphan_process_state(pid, true);
+        let environment_lease = match child_pid {
+            Some(child_pid) => {
+                match crate::kernel::bootstrap::register_kernel_python_lease(&python, child_pid) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        // The handoff stays live until death is observed. Never
+                        // let an unleased interpreter escape this failure path.
+                        let _ = child.start_kill();
+                        let exit_observed = child.wait().await.is_ok();
+                        if exit_observed {
+                            if let Some(handoff) = environment_handoff {
+                                handoff.release();
+                            }
+                            orphan_journal::record_orphan_process_state(pid, false);
+                        }
+                        live_kernels::remove(self);
+                        let mut g = lock(&self.guarded);
+                        g.state = KernelState::Shutdown;
+                        return Err(anyhow!(
+                            "failed to lease the spawned kernel environment: {error:#}"
+                        ));
+                    }
+                }
+            }
+            None if environment_handoff.is_some() => {
+                let _ = child.start_kill();
+                if child.wait().await.is_ok() {
+                    if let Some(handoff) = environment_handoff {
+                        handoff.release();
+                    }
+                }
+                live_kernels::remove(self);
+                let mut g = lock(&self.guarded);
+                g.state = KernelState::Shutdown;
+                return Err(anyhow!(
+                    "spawned kernel did not expose a pid for its environment lease"
+                ));
+            }
+            None => None,
+        };
+        // The child lease is now durable (or this is an unmanaged custom
+        // interpreter), so the crash-window handoff can be released.
+        if let Some(handoff) = environment_handoff {
+            handoff.release();
+        }
         let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<i64>>();
         {
             let mut g = lock(&self.guarded);
             g.startup_protocol_error = None;
             g.ready_tx = Some(ready_tx);
         }
-        self.wire_child(child, generation);
+        self.wire_child(child, generation, environment_lease);
 
         let protocol = match self.wait_for_ready(ready_rx, generation).await {
             Ok(protocol) => protocol,
@@ -265,7 +349,12 @@ impl Inner {
 
     /// Wire the spawned child: protocol reader, stderr tail + log, and the
     /// exit watcher that settles the manager when the process dies.
-    fn wire_child(self: &Arc<Self>, mut child: tokio::process::Child, generation: u64) {
+    fn wire_child(
+        self: &Arc<Self>,
+        mut child: tokio::process::Child,
+        generation: u64,
+        environment_lease: Option<crate::kernel::bootstrap::GenerationLeaseGuard>,
+    ) {
         let pid = child.id().map_or(-1, |p| p as i32);
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -417,15 +506,25 @@ impl Inner {
         // whole life.
         let inner = Arc::downgrade(self);
         tokio::spawn(async move {
+            // Signalling is not death. Hold the generation until wait() has
+            // observed process exit; dropping this task after that removes only
+            // its exact lease record.
+            let mut environment_lease = environment_lease;
             let exit = match child.wait().await {
-                Ok(status) => ExitInfo {
-                    code: status.code(),
-                    #[cfg(unix)]
-                    signal: unix_signal_of(status),
-                    #[cfg(not(unix))]
-                    signal: None,
-                },
+                Ok(status) => {
+                    if let Some(lease) = environment_lease.take() {
+                        lease.release();
+                    }
+                    ExitInfo {
+                        code: status.code(),
+                        #[cfg(unix)]
+                        signal: unix_signal_of(status),
+                        #[cfg(not(unix))]
+                        signal: None,
+                    }
+                }
                 Err(_) => ExitInfo {
+                    // The lease stays on disk: wait did not prove death.
                     code: None,
                     signal: None,
                 },

@@ -3,12 +3,14 @@
 //! signatures; session-engine call sites never branch on `cfg` themselves.
 
 pub mod browser;
+mod directory_identity;
 pub mod fs;
 pub mod lock_dir;
 pub mod perms;
 pub mod process;
 pub mod shell;
 
+pub(crate) use directory_identity::{directory_identity, DirectoryIdentity};
 pub use fs::fsync;
 pub use lock_dir::{lock_exclusive, try_lock_exclusive, unlock_file, LockDir};
 pub use perms::{
