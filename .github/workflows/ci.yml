@@ -344,11 +344,31 @@ jobs:
       - name: Bootstrap the kernel venv (ready before the kernel e2e units)
         if: steps.selection.outputs.units != '0'
         run: |
-          ./target/debug/prime-agent --prime-agent-bootstrap
-          # Package receipt tests never inspect an operator's ambient ~/.prime.
-          # Publish this CI-owned interpreter to subsequent shard steps so the
-          # live package test executes instead of taking its documented skip.
-          echo "PA_E2E_KERNEL_PYTHON=${HOME}/.prime/agent/kernel-venv/bin/python" >> "${GITHUB_ENV}"
+          set -euo pipefail
+          bootstrap_output="$(./target/debug/prime-agent --prime-agent-bootstrap)"
+          printf '%s\n' "${bootstrap_output}"
+          kernel_python="$(printf '%s\n' "${bootstrap_output}" | sed -n 's/^kernel python: //p' | tail -1)"
+          test -n "${kernel_python}"
+          test -x "${kernel_python}"
+
+          # ABI 2 is a closed host-payload contract. Run the ignored positive
+          # verifier explicitly against the exact runtime this shard booted,
+          # and audit that one test really executed (filter-0 is not green).
+          abi_test='kernel::bootstrap::venv::probe::runtime_abi_tests::configured_packaged_runtime_satisfies_the_full_probe'
+          abi_log="${RUNNER_TEMP}/runtime-abi-${{ matrix.shard }}.log"
+          PA_TEST_RUNTIME_ABI_PYTHON="${kernel_python}" \
+            cargo test -p pa-core --lib "${abi_test}" -- --ignored --exact --nocapture 2>&1 | tee "${abi_log}"
+          grep -F "test ${abi_test} ... ok" "${abi_log}"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored' "${abi_log}"
+
+          # Every later kernel/package test in this shard uses the same owned,
+          # ABI-verified interpreter. No ambient ~/.prime fallback is allowed.
+          {
+            echo "PRIME_AGENT_KERNEL_PYTHON=${kernel_python}"
+            echo "PA_CORE_KERNEL_PYTHON=${kernel_python}"
+            echo "PA_E2E_KERNEL_PYTHON=${kernel_python}"
+            echo "PA_TEST_RUNTIME_ABI_PYTHON=${kernel_python}"
+          } >> "${GITHUB_ENV}"
       # The real-binary lifecycle checks drive the debug binary through owned
       # daemons, PTYs and loopback providers only. One leg is enough.
       - name: Run the rust lifecycle checks
@@ -358,9 +378,9 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/lifecycle-check-receipts"
           export PA_RUST_BINARY="${GITHUB_WORKSPACE}/target/debug/prime-agent"
-          export PRIME_AGENT_KERNEL_PYTHON="${HOME}/.prime/agent/kernel-venv/bin/python"
-          export PA_E2E_KERNEL_PYTHON="${PRIME_AGENT_KERNEL_PYTHON}"
           test -x "${PRIME_AGENT_KERNEL_PYTHON}"
+          test "${PRIME_AGENT_KERNEL_PYTHON}" = "${PA_CORE_KERNEL_PYTHON}"
+          test "${PRIME_AGENT_KERNEL_PYTHON}" = "${PA_E2E_KERNEL_PYTHON}"
           check_status=0
           python3 scripts/test_lifecycle_lib.py || check_status=1
           # Discover independently added checks so feature PRs do not
