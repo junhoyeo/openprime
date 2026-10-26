@@ -1031,13 +1031,17 @@ async fn abort_and_send_queued_under_a_held_pause_delivers_on_the_release() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The TUI's refine cancel is TS `interruptOrClearInput`'s plain `abort` (fork tip 703367bad):
+/// under an active `/refine` the TS `requestAbort` semantics hold — the queue-visible rows (human
+/// prompts and visible internal notices) park in order behind the queued-input suspension, the
+/// queue-invisible turn actions withdraw with the TS error, and nothing is cleared or delivered.
 #[tokio::test]
-async fn refine_queue_restore_clears_humans_and_preserves_internal_provenance() {
+async fn plain_abort_under_an_active_refine_parks_the_visible_queue() {
     let worker = created_dispatch_worker().await;
-    let item = |message: &str, visible: bool| QueuedItem {
+    let item = |message: &str, priority: QueuePriority, visible: bool| QueuedItem {
         message: message.to_string(),
-        priority: QueuePriority::Human,
-        preview: Some(message.to_string()),
+        priority,
+        preview: None,
         custom_message: None,
         agent_message: None,
         queue_key: None,
@@ -1045,29 +1049,60 @@ async fn refine_queue_restore_clears_humans_and_preserves_internal_provenance() 
         images: Vec::new(),
         done: None,
         queue_visible: visible,
-        policy: TurnPolicy::Queued,
+        policy: if visible {
+            TurnPolicy::Queued
+        } else {
+            TurnPolicy::Injected
+        },
         forced_batch: false,
     };
+    let (withdrawn_tx, withdrawn_rx) = oneshot::channel();
     {
         let mut core = worker.core.lock().unwrap();
-        core.steering.push_back(item("human steer", true));
-        core.steering.push_back(item("internal heartbeat", false));
-        core.follow_up.push_back(item("human follow", true));
+        // The running `/refine` session command holds the session busy.
+        core.busy = true;
+        core.active_action = Some(crate::types::SessionActionActive {
+            kind: "session_command".to_string(),
+            phase: "running".to_string(),
+            label: Some("/refine".to_string()),
+        });
+        core.steering
+            .push_back(item("human steer", QueuePriority::Human, true));
+        core.steering
+            .push_back(item("background notice", QueuePriority::Background, true));
+        let mut continuation = item("goal continuation", QueuePriority::Background, false);
+        continuation.done = Some(withdrawn_tx);
+        core.follow_up.push_back(continuation);
+        core.follow_up
+            .push_back(item("human follow", QueuePriority::Human, true));
     }
-    let result = worker
-        .dispatch("abort_and_clear_queue", &json!({"preserveInternal":true}))
-        .await;
-    assert!(result.success, "{result:?}");
+    let aborted = worker.dispatch("abort", &json!({})).await;
+    assert!(aborted.success, "abort failed: {aborted:?}");
+    {
+        let core = worker.core.lock().unwrap();
+        let lane = |lane: &VecDeque<QueuedItem>| {
+            lane.iter()
+                .map(|item| item.message.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lane(&core.steering), ["human steer", "background notice"]);
+        assert_eq!(lane(&core.follow_up), ["human follow"]);
+        assert!(core.queued_input_suspended);
+        assert!(core.abort_requested);
+    }
     assert_eq!(
-        result.data.as_ref().unwrap()["steering"],
-        json!(["human steer"])
+        withdrawn_rx.await.unwrap(),
+        TurnSettle::Withdrawn(PROMPT_ABORTED_BEFORE_DELIVERY.to_string())
     );
+    let queue = worker.dispatch("get_queue", &json!({})).await;
     assert_eq!(
-        result.data.as_ref().unwrap()["followUp"],
-        json!(["human follow"])
+        queue.data,
+        Some(json!({
+            "steering": ["human steer", "background notice"],
+            "followUp": ["human follow"],
+        }))
     );
-    let core = worker.core.lock().unwrap();
-    assert_eq!(core.steering.len(), 1);
-    assert_eq!(core.steering[0].message, "internal heartbeat");
-    assert!(core.follow_up.is_empty());
+    // Zero model calls: nothing delivered, so the transcript holds no turn.
+    let messages = worker.dispatch("get_messages", &json!({})).await;
+    assert_eq!(messages.data.as_ref().unwrap()["messages"], json!([]));
 }
