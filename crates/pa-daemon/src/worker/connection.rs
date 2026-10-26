@@ -532,6 +532,15 @@ impl Worker {
                         self.write_response_frame(&sink, &request_id, failure).await;
                         continue;
                     }
+                    // The attach window (legacy `da68b1903` pending-binding hold and
+                    // replay): the stream opens BEFORE the attach cuts its snapshot, so an
+                    // event emitted after the cut can never be skipped by this connection's
+                    // fan-out; the client's snapshot cursor discards what the snapshot
+                    // already covers. A refused attach restores the prior stream state.
+                    let was_attached = session.is_attached();
+                    if command_type == "attach" {
+                        session.mark_attached();
+                    }
                     // Session-plane commands run concurrently for the same
                     // reason as the supervisor arm above.
                     let worker = Arc::clone(&self);
@@ -543,13 +552,10 @@ impl Worker {
                         let response = worker.dispatch(&command_type, &payload).await;
                         // The attach/detach bookkeeping reads the outcome
                         // before the write consumes the response.
-                        let success = response.success;
-                        if success {
-                            match command_type.as_str() {
-                                "attach" => session.mark_attached(),
-                                "detach" => session.mark_detached(),
-                                _ => {}
-                            }
+                        match (command_type.as_str(), response.success) {
+                            ("attach", false) if !was_attached => session.mark_detached(),
+                            ("detach", true) => session.mark_detached(),
+                            _ => {}
                         }
                         worker
                             .write_response_frame(&sink, &request_id, response)
