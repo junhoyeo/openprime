@@ -171,7 +171,10 @@ impl Inner {
             &python.to_string_lossy(),
             &env,
             cwd.as_deref(),
-        ) {
+            Duration::from_millis(READY_TIMEOUT_MS),
+        )
+        .await
+        {
             live_kernels::remove(self);
             let mut g = lock(&self.guarded);
             if g.state != KernelState::Shutdown {
@@ -181,6 +184,14 @@ impl Inner {
                 "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
                 python.display()
             ));
+        }
+        // The probe awaited child processes: a teardown or newer start may
+        // have landed meanwhile and must not be followed by a spawn.
+        if self.start_stale(generation) {
+            return Err(anyhow!("Kernel start superseded"));
+        }
+        if lock(&self.guarded).state == KernelState::Shutdown {
+            return Err(anyhow!("Kernel was disposed during startup"));
         }
         // Bridge resolver ownership to the child-PID lease. If this host
         // crashes after exec but before child publication, the durable handoff
@@ -676,6 +687,48 @@ mod tests {
             env.get("PRIME_AGENT_KERNEL_OWNER_PID").map(String::as_str),
             Some(std::process::id().to_string().as_str())
         );
+    }
+
+    /// The pre-spawn interpreter probe runs inside the async start. A probe
+    /// interpreter that never exits must not block the runtime: a blocked
+    /// current-thread runtime cannot fire the caller's timeout, so the
+    /// caller (and every request queued behind it) would hang. The probe's
+    /// own bound is covered in `bootstrap::venv::probe`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wedged_pre_spawn_probe_does_not_block_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = dir.path().join("wedged-probe-python");
+        std::fs::write(
+            &python,
+            "#!/bin/sh\nif [ \"${1:-}\" = \"-c\" ]; then exec sleep 600; fi\nexit 1\n",
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.start(KernelStartOptions::default()),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the wedged probe must not settle the start"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the caller's timeout must fire while the probe runs"
+        );
+        // Dropping the runtime at test end drops the detached start, whose
+        // kill-on-drop probe child dies with it.
+        manager.kill();
     }
 
     #[test]
