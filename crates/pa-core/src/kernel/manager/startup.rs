@@ -191,15 +191,18 @@ impl Inner {
         let rejection = match probe {
             SpawnProbe::Ready => None,
             SpawnProbe::LaunchFailed(error) => {
-                // The interpreter itself cannot launch: surface that cause
-                // (not an ABI verdict) and drop the stale runtime-ready memo,
-                // as a failed kernel spawn does.
+                // The interpreter itself cannot launch: the same outcome as a
+                // failed kernel spawn (c4c semantics), so the manager turns
+                // defunct and the stale runtime-ready memo is dropped.
                 crate::kernel::bootstrap::invalidate_runtime_probe_cache();
                 self.append_diagnostic(&format!("spawn error: {error}"));
-                Some(anyhow!(
+                lock(&self.guarded).state = KernelState::Shutdown;
+                live_kernels::remove(self);
+                self.cleanup_resources(Signal::Term);
+                return Err(anyhow!(
                     "failed to spawn kernel python {}: {error}",
                     python.display()
-                ))
+                ));
             }
             // `wanted` turned false, which only a teardown or a newer start
             // causes; both returned above.
