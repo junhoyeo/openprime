@@ -200,10 +200,10 @@ pub fn provider_retry_delay(
     }
     let exponential = policy
         .base_delay_ms
-        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
-        .min(policy.max_delay_ms);
+        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
     let delay_ms = exponential
         .max(retry_after_ms.unwrap_or(0))
+        .min(policy.max_delay_ms)
         .min(MAX_TIMER_DELAY_MS);
     ProviderRetryDelay::Wait { delay_ms }
 }
@@ -400,6 +400,11 @@ mod tests {
                 ProviderRetryDelay::Wait { delay_ms: 4 },
                 ProviderRetryDelay::Wait { delay_ms: 4 },
             ]
+        );
+        assert_eq!(
+            provider_retry_delay(1, Some(30_000), &capped),
+            ProviderRetryDelay::Wait { delay_ms: 4 },
+            "the agent backoff cap applies after a permitted Retry-After"
         );
 
         let uncapped = ProviderRetryPolicy {
