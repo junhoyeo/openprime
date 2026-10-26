@@ -15,6 +15,7 @@
 //!   creator's;
 //! - e32bce384 / 48fae2a5a through the update restore: a roster row is
 //!   recreated from its captured launch context, not the transcript header;
+//!   the session's telemetry opt-out survives the restore;
 //! - c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched in over a
 //!   fileless or foreign launch never inherits the launch cwd on respawn;
 //! - 6470a60e7: a cancellable prompt never starts a revival;
@@ -1132,4 +1133,153 @@ fn an_update_restore_recreates_a_session_with_its_captured_launch_context() {
         canonical(&fallback),
         "the restore must run in the captured explicit cwd"
     );
+}
+
+/// Row e32bce384's telemetry half through the update restore: a telemetry
+/// opt-out is a privacy setting, so a restored session keeps it — from the
+/// row's own `telemetryDisabled` (written by current daemons), from a TS
+/// row's `config.telemetryDisabled` (TS keeps it in the runtime config), or,
+/// for a row written before the field existed, from the session's surviving
+/// worker descriptor. Without evidence the daemon default applies (the
+/// control row: the opted-out attach is refused there).
+#[test]
+fn an_update_restore_keeps_a_sessions_telemetry_opt_out() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let socket = dir.path().join("daemon.sock");
+    let transcript = |id: &str| {
+        let path = sessions.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session", "version": 3, "id": id,
+                    "timestamp": "2026-10-12T00:00:00.000Z", "cwd": project,
+                })
+            ),
+        )
+        .expect("write transcript");
+        path
+    };
+    let flat_create = |path: &Path| {
+        json!({
+            "sessionPath": path, "cwd": project, "sessionDir": sessions,
+            "provider": "prime-inference", "model": "mock-1",
+        })
+    };
+    let row = |id: &str, worker: &str, runtime_config: Value| {
+        json!({
+            "session_id": id,
+            "active_session_id": worker,
+            "session_file": sessions.join(format!("{id}.jsonl")),
+            "kind": "top-level",
+            "rlm_depth": 0,
+            "cwd": project,
+            "runtime_config": runtime_config,
+            "queue": { "next_turn": [], "actions": {} },
+            "in_flight": {
+                "streaming": false, "compacting": false, "bash_running": false,
+                "rlm_children": false, "retrying": false, "prompt_in_flight": false
+            },
+            "should_resume": false
+        })
+    };
+    let explicit = transcript("explicit-opt-out");
+    let ts_shaped = transcript("ts-config-opt-out");
+    let legacy = transcript("descriptor-opt-out");
+    let control = transcript("no-evidence");
+    // The pre-field row's surviving descriptor (a dead, unkept worker the
+    // update boot leaves on disk) is its only opt-out evidence.
+    let descriptor_dir = pa_daemon::descriptor::descriptor_dir(&agent_dir, &socket);
+    std::fs::create_dir_all(&descriptor_dir).expect("descriptor dir");
+    std::fs::write(
+        descriptor_dir.join("legacy-worker.json"),
+        json!({
+            "version": 2,
+            "workerId": "legacy-worker",
+            "pid": 999_999,
+            "socketPath": dir.path().join("legacy-worker.sock"),
+            "recoveryJournalPath": dir.path().join("legacy-worker.recovery.jsonl"),
+            "supervisorSocketPath": socket,
+            "authenticationToken": "legacy-token",
+            "rootActiveSessionId": "legacy-worker",
+            "rootSessionId": "descriptor-opt-out",
+            "sessionFile": legacy,
+            "telemetryDisabled": true,
+            "createdAt": "2026-10-12T00:00:00.000Z",
+            "updatedAt": "2026-10-12T00:00:00.000Z",
+            "lifecycle": "ready",
+            "createCommand": flat_create(&legacy),
+            "consecutiveFailures": 0,
+        })
+        .to_string(),
+    )
+    .expect("write the legacy descriptor");
+    let roster = dir.path().join("update-roster.json");
+    std::fs::write(
+        &roster,
+        json!({
+            "format_version": 1,
+            "update_id": "u-telemetry-1",
+            "socket_path": socket,
+            "created_at": "2026-10-12T00:00:00Z",
+            "supervisor": { "pid": 1, "process_start_id": "p", "generation": "g" },
+            "binary": { "from_version": "0.1", "to_version": "0.2" },
+            "sessions": [
+                row("explicit-opt-out", "explicit-worker",
+                    json!({ "create": flat_create(&explicit), "telemetryDisabled": true })),
+                row("ts-config-opt-out", "ts-worker", json!({ "create": {
+                    "sessionPath": ts_shaped,
+                    "config": {
+                        "cwd": project, "sessionDir": sessions, "telemetryDisabled": true,
+                        "provider": "prime-inference", "model": "mock-1",
+                    },
+                }})),
+                row("descriptor-opt-out", "legacy-worker", json!({ "create": flat_create(&legacy) })),
+                row("no-evidence", "control-worker", json!({ "create": flat_create(&control) })),
+            ],
+        })
+        .to_string(),
+    )
+    .expect("write roster");
+    let _daemon = spawn_daemon_with_env(
+        &socket,
+        &agent_dir,
+        &[(
+            pa_types::daemon::update_flow::UPDATE_ROSTER_ENV,
+            roster.as_path(),
+        )],
+    );
+    let mut client = Client::connect(&socket);
+    for session_id in [
+        "explicit-opt-out",
+        "ts-config-opt-out",
+        "descriptor-opt-out",
+        "no-evidence",
+    ] {
+        wait_until(
+            "the restored session is live",
+            Duration::from_secs(30),
+            || client.live_active_id(&format!("list-{session_id}"), session_id),
+        );
+        let attached = client.request(
+            &format!("attach-{session_id}"),
+            &json!({ "type": "attach", "activeSessionId": session_id, "telemetryDisabled": true }),
+        );
+        if session_id == "no-evidence" {
+            assert_eq!(
+                attached["success"], false,
+                "without evidence the daemon default applies: {attached}"
+            );
+        } else {
+            assert_eq!(
+                attached["success"], true,
+                "the restore must keep {session_id}'s telemetry opt-out: {attached}"
+            );
+        }
+    }
 }

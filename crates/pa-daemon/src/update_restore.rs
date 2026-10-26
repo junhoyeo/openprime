@@ -703,9 +703,50 @@ async fn restore_session(
     // never reads them: they move back under `config`, so the restore runs
     // with the captured launch context instead of the transcript header. A TS
     // legacy row nests `config` already and parses as-is.
-    if let DaemonCommand::Create { config, rest, .. } = &mut command {
+    if let DaemonCommand::Create {
+        config,
+        rest,
+        telemetry_disabled,
+        ..
+    } = &mut command
+    {
         if config.is_none() && !rest.is_empty() {
             *config = Some(serde_json::Value::Object(std::mem::take(rest)));
+        }
+        // The telemetry opt-out is a privacy setting a restore must never drop.
+        // The evidence, most explicit first: the row's own field (current
+        // rosters); the TS shape's `config.telemetryDisabled` (TS keeps the
+        // opt-out in the runtime config: daemon-supervisor.ts:3581,
+        // daemon-mode.ts:6636-6640); for a row written before the field, the
+        // session's surviving worker descriptor. No evidence: the daemon default.
+        let row_opt_out = row
+            .runtime_config
+            .get("telemetryDisabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let config_opt_out = config
+            .as_ref()
+            .and_then(|config| config.get("telemetryDisabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let descriptor_opt_out = || {
+            let path = crate::descriptor::descriptor_dir(
+                &supervisor.options.agent_dir,
+                &supervisor.options.socket_path,
+            )
+            .join(format!("{}.json", row.active_session_id));
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .and_then(|descriptor| {
+                    descriptor
+                        .get("telemetryDisabled")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                == Some(true)
+        };
+        if row_opt_out || config_opt_out || descriptor_opt_out() {
+            *telemetry_disabled = Some(true);
         }
     }
     let summary = supervisor
