@@ -124,7 +124,7 @@ mod tests {
         let paid_zen = Model {
             cost: ModelCost {
                 input: JsNumber::from(1.0),
-                ..free_zen.cost.clone()
+                ..free_zen.cost
             },
             ..free_zen.clone()
         };
