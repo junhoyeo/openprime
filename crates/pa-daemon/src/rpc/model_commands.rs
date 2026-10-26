@@ -38,11 +38,9 @@ pub(crate) async fn set_model(
         .ok_or_else(|| "set_model requires a modelId".to_string())?;
     let mut registry = registry(state);
     let model = registry
-        .get_available()
-        .into_iter()
-        .find(|candidate| candidate.provider == provider && candidate.id == model_id)
+        .resolve_set_model_selection(provider, model_id)
         .cloned()
-        .ok_or_else(|| format!("Model not found: {provider}/{model_id}"))?;
+        .map_err(|error| error.to_string())?;
     apply_model_selection(state, &mut registry, &model).await?;
     Ok(ResponseData::Present(
         serde_json::to_value(&model).unwrap_or(Value::Null),

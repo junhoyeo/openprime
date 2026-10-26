@@ -7,6 +7,7 @@ async fn capture(
     api: &str,
     provider: &str,
     id: &str,
+    api_key: Option<&str>,
     headers: Option<std::collections::HashMap<String, String>>,
 ) -> Vec<(String, String)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -45,7 +46,7 @@ async fn capture(
     }))
     .unwrap();
     let options = SimpleStreamOptions::from_base(StreamOptions {
-        api_key: Some("synthetic-only".into()),
+        api_key: api_key.map(str::to_string),
         session_id: Some(id.into()),
         cache_retention: Some(CacheRetention::None),
         timeout_ms: Some(5_000),
@@ -74,7 +75,14 @@ async fn opencode_session_identity_reaches_every_transport_without_cache_retenti
         "anthropic-messages",
         "google-generative-ai",
     ] {
-        let headers = capture(api, "opencode-go", "conversation", None).await;
+        let headers = capture(
+            api,
+            "opencode-go",
+            "conversation",
+            Some("synthetic-only"),
+            None,
+        )
+        .await;
         assert_eq!(
             headers
                 .iter()
@@ -103,7 +111,14 @@ async fn opencode_session_preserves_case_insensitive_explicit_overrides() {
             ("X-OpenCode-Session".into(), "explicit".into()),
             ("User-Agent".into(), "custom-client".into()),
         ]);
-        let headers = capture(api, "opencode-go", "conversation", Some(explicit)).await;
+        let headers = capture(
+            api,
+            "opencode-go",
+            "conversation",
+            Some("synthetic-only"),
+            Some(explicit),
+        )
+        .await;
         assert_eq!(
             headers
                 .iter()
@@ -117,7 +132,25 @@ async fn opencode_session_preserves_case_insensitive_explicit_overrides() {
 }
 
 #[tokio::test]
+async fn zero_cost_zen_uses_the_public_key_without_configured_auth() {
+    let headers = capture("openai-completions", "opencode", "conversation", None, None).await;
+    assert!(headers.contains(&(
+        "authorization".into(),
+        format!("Bearer {}", pa_ai::models::OPENCODE_PUBLIC_API_KEY),
+    )));
+    assert!(headers.contains(&("user-agent".into(), "prime-agent".into())));
+    assert!(headers.contains(&("x-opencode-session".into(), "conversation".into())));
+}
+
+#[tokio::test]
 async fn unrelated_gateway_does_not_receive_opencode_identity() {
-    let headers = capture("openai-completions", "custom-gateway", "conversation", None).await;
+    let headers = capture(
+        "openai-completions",
+        "custom-gateway",
+        "conversation",
+        Some("synthetic-only"),
+        None,
+    )
+    .await;
     assert!(headers.iter().all(|(name, _)| name != "x-opencode-session"));
 }

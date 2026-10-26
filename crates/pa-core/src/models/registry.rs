@@ -249,6 +249,15 @@ impl ModelRegistry {
             || self.has_configured_provider_request_auth(&model.provider)
     }
 
+    /// Whether an explicit user selection can serve this model. This is deliberately wider than
+    /// [`ModelRegistry::has_configured_auth`] only for zero-cost OpenCode Zen models, which use
+    /// OpenCode's public credential. Automatic discovery and cycling must keep using the narrower
+    /// configured-auth predicate.
+    #[must_use]
+    pub fn is_explicitly_selectable(&self, model: &Model) -> bool {
+        self.has_configured_auth(model) || pa_ai::models::is_opencode_public_model(model)
+    }
+
     /// The provider's auth status without credential values: callers
     /// classifying unauthenticated vs stale providers read this instead of
     /// probing for keys.
@@ -293,10 +302,13 @@ impl ModelRegistry {
         {
             return Ok(model);
         }
-        if !self.has_configured_auth(model) {
+        if !self.is_explicitly_selectable(model) {
             return Err(SetModelSelectionError::ProviderUnauthenticated {
                 provider: provider.to_string(),
             });
+        }
+        if pa_ai::models::is_opencode_public_model(model) {
+            return Ok(model);
         }
         Err(SetModelSelectionError::NotFound {
             provider: provider.to_string(),
@@ -798,7 +810,7 @@ impl ModelRegistry {
             return !is_private_prime_inference_model(model)
                 || self.is_authorized_private_model(model);
         }
-        if !self.has_configured_auth(model) {
+        if !self.is_explicitly_selectable(model) {
             return false;
         }
         if !is_private_prime_inference_model(model) {
@@ -832,6 +844,7 @@ impl ModelRegistry {
                 }
             }
         }
+        api_key = pa_ai::models::opencode_public_api_key(model, api_key);
         let provider_headers = provider_config
             .as_ref()
             .and_then(|config| config.headers.clone());

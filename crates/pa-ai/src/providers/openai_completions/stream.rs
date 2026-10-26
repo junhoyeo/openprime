@@ -544,11 +544,14 @@ async fn run_stream(
     let base_options = options
         .map(|options| options.base.clone())
         .unwrap_or_default();
-    let api_key = base_options
-        .api_key
-        .clone()
-        .or_else(|| get_env_api_key(&model.provider))
-        .unwrap_or_default();
+    let api_key = crate::models::opencode_public_api_key(
+        model,
+        base_options
+            .api_key
+            .clone()
+            .or_else(|| get_env_api_key(&model.provider)),
+    )
+    .unwrap_or_default();
     let compat = get_compat(model);
     let cache_retention = resolve_cache_retention(base_options.cache_retention);
     let cache_control = get_compat_cache_control(&compat, cache_retention);

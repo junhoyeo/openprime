@@ -49,7 +49,7 @@ impl AgentSessionEngine {
                 self.config.agent_dir.join("models.json"),
             );
             registry.load_private_authorization_from_cache();
-            if !registry.has_configured_auth(&preflight_model) {
+            if !registry.is_explicitly_selectable(&preflight_model) {
                 let uses_oauth = registry
                     .auth
                     .get_all()

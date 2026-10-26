@@ -194,11 +194,14 @@ async fn run_stream(
     let base_options = options
         .map(|options| options.base.clone())
         .unwrap_or_default();
-    let api_key = base_options
-        .api_key
-        .clone()
-        .or_else(|| get_env_api_key(&model.provider))
-        .unwrap_or_default();
+    let api_key = crate::models::opencode_public_api_key(
+        model,
+        base_options
+            .api_key
+            .clone()
+            .or_else(|| get_env_api_key(&model.provider)),
+    )
+    .unwrap_or_default();
 
     let interleaved_thinking = options
         .and_then(|options| options.interleaved_thinking)

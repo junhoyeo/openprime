@@ -93,6 +93,20 @@ pub fn resolve_child_model_unchecked(
     {
         return Ok(selector_of(exact));
     }
+    // A fully qualified reference is an explicit selection. Free OpenCode Zen models stay out of
+    // discovery because they have no configured credential, but may resolve here with OpenCode's
+    // public key. Keep this fallback narrower than configured/stale/private models: those follow
+    // the searchable catalog and entitlement rules above.
+    if normalized.split_once('/').is_some() {
+        let registry = crate::state_getters::worker_model_registry(agent_dir);
+        if let Some(model) = registry.get_all().iter().find(|model| {
+            format!("{}/{}", model.provider, model.id).to_lowercase() == normalized
+                && !registry.has_configured_auth(model)
+                && registry.is_explicitly_selectable(model)
+        }) {
+            return Ok(format!("{}/{}", model.provider, model.id));
+        }
+    }
     // Short form: the full selector ends with "/<reference>".
     let short_matches: Vec<&RlmModelInfo> = candidates
         .iter()
@@ -294,6 +308,30 @@ mod tests {
             error.to_string(),
             "No model selected. Use /model to pick one."
         );
+    }
+
+    #[test]
+    fn fully_qualified_free_zen_resolves_without_entering_short_form_discovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let registry = crate::state_getters::worker_model_registry(dir.path());
+        let free_zen = registry
+            .get_all()
+            .iter()
+            .find(|model| pa_ai::models::is_opencode_public_model(model))
+            .expect("compiled catalog has a free Zen model");
+        let selector = format!("{}/{}", free_zen.provider, free_zen.id);
+        let id = free_zen.id.clone();
+        assert!(!registry
+            .get_rlm_searchable_models()
+            .iter()
+            .any(|model| model.provider == free_zen.provider && model.id == free_zen.id));
+
+        assert_eq!(
+            resolve_child_model_unchecked(dir.path(), Some(&selector), None, "subagent").unwrap(),
+            selector
+        );
+        assert!(resolve_child_model_unchecked(dir.path(), Some(&id), None, "subagent").is_err());
     }
 
     #[test]

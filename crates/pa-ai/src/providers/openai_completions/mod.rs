@@ -329,9 +329,12 @@ pub fn stream_simple_openai_completions(
     context: &Context,
     options: Option<&SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let api_key = options
-        .and_then(|options| options.base.api_key.clone())
-        .or_else(|| get_env_api_key(&model.provider));
+    let api_key = crate::models::opencode_public_api_key(
+        model,
+        options
+            .and_then(|options| options.base.api_key.clone())
+            .or_else(|| get_env_api_key(&model.provider)),
+    );
     let Some(api_key) = api_key else {
         let (writer, reader) = create_assistant_message_event_stream();
         let mut message = AssistantMessage {
