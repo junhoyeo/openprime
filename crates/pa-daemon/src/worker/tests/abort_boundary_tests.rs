@@ -1106,3 +1106,90 @@ async fn plain_abort_under_an_active_refine_parks_the_visible_queue() {
     let messages = worker.dispatch("get_messages", &json!({})).await;
     assert_eq!(messages.data.as_ref().unwrap()["messages"], json!([]));
 }
+
+/// TS `requestAbort` cancels an in-flight `/refine` (`_refineAbortController.abort()`): a
+/// directly admitted `/refine` projects as the running session command, the abort drops its
+/// planning request, nothing is written to the harness, the command settles with its
+/// `refine_failed` event and `Command failed` row, the queue stays suspended, and no further
+/// model request runs.
+#[tokio::test]
+// the faux registry is process-global: the guard must span the async flow
+#[allow(clippy::await_holding_lock)]
+async fn abort_cancels_a_planning_refine_and_settles_its_failure() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let late_plan = r#"{"summary":"late","edits":[{"action":"create","kind":"memory","id":"late","title":"Late","content":"never applied"}]}"#;
+    let (worker, dir, requested) =
+        held_turn_worker("refine-cancel-session", "refine-cancel", late_plan).await;
+    let mut subscription = worker.events.subscribe();
+    let prompt = worker
+        .dispatch(
+            "prompt",
+            &json!({ "activeSessionId": "refine-cancel-session", "message": "/refine --global" }),
+        )
+        .await;
+    assert!(prompt.success, "prompt failed: {prompt:?}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified())
+        .await
+        .expect("the refine planning request never started");
+    let state = worker.dispatch("get_connection_state", &json!({})).await;
+    let state = state.data.expect("connection state");
+    assert_eq!(state["isStreaming"], json!(true));
+    assert_eq!(
+        state["sessionActions"]["active"]["kind"],
+        json!("session_command")
+    );
+    assert_eq!(
+        state["sessionActions"]["active"]["label"],
+        json!("/refine --global")
+    );
+
+    let aborted = worker.dispatch("abort", &json!({})).await;
+    assert!(aborted.success, "abort failed: {aborted:?}");
+    let idle = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        worker.dispatch("wait_for_idle", &json!({})),
+    )
+    .await
+    .expect("the cancelled refine settles");
+    assert!(idle.success, "wait_for_idle failed: {idle:?}");
+
+    assert!(
+        !pa_core::refinement::get_harness_state_path(&dir.join("agent")).exists(),
+        "the cancelled plan wrote nothing"
+    );
+    assert!(
+        futures::FutureExt::now_or_never(requested.notified()).is_none(),
+        "no model request runs after the cancel"
+    );
+    let events = session_events_since(&mut subscription);
+    assert!(
+        events.iter().any(|event| event["type"] == "refine_failed"
+            && event["error"] == json!(pa_agent::abort::ABORT_ERROR_MESSAGE)),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event["type"] == "agent_end"),
+        "the command settles: {events:?}"
+    );
+    let last_action = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "session_action_update")
+        .expect("a queue projection frame");
+    assert!(
+        last_action["actions"]["active"].is_null(),
+        "the refine activity clears: {last_action}"
+    );
+    let messages = worker.dispatch("get_messages", &json!({})).await;
+    let rows = messages.data.expect("messages")["messages"].clone();
+    assert!(
+        rows.as_array().unwrap().iter().any(|row| {
+            crate::types::message_text(row) == "Command failed: Request was aborted"
+        }),
+        "{rows}"
+    );
+    assert!(worker.core.lock().unwrap().queued_input_suspended);
+    let _ = std::fs::remove_dir_all(&dir);
+}
