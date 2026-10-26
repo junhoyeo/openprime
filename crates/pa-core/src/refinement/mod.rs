@@ -92,8 +92,9 @@ pub struct HarnessState {
     pub entries: BTreeMap<RefinementKind, BTreeMap<String, HarnessEntry>>,
     pub refinements: Vec<HarnessRefinementEvent>,
     /// Stored rows this build cannot type (hand-edited or foreign shapes), by kind then id.
-    /// They are never rendered or refined; a save writes them back verbatim so a load-save
-    /// cycle never erases an entry the TS loader would have kept.
+    /// They are never rendered or refined; a Rust save writes them back verbatim so its
+    /// load-save cycle never erases an entry the TS loader would have kept. The kernel's
+    /// Python writer (`rlm/harness.py`) does not preserve them.
     #[serde(skip)]
     pub preserved_entries: BTreeMap<RefinementKind, serde_json::Map<String, serde_json::Value>>,
 }
