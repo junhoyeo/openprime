@@ -435,3 +435,259 @@ fn a_superseded_binding_never_reaches_the_rebound_view() {
         "the old id detaches only after the new attach lands: {commands:?}"
     );
 }
+
+const REVIVAL_PROMPT: &str = "a prompt the dead worker refused";
+const FIRST_PROMPT: &str = "a prompt the moved binding refused";
+const SECOND_PROMPT: &str = "the next prompt after the move";
+const REFUSAL_TEXT: &str = "Unknown active session: s1";
+
+/// An admitted prompt's turn: the user row, then the turn's end.
+fn settled_turn_frames(active: &str, generation: &str, text: &str) -> Vec<Value> {
+    let mut frames = user_row_frames(active, generation, 1, text);
+    frames.push(session_event(
+        active,
+        generation,
+        3,
+        &json!({ "type": "turn_end" }),
+    ));
+    frames.push(session_event(
+        active,
+        generation,
+        4,
+        &json!({ "type": "agent_end" }),
+    ));
+    frames
+}
+
+fn prompt_refusal(id: &str, active: &str) -> Value {
+    json!({
+        "type": "response", "id": id, "command": "prompt",
+        "success": false,
+        "error": format!("Unknown active session: {active}"),
+    })
+}
+
+/// The startup attach every revival test opens with.
+fn initial_attach(request: &Request, writer: &mut UnixStream) {
+    write_json(
+        writer,
+        &attach_response(&request.id, "s1", "g1", 0, &[user_message(FIRST_ROW, 101)]),
+    );
+}
+
+/// The prompt labels the mock saw, in wire order.
+fn prompts(commands: &[String]) -> Vec<&str> {
+    commands
+        .iter()
+        .filter(|command| command.starts_with("prompt:"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// A prompt refused because its worker is gone re-attaches by the durable
+/// transcript id and replays exactly once to the worker now serving the SAME
+/// transcript (the revival the TS client ran by hand).
+#[test]
+fn a_refused_prompt_replays_once_on_its_revived_transcript() {
+    std::env::remove_var("TMUX");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("tui.sock");
+    let listener = UnixListener::bind(&socket).expect("bind mock socket");
+    let handle = std::thread::spawn(move || {
+        serve(&listener, |request, writer| {
+            match (request.command_type.as_str(), request.active.as_str()) {
+                ("attach", "s1") => initial_attach(request, writer),
+                ("prompt", "s1") => write_json(writer, &prompt_refusal(&request.id, "s1")),
+                ("attach", "sess-1") => write_json(
+                    writer,
+                    &attach_response_for(
+                        &request.id,
+                        "s3",
+                        "sess-1",
+                        "g3",
+                        0,
+                        &[user_message(FIRST_ROW, 101)],
+                    ),
+                ),
+                ("prompt", "s3") => {
+                    write_json(writer, &generic_response(&request.id, "prompt"));
+                    for frame in settled_turn_frames("s3", "g3", REVIVAL_PROMPT) {
+                        write_json(writer, &frame);
+                    }
+                }
+                _ => return false,
+            }
+            true
+        })
+    });
+    let frame = run_plan(
+        socket,
+        vec![
+            HeadlessStep::Submit(REVIVAL_PROMPT.to_string()),
+            HeadlessStep::WaitRender {
+                needle: REVIVAL_PROMPT.to_string(),
+                timeout_ms: 5000,
+            },
+        ],
+    );
+    let commands = handle.join().expect("mock daemon finished");
+    assert_eq!(
+        prompts(&commands),
+        vec![
+            format!("prompt:s1:{REVIVAL_PROMPT}"),
+            format!("prompt:s3:{REVIVAL_PROMPT}"),
+        ],
+        "one refused attempt, one replay on the revived transcript: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|command| command == "attach:sess-1"),
+        "the replay re-attaches by the durable transcript id: {commands:?}"
+    );
+    assert_eq!(frame.matches(REVIVAL_PROMPT).count(), 1, "{frame}");
+    assert!(
+        !frame.contains(REFUSAL_TEXT),
+        "the replay hides the refusal:\n{frame}"
+    );
+}
+
+/// The durable re-attach lands on a worker now showing ANOTHER transcript (an
+/// in-worker switch moved it): the refused prompt is never re-sent there, and
+/// its original refusal surfaces (legacy `5a19fe961`, `ae2db8c32`).
+#[test]
+fn a_refused_prompt_never_replays_into_a_moved_transcript() {
+    std::env::remove_var("TMUX");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("tui.sock");
+    let listener = UnixListener::bind(&socket).expect("bind mock socket");
+    let handle = std::thread::spawn(move || {
+        serve(&listener, |request, writer| {
+            match (request.command_type.as_str(), request.active.as_str()) {
+                ("attach", "s1") => initial_attach(request, writer),
+                ("prompt", "s1") => write_json(writer, &prompt_refusal(&request.id, "s1")),
+                ("attach", "sess-1") => write_json(
+                    writer,
+                    &attach_response_for(
+                        &request.id,
+                        "s3",
+                        "sess-moved",
+                        "g3",
+                        0,
+                        &[user_message(REBOUND_ROW, 102)],
+                    ),
+                ),
+                // A replay would land here: admitted, so the run settles and the
+                // prompt count names it.
+                ("prompt", active) => {
+                    write_json(writer, &generic_response(&request.id, "prompt"));
+                    for frame in settled_turn_frames(active, "g3", &request.message) {
+                        write_json(writer, &frame);
+                    }
+                }
+                _ => return false,
+            }
+            true
+        })
+    });
+    let frame = run_plan(
+        socket,
+        vec![
+            HeadlessStep::Submit(REVIVAL_PROMPT.to_string()),
+            HeadlessStep::WaitRender {
+                needle: REFUSAL_TEXT.to_string(),
+                timeout_ms: 5000,
+            },
+        ],
+    );
+    let commands = handle.join().expect("mock daemon finished");
+    assert_eq!(
+        prompts(&commands),
+        vec![format!("prompt:s1:{REVIVAL_PROMPT}")],
+        "the prompt is never re-sent into the moved transcript: {commands:?}"
+    );
+    assert!(
+        frame.contains(REFUSAL_TEXT),
+        "the original refusal surfaces:\n{frame}"
+    );
+}
+
+/// The binding moves (a supersede notice) while a prompt's refusal is in
+/// flight: the refusal surfaces instead of a replay, and the NEXT prompt follows
+/// the live binding (legacy `966c11aa7` late rebind, `324f9b637`).
+#[test]
+fn a_prompt_refused_after_its_binding_moved_is_not_replayed() {
+    std::env::remove_var("TMUX");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("tui.sock");
+    let listener = UnixListener::bind(&socket).expect("bind mock socket");
+    let handle = std::thread::spawn(move || {
+        let mut held_prompt: Option<String> = None;
+        serve(&listener, move |request, writer| {
+            match (request.command_type.as_str(), request.active.as_str()) {
+                ("attach", "s1") => initial_attach(request, writer),
+                ("prompt", "s1") => {
+                    // The refusal waits until the client has rebound to s2.
+                    held_prompt = Some(request.id.clone());
+                    write_json(
+                        writer,
+                        &json!({
+                            "type": "session_binding",
+                            "previousActiveSessionId": "s1",
+                            "activeSessionId": "s2",
+                        }),
+                    );
+                }
+                ("attach", "s2") => {
+                    write_json(
+                        writer,
+                        &attach_response(
+                            &request.id,
+                            "s2",
+                            "g2",
+                            0,
+                            &[user_message(FIRST_ROW, 101)],
+                        ),
+                    );
+                    if let Some(id) = held_prompt.take() {
+                        write_json(writer, &prompt_refusal(&id, "s1"));
+                    }
+                }
+                ("prompt", "s2") => {
+                    write_json(writer, &generic_response(&request.id, "prompt"));
+                    for frame in settled_turn_frames("s2", "g2", SECOND_PROMPT) {
+                        write_json(writer, &frame);
+                    }
+                }
+                _ => return false,
+            }
+            true
+        })
+    });
+    let frame = run_plan(
+        socket,
+        vec![
+            HeadlessStep::Submit(FIRST_PROMPT.to_string()),
+            HeadlessStep::WaitRender {
+                needle: REFUSAL_TEXT.to_string(),
+                timeout_ms: 5000,
+            },
+            HeadlessStep::Submit(SECOND_PROMPT.to_string()),
+            HeadlessStep::WaitRender {
+                needle: SECOND_PROMPT.to_string(),
+                timeout_ms: 5000,
+            },
+        ],
+    );
+    let commands = handle.join().expect("mock daemon finished");
+    assert_eq!(
+        prompts(&commands),
+        vec![
+            format!("prompt:s1:{FIRST_PROMPT}"),
+            format!("prompt:s2:{SECOND_PROMPT}"),
+        ],
+        "the refused prompt is not replayed; the next one follows the binding: {commands:?}"
+    );
+    assert!(
+        frame.contains(REFUSAL_TEXT),
+        "the refusal surfaces:\n{frame}"
+    );
+}
