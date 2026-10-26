@@ -539,7 +539,11 @@ impl SessionUi {
                 self.dirty = true;
                 return Ok(());
             }
-            let action = if self.turn_active || view.editor.get_text().trim().is_empty() {
+            // TS `hasInterruptibleWork`: an active `/refine` counts like a streaming turn.
+            let action = if self.turn_active
+                || self.refine_active
+                || view.editor.get_text().trim().is_empty()
+            {
                 "tree"
             } else {
                 "clear"
@@ -602,11 +606,7 @@ impl SessionUi {
                     }
                 });
             }
-            if self.refine_active {
-                self.abort_refine_and_restore_queue(view).await;
-            } else {
-                self.interrupt_running_work(view);
-            }
+            self.interrupt_running_work(view);
             self.show_ctrl_c_hint();
             self.dirty = true;
             return Ok(());
