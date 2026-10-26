@@ -343,7 +343,8 @@ pub struct KernelSnapshotConfig {
 /// Options for constructing a [`ReplKernelManager`].
 #[derive(Clone, Default)]
 pub struct KernelManagerOptions {
-    /// Python interpreter with the kernel runtime available. Defaults to the auto-bootstrapped kernel.
+    /// Python interpreter with exactly the supported kernel runtime ABI. The manager validates it
+    /// read-only before spawn and anchors relative paths to the host cwd. Defaults to auto-bootstrap.
     pub python: Option<std::path::PathBuf>,
     pub cwd: Option<std::path::PathBuf>,
     pub env: HashMap<String, String>,

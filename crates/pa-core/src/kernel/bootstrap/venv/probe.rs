@@ -25,13 +25,66 @@ fn run_quiet(command: &str, args: &[&str]) -> bool {
     matches!(child.status(), Ok(status) if status.success())
 }
 
+/// Exact internal runtime ABI understood by this host. Closed enum additions
+/// require an explicit new host/runtime pairing; unknown newer ABIs fail closed.
+pub(crate) const SUPPORTED_RLM_RUNTIME_ABI: u64 = 2;
+
+fn run_quiet_with_env(
+    command: &str,
+    args: &[&str],
+    env: &HashMap<String, String>,
+    cwd: Option<&Path>,
+) -> bool {
+    let mut child = std::process::Command::new(command);
+    child
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
+    crate::platform::process::set_no_window(&mut child);
+    matches!(child.status(), Ok(status) if status.success())
+}
+
 /// The runtime-ready assertion from the TS product: a current
 /// prime-agent-runtime with the callable RLM surface, harness CRUD, bash
 /// handles, and protocol version 3.
-const RUNTIME_READY_CHECK: &str = "import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ['create_memory', 'update_memory', 'delete_memory', 'create_skill', 'update_skill', 'delete_skill', 'create_subagent', 'update_subagent', 'delete_subagent', 'create_prompt_note', 'update_prompt_note', 'delete_prompt_note', 'record_refinement']; _mcp_discovery_methods = ['list_plugins', 'search_plugins', 'list_connections', 'search_tools', 'describe_tool']; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert all(callable(getattr(mcp, _m, None)) for _m in _mcp_discovery_methods), \"rlm.mcp is missing MCP discovery methods (list_plugins, search_plugins, list_connections, search_tools, describe_tool); the kernel venv needs a current prime-agent-runtime\"; assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert callable(rlm.rename); assert callable(rlm.rlm.rename); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert {'persistent', 'yield_after'} <= set(inspect.signature(rlm.bash).parameters); assert callable(rlm.persistent_shells); assert callable(rlm._set_completion_notices_wired); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')";
+const RUNTIME_READY_CHECK: &str = "import inspect; import rlm; assert type(getattr(rlm, 'RLM_RUNTIME_ABI', None)) is int and rlm.RLM_RUNTIME_ABI == 2, 'prime-agent-runtime ABI 2 is required (queued/error subagent rows)'; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ['create_memory', 'update_memory', 'delete_memory', 'create_skill', 'update_skill', 'delete_skill', 'create_subagent', 'update_subagent', 'delete_subagent', 'create_prompt_note', 'update_prompt_note', 'delete_prompt_note', 'record_refinement']; _mcp_discovery_methods = ['list_plugins', 'search_plugins', 'list_connections', 'search_tools', 'describe_tool']; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert all(callable(getattr(mcp, _m, None)) for _m in _mcp_discovery_methods), \"rlm.mcp is missing MCP discovery methods (list_plugins, search_plugins, list_connections, search_tools, describe_tool); the kernel venv needs a current prime-agent-runtime\"; assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert callable(rlm.rename); assert callable(rlm.rlm.rename); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert {'persistent', 'yield_after'} <= set(inspect.signature(rlm.bash).parameters); assert callable(rlm.persistent_shells); assert callable(rlm._set_completion_notices_wired); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')";
 
 pub(crate) fn has_prime_agent_runtime(python: &str) -> bool {
     run_quiet(python, &["-c", RUNTIME_READY_CHECK])
+}
+
+pub(crate) fn has_state_snapshot_runtime(python: &str) -> bool {
+    python_imports(python, "dill")
+}
+
+pub(crate) fn has_required_default_imports(python: &str) -> bool {
+    let imports = DEFAULT_RLM_EXTRA_PACKAGES
+        .iter()
+        .map(|(_, import, _)| *import)
+        .collect::<Vec<_>>()
+        .join(",");
+    run_quiet(python, &["-c", &format!("import {imports}")])
+}
+
+pub(crate) fn spawn_environment_ready(
+    python: &str,
+    env: &HashMap<String, String>,
+    cwd: Option<&Path>,
+) -> bool {
+    let imports = DEFAULT_RLM_EXTRA_PACKAGES
+        .iter()
+        .map(|(_, import, _)| *import)
+        .collect::<Vec<_>>()
+        .join(",");
+    run_quiet_with_env(python, &["-c", RUNTIME_READY_CHECK], env, cwd)
+        && run_quiet_with_env(python, &["-c", "import dill"], env, cwd)
+        && run_quiet_with_env(python, &["-c", &format!("import {imports}")], env, cwd)
 }
 
 pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
@@ -210,4 +263,26 @@ pub fn invalidate_runtime_probe_cache() {
 #[cfg(all(test, unix))]
 pub(crate) fn clear_in_process_probe_memo_for_tests() {
     *lock_probe_memo() = None;
+}
+
+#[cfg(test)]
+mod runtime_abi_tests {
+    use super::{RUNTIME_READY_CHECK, SUPPORTED_RLM_RUNTIME_ABI};
+
+    #[test]
+    fn runtime_probe_requires_the_exact_integer_abi_two() {
+        assert_eq!(SUPPORTED_RLM_RUNTIME_ABI, 2);
+        assert!(RUNTIME_READY_CHECK.contains(
+            "type(getattr(rlm, 'RLM_RUNTIME_ABI', None)) is int and rlm.RLM_RUNTIME_ABI == 2"
+        ));
+        assert!(!RUNTIME_READY_CHECK.contains(">= 2"));
+    }
+
+    #[test]
+    #[ignore = "live: PA_TEST_RUNTIME_ABI_PYTHON must name an installed packaged ABI-2 runtime"]
+    fn configured_packaged_runtime_satisfies_the_full_probe() {
+        let python = std::env::var("PA_TEST_RUNTIME_ABI_PYTHON")
+            .expect("set PA_TEST_RUNTIME_ABI_PYTHON for this live verifier");
+        assert!(super::has_prime_agent_runtime(&python));
+    }
 }

@@ -12,20 +12,25 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 
 use dir_lock::acquire_bootstrap_lock;
 pub use runtime_code::{
     build_rlm_bootstrap_code, parse_unavailable_python_skills, UnavailablePythonSkills,
     PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
 };
+pub(crate) use venv::{
+    begin_kernel_lease_handoff, register_kernel_python_lease, GenerationLeaseGuard,
+};
 use venv::{
-    bootstrap_venv, ensure_uv, expand_home, has_prime_agent_runtime,
+    bootstrap_venv, expand_home, generation_identity, generation_root, has_prime_agent_runtime,
+    kernel_ready, kernel_ready_read_only, kernel_runtime_ready, lease_for_resolver,
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
-    resolve_writable_kernel_venv_dir, sync_python_skills, BootstrapPythonSkill,
+    prepare_generation_root, published_candidates, recorded_unavailable_python_skills,
+    resolve_writable_kernel_venv_dir, BootstrapPythonSkill, GenerationBuild,
+    SUPPORTED_RLM_RUNTIME_ABI,
 };
 pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
-use venv::{kernel_base_ready, kernel_ready};
 
 /// One Python skill the kernel should import at bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,9 +188,9 @@ async fn ensure_kernel_python_uncached(
             let python_str = python.to_string_lossy().to_string();
             let mut missing = Vec::new();
             if !has_prime_agent_runtime(&python_str) {
-                missing.push(
-                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, rlm.rename, rlm._set_completion_notices_wired, and explicit harness CRUD methods".to_string(),
-                );
+                missing.push(format!(
+                    "prime-agent-runtime ABI {SUPPORTED_RLM_RUNTIME_ABI} (queued/error subagent rows) with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, rlm.rename, rlm._set_completion_notices_wired, and explicit harness CRUD methods"
+                ));
             }
             if missing.is_empty() {
                 let missing_extras = missing_rlm_extra_import_labels(&python_str);
@@ -224,98 +229,245 @@ async fn ensure_kernel_python_uncached(
 async fn ensure_kernel_venv(
     options: &EnsureKernelPythonOptions,
     python_skills: &[BootstrapPythonSkill],
-    venv: PathBuf,
+    base_venv: PathBuf,
 ) -> anyhow::Result<PathBuf> {
-    let python = kernel_venv_python(&venv);
-    let python_str = python.to_string_lossy().to_string();
-    // Validate the local source before probing any installed runtime or
-    // removing an existing venv. Missing payloads must fail closed.
+    // Validate the bundled source before trusting or touching any environment.
     let source_dir =
         venv::require_runtime_source_dir().map_err(|error| format_bootstrap_failure(&error))?;
     let runtime_identity =
         venv::hash_runtime_source(&source_dir).map_err(|error| format_bootstrap_failure(&error))?;
-    if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
-        return Ok(python);
-    }
-
-    let release_lock = match acquire_bootstrap_lock(&venv).await {
-        Ok(release_lock) => release_lock,
-        Err(error) if dir_lock::lock_creation_denied(&error) => {
-            return unwritable_venv(options, &python, &venv, &runtime_identity, &error);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = async {
-        if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
-            return Ok(python);
-        }
-        if kernel_base_ready(&python_str, &venv, &runtime_identity) {
-            let uv = ensure_uv()?;
-            sync_python_skills(
-                &uv,
-                &venv,
-                &python,
-                &source_dir,
-                &runtime_identity,
-                python_skills,
-                options,
-            )
-            .await?;
-            return Ok(python);
-        }
-        let had_venv = venv.exists();
-        options.report("› setting up python kernel (one-time, ~30s)…");
-        if had_venv {
-            options.report("rebuilding kernel venv");
-            std::fs::remove_dir_all(&venv)
-                .with_context(|| format!("removing {}", venv.display()))?;
-        }
-        bootstrap_venv(
-            &venv,
+    let explicit = std::env::var("PRIME_AGENT_KERNEL_VENV").is_ok_and(|value| !value.is_empty());
+    let result = if explicit {
+        ensure_exact_kernel_venv(
+            options,
+            python_skills,
+            &base_venv,
             &source_dir,
             &runtime_identity,
+        )
+        .await
+    } else {
+        ensure_managed_kernel_venv(
+            options,
+            python_skills,
+            &base_venv,
+            &source_dir,
+            &runtime_identity,
+        )
+        .await
+    };
+    result.map_err(|error| format_bootstrap_failure(&error))
+}
+
+fn report_recorded_unavailable_skills(options: &EnsureKernelPythonOptions, venv: &std::path::Path) {
+    for unavailable in recorded_unavailable_python_skills(venv) {
+        options.report(&format!(
+            "Warning: Python skill {} remains unavailable in this immutable kernel generation: {}",
+            unavailable.import_name, unavailable.reason
+        ));
+    }
+}
+
+fn exact_venv_stale_error(venv: &std::path::Path) -> anyhow::Error {
+    anyhow!(
+        "PRIME_AGENT_KERNEL_VENV points to a non-current environment at {}. Prime Agent will not replace, relocate, or install into it while another process may use it. Stop dependent sessions and remove or move that path manually, choose a new PRIME_AGENT_KERNEL_VENV, or set PRIME_AGENT_KERNEL_PYTHON",
+        venv.display()
+    )
+}
+
+/// The explicit override is caller-owned and exact. A current path is read
+/// only; a stale, broken, symlinked-to-stale, or otherwise unknown path is
+/// never replaced. A missing path is the only path this process may build.
+async fn ensure_exact_kernel_venv(
+    options: &EnsureKernelPythonOptions,
+    python_skills: &[BootstrapPythonSkill],
+    venv: &std::path::Path,
+    source_dir: &std::path::Path,
+    runtime_identity: &str,
+) -> anyhow::Result<PathBuf> {
+    let python = kernel_venv_python(venv);
+    let python_str = python.to_string_lossy().to_string();
+    if kernel_ready_read_only(&python_str, venv, runtime_identity, python_skills) {
+        report_recorded_unavailable_skills(options, venv);
+        return Ok(python);
+    }
+    match std::fs::symlink_metadata(venv) {
+        Ok(_) => return Err(exact_venv_stale_error(venv)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow!(
+                "cannot inspect PRIME_AGENT_KERNEL_VENV at {} without risking another owner's files: {error}",
+                venv.display()
+            ));
+        }
+    }
+
+    let release_lock = acquire_bootstrap_lock(venv).await.map_err(|error| {
+        anyhow!(
+            "cannot create the bootstrap lock for the exact PRIME_AGENT_KERNEL_VENV at {}; choose a writable PRIME_AGENT_KERNEL_VENV or set PRIME_AGENT_KERNEL_PYTHON: {error:#}",
+            venv.display()
+        )
+    })?;
+    let result = async {
+        if kernel_ready_read_only(&python_str, venv, runtime_identity, python_skills) {
+            report_recorded_unavailable_skills(options, venv);
+            return Ok(python);
+        }
+        match std::fs::symlink_metadata(venv) {
+            Ok(_) => return Err(exact_venv_stale_error(venv)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "cannot inspect PRIME_AGENT_KERNEL_VENV at {} without risking another owner's files: {error}",
+                    venv.display()
+                ));
+            }
+        }
+        options.report("› setting up python kernel (one-time, ~30s)…");
+        // Atomically reserve the exact missing path before uv. It remains at
+        // that path (never renamed), so Windows entry points and pyvenv.cfg
+        // embed the caller's exact directory.
+        std::fs::create_dir(venv).map_err(|error| {
+            anyhow!(
+                "could not atomically reserve PRIME_AGENT_KERNEL_VENV at {}: {error}",
+                venv.display()
+            )
+        })?;
+        crate::platform::perms::restrict_dir(venv)?;
+        let Some(expected_identity) = crate::platform::directory_identity(venv)? else {
+            return Err(anyhow!(
+                "filesystem cannot prove PRIME_AGENT_KERNEL_VENV directory identity at {}",
+                venv.display()
+            ));
+        };
+        // A failed partial path is retained for explicit user inspection;
+        // deleting it cannot be made safe if an external process replaced it.
+        let bootstrap = bootstrap_venv(
+            venv,
+            source_dir,
+            runtime_identity,
             python_skills,
             options,
+            None,
         )
-        .await?;
+        .await;
+        if crate::platform::directory_identity(venv)?.as_ref() != Some(&expected_identity) {
+            return Err(anyhow!(
+                "PRIME_AGENT_KERNEL_VENV ownership changed during bootstrap; the path was retained without publication: {}",
+                venv.display()
+            ));
+        }
+        bootstrap?;
+        validate_built_environment(&python, venv, runtime_identity, python_skills)?;
+        options.report("✓ ready");
         Ok(python)
     }
     .await;
     drop(release_lock);
-    options.report("✓ ready");
-    result.map_err(|error| format_bootstrap_failure(&error))
+    result
 }
 
-/// The venv's directory denies writes to this user, so the bootstrap lock cannot be
-/// created: a base-ready venv degrades the way a `PRIME_AGENT_KERNEL_PYTHON` override
-/// does (uncovered skills disabled with a warning, nothing installed), and anything
-/// less is a setup error naming the venv and both env overrides.
-fn unwritable_venv(
+/// The default managed path first honors a fully current legacy environment.
+/// Every replacement is an immutable, leased generation; this function never
+/// mutates or deletes the legacy directory.
+async fn ensure_managed_kernel_venv(
     options: &EnsureKernelPythonOptions,
+    python_skills: &[BootstrapPythonSkill],
+    base_venv: &std::path::Path,
+    source_dir: &std::path::Path,
+    runtime_identity: &str,
+) -> anyhow::Result<PathBuf> {
+    let legacy_python = kernel_venv_python(base_venv);
+    let legacy_python_str = legacy_python.to_string_lossy().to_string();
+    if kernel_ready_read_only(
+        &legacy_python_str,
+        base_venv,
+        runtime_identity,
+        python_skills,
+    ) {
+        report_recorded_unavailable_skills(options, base_venv);
+        return Ok(legacy_python);
+    }
+
+    let root = generation_root(base_venv)?;
+    let identity = generation_identity(runtime_identity, python_skills)?;
+    let release_lock = acquire_bootstrap_lock(&root).await.map_err(|error| {
+        anyhow!(
+            "cannot publish a managed Python kernel generation under {} without risking the legacy environment at {}; set PRIME_AGENT_KERNEL_VENV to a writable missing path or set PRIME_AGENT_KERNEL_PYTHON: {error:#}",
+            root.display(),
+            base_venv.display()
+        )
+    })?;
+    let result = async {
+        prepare_generation_root(&root)?;
+        for generation in published_candidates(&root, &identity)? {
+            let python = kernel_venv_python(&generation);
+            let python_str = python.to_string_lossy().to_string();
+            if kernel_ready(&python_str, &generation, runtime_identity, python_skills) {
+                report_recorded_unavailable_skills(options, &generation);
+                // Durable before the root lock releases: pruning can never
+                // interleave between selection and resolver ownership.
+                lease_for_resolver(&generation)?;
+                prepare_generation_root(&root)?;
+                return Ok(python);
+            }
+        }
+
+        options.report("› setting up python kernel (one-time, ~30s)…");
+        let build = GenerationBuild::begin(&root, &identity)?;
+        let bootstrap = bootstrap_venv(
+            build.path(),
+            source_dir,
+            runtime_identity,
+            python_skills,
+            options,
+            Some(&build),
+        )
+        .await;
+        if let Err(error) = bootstrap {
+            build.discard();
+            return Err(error);
+        }
+        let python = kernel_venv_python(build.path());
+        if let Err(error) =
+            validate_built_environment(&python, build.path(), runtime_identity, python_skills)
+        {
+            build.discard();
+            return Err(error);
+        }
+        if let Err(error) = build.publish() {
+            build.discard();
+            return Err(error);
+        }
+        prepare_generation_root(&root)?;
+        options.report("✓ ready");
+        Ok(python)
+    }
+    .await;
+    drop(release_lock);
+    result
+}
+
+fn validate_built_environment(
     python: &std::path::Path,
     venv: &std::path::Path,
     runtime_identity: &str,
-    lock_error: &anyhow::Error,
-) -> anyhow::Result<PathBuf> {
+    python_skills: &[BootstrapPythonSkill],
+) -> anyhow::Result<()> {
     let python_str = python.to_string_lossy().to_string();
-    if !kernel_base_ready(&python_str, venv, runtime_identity) {
+    if !kernel_runtime_ready(&python_str, venv, runtime_identity, python_skills) {
         return Err(anyhow!(
-            "cannot set up the Python kernel runtime: the kernel venv at {} is not writable by \
-             this user and does not hold a current runtime. Set PRIME_AGENT_KERNEL_VENV to a \
-             writable directory, or set PRIME_AGENT_KERNEL_PYTHON to a Python with a current \
-             prime-agent-runtime and the default Python packages installed. ({lock_error:#})",
-            venv.display()
+            "the new kernel environment failed its runtime/version validation"
         ));
     }
-    let missing = missing_python_skill_import_labels(&python_str, &options.python_skills);
-    if !missing.is_empty() {
-        options.report(&format!(
-            "Warning: Python skills unavailable in {} and will be disabled: {}",
-            venv.display(),
-            missing.join(", ")
+    let missing_packages = missing_rlm_extra_import_labels(&python_str);
+    if !missing_packages.is_empty() {
+        return Err(anyhow!(
+            "the new kernel environment is missing default Python packages: {}",
+            missing_packages.join(", ")
         ));
     }
-    Ok(python.to_path_buf())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -329,7 +481,8 @@ mod tests {
         std::fs::create_dir(&venv).unwrap();
         let sentinel = venv.join("owner-state");
         std::fs::write(&sentinel, "another bootstrap owns this venv").unwrap();
-        let owner = acquire_bootstrap_lock(&venv).await.unwrap();
+        let generation_root = generation_root(&venv).unwrap();
+        let owner = acquire_bootstrap_lock(&generation_root).await.unwrap();
         let options = EnsureKernelPythonOptions {
             // Fail before any destructive operation or network access if the
             // caller regresses and enters setup without acquiring the lock.
@@ -352,7 +505,10 @@ mod tests {
             std::fs::read_to_string(sentinel).unwrap(),
             "another bootstrap owns this venv"
         );
-        assert!(root.path().join("kernel-venv.bootstrap.lock").exists());
+        assert!(root
+            .path()
+            .join("kernel-venv.generations.bootstrap.lock")
+            .exists());
         drop(owner);
     }
 }

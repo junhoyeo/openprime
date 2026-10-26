@@ -4,13 +4,20 @@
 use super::{anyhow, Path, PathBuf};
 
 pub(crate) fn expand_home(path: &str) -> PathBuf {
-    if path == "~" {
-        return home_dir();
+    let expanded = if path == "~" {
+        home_dir()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else {
+        PathBuf::from(path)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expanded)
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home_dir().join(rest);
-    }
-    PathBuf::from(path)
 }
 
 pub(super) fn home_dir() -> PathBuf {

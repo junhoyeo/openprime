@@ -1,6 +1,9 @@
 //! The version-file concern: the schema consts, the `.bootstrap-version` read/write.
 
-use super::{default_rlm_extra_uv_args, BootstrapPythonSkill, BootstrapVersion, Path};
+use super::{
+    default_rlm_extra_uv_args, BootstrapPythonSkill, BootstrapUnavailablePythonSkill,
+    BootstrapVersion, Path,
+};
 
 /// Schema of `.bootstrap-version`; a mismatch rebuilds the venv.
 pub(super) const BOOTSTRAP_SCHEMA: u64 = 9;
@@ -46,6 +49,55 @@ pub(super) fn recorded_skills_cover(
     })
 }
 
+fn requested_skills_match(
+    recorded: &[BootstrapPythonSkill],
+    current: &[BootstrapPythonSkill],
+) -> bool {
+    recorded.len() == current.len()
+        && current.iter().all(|skill| {
+            recorded.iter().any(|entry| {
+                bootstrap_skill_key(entry) == bootstrap_skill_key(skill)
+                    && entry.pyproject_path == skill.pyproject_path
+                    && entry.pyproject_hash == skill.pyproject_hash
+            })
+        })
+}
+
+fn requested_outcome_matches(
+    version: &BootstrapVersion,
+    requested: &[BootstrapPythonSkill],
+) -> bool {
+    let installed = version.python_skills.as_deref().unwrap_or_default();
+    let unavailable = version
+        .unavailable_python_skills
+        .as_deref()
+        .unwrap_or_default();
+    if installed.len() + unavailable.len() != requested.len() {
+        return false;
+    }
+    requested.iter().all(|skill| {
+        let installed_matches = installed
+            .iter()
+            .filter(|entry| {
+                bootstrap_skill_key(entry) == bootstrap_skill_key(skill)
+                    && entry.pyproject_path == skill.pyproject_path
+                    && entry.pyproject_hash == skill.pyproject_hash
+            })
+            .count();
+        let unavailable_matches = unavailable
+            .iter()
+            .filter(|entry| {
+                entry.import_name == skill.import_name
+                    && entry.package_path == skill.package_path
+                    && entry.pyproject_path == skill.pyproject_path
+                    && entry.pyproject_hash == skill.pyproject_hash
+                    && !entry.reason.is_empty()
+            })
+            .count();
+        installed_matches + unavailable_matches == 1
+    })
+}
+
 pub(super) fn bootstrap_base_version_current(
     version: Option<BootstrapVersion>,
     runtime_identity: &str,
@@ -71,14 +123,47 @@ pub(super) fn bootstrap_version_current(
 ) -> bool {
     version.is_some_and(|version| {
         bootstrap_base_version_current(Some(version.clone()), runtime_identity)
-            && recorded_skills_cover(version.python_skills.as_deref(), python_skills)
+            && version.requested_python_skills.as_deref().map_or_else(
+                || recorded_skills_cover(version.python_skills.as_deref(), python_skills),
+                |requested| {
+                    requested_skills_match(requested, python_skills)
+                        && requested_outcome_matches(version, requested)
+                },
+            )
     })
 }
 
+#[cfg(test)]
 pub(crate) fn write_bootstrap_version(
     venv: &Path,
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
+) -> anyhow::Result<()> {
+    write_bootstrap_version_record(venv, runtime_identity, python_skills, None, None)
+}
+
+pub(super) fn write_bootstrap_version_with_outcome(
+    venv: &Path,
+    runtime_identity: &str,
+    installed_python_skills: &[BootstrapPythonSkill],
+    requested_python_skills: &[BootstrapPythonSkill],
+    unavailable_python_skills: &[BootstrapUnavailablePythonSkill],
+) -> anyhow::Result<()> {
+    write_bootstrap_version_record(
+        venv,
+        runtime_identity,
+        installed_python_skills,
+        Some(requested_python_skills),
+        Some(unavailable_python_skills),
+    )
+}
+
+fn write_bootstrap_version_record(
+    venv: &Path,
+    runtime_identity: &str,
+    installed_python_skills: &[BootstrapPythonSkill],
+    requested_python_skills: Option<&[BootstrapPythonSkill]>,
+    unavailable_python_skills: Option<&[BootstrapUnavailablePythonSkill]>,
 ) -> anyhow::Result<()> {
     let version = BootstrapVersion {
         schema: BOOTSTRAP_SCHEMA,
@@ -90,7 +175,9 @@ pub(crate) fn write_bootstrap_version(
                 .map(String::from)
                 .collect(),
         ),
-        python_skills: Some(python_skills.to_vec()),
+        python_skills: Some(installed_python_skills.to_vec()),
+        requested_python_skills: requested_python_skills.map(<[_]>::to_vec),
+        unavailable_python_skills: unavailable_python_skills.map(<[_]>::to_vec),
     };
     std::fs::write(
         venv.join(BOOTSTRAP_VERSION_FILE),

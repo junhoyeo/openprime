@@ -14,18 +14,22 @@ fn redaction_patterns() -> &'static [(fancy_regex::Regex, &'static str)] {
                 r"(?i)\b(Authorization[ \t]*:[ \t]*)(Basic|Bearer|Token)[ \t]+\S+",
                 "$1$2 [redacted]",
             ),
+            (
+                r"(?i)\b([a-z0-9_-]*(?:token|secret|password|credential|api[_-]?key|access[_-]?key)[a-z0-9_-]*)[ \t]*:[ \t]*\S+",
+                "$1: [redacted]",
+            ),
             (r"(?i)\b(Bearer|Token)[ \t]+\S+", "$1 [redacted]"),
             (r"(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+@", "$1[redacted]@"),
             (
-                r"(?i)([?&](?:[a-z0-9_-]*(?:token|secret|password)|api[_-]?key)=)[^&\s]+",
+                r"(?i)([?&][a-z0-9_-]*(?:token|secret|password|credential|api[_-]?key|access[_-]?key)[a-z0-9_-]*=)[^&\s]+",
                 "$1[redacted]",
             ),
             (
-                r"(?i)\b((?:[a-z0-9_-]*(?:token|secret|password)|api[_-]?key)[ \t]*=[ \t]*)\S+",
+                r"(?i)\b([a-z0-9_-]*(?:token|secret|password|credential|api[_-]?key|access[_-]?key)[a-z0-9_-]*[ \t]*=[ \t]*)\S+",
                 "$1[redacted]",
             ),
             (
-                r"(?i)(--?(?:[a-z0-9_-]*(?:token|secret|password)|api[_-]?key)(?:[= \t]+))\S+",
+                r"(?i)(--?[a-z0-9_-]*(?:token|secret|password|credential|api[_-]?key|access[_-]?key)[a-z0-9_-]*(?:[= \t]+))\S+",
                 "$1[redacted]",
             ),
         ]
@@ -48,11 +52,12 @@ pub(super) fn ambient_secret_values() -> Vec<String> {
         .filter_map(|(name, value)| {
             let name = name.to_str()?.to_ascii_uppercase();
             let value = value.into_string().ok()?;
-            let credential_shaped = name.ends_with("_TOKEN")
-                || name.ends_with("_SECRET")
-                || name.ends_with("_PASSWORD")
-                || name.ends_with("_CREDENTIAL")
-                || name.contains("_API_KEY")
+            let credential_shaped = name.contains("TOKEN")
+                || name.contains("SECRET")
+                || name.contains("PASSWORD")
+                || name.contains("CREDENTIAL")
+                || name.contains("API_KEY")
+                || name.contains("ACCESS_KEY")
                 || name == "AUTHORIZATION";
             (credential_shaped && !value.is_empty()).then_some(value)
         })
@@ -123,7 +128,8 @@ mod tests {
             "bare Bearer\nhttps://user:password@example.test/simple\n",
             "client_secret=oauth-client refresh_token=oauth-refresh id_token=oauth-id\n",
             "https://pypi-user:pypi-pass@example.test/simple?access_token=query-secret\n",
-            "--api-key cli-api-secret --password=cli-password",
+            "--api-key cli-api-secret --password=cli-password\n",
+            "AWS_SECRET_ACCESS_KEY=aws-secret X-Api-Key: header-api-key",
         );
         let sanitized = sanitize_bootstrap_diagnostic(input, &[]);
         for secret in [
@@ -139,6 +145,8 @@ mod tests {
             "query-secret",
             "cli-api-secret",
             "cli-password",
+            "aws-secret",
+            "header-api-key",
         ] {
             assert!(!sanitized.contains(secret), "leaked {secret}: {sanitized}");
         }

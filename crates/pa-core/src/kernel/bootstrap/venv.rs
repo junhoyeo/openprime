@@ -3,13 +3,14 @@
 //! file is a cross-session cache, not a per-session manifest.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use sha2::Digest;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{
     default_rlm_extra_uv_args, EnsureKernelPythonOptions, KernelPythonSkill,
@@ -19,6 +20,7 @@ use super::{
 // The concern children (the flows + the shared record stay in the
 // composition root).
 mod diagnostics;
+mod generation;
 mod layout;
 mod probe;
 mod runtime_source;
@@ -28,6 +30,13 @@ mod version;
 
 use diagnostics::{
     ambient_secret_values, bounded_stderr_tail, sanitize_bootstrap_diagnostic, STDERR_BUFFER_BYTES,
+};
+pub(crate) use generation::{
+    begin_kernel_lease_handoff, register_kernel_python_lease, GenerationLeaseGuard,
+};
+pub(super) use generation::{
+    generation_identity, generation_root, lease_for_resolver, prepare_generation_root,
+    published_candidates, GenerationBuild,
 };
 use layout::home_dir;
 pub(crate) use layout::{expand_home, resolve_writable_kernel_venv_dir};
@@ -40,7 +49,9 @@ use probe::{installed_rlm_dir, lock_probe_memo, runtime_probe_key};
 #[cfg(all(test, unix))]
 use probe::{clear_in_process_probe_memo_for_tests, installed_package_dir};
 pub(crate) use probe::{
-    has_prime_agent_runtime, missing_python_skill_import_labels, missing_rlm_extra_import_labels,
+    has_prime_agent_runtime, has_required_default_imports, has_state_snapshot_runtime,
+    missing_python_skill_import_labels, missing_rlm_extra_import_labels, spawn_environment_ready,
+    SUPPORTED_RLM_RUNTIME_ABI,
 };
 use probe::{has_prime_agent_runtime_memoized, installed_runtime_identity};
 use runtime_source::collect_python_files;
@@ -54,18 +65,29 @@ pub(crate) use skills::{normalize_python_skills, BootstrapPythonSkill};
 pub(crate) use uv::ensure_uv;
 #[cfg(test)]
 use uv::windows_executable_candidates;
-use version::{
-    bootstrap_base_version_current, bootstrap_skill_key, bootstrap_version_current,
-    read_bootstrap_version, read_bootstrap_version_raw, write_bootstrap_version,
-    STATE_SNAPSHOT_REQUIREMENT,
-};
 #[cfg(test)]
-use version::{recorded_skills_cover, BOOTSTRAP_SCHEMA};
+use version::{
+    bootstrap_base_version_current, recorded_skills_cover, write_bootstrap_version,
+    BOOTSTRAP_SCHEMA,
+};
+use version::{
+    bootstrap_skill_key, bootstrap_version_current, read_bootstrap_version,
+    read_bootstrap_version_raw, write_bootstrap_version_with_outcome, STATE_SNAPSHOT_REQUIREMENT,
+};
 
 const PYTHON_VERSION: &str = "3.11";
 pub(crate) const BOOTSTRAP_LOCK_NAME: &str = ".bootstrap.lock";
 pub(crate) const BOOTSTRAP_LOCK_RETRY_MS: u64 = 100;
 pub(crate) const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS: u64 = 30_000;
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BootstrapUnavailablePythonSkill {
+    pub(super) import_name: String,
+    pub(super) package_path: String,
+    pub(super) pyproject_path: String,
+    pub(super) pyproject_hash: String,
+    pub(super) reason: String,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BootstrapVersion {
     schema: u64,
@@ -77,103 +99,156 @@ pub(crate) struct BootstrapVersion {
     extra_uv_args: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     python_skills: Option<Vec<BootstrapPythonSkill>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_python_skills: Option<Vec<BootstrapPythonSkill>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_python_skills: Option<Vec<BootstrapUnavailablePythonSkill>>,
 }
 
+#[derive(Clone, Default)]
 struct RetainedStderr {
     bytes: Vec<u8>,
     leading_record_truncated: bool,
 }
 
-fn drain_stderr_tail(mut stderr: impl Read) -> std::io::Result<RetainedStderr> {
-    let mut retained = Vec::with_capacity(STDERR_BUFFER_BYTES);
-    let mut leading_record_truncated = false;
+struct AbortTaskOnDrop {
+    handle: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl AbortTaskOnDrop {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self {
+            handle,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.abort();
+        }
+    }
+}
+
+async fn drain_stderr_tail(
+    mut stderr: impl AsyncRead + Unpin,
+    shared: &Mutex<RetainedStderr>,
+) -> std::io::Result<()> {
+    let mut retained = RetainedStderr {
+        bytes: Vec::with_capacity(STDERR_BUFFER_BYTES),
+        leading_record_truncated: false,
+    };
     let mut chunk = [0u8; 4 * 1024];
     loop {
-        let count = stderr.read(&mut chunk)?;
+        let count = stderr.read(&mut chunk).await?;
         if count == 0 {
             break;
         }
-        let mut combined = Vec::with_capacity(retained.len() + count);
-        combined.extend_from_slice(&retained);
+        let mut combined = Vec::with_capacity(retained.bytes.len() + count);
+        combined.extend_from_slice(&retained.bytes);
         combined.extend_from_slice(&chunk[..count]);
         if combined.len() > STDERR_BUFFER_BYTES {
             let split = combined.len() - STDERR_BUFFER_BYTES;
-            leading_record_truncated = combined[split - 1] != b'\n';
-            retained = combined.split_off(split);
+            retained.leading_record_truncated = combined[split - 1] != b'\n';
+            retained.bytes = combined.split_off(split);
         } else {
-            retained = combined;
+            retained.bytes = combined;
         }
+        *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retained.clone();
     }
-    Ok(RetainedStderr {
-        bytes: retained,
-        leading_record_truncated,
-    })
+    Ok(())
 }
 
 async fn run_async(command: &str, args: &[String]) -> anyhow::Result<()> {
-    // Run on a blocking thread: the bootstrap is an IO-bound child process.
-    let command = command.to_string();
-    let args = args.to_vec();
     let secrets = ambient_secret_values();
-    tokio::task::spawn_blocking(move || {
-        let command_label = sanitize_bootstrap_diagnostic(&command, &secrets);
-        let mut process = std::process::Command::new(&command);
-        process
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        // Hidden window on Windows (TS `spawnHidden`).
-        crate::platform::process::set_no_window(&mut process);
-        // CPython must read UTF-8 .pth files even under a Windows legacy
-        // code page (TS bootstrap.ts:429).
-        if cfg!(windows) {
-            process.env("PYTHONUTF8", "1");
+    let command_label = sanitize_bootstrap_diagnostic(command, &secrets);
+    let mut process = tokio::process::Command::new(command);
+    process
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // Hidden window on Windows (TS `spawnHidden`).
+    crate::platform::process::set_no_window(process.as_std_mut());
+    if cfg!(windows) {
+        process.env("PYTHONUTF8", "1");
+    }
+    process.kill_on_drop(true);
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("failed to spawn bootstrap command {command_label}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("bootstrap command {command_label} did not expose stderr"))?;
+    let retained = Arc::new(Mutex::new(RetainedStderr::default()));
+    let retained_for_reader = Arc::clone(&retained);
+    let mut reader =
+        tokio::spawn(async move { drain_stderr_tail(stderr, &retained_for_reader).await });
+    let mut reader_abort = AbortTaskOnDrop::new(reader.abort_handle());
+    let status_result = child.wait().await;
+    match tokio::time::timeout(Duration::from_millis(250), &mut reader).await {
+        Ok(Ok(result)) => {
+            reader_abort.disarm();
+            result.with_context(|| {
+                format!("failed to drain bootstrap command {command_label} stderr")
+            })?;
         }
-        let mut child = process
-            .spawn()
-            .with_context(|| format!("failed to spawn bootstrap command {command_label}"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("bootstrap command {command_label} did not expose stderr"))?;
-        // Drain concurrently with wait(): waiting first can deadlock once the
-        // child fills the pipe. The reader retains only the newest bounded bytes.
-        let reader = std::thread::spawn(move || drain_stderr_tail(stderr));
-        let status = child
-            .wait()
-            .with_context(|| format!("failed to wait for bootstrap command {command_label}"))?;
-        let retained = reader
-            .join()
-            .map_err(|_| anyhow!("bootstrap command {command_label} stderr reader panicked"))?
-            .with_context(|| format!("failed to drain bootstrap command {command_label} stderr"))?;
-        if status.success() {
-            return Ok(());
+        Ok(Err(error)) => {
+            reader_abort.disarm();
+            return Err(anyhow!(
+                "bootstrap command {command_label} stderr reader failed: {error}"
+            ));
         }
-        let stderr = String::from_utf8_lossy(&retained.bytes);
-        let tail = bounded_stderr_tail(&stderr, retained.leading_record_truncated, &secrets);
-        let reason = status.code().map_or_else(
-            || "terminated by a signal".to_string(),
-            |code| format!("failed with exit code {code}"),
-        );
-        if tail.is_empty() {
-            Err(anyhow!("bootstrap command {command_label} {reason}"))
-        } else {
-            Err(anyhow!(
-                "bootstrap command {command_label} {reason}\nstderr (safe tail):\n{tail}"
-            ))
+        Err(_) => {
+            // A descendant inherited stderr. Cancelling the async reader drops
+            // our pipe handle; bootstrap completion never waits for foreign EOF.
+            reader.abort();
+            let _ = reader.await;
+            reader_abort.disarm();
         }
-    })
-    .await
-    .map_err(|error| anyhow!("bootstrap task join failed: {error}"))?
+    }
+
+    let status = status_result
+        .with_context(|| format!("failed to wait for bootstrap command {command_label}"))?;
+    let retained = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&retained.bytes);
+    let tail = bounded_stderr_tail(&stderr, retained.leading_record_truncated, &secrets);
+    let reason = status.code().map_or_else(
+        || "terminated by a signal".to_string(),
+        |code| format!("failed with exit code {code}"),
+    );
+    if tail.is_empty() {
+        Err(anyhow!("bootstrap command {command_label} {reason}"))
+    } else {
+        Err(anyhow!(
+            "bootstrap command {command_label} {reason}\nstderr (safe tail):\n{tail}"
+        ))
+    }
 }
 
-pub(crate) async fn bootstrap_venv(
+pub(in crate::kernel::bootstrap) async fn bootstrap_venv(
     venv: &Path,
     source_dir: &Path,
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
     options: &EnsureKernelPythonOptions,
+    generation_build: Option<&GenerationBuild>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(venv.parent().unwrap_or(Path::new("/")))?;
     let uv = ensure_uv()?;
@@ -213,6 +288,9 @@ pub(crate) async fn bootstrap_venv(
         ],
     )
     .await?;
+    if let Some(build) = generation_build {
+        build.claim_created_path()?;
+    }
     run_async(&uv, &install_args).await?;
     sync_python_skills(
         &uv,
@@ -246,10 +324,11 @@ pub(crate) async fn sync_python_skills(
         .unwrap_or_default()
         .into_iter()
         .filter(|recorded| Path::new(&recorded.package_path).is_dir())
-        .map(|s| (bootstrap_skill_key(&s), s))
+        .map(|skill| (bootstrap_skill_key(&skill), skill))
         .collect();
     let python_str = python.to_string_lossy().to_string();
     let mut installed: HashMap<String, BootstrapPythonSkill> = current_python_skills;
+    let mut install_failures = HashMap::new();
     let mut missing: Vec<&BootstrapPythonSkill> = Vec::new();
     for skill in python_skills {
         let key = bootstrap_skill_key(skill);
@@ -279,13 +358,12 @@ pub(crate) async fn sync_python_skills(
             install_args.push(skill.package_path.clone());
         }
         if run_async(uv, &install_args).await.is_ok() {
-            // A changed pyproject (hash moved) replaces the stale record.
             for skill in &missing {
                 installed.insert(bootstrap_skill_key(skill), (*skill).clone());
             }
         } else {
             for skill in &missing {
-                let result = run_async(
+                match run_async(
                     uv,
                     &[
                         "pip".to_string(),
@@ -297,31 +375,106 @@ pub(crate) async fn sync_python_skills(
                         skill.package_path.clone(),
                     ],
                 )
-                .await;
-                match result {
+                .await
+                {
                     Ok(()) => {
                         installed.insert(bootstrap_skill_key(skill), (*skill).clone());
                     }
-                    Err(error) => options.report(&format!(
-                        "Warning: Python skill {} failed to install and will be unavailable: {error}",
-                        skill.import_name
-                    )),
+                    Err(error) => {
+                        install_failures.insert(bootstrap_skill_key(skill), error.to_string());
+                    }
                 }
             }
         }
     }
+
+    // Publication records observable import readiness, not a package manager's
+    // exit status. Every requested fingerprint lands in exactly one side of
+    // installed ∪ unavailable, including an installed module that fails import.
+    let mut unavailable = Vec::new();
+    for skill in python_skills {
+        let key = bootstrap_skill_key(skill);
+        let import = run_async(
+            &python_str,
+            &["-c".to_string(), format!("import {}", skill.import_name)],
+        )
+        .await;
+        match import {
+            Ok(()) => {
+                installed.insert(key, skill.clone());
+            }
+            Err(import_error) => {
+                installed.remove(&key);
+                let reason = install_failures.remove(&key).map_or_else(
+                    || import_error.to_string(),
+                    |install_error| format!("{install_error}; import probe failed: {import_error}"),
+                );
+                options.report(&format!(
+                    "Warning: Python skill {} is unavailable in this kernel generation: {reason}",
+                    skill.import_name
+                ));
+                unavailable.push(BootstrapUnavailablePythonSkill {
+                    import_name: skill.import_name.clone(),
+                    package_path: skill.package_path.clone(),
+                    pyproject_path: skill.pyproject_path.clone(),
+                    pyproject_hash: skill.pyproject_hash.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+
     let mut merged: Vec<BootstrapPythonSkill> = installed.into_values().collect();
     merged.sort_by(|a, b| {
         a.package_path
             .cmp(&b.package_path)
             .then(a.import_name.cmp(&b.import_name))
     });
-    write_bootstrap_version(venv, runtime_identity, &merged)
+    unavailable.sort_by(|a, b| {
+        a.package_path
+            .cmp(&b.package_path)
+            .then(a.import_name.cmp(&b.import_name))
+    });
+    write_bootstrap_version_with_outcome(
+        venv,
+        runtime_identity,
+        &merged,
+        python_skills,
+        &unavailable,
+    )
 }
 
-pub(crate) fn kernel_base_ready(python: &str, venv: &Path, runtime_identity: &str) -> bool {
+pub(crate) fn recorded_unavailable_python_skills(
+    venv: &Path,
+) -> Vec<BootstrapUnavailablePythonSkill> {
+    read_bootstrap_version(venv)
+        .and_then(|version| version.unavailable_python_skills)
+        .unwrap_or_default()
+}
+
+pub(crate) fn kernel_ready_read_only(
+    python: &str,
+    venv: &Path,
+    runtime_identity: &str,
+    python_skills: &[BootstrapPythonSkill],
+) -> bool {
+    bootstrap_version_current(
+        read_bootstrap_version(venv).as_ref(),
+        runtime_identity,
+        python_skills,
+    ) && has_prime_agent_runtime(python)
+        && has_state_snapshot_runtime(python)
+        && has_required_default_imports(python)
+}
+
+pub(crate) fn kernel_runtime_ready(
+    python: &str,
+    venv: &Path,
+    runtime_identity: &str,
+    python_skills: &[BootstrapPythonSkill],
+) -> bool {
     let (version, raw) = read_bootstrap_version_raw(venv);
-    bootstrap_base_version_current(version, runtime_identity)
+    bootstrap_version_current(version.as_ref(), runtime_identity, python_skills)
         && has_prime_agent_runtime_memoized(
             python,
             runtime_identity,
@@ -337,15 +490,8 @@ pub(crate) fn kernel_ready(
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
 ) -> bool {
-    let (version, raw) = read_bootstrap_version_raw(venv);
-    bootstrap_version_current(version.as_ref(), runtime_identity, python_skills)
-        && has_prime_agent_runtime_memoized(
-            python,
-            runtime_identity,
-            &raw,
-            &installed_runtime_identity(Path::new(python), venv),
-            venv,
-        )
+    kernel_runtime_ready(python, venv, runtime_identity, python_skills)
+        && has_required_default_imports(python)
 }
 
 #[cfg(test)]

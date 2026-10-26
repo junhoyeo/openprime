@@ -398,7 +398,8 @@ fn counting_kernel(
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf x >> '{}'\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"-c\" ]; then exec '{}' \"$@\"; fi\nprintf x >> '{}'\nexec '{}' \"$@\"\n",
+            python.display(),
             count.display(),
             python.display()
         ),

@@ -84,7 +84,8 @@ fn counting_gated_kernel(
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nn=$(wc -c < '{}')\nprintf x >> '{}'\nwhile [ ! -f '{}'/gate$n ] && [ -d '{}' ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"-c\" ]; then exec '{}' \"$@\"; fi\nn=$(wc -c < '{}')\nprintf x >> '{}'\nwhile [ ! -f '{}'/gate$n ] && [ -d '{}' ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
+            python.display(),
             count.display(),
             count.display(),
             gates.display(),
@@ -611,7 +612,8 @@ fn flaky_first_kernel(
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf x >> '{}'\nif [ -f '{}' ]; then exec '{}' \"$@\"; fi\nwhile [ ! -f '{}' ] && [ -d '{}' ]; do sleep 0.05; done\nexit 1\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = \"-c\" ]; then exec '{}' \"$@\"; fi\nprintf x >> '{}'\nif [ -f '{}' ]; then exec '{}' \"$@\"; fi\nwhile [ ! -f '{}' ] && [ -d '{}' ]; do sleep 0.05; done\nexit 1\n",
+            python.display(),
             count.display(),
             flip.display(),
             python.display(),
