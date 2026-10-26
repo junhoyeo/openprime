@@ -1107,6 +1107,11 @@ async fn plain_abort_under_an_active_refine_parks_the_visible_queue() {
     assert_eq!(messages.data.as_ref().unwrap()["messages"], json!([]));
 }
 
+/// The failure bound of the refine abort tests' readiness waits: they wait on concrete events
+/// (the provider request, the settle frames, idle); the bound only stops a broken run, so it
+/// stays generous for a loaded machine.
+const REFINE_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// TS `requestAbort` cancels an in-flight `/refine` (`_refineAbortController.abort()`): a
 /// directly admitted `/refine` projects as the running session command, the abort drops its
 /// planning request, nothing is written to the harness, the command settles with its
@@ -1130,7 +1135,7 @@ async fn abort_cancels_a_planning_refine_and_settles_its_failure() {
         )
         .await;
     assert!(prompt.success, "prompt failed: {prompt:?}");
-    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified())
+    tokio::time::timeout(REFINE_TEST_BOUND, requested.notified())
         .await
         .expect("the refine planning request never started");
     let state = worker.dispatch("get_connection_state", &json!({})).await;
@@ -1148,7 +1153,7 @@ async fn abort_cancels_a_planning_refine_and_settles_its_failure() {
     let aborted = worker.dispatch("abort", &json!({})).await;
     assert!(aborted.success, "abort failed: {aborted:?}");
     let idle = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        REFINE_TEST_BOUND,
         worker.dispatch("wait_for_idle", &json!({})),
     )
     .await
@@ -1239,7 +1244,7 @@ async fn an_abort_reaches_a_planning_refine_while_the_session_slot_is_held() {
         )
         .await;
     assert!(prompt.success, "prompt failed: {prompt:?}");
-    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified())
+    tokio::time::timeout(REFINE_TEST_BOUND, requested.notified())
         .await
         .expect("the refine planning request never started");
     let engine = std::sync::Arc::clone(worker.agent_engine.as_ref().expect("the faux engine"));
@@ -1247,14 +1252,14 @@ async fn an_abort_reaches_a_planning_refine_while_the_session_slot_is_held() {
     let aborted = worker.dispatch("abort", &json!({})).await;
     assert!(aborted.success, "abort failed: {aborted:?}");
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        REFINE_TEST_BOUND,
         await_session_event(&mut subscription, is_aborted_refine_failure),
     )
     .await
     .expect("the refine cancels while the session slot is held");
     drop(held);
     let idle = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        REFINE_TEST_BOUND,
         worker.dispatch("wait_for_idle", &json!({})),
     )
     .await
@@ -1290,7 +1295,7 @@ async fn an_abort_before_the_refine_registers_cancels_it_unplanned() {
     assert!(prompt.success, "prompt failed: {prompt:?}");
     // The delivery picked the refine up and parks at the gate before registering.
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        REFINE_TEST_BOUND,
         await_session_event(&mut subscription, |event| {
             event["type"] == "session_action_update"
                 && event["actions"]["active"]["kind"] == "session_command"
@@ -1302,13 +1307,13 @@ async fn an_abort_before_the_refine_registers_cancels_it_unplanned() {
     assert!(aborted.success, "abort failed: {aborted:?}");
     drop(gate);
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        REFINE_TEST_BOUND,
         await_session_event(&mut subscription, is_aborted_refine_failure),
     )
     .await
     .expect("the gated refine refuses with the abort");
     let idle = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        REFINE_TEST_BOUND,
         worker.dispatch("wait_for_idle", &json!({})),
     )
     .await
