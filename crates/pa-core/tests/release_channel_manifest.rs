@@ -290,10 +290,11 @@ fn the_rolling_nightly_refresh_is_a_serialized_job() {
     assert_eq!(
         refresh.r#if.as_deref(),
         Some(
-            "${{ !cancelled() && needs.promote.result == 'success' \
-&& contains(github.ref_name, '-') }}",
+            "${{ github.repository == 'junhoyeo/openprime' && !cancelled() \
+&& needs.promote.result == 'success' && contains(github.ref_name, '-') }}",
         ),
-        "the refresh gate is the explicit result form (the promote precedent): \
+        "the refresh gate is the fork-origin guard plus the explicit result form \
+         (the promote precedent): an `if` without a status function is auto-prefixed with success(), and \
          an `if` without a status function is auto-prefixed with success(), and \
          the default needs gate skips every job downstream of a skipped job in \
          the dependency chain - on a -beta* tag the two stable-route build jobs \
