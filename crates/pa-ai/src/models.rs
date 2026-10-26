@@ -10,19 +10,19 @@ pub use pa_types::ai::thinking_levels::{
 
 use crate::types::{Model, Usage, UsageCost};
 
-/// OpenCode's public credential for free Zen models. These models remain out of automatic model
+/// `OpenCode`'s public credential for free Zen models. These models remain out of automatic model
 /// discovery unless the provider has configured auth; the fallback applies only after a user
 /// explicitly selects one.
 pub const OPENCODE_PUBLIC_API_KEY: &str = "public";
 
-/// Whether `model` is a zero-cost model on an OpenCode Zen provider.
+/// Whether `model` is a zero-cost model on an `OpenCode` Zen provider.
 #[must_use]
 pub fn is_opencode_public_model(model: &Model) -> bool {
     matches!(model.provider.as_str(), "opencode" | "opencode-go")
         && model.cost.input.as_f64() == 0.0
 }
 
-/// Prefer a configured key, otherwise use OpenCode's public credential for a free Zen model.
+/// Prefer a configured key, otherwise use `OpenCode`'s public credential for a free Zen model.
 #[must_use]
 pub fn opencode_public_api_key(model: &Model, configured: Option<String>) -> Option<String> {
     configured
