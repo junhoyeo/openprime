@@ -288,3 +288,27 @@ fn saving_after_a_legacy_load_never_erases_an_entry() {
         .get("topic")
         .is_none());
 }
+
+#[test]
+fn a_typed_entry_wins_over_a_preserved_row_with_the_same_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = copied_harness_dir(temp.path(), "harness_state.topic-era.json");
+    update_harness_state(&dir, HarnessScope::Local, |state| {
+        let mut entry = state.entries[&RefinementKind::Memory]["topic_entry"].clone();
+        entry.id = "hand_edited".to_string();
+        entry.title = "Typed replacement".to_string();
+        state
+            .entries
+            .get_mut(&RefinementKind::Memory)
+            .unwrap()
+            .insert("hand_edited".to_string(), entry);
+    })
+    .unwrap();
+    let after: Value =
+        serde_json::from_str(&std::fs::read_to_string(get_harness_state_path(&dir)).unwrap())
+            .unwrap();
+    assert_eq!(
+        after["entries"]["memory"]["hand_edited"]["title"],
+        "Typed replacement"
+    );
+}
