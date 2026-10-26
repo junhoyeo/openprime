@@ -1,0 +1,1 @@
+- Session persistence now keeps one lease identity when a not-yet-created session path crosses a platform filesystem alias such as macOS `/var` and `/private/var`, preventing valid prompt rows from being rejected after the file appears.

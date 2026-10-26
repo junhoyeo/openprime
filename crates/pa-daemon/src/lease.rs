@@ -70,12 +70,30 @@ impl SessionAlreadyActiveError {
 }
 
 pub fn canonical_session_path(path: &Path) -> PathBuf {
-    match path.canonicalize() {
-        Ok(canonical) => canonical,
-        Err(_) => match path.parent().map(std::path::Path::canonicalize) {
-            Some(Ok(parent)) => parent.join(path.file_name().unwrap_or_default()),
-            _ => path.to_path_buf(),
-        },
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    // A lease can be acquired before the nested session directory/file exists.
+    // Canonicalize the nearest existing ancestor, then append the missing suffix,
+    // so platform aliases (macOS `/var` -> `/private/var`) cannot change the
+    // lease identity once the file is created.
+    let mut cursor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = cursor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        cursor = parent;
     }
 }
 
@@ -603,6 +621,24 @@ pub(crate) fn reclaim_dead_owner_leases(agent_dir: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_nested_path_keeps_one_canonical_identity_after_creation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let session = alias.join("nested").join("session.jsonl");
+        let before = canonical_session_path(&session);
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, "{}\n").unwrap();
+        assert_eq!(before, canonical_session_path(&session));
+        assert!(before.starts_with(real.canonicalize().unwrap()));
+    }
 
     #[test]
     fn process_start_id_reflects_the_platform_ladder() {
