@@ -107,6 +107,22 @@ async fn keyless_free_zen_is_explicitly_selectable_but_not_discoverable() {
 }
 
 #[test]
+fn stale_prime_auth_never_bypasses_private_model_entitlement() {
+    let mut auth = auth_without_env(&serde_json::json!({
+        "prime-inference": { "type": "api_key", "key": "synthetic-prime-key" }
+    }));
+    assert!(auth.mark_auth_stale("prime-inference"));
+    let mut registry = ModelRegistry::in_memory(auth);
+    let private = model("internal/private-probe", "prime-inference");
+    registry.models.push(private.clone());
+
+    assert!(matches!(
+        registry.resolve_set_model_selection(&private.provider, &private.id),
+        Err(SetModelSelectionError::NotFound { .. })
+    ));
+}
+
+#[test]
 fn explicit_zen_selection_does_not_admit_paid_or_unrelated_free_models() {
     let registry = ModelRegistry::in_memory(auth_without_env(&serde_json::json!({})));
     let mut paid_zen = model("paid", "opencode");
