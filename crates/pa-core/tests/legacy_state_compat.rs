@@ -187,18 +187,6 @@ fn copied_harness_dir(temp: &Path, name: &str) -> PathBuf {
     dir
 }
 
-fn entry_ids(path: &Path) -> Vec<(String, String)> {
-    let state: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let mut ids = Vec::new();
-    for (kind, records) in state["entries"].as_object().unwrap() {
-        for id in records.as_object().unwrap().keys() {
-            ids.push((kind.clone(), id.clone()));
-        }
-    }
-    ids.sort();
-    ids
-}
-
 #[test]
 fn a_legacy_kernel_written_harness_state_loads_every_entry() {
     let temp = tempfile::tempdir().unwrap();
@@ -267,14 +255,21 @@ fn saving_after_a_legacy_load_never_erases_an_entry() {
         state.refinements.clear();
     })
     .unwrap();
-    assert_eq!(
-        entry_ids(&path),
-        vec![
-            ("memory".to_string(), "hand_edited".to_string()),
-            ("memory".to_string(), "topic_entry".to_string()),
-        ]
-    );
     let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut ids: Vec<(&str, &str)> = after["entries"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .flat_map(|(kind, records)| {
+            records
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(move |id| (kind.as_str(), id.as_str()))
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [("memory", "hand_edited"), ("memory", "topic_entry")]);
     // A row this build cannot type survives byte-for-byte as JSON.
     assert_eq!(
         after["entries"]["memory"]["hand_edited"],
