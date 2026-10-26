@@ -137,21 +137,29 @@ impl SideQuestionRecorder {
         }
     }
 
-    pub(crate) fn ensure_started(&self, question: &str, provider: &str, model_id: &str) {
+    pub(crate) fn ensure_started(
+        &self,
+        question: &str,
+        provider: &str,
+        model_id: &str,
+    ) -> anyhow::Result<()> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.disabled || state.transcript.is_some() {
-            return;
+        anyhow::ensure!(
+            !state.disabled,
+            "side-question persistence is disabled for pane {}",
+            self.btw_id
+        );
+        if state.transcript.is_some() {
+            return Ok(());
         }
         if let Err(error) = self.ensure_started_inner(&mut state, question, provider, model_id) {
             state.disabled = true;
-            eprintln!(
-                "pa-daemon: side-question pointer {} disabled: {error:#}",
-                self.btw_id
-            );
+            return Err(error);
         }
+        Ok(())
     }
 
     pub(crate) fn record_turn(
@@ -679,7 +687,9 @@ mod tests {
     fn cancelled_partial_turn_has_pointer_message_usage_label_and_status() {
         let (_temp, core, registry) = fixture();
         let recorder = registry.resolve("pane:cancel", "cancel", true);
-        recorder.ensure_started("long?", "test-provider", "test-model");
+        recorder
+            .ensure_started("long?", "test-provider", "test-model")
+            .unwrap();
         let mut partial = assistant("partial", 0);
         partial.stop_reason = pa_agent::types::StopReason::Aborted;
         recorder.record_turn("long?", &partial, &[]);

@@ -1016,7 +1016,12 @@ impl SessionEngine for AgentSessionEngine {
                 )
             });
         if let Some(recorder) = &recorder {
-            recorder.ensure_started(&question, &model.provider, &model.id);
+            if let Err(error) = recorder.ensure_started(&question, &model.provider, &model.id) {
+                return SideQuestionOutcome::Failed {
+                    answer: String::new(),
+                    error: format!("Side-question persistence failed before admission: {error:#}"),
+                };
+            }
         }
         let previous_turns = request.previous_turns;
         let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;

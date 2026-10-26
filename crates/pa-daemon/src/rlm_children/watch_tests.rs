@@ -33,6 +33,7 @@ enum FakeKill {
 enum FakeChild {
     Healthy,
     PromptFails,
+    FirstPromptFailsAfterGate,
     Unreachable,
     /// The first `get_last_assistant_text` reads no text (the settle raced
     /// the worker's answer hand-off); later reads answer it.
@@ -201,7 +202,16 @@ async fn spawn_fake_supervisor(
                                 gate.copied.notify_one();
                                 gate.release.notified().await;
                             }
-                            response_success(Some(&id), command_type, None)
+                            if matches!(child, FakeChild::FirstPromptFailsAfterGate) {
+                                response_failure(
+                                    Some(&id),
+                                    command_type,
+                                    "first prompt refused after gate",
+                                    None,
+                                )
+                            } else {
+                                response_success(Some(&id), command_type, None)
+                            }
                         }
                         "wait_for_idle" => {
                             tokio::time::sleep(std::time::Duration::from_millis(idle_delay_ms))
@@ -977,6 +987,48 @@ async fn deletion_during_collect_release_wins_without_resurrection() {
     gate.release.notify_one();
     sessions.notify_turn_done();
     assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Cancellation between the first failed kickoff RPC and its retry prevents
+/// the retry from admitting work.
+#[tokio::test]
+async fn cancellation_between_kickoff_attempts_prevents_retry() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&gate)),
+        ..FakeChildSubagents::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::FirstPromptFailsAfterGate,
+        Arc::clone(&child),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+    let collect = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.collect(vec![child_id], 10_000).await })
+    };
+    gate.copied.notified().await;
+    assert!(sessions.cancel_child_run(&handle.rlm_child_id).await);
+    gate.release.notify_one();
+    let rows = collect
+        .await
+        .expect("collect task")
+        .expect("collect response");
+    assert_eq!(rows[0].status, "cancelled");
+    assert_eq!(
+        child.prompt_calls.load(Ordering::SeqCst),
+        1,
+        "no retry prompt"
+    );
 }
 
 /// A zero-timeout collect is a pure snapshot: it reports queued and does not
