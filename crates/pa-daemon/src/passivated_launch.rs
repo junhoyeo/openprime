@@ -7,14 +7,16 @@
 //! attach then fails), and no opened-with runtime config. The wake replays
 //! the durable create command the stopped worker ran with instead.
 //!
-//! In memory only, like the update roster's launch snapshot: a supervisor
-//! restart forgets the record and a later wake falls back to the header.
+//! Durable beside the descriptors (one record per canonical session file):
+//! the TS window held its revive config in the client process, so a daemon
+//! restart never lost it, and a supervisor restart must not lose it here.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 
 use pa_types::daemon::{DaemonCommand, DurableDaemonCreateCommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 /// The durable create-command keys that are not runtime config: the client
 /// env and the runtime metadata ride their own create fields, and the name
@@ -23,7 +25,8 @@ use serde_json::{Map, Value};
 const NON_CONFIG_KEYS: [&str; 4] = ["env", "runtimeMetadata", "name", "rlmChildId"];
 
 /// One passivated session's opened-with launch context.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PassivatedLaunch {
     create_command: DurableDaemonCreateCommand,
     telemetry_disabled: Option<bool>,
@@ -82,43 +85,46 @@ impl PassivatedLaunch {
     }
 }
 
-/// The passivated launch contexts, keyed by canonical session file.
-#[derive(Debug, Default)]
+/// The passivated launch records: `<dir>/<sha256(canonical session file)>.json`.
+#[derive(Debug)]
 pub(crate) struct PassivatedLaunches {
-    by_session_file: Mutex<HashMap<String, PassivatedLaunch>>,
+    dir: PathBuf,
 }
 
 impl PassivatedLaunches {
-    fn key(session_file: &str) -> String {
-        crate::lease::canonical_session_path(std::path::Path::new(session_file))
-            .to_string_lossy()
-            .to_string()
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self { dir }
     }
 
-    /// Record the context a passivated worker ran `session_file` with.
-    pub(crate) fn remember(&self, session_file: &str, launch: PassivatedLaunch) {
-        self.by_session_file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(Self::key(session_file), launch);
+    fn record_path(&self, session_file: &str) -> PathBuf {
+        let canonical = crate::lease::canonical_session_path(Path::new(session_file));
+        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+        let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.dir.join(format!("{name}.json"))
+    }
+
+    /// Record the context a passivated worker ran `session_file` with. A
+    /// failed write keeps the header fallback for that session's wake.
+    pub(crate) fn remember(
+        &self,
+        session_file: &str,
+        launch: &PassivatedLaunch,
+    ) -> anyhow::Result<()> {
+        crate::paths::ensure_dir(&self.dir)?;
+        let content = serde_json::to_string_pretty(launch)?;
+        crate::descriptor::write_file_atomic(&self.record_path(session_file), &content)
     }
 
     /// The recorded context for `session_file`, if its worker passivated.
     pub(crate) fn get(&self, session_file: &str) -> Option<PassivatedLaunch> {
-        self.by_session_file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&Self::key(session_file))
-            .cloned()
+        let content = std::fs::read_to_string(self.record_path(session_file)).ok()?;
+        serde_json::from_str(&content).ok()
     }
 
     /// Drop the record once a worker hosts the session again (any launch
     /// over the file): the new resident's descriptor owns the context.
     pub(crate) fn forget(&self, session_file: &str) {
-        self.by_session_file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&Self::key(session_file));
+        let _ = std::fs::remove_file(self.record_path(session_file));
     }
 }
 
@@ -170,5 +176,27 @@ mod tests {
             rest: Map::default(),
         };
         assert_eq!(create, expected);
+    }
+
+    /// The record is durable: a fresh store over the same directory (a
+    /// restarted supervisor) reads it back, by any spelling of the file.
+    #[test]
+    fn a_record_survives_a_fresh_store_and_is_spent_by_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = dir.path().join("session.jsonl");
+        std::fs::write(&session_file, "").unwrap();
+        let launch = PassivatedLaunch::new(
+            crate::descriptor::durable_create_command(&json!({ "cwd": "/fallback" })),
+            Some(true),
+        );
+        let records = dir.path().join("passivated-launches");
+        PassivatedLaunches::new(records.clone())
+            .remember(&session_file.to_string_lossy(), &launch)
+            .unwrap();
+        let restarted = PassivatedLaunches::new(records);
+        let spelled = dir.path().join(".").join("session.jsonl");
+        assert_eq!(restarted.get(&spelled.to_string_lossy()), Some(launch));
+        restarted.forget(&session_file.to_string_lossy());
+        assert_eq!(restarted.get(&session_file.to_string_lossy()), None);
     }
 }

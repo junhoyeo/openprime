@@ -6,7 +6,8 @@
 //!
 //! - b2bb37bb2 / 48fae2a5a / 843615757 / 837be6824 (+ 502e7a496): a
 //!   transcript opened with an explicit fallback cwd (its recorded
-//!   directory is missing) revives in that fallback instead of dead-ending;
+//!   directory is missing) revives in that fallback instead of dead-ending,
+//!   also across a supervisor restart;
 //! - e32bce384 (+ 837be6824): the opened-with runtime config (system prompt
 //!   append, telemetry opt-out) survives the wake, so an opted-out client
 //!   can still attach and the revived worker never reports telemetry;
@@ -842,5 +843,76 @@ fn a_revival_keeps_a_sibling_attached_and_leaves_no_stale_attachment() {
         attached_clients(&mut driver, "count-0"),
         0,
         "no stale attachment pins the session against idle passivation"
+    );
+}
+
+/// Rows b2bb37bb2 / 48fae2a5a / 843615757 / 837be6824 / e32bce384 across a
+/// supervisor restart: the TS window held its revive config in the client
+/// process, so a daemon restart never lost it. The passivated session's
+/// launch context is durable here too: after the supervisor restarts, the
+/// durable-id rebind attach still revives the session in its fallback cwd
+/// and under the opted-out telemetry.
+#[test]
+fn a_passivated_launch_context_survives_a_supervisor_restart() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let fallback = dir.path().join("fallback");
+    std::fs::create_dir_all(&fallback).expect("fallback dir");
+    let saved = write_missing_cwd_transcript(&sessions, &dir.path().join("gone"));
+    let socket = dir.path().join("daemon.sock");
+    let daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "sessionPath": saved,
+            "telemetryDisabled": true,
+            "config": {
+                "cwd": fallback,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "fallback open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = client.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    passivate(&mut client, &agent_dir, &active, "passivate");
+
+    // The supervisor restarts (an update, a crash): nothing in memory survives.
+    drop(client);
+    drop(daemon);
+    let _ = std::fs::remove_file(&socket);
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let attached = client.request(
+        "attach-durable",
+        &json!({ "type": "attach", "activeSessionId": session_id, "telemetryDisabled": true }),
+    );
+    assert_eq!(
+        attached["success"], true,
+        "the restarted daemon must revive with the opened-with telemetry opt-out: {attached}"
+    );
+    let woken = client
+        .live_active_id("list", &session_id)
+        .expect("the revived session is live");
+    assert_eq!(
+        pwd_output(&client.pwd("pwd", &woken)),
+        canonical(&fallback),
+        "the restarted daemon must revive in the fallback the session was opened with"
     );
 }
