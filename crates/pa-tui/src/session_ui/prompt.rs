@@ -521,6 +521,14 @@ impl SessionUi {
         self.dirty = true;
         let previous_turns =
             (!previous_turns.is_empty()).then_some(serde_json::Value::Array(previous_turns));
+        let pane_id = self
+            .side_question_pane_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        let pane_id = self
+            .client
+            .supports_server_capability("side_question_pane_id")
+            .then_some(pane_id);
         let started = self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -530,6 +538,7 @@ impl SessionUi {
                     side_question_id: id.clone(),
                     question: question.to_string(),
                     previous_turns,
+                    pane_id,
                     rest: Map::default(),
                 },
             )
@@ -584,6 +593,7 @@ impl SessionUi {
                 });
             }
         }
+        self.side_question_pane_id = None;
         view.side_pane = None;
         self.dirty = true;
     }

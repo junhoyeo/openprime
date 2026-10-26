@@ -497,6 +497,10 @@ pub enum DaemonCommand {
         question: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_turns: Option<Value>,
+        /// Stable identity of the open `/btw` pane. Optional and capability-gated so
+        /// older daemons continue to serve side questions without transcript grouping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },

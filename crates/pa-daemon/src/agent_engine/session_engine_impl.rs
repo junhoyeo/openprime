@@ -1003,6 +1003,18 @@ impl SessionEngine for AgentSessionEngine {
             }
         };
         let question = request.question.clone();
+        let recorder = self
+            .side_question_recorders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|registry| {
+                registry.resolve(
+                    &request.recorder_key,
+                    &request.btw_id,
+                    request.reuse_recorder,
+                )
+            });
         let previous_turns = request.previous_turns;
         let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;
         // TS `unwrapSemanticEdgeStreamFn`: the side call runs on the
@@ -1010,11 +1022,16 @@ impl SessionEngine for AgentSessionEngine {
         // and the ledger records nothing. The engine build always wires
         // it; no fallback to the agent's own fn, which would leak the
         // id-carrying wrapper into the side call.
-        let side_stream_fn = {
+        let (side_stream_fn, compaction_settings) = {
             let guard = self.session.blocking_lock();
-            guard
-                .as_deref()
-                .and_then(|engine| engine.session.side_question_stream_fn())
+            (
+                guard
+                    .as_deref()
+                    .and_then(|engine| engine.session.side_question_stream_fn()),
+                guard
+                    .as_deref()
+                    .map(|engine| engine.session.compaction_settings()),
+            )
         };
         let Some(side_stream_fn) = side_stream_fn else {
             return SideQuestionOutcome::Failed {
@@ -1030,9 +1047,30 @@ impl SessionEngine for AgentSessionEngine {
                     &question,
                     &previous_turns,
                     &retry_policy,
+                    compaction_settings.as_ref(),
                     signal,
                     sink,
                 ));
+        if let (Some(recorder), Some(assistant)) = (&recorder, result.assistant.as_ref()) {
+            recorder.record_turn(&question, assistant, &result.auxiliary_completions);
+        }
+        if let Some(recorder) = &recorder {
+            match result.status {
+                pa_core::session_engine::side_question::SideQuestionStatus::Complete => {}
+                pa_core::session_engine::side_question::SideQuestionStatus::Cancelled => {
+                    recorder.record_status(
+                        crate::side_question_store::SideQuestionRecordStatus::Cancelled,
+                        None,
+                    );
+                }
+                pa_core::session_engine::side_question::SideQuestionStatus::Error => {
+                    recorder.record_status(
+                        crate::side_question_store::SideQuestionRecordStatus::Error,
+                        result.error_message.as_deref(),
+                    );
+                }
+            }
+        }
         match result.status {
             pa_core::session_engine::side_question::SideQuestionStatus::Complete => {
                 SideQuestionOutcome::Complete {

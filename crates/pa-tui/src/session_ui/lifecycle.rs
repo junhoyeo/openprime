@@ -89,6 +89,7 @@ impl SessionUi {
             anthropic_subscription_warning_shown: false,
             anthropic_warning_mark_pending: std::sync::Arc::default(),
             active_side_question_id: None,
+            side_question_pane_id: None,
             side_question_counter: 0,
             share: None,
             reload: None,

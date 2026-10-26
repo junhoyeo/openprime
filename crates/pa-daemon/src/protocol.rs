@@ -337,6 +337,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "heartbeat_management",
                 "model_catalog",
                 "side_question_transcript",
+                "side_question_pane_id",
                 "transient_bash",
                 "kernel_bash_activity",
                 "persistent_shells",
@@ -1071,6 +1072,47 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn side_question_pane_identity_is_optional_and_capability_advertised() {
+        let with_pane = serde_json::json!({
+            "type": "command",
+            "id": "sq1",
+            "protocol": current_protocol_info(),
+            "command": {
+                "type": "start_side_question",
+                "activeSessionId": "session",
+                "sideQuestionId": "turn-1",
+                "question": "why?",
+                "paneId": "pane-stable"
+            }
+        })
+        .to_string();
+        let parsed = parse_daemon_command_line(&with_pane).unwrap();
+        let DaemonCommand::StartSideQuestion { pane_id, .. } = parsed.command else {
+            panic!("start_side_question command");
+        };
+        assert_eq!(pane_id.as_deref(), Some("pane-stable"));
+
+        let legacy = serde_json::json!({
+            "type": "command",
+            "id": "sq2",
+            "protocol": current_protocol_info(),
+            "command": {
+                "type": "start_side_question",
+                "activeSessionId": "session",
+                "sideQuestionId": "turn-2",
+                "question": "why again?"
+            }
+        })
+        .to_string();
+        let parsed = parse_daemon_command_line(&legacy).unwrap();
+        let DaemonCommand::StartSideQuestion { pane_id, .. } = parsed.command else {
+            panic!("legacy start_side_question command");
+        };
+        assert_eq!(pane_id, None);
+        assert!(default_server_capabilities().contains(&"side_question_pane_id".to_string()));
+    }
 
     #[test]
     fn kernel_bash_activity_commands_are_session_scoped() {

@@ -195,6 +195,7 @@ impl AgentSessionEngine {
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
             compaction_summary_sink: std::sync::Mutex::new(None),
+            side_question_recorders: std::sync::Mutex::new(None),
             progress_notes: std::sync::Mutex::new(None),
             progress_note_emit: std::sync::Mutex::new(None),
             model_refusal_telemetry,
@@ -217,6 +218,16 @@ impl AgentSessionEngine {
             .autonomous_driver
             .write()
             .expect("autonomous driver lock") = driver;
+    }
+
+    pub(crate) fn set_side_question_recorders(
+        &self,
+        recorders: std::sync::Arc<crate::side_question_store::SideQuestionPaneRegistry>,
+    ) {
+        *self
+            .side_question_recorders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(recorders);
     }
 
     pub(crate) fn cwd(&self) -> std::path::PathBuf {

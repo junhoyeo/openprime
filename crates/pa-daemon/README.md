@@ -243,6 +243,8 @@ broadcast owns its surface here too (the worker's cron-store
 to every client, so any heartbeat mutation anywhere in the daemon reaches
 attached UIs daemon-wide).
 
+Side-question lifecycle (`side_question` + `side_question_store`): `/btw` runs stream through the worker, settle before close, and persist each pane as a depth-zero linked transcript under the parent artifact directory. One immutable `side_question` pointer in the parent keeps the side messages out of main context while preserving their complete paid usage. Negotiated `side_question_pane_id` groups follow-ups across reconnects; legacy pointer/transcript files resume in place.
+
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 

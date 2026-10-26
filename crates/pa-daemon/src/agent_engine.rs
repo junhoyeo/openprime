@@ -228,6 +228,11 @@ pub struct AgentSessionEngine {
     /// session. `None` without a worker pump.
     compaction_summary_sink:
         std::sync::Mutex<Option<pa_core::session_engine::compaction_exec::SummaryDeltaSink>>,
+    /// The worker-owned durable `/btw` recorder registry. It is installed after
+    /// the worker core exists; standalone engines leave side turns unpersisted.
+    pub(crate) side_question_recorders: std::sync::Mutex<
+        Option<std::sync::Arc<crate::side_question_store::SideQuestionPaneRegistry>>,
+    >,
     /// The built session's progress-note store, mirrored at every build
     /// adoption; `None` until the first build.
     pub(crate) progress_notes: std::sync::Mutex<
