@@ -27,6 +27,7 @@ The complete 99-commit, non-merge legacy inventory is in:
 - [`evidence/providers.md`](evidence/providers.md), the final provider review/provenance record plus combined safe-metadata seam evidence.
 - [`evidence/kernel.md`](evidence/kernel.md), the retain-only immutable-generation/diagnostics review and hermetic ABI evidence, including native holds.
 - [`evidence/lifecycle.md`](evidence/lifecycle.md), the final RLM/`/btw`/heartbeat review and combined hermetic evidence, with both isolation incidents and native hold.
+- [`evidence/native-collect.md`](evidence/native-collect.md), the one approved combined faux collect run, including its successful core behavior, post-collection harness failure, and exact cleanup.
 
 Each commit and PR #32/#33 must end in exactly one state:
 
@@ -58,7 +59,9 @@ Shared `pa-core` and CLI seams require owner coordination. Duplicate or stub imp
 
 ## Safety boundary
 
-All runtime and state checks use a temporary `HOME`, explicit temporary daemon socket, isolated session directories, copied or synthetic fixtures, private build output, and mock provider endpoints. Tests never auto-discover or stop the installed daemon. Real OAuth files are neither read into tracked artifacts nor copied into another runtime. No test mutates `~/.prime`, `~/prime-agent`, the installed symlinks, gateway configuration, or existing processes.
+Runtime and state checks must use a resolved-path preflight, short owned root, explicit agent/session/kernel/socket paths, copied or synthetic fixtures, private build output, and mock providers. Tests must never auto-discover or stop the installed daemon. Real OAuth values are never copied into another runtime or recorded in evidence.
+
+Two non-accepted worker attempts violated isolation and remain preserved as incident evidence rather than being erased: a lifecycle attempt omitted the agent-dir override and wrote one synthetic child artifact under the real `~/.prime` artifact tree; a kernel test selected the real managed interpreter when its test-specific Python override was omitted. The lifecycle artifact was not deleted, the exact owned test processes were stopped, and neither attempt counts as acceptance. Records: `/tmp/openprime-native-isolation-incident-audit.md` and `/tmp/openprime-kernel-isolation-incident.md`. Later hermetic/native work uses pre-write resolver guards; absence of intentional writes is never presented as proof of no mutation when no before-state exists.
 
 State-compatibility acceptance is not satisfied by `--version`. Before cutover, the integrated binary must prove all of the following while original evidence remains byte-identical:
 
@@ -129,6 +132,6 @@ After every blocker is closed, the integration lead will provide the tested Rust
 
 ## Current blockers
 
-The scout inventory is fully recorded, and inventory disposition remains separate from verification outcome. The independently reviewed provider lane plus combined safe metadata seam now closes 10 rows as `ported`, 4 as `verified-upstream-equivalent`, and 2 as `truly-obsolete`; 83 remain `BLOCKED`. Multiple legacy commits that name one invariant may share one reviewed regression proof. Skills are integrated/Terra-clear but remain blocked on the post-kernel staged package rerun. Lifecycle and kernel are not integrated and remain review-blocked. PR #32 remains open through final Rust acceptance; PR #33 tracks both Aside indexing (`4af3c6d89`) and Unicode smart-case (`5d4d1eb26`) and also stays open.
+The scout inventory is fully recorded, and inventory disposition remains separate from verification outcome. The independently reviewed provider lane plus combined safe metadata seam closes 10 rows as `ported`, 4 as `verified-upstream-equivalent`, and 2 as `truly-obsolete`; 83 remain `BLOCKED`. Skills, kernel, and lifecycle source are now integrated and independently CLEAR, but their rows stay blocked until combined package/native/state acceptance closes. Multiple legacy commits naming one invariant may share one reviewed regression proof. PR #32 and PR #33 remain open through final migration landing.
 
-The known pinned-base native blocker is the immediate spawn-to-collect positive-timeout race. State compatibility, final integrated package assembly and real-cell receipts, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.
+The spawn-to-positive-collect source race is fixed. One approved combined native case returned the expected terminal child inside the parent turn in 0.782 seconds and later recorded exactly one spawn row, but its post-collection harness exited 1 because it looked for the child JSONL in the wrong contained directory; no unchanged rerun occurred and parent acceptance of that evidence is pending. Remaining blockers are copied legacy state/`/btw` semantic fixtures, final packaged ABI2/skills self-bootstrap, exact-tip workspace gates, substantive (non-skipped) Rust CI, changed-surface parity, and independent combined review.
