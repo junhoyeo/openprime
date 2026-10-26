@@ -196,6 +196,55 @@ fn models_json_custom_models_and_auth_header() {
 }
 
 #[test]
+fn gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    std::fs::write(
+        &models_path,
+        serde_json::json!({
+            "providers": { "openai": {
+                "baseUrl": "http://127.0.0.1:8787/v1",
+                "apiKey": "synthetic-gateway-key",
+                "models": [{
+                    "id": "gpt-6-astra", "name": "GPT-6 Astra",
+                    "api": "openai-responses", "reasoning": true,
+                    "input": ["text", "image"],
+                    "cost": {"input": 10, "output": 50, "cacheRead": 1, "cacheWrite": 12.5},
+                    "contextWindow": 1_050_000, "maxTokens": 128_000
+                }],
+                "modelOverrides": {
+                    "gpt-6-astra": {"compat": {"supportsFastMode": true}}
+                }
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut registry =
+        ModelRegistry::create(auth_without_env(&serde_json::json!({})), &models_path);
+    assert!(registry.get_error().is_none());
+    let model = registry
+        .get_all()
+        .iter()
+        .find(|model| model.provider == "openai" && model.id == "gpt-6-astra")
+        .expect("custom Astra model")
+        .clone();
+    assert_eq!(model.api, "openai-responses");
+    assert_eq!(model.base_url, "http://127.0.0.1:8787/v1");
+    assert_eq!(model.context_window, 1_050_000);
+    assert_eq!(model.max_tokens, 128_000);
+    assert!(pa_types::ai::supports_fast_mode(&model));
+    assert_eq!(
+        registry
+            .get_api_key_and_headers(&model, None)
+            .api_key
+            .as_deref(),
+        Some("synthetic-gateway-key")
+    );
+}
+
+#[test]
 fn models_json_error_keeps_built_ins() {
     let dir = tempfile::tempdir().unwrap();
     let models_path = dir.path().join("models.json");
