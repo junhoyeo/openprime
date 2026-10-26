@@ -28,6 +28,7 @@ The complete 99-commit, non-merge legacy inventory is in:
 - [`evidence/kernel.md`](evidence/kernel.md), the retain-only immutable-generation/diagnostics review and hermetic ABI evidence, including native holds.
 - [`evidence/lifecycle.md`](evidence/lifecycle.md), the final RLM/`/btw`/heartbeat review and combined hermetic evidence, with both isolation incidents and native hold.
 - [`evidence/state-compat.md`](evidence/state-compat.md), legacy session/harness/skill/auth/`/btw`/archive state compatibility from synthetic TS-writer fixtures, with its independent review.
+- [`evidence/attach.md`](evidence/attach.md), the attach event-window and supersession lane with its scope-limited review.
 - [`evidence/refine-cancel.md`](evidence/refine-cancel.md), the refine surfacing and cancellation lane (Option A, TS parity) with its review history.
 - [`evidence/revival.md`](evidence/revival.md), the integrated revival launch-context/switched-cwd lane with its scope-limited review and open residuals R1-R4.
 - [`evidence/native-collect.md`](evidence/native-collect.md), the one approved combined faux collect run, including its successful core behavior, post-collection harness failure, and exact cleanup.

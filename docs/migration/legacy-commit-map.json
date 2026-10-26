@@ -434,10 +434,17 @@
       "notes": "fork-side reconciliation with upstream v0.9.6 merge; meaningless on a Rust base.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; F1-F3 (T1,T4,H1; H2)"
+        }
+      ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): F1-F3 (T1,T4,H1; H2); final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "69bea2c159eea0107bfecc01b2fb9ebf80c11517",
@@ -1382,10 +1389,17 @@
       "notes": "TS test asserts resume guarantee",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; create_reuse_e2e::create_over_a_live_worker_answers_the_live_binding + create_join_e2e"
+        }
+      ],
       "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): create_reuse_e2e::create_over_a_live_worker_answers_the_live_binding + create_join_e2e; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "6865437be45315a882a8298abc34d9cbfce411f9",
@@ -3200,10 +3214,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; F4 (H4 red->green, H3); agents-view reviveConfig half = revival lane"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): F4 (H4 red->green, H3); agents-view reviveConfig half = revival lane; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "c5e9a2a5f74713244e93132192e61e35f748bdea",
@@ -3245,10 +3266,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; ownership capability obsolete (T2/T3); cwd half proven by the revival lane"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): ownership capability obsolete (T2/T3); cwd half proven by the revival lane; final combined acceptance pending",
+      "candidate_verification_status": "truly-obsolete"
     },
     {
       "hash": "837be68249a6e6d631c7bc50ca0814b0cbbb13d1",
@@ -3407,10 +3435,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; per-connection subscriptions; T2,T3"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): per-connection subscriptions; T2,T3; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "60afe1a781cf9e37466bf65c78eeb6138d41da8f",
@@ -3453,10 +3488,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; T2,T3; H2 detach-after-attach order"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): T2,T3; H2 detach-after-attach order; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "38b69af3a15f2ff66b3b0f55e2bfc66d210df858",
@@ -3497,10 +3539,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; no client revival resync; F4"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): no client revival resync; F4; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "ec5e6766e57ee41ace0c9b31d0457b9f93b1d519",
@@ -3541,10 +3590,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; revival sibling test; wasAttached truly obsolete"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): revival sibling test; wasAttached truly obsolete; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "5a19fe961441376cbb87a5800e19e0ea400b191a",
@@ -3585,10 +3641,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; F4 (H4)"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): F4 (H4); final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "b66ce86d3f3c57d532c36f025e3bfd6cb53548f0",
@@ -3629,10 +3692,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; T1,T4,H1"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): T1,T4,H1; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "324f9b63749ccfc71a1ab6d890b21d4d12226992",
@@ -3673,10 +3743,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; H5"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): H5; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "0d2e4ed73222f1cb940558f77cdeed5413b5d670",
@@ -3717,10 +3794,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; H1,T1"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): H1,T1; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "ba1ad540dd9e8f73f4aa632a9e1bf4ee86dd31cc",
@@ -3761,10 +3845,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; structural, Rust TUI never requests chunked_snapshot; loss class closed by T1/T4"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): structural, Rust TUI never requests chunked_snapshot; loss class closed by T1/T4; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "8109307ac3bbbb898f6e21a2ace2ed69d9ea46f6",
@@ -3805,10 +3896,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; structural, as ba1ad540d"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): structural, as ba1ad540d; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "fed4fd4c7624a33459a0cd62d8d4919977f87e35",
@@ -3893,10 +3991,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; H2 green at base"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): H2 green at base; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "b06797e3218a8c45963cdb81ff8996830b6ee3d7",
@@ -3987,10 +4092,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; T1,T4,H1,H2"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): T1,T4,H1,H2; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "6470a60e7f3ec2ed7e1bf26b56ed230ae51297ca",
@@ -4087,10 +4199,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; H2 green at base"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): H2 green at base; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "3201db6436272687236b1d52658444da115a1fb6",
@@ -4131,10 +4250,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; H2+H5; single UI loop attach"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): H2+H5; single UI loop attach; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "4d987e7008fff296f5c547f23cba948b1634a3dd",
@@ -4175,10 +4301,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; H2+H5; single UI loop attach"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): H2+H5; single UI loop attach; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "966c11aa77a73ffd8634f063d8de1d49477b72f7",
@@ -4219,10 +4352,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "attach-evidence",
+          "ref": "docs/migration/evidence/attach.md",
+          "note": "verify/attach-window-int 4a740ed50, lifecycle-review-opus CLEAR (scope-limited); integrated ..9307b29e6; F5 + revival passivated_launch; H5/H4; structural"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "attach lane integrated and CLEAR (scope-limited): F5 + revival passivated_launch; H5/H4; structural; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "502e7a496c9c6923063a30067fd5215443c62659",
