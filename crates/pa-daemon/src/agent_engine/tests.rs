@@ -411,6 +411,11 @@ fn corrupt_side_pointer_stops_before_provider_admission() {
     use crate::session_store::{session_file_name, SessionFile};
     use std::io::Write as _;
 
+    // The faux provider registry is process-global: a parallel faux test would drain or
+    // replace this test's one scripted response.
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path().join("agent");
     let sessions = dir.path().join("sessions");
