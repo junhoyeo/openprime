@@ -62,8 +62,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fork safety: both jobs create repository state. Keep the hard-coded
+  # origin guard; scripts/release/test_fork_release_target.py enforces it.
   prepare:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.repository == 'junhoyeo/openprime' && github.event_name == 'workflow_dispatch'
     name: open the release PR
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -284,6 +286,7 @@ jobs:
     # The title prefix is the release marker set by the prepare act; every
     # other merged PR skips here without touching the release bot.
     if: >-
+      github.repository == 'junhoyeo/openprime' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&

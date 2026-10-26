@@ -638,6 +638,8 @@ jobs:
           path: restamped/artifacts-x86_64-unknown-linux-gnu/*
           if-no-files-found: error
 
+  # Fork safety: the build jobs may verify tags anywhere, but only origin is
+  # allowed to publish channel metadata, assets, or rolling releases.
   promote:
     # One gate for both build routes: the stable build jobs (plain tags) or
     # the reuse-continuous set (beta tags) upload the same artifacts-<target>
@@ -652,7 +654,7 @@ jobs:
     # promote skipped, matching the pre-consume failure semantics. The
     # artifact completeness assertion inside the gate is the belt behind the
     # routing: an incomplete set fails the promotion loudly either way.
-    if: ${{ !cancelled() && needs.build-windows.result == 'success' && (
+    if: ${{ github.repository == 'junhoyeo/openprime' && !cancelled() && needs.build-windows.result == 'success' && (
           (needs.build-gnu.result == 'success' && needs.build-darwin.result == 'success')
           || needs.reuse-continuous.result == 'success') }}
     needs: [build-gnu, build-darwin, build-windows, reuse-continuous]
@@ -1266,7 +1268,7 @@ jobs:
     # exactly the one healthy state: a green promote - the only producer of
     # the nightly-refresh-payload artifact - on a -beta* tag. A failed,
     # skipped, or cancelled promote leaves the refresh skipped.
-    if: ${{ !cancelled() && needs.promote.result == 'success' && contains(github.ref_name, '-') }}
+    if: ${{ github.repository == 'junhoyeo/openprime' && !cancelled() && needs.promote.result == 'success' && contains(github.ref_name, '-') }}
     name: rolling nightly release refresh (the nightly channel's discoverable base)
     concurrency:
       group: rolling-nightly-refresh

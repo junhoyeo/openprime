@@ -1,5 +1,6 @@
 # Merge gate (AGENTS.md): fmt + clippy + test + release build must pass before every merge.
 check:
+	python3 scripts/release/test_fork_release_target.py
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
@@ -207,3 +208,10 @@ legacy-upgrade-gates:
 	python3 scripts/release/test_npm_bridge.py
 
 .PHONY: legacy-upgrade-gates
+
+# Fork ownership gate: write-capable release jobs must be unable to publish
+# from an accidental copy of these workflows in the upstream repository.
+fork-release-gates:
+	python3 scripts/release/test_fork_release_target.py
+
+.PHONY: fork-release-gates

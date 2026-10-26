@@ -90,7 +90,10 @@ env:
   HAS_RELEASE_BOT: ${{ secrets.RELEASE_BOT_CLIENT_ID != '' && secrets.RELEASE_BOT_PRIVATE_KEY != '' }}
 
 jobs:
+  # Fork safety: this job writes tags. A copied workflow must never publish
+  # from PrimeIntellect-ai/prime-agent or any repository other than origin.
   cut:
+    if: github.repository == 'junhoyeo/openprime'
     name: "cut the nightly beta tag (tag-only commit, never a branch change)"
     runs-on: ubuntu-latest
     # THE WAIT'S BUDGET: the pushed commit's continuous run must conclude
