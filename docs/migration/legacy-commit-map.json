@@ -67,7 +67,8 @@
     "behavioral_acceptance_note": "Source disposition != behavioral acceptance. covered-by-rewrite / already-covered are source-level readings of the frozen tip. Medium/low-confidence rows stay BLOCKED until lane verifiers pass. Disproved so far: kernel generation/bootstrap rewrite claims (venv/stderr cluster — real gaps per kernel lane tests+source review); bd15cf317 custom fast-mode compat (provider lane: missing); adde4cc6b queued/admission state (session lane: measured spawn->collect race; already re-dispositioned must-port in this ledger).",
     "cutover_policy": "CONDITIONAL cutover only: never run unqualified `prime-agent update` on the fork install — the updater resolves latest.json under PRIME_AGENT_DOWNLOAD_BASE_URL or the DEFAULT upstream bucket and may install upstream artifacts. Use a fork-artifact channel (publish jobs pinned to fork origin, 93c2a3f6a) or isolated manual install, after URL/channel + checksum verification.",
     "provider_final_review": "docs/migration/evidence/providers.md",
-    "kernel_final_review": "docs/migration/evidence/kernel.md"
+    "kernel_final_review": "docs/migration/evidence/kernel.md",
+    "lifecycle_final_review": "docs/migration/evidence/lifecycle.md"
   },
   "commits": [
     {
@@ -1202,11 +1203,29 @@
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
       "notes": "Fork btw feature: persist side-question pointer + full spend. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "1bfc4904b1fa778296fe1135f26557d6a528b9e7",
@@ -1233,11 +1252,29 @@
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
       "notes": "Fork btw feature: capability-gate side-question pane ids on the wire. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "a4ca8cbd8ccd5b44718e9ea8eee184cdcb13e9be",
@@ -1267,11 +1304,29 @@
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
       "notes": "Fork btw feature: persist side conversations as linked sub-sessions — upstream /btw is ephemeral by design. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "660476b2485e01ebce78fe3a4ba574d017ed0723",
@@ -1493,11 +1548,29 @@
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
       "notes": "Fork btw feature: settle btw panes reliably (TUI/daemon). MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "4f60d6426661c077c63b409a9efb1e867b8ad8e7",
@@ -1663,11 +1736,29 @@
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
       "notes": "Fork btw feature: honor hooks during btw compaction. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "ecb6288b88494e38f2e291da0f7a6a74c0c37472",
@@ -1696,11 +1787,29 @@
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
       "notes": "Fork btw feature: auto-compact btw context (upstream has only a 3-turn cap). MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "0b5676b6498cf0ecb89dbffc530b2f67545b8f18",
@@ -2447,11 +2556,29 @@
       "port_target": "pa-core kernel/factory + pa-daemon agent_engine (rlm children state) + prime-agent-runtime/src/rlm/__init__.py registry statuses",
       "notes": "Partially covered upstream; the measured spawn→collect race is exactly the gap the fork closed with a distinct `queued` state and bounded startup-failure details. rust-port-sessions owns the red-first host regression/fix; use fork tests test_subagent_registry.py::test_lists_queued_subagents_from_host and agent-session-recursion \"normalizes and bounds startup failures\" as reference.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3746db134",
+        "77ef88fe7",
+        "62997a6e5",
+        "46b7d10a2",
+        "511f0a774",
+        "33d394568",
+        "4077a6931",
+        "ef2b71c59",
+        "c2ae42415",
+        "a02416f19"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "lifecycle-evidence",
+          "ref": "docs/migration/evidence/lifecycle.md",
+          "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "43556ee4f9ddbcf7956164443877eb8c71fd8a0b",

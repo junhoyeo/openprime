@@ -26,6 +26,7 @@ The complete 99-commit, non-merge legacy inventory is in:
 - [`evidence/skills.md`](evidence/skills.md), the integrated #33 source/package/review record with disclosed non-green attempts.
 - [`evidence/providers.md`](evidence/providers.md), the final provider review/provenance record plus combined safe-metadata seam evidence.
 - [`evidence/kernel.md`](evidence/kernel.md), the retain-only immutable-generation/diagnostics review and hermetic ABI evidence, including native holds.
+- [`evidence/lifecycle.md`](evidence/lifecycle.md), the final RLM/`/btw`/heartbeat review and combined hermetic evidence, with both isolation incidents and native hold.
 
 Each commit and PR #32/#33 must end in exactly one state:
 
