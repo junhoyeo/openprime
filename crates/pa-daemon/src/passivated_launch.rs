@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use pa_types::daemon::{DaemonCommand, DurableDaemonCreateCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 /// The durable create-command keys that are not runtime config: the client
 /// env and the runtime metadata ride their own create fields, and the name
@@ -97,8 +96,7 @@ impl PassivatedLaunches {
 
     fn record_path(&self, session_file: &str) -> PathBuf {
         let canonical = crate::lease::canonical_session_path(Path::new(session_file));
-        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-        let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let name = crate::paths::hash_key(&canonical.to_string_lossy(), 64);
         self.dir.join(format!("{name}.json"))
     }
 
