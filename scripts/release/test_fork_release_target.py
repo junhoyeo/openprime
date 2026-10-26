@@ -31,6 +31,20 @@ def job_block(text: str, job: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def workflow_trigger_block(text: str) -> str:
+    lines = text.splitlines()
+    try:
+        start = lines.index("on:")
+        end = next(
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("permissions:")
+        )
+    except (ValueError, StopIteration) as error:
+        raise AssertionError("workflow must have explicit on:/permissions: boundaries") from error
+    return "\n".join(lines[start:end])
+
+
 def job_condition(block: str, job: str) -> str:
     lines = block.splitlines()
     for index, line in enumerate(lines):
@@ -57,7 +71,19 @@ def main() -> None:
                     f"got {condition!r}"
                 )
             checked += 1
-    print(f"fork release target policy passed: {checked} jobs target {REPOSITORY}")
+    nightly = (ROOT / ".github/workflows/nightly.yml").read_text(encoding="utf-8")
+    triggers = workflow_trigger_block(nightly)
+    if "\n  push:" in triggers:
+        raise AssertionError(
+            "nightly.yml must stay manual-dispatch-only: an ordinary main merge cannot cut a tag"
+        )
+    if "\n  workflow_dispatch:" not in triggers:
+        raise AssertionError("nightly.yml must retain its explicit manual dispatch control")
+
+    print(
+        f"fork release target policy passed: {checked} jobs target {REPOSITORY}; "
+        "nightly is manual-dispatch-only"
+    )
 
 
 if __name__ == "__main__":

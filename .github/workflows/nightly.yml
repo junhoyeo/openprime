@@ -5,18 +5,12 @@
 # parent only by the workspace version rows, and no branch head ever
 # references it.
 #
-# CADENCE (the operator's ruling: the beta channel follows EVERY green
-# tip - 'nightly' meant the beta release, and the beta updates on every
-# commit, not once a night): every push to `main` fires a cut for that
-# commit. The cut WAITS for the pushed commit's `continuous` run to
-# conclude green (the proven-built evidence: the tip CI must have greened
-# on that commit) before tagging. The SUPERSEDE cost-guard keeps busy days
-# cheap: this job's concurrency group cancels the in-flight WAIT when a
-# newer push lands (nothing has been tagged during the wait), and
-# release.yml's beta publish refuses to move the channel pointers when a
-# newer commit exists on main - so only the LATEST green commit ever
-# advances the channel, and 20 merges cost at most a handful of actual
-# beta cuts, each the freshest green.
+# FORK CADENCE: manual dispatch only. Merging the Rust migration (or any
+# ordinary change) into `junhoyeo/openprime` must never cut a tag or publish a
+# beta as a side effect. A supervised dispatch resolves the newest proven-green
+# `main` commit using the existing walk below; release.yml then handles the tag.
+# This deliberately replaces upstream's per-push rolling-beta trigger while
+# preserving the build/provenance machinery for an explicit future release.
 #
 # The cut, in order:
 #   1. Resolve the parent: the pushed commit (waiting out its `continuous`
@@ -63,14 +57,8 @@
 name: nightly
 
 on:
-  # The rolling beta (the operator's ruling): every push to `main` fires a
-  # cut for that commit; the cut waits out the pushed commit's continuous
-  # CI before tagging (the proven-built evidence).
-  push:
-    branches:
-      - main
-  # The operator's supervised cut: resolves the newest proven-green commit
-  # instead of a pushed one (the walk).
+  # Explicit operator action only: resolves the newest proven-green `main`
+  # commit instead of turning an ordinary merge into a release.
   workflow_dispatch: {}
 
 permissions: {}
