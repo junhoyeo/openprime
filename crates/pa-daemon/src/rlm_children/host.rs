@@ -300,6 +300,15 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         child_session_file.as_deref(),
                         &kickoff_row_id,
                     );
+                    let retry_allowed = {
+                        let record = watcher_record.lock().await;
+                        !record.closed_by_parent
+                            && !record.retiring
+                            && record.settled_status.is_none()
+                    };
+                    if !landed && !retry_allowed {
+                        return;
+                    }
                     let retried = if landed {
                         Ok(())
                     } else {

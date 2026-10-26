@@ -284,7 +284,8 @@ enum UiInput {
     /// rows re-render their `◷` counts.
     HeartbeatsLoaded {
         generation: u64,
-        heartbeats: Vec<crate::heartbeats_picker::HeartbeatEntry>,
+        heartbeats: Option<Vec<crate::heartbeats_picker::HeartbeatEntry>>,
+        error: Option<String>,
     },
     /// A `list_persistent_shells` fetch landed (`None`: it failed, the last list stays).
     PersistentShellsLoaded(Option<Value>),
@@ -1063,9 +1064,15 @@ async fn run_agents_view_surface(
                 UiInput::HeartbeatsLoaded {
                     generation,
                     heartbeats,
+                    error,
                 } => {
                     if generation == heartbeat_generation {
-                        mode.heartbeats = heartbeats;
+                        if let Some(heartbeats) = heartbeats {
+                            mode.heartbeats = heartbeats;
+                        }
+                        if let Some(error) = error {
+                            mode.set_status_tone(&error, StatusTone::Warning);
+                        }
                     }
                 }
                 UiInput::PersistentShellsLoaded(data) => {
