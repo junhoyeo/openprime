@@ -714,7 +714,7 @@ impl Supervisor {
                 (
                     file,
                     crate::passivated_launch::PassivatedLaunch::new(
-                        descriptor.create_command.clone(),
+                        &descriptor.create_command,
                         descriptor.telemetry_disabled,
                     ),
                 )
@@ -736,12 +736,19 @@ impl Supervisor {
                 ));
                 response_success(Some(command_id), type_name, None)
             }
-            Err(error) => response_failure(
-                Some(command_id),
-                type_name,
-                &format!("Idle passivation stop failed: {error:#}"),
-                None,
-            ),
+            Err(error) => {
+                // The worker stays resident: its own descriptor keeps owning the
+                // launch context, so the record written ahead of the stop is spent.
+                if let Some((session_file, _)) = &launch {
+                    self.passivated_launches.forget(session_file);
+                }
+                response_failure(
+                    Some(command_id),
+                    type_name,
+                    &format!("Idle passivation stop failed: {error:#}"),
+                    None,
+                )
+            }
         }
     }
 

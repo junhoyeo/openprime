@@ -17,11 +17,31 @@ use pa_types::daemon::{DaemonCommand, DurableDaemonCreateCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// The durable create-command keys that are not runtime config: the client
-/// env and the runtime metadata ride their own create fields, and the name
-/// already lives in the session file (a wake must not re-run the name
-/// admission).
-const NON_CONFIG_KEYS: [&str; 4] = ["env", "runtimeMetadata", "name", "rlmChildId"];
+/// The non-secret launch context a record keeps (an allowlist of the
+/// durable create's runtime keys): never a CLI `apiKey` and never the
+/// client env — the record must not become a new secret-at-rest location
+/// (the descriptor holding them dies with the stop). A revived session
+/// resolves its provider credential the normal way at wake time.
+const PERSISTED_LAUNCH_KEYS: [&str; 18] = [
+    "cwd",
+    "sessionDir",
+    "script",
+    "provider",
+    "model",
+    "thinking",
+    "models",
+    "rlmDepth",
+    "rlmMaxDepth",
+    "parentSessionPath",
+    "childScript",
+    "spawnedByRequestId",
+    "systemPrompt",
+    "appendSystemPrompt",
+    "skills",
+    "promptTemplates",
+    "autonomous",
+    "executionMode",
+];
 
 /// One passivated session's opened-with launch context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,12 +52,23 @@ pub(crate) struct PassivatedLaunch {
 }
 
 impl PassivatedLaunch {
+    /// Keep only the allowlisted non-secret launch context of `create_command`.
     pub(crate) fn new(
-        create_command: DurableDaemonCreateCommand,
+        create_command: &DurableDaemonCreateCommand,
         telemetry_disabled: Option<bool>,
     ) -> Self {
+        let rest = create_command
+            .rest
+            .iter()
+            .filter(|(key, _)| PERSISTED_LAUNCH_KEYS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         Self {
-            create_command,
+            create_command: DurableDaemonCreateCommand {
+                session_path: create_command.session_path.clone(),
+                no_session: None,
+                rest,
+            },
             telemetry_disabled,
         }
     }
@@ -51,13 +82,7 @@ impl PassivatedLaunch {
         rlm_depth: u64,
         runtime_metadata: Option<Value>,
     ) -> DaemonCommand {
-        let mut config: Map<String, Value> = self
-            .create_command
-            .rest
-            .iter()
-            .filter(|(key, _)| !NON_CONFIG_KEYS.contains(&key.as_str()))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        let mut config: Map<String, Value> = self.create_command.rest.clone();
         config.insert("rlmDepth".to_string(), Value::from(rlm_depth));
         DaemonCommand::Create {
             id: None,
@@ -131,8 +156,8 @@ mod tests {
     use serde_json::json;
 
     /// The wake create is the stopped worker's create with the wake path's
-    /// identity: config keys survive; the creator's pane env, the name, and
-    /// the metadata never ride along.
+    /// identity: config keys survive; the api key, the creator's pane env,
+    /// the name, and the metadata never ride along.
     #[test]
     fn the_wake_create_replays_the_opened_with_context() {
         let durable = crate::descriptor::durable_create_command(&json!({
@@ -141,13 +166,14 @@ mod tests {
             "cwd": "/fallback",
             "sessionDir": "/sessions",
             "model": "mock-1",
+            "apiKey": "sk-secret",
             "appendSystemPrompt": ["marker"],
             "name": "alpha",
             "env": {"HERDR_PANE_ID": "pane-1"},
             "runtimeMetadata": {"kind": "subagent"},
             "rlmDepth": 0,
         }));
-        let launch = PassivatedLaunch::new(durable, Some(true));
+        let launch = PassivatedLaunch::new(&durable, Some(true));
         let create = launch.wake_create("/saved/file.jsonl", 2, None);
         let expected = DaemonCommand::Create {
             id: None,
@@ -180,7 +206,7 @@ mod tests {
         let session_file = dir.path().join("session.jsonl");
         std::fs::write(&session_file, "").unwrap();
         let launch = PassivatedLaunch::new(
-            crate::descriptor::durable_create_command(&json!({ "cwd": "/fallback" })),
+            &crate::descriptor::durable_create_command(&json!({ "cwd": "/fallback" })),
             Some(true),
         );
         let records = dir.path().join("passivated-launches");

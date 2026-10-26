@@ -16,6 +16,8 @@
 //! - e32bce384 / 48fae2a5a through the update restore: a roster row is
 //!   recreated from its captured launch context, not the transcript header;
 //!   the session's telemetry opt-out survives the restore;
+//! - the passivated launch record holds no api key or client env and dies
+//!   with its session;
 //! - c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched in over a
 //!   fileless or foreign launch never inherits the launch cwd on respawn;
 //! - 6470a60e7: a cancellable prompt never starts a revival;
@@ -1282,4 +1284,106 @@ fn an_update_restore_keeps_a_sessions_telemetry_opt_out() {
             );
         }
     }
+}
+
+/// The passivated launch record is not a new secret-at-rest location: it
+/// holds the non-secret launch context only — never a CLI `apiKey` and never
+/// a client env — while the revival still works (credentials resolve the
+/// normal way at wake time); and the record dies with its session.
+#[test]
+fn a_passivated_launch_record_holds_no_secrets_and_dies_with_its_session() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let secret = "sk-revival-SENTINEL-do-not-persist";
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "env": pane_env(&dir.path().join("herdr.sock"), "pane:sentinel"),
+            "config": {
+                "cwd": project,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+                "apiKey": secret,
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let session_file = created["data"]["sessionFile"]
+        .as_str()
+        .expect("session file")
+        .to_string();
+    passivate(&mut client, &agent_dir, &active, "passivate");
+    let records_dir =
+        pa_daemon::descriptor::descriptor_dir(&agent_dir, &socket).join("passivated-launches");
+    let records = || -> Vec<String> {
+        std::fs::read_dir(&records_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let persisted = records();
+    assert_eq!(persisted.len(), 1, "one record for the passivated session");
+    assert!(
+        persisted[0].contains("mock-1") && !persisted[0].contains(secret),
+        "the record keeps the launch context but never the api key: {}",
+        persisted[0]
+    );
+    assert!(
+        !persisted[0].contains("HERDR") && !persisted[0].contains("pane:sentinel"),
+        "the record never holds a client env: {}",
+        persisted[0]
+    );
+
+    // The revival still runs (the provider credential resolves the normal way).
+    let attached = client.request(
+        "attach-durable",
+        &json!({ "type": "attach", "activeSessionId": session_id }),
+    );
+    assert_eq!(attached["success"], true, "{attached}");
+    let woken = client
+        .live_active_id("list", &session_id)
+        .expect("the revived session is live");
+    let turn = client.request(
+        "turn",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": woken, "message": "after idle" }),
+    );
+    assert_eq!(turn["success"], true, "{turn}");
+    assert!(records().is_empty(), "the wake's launch spent the record");
+
+    // Passivated again, then deleted: the record dies with the session.
+    client.request(
+        "detach",
+        &json!({ "type": "detach", "activeSessionId": woken }),
+    );
+    passivate(&mut client, &agent_dir, &woken, "passivate-again");
+    assert_eq!(records().len(), 1);
+    let deleted = client.request(
+        "delete",
+        &json!({ "type": "delete_saved_session", "sessionPath": session_file }),
+    );
+    assert_eq!(deleted["success"], true, "{deleted}");
+    assert!(
+        records().is_empty(),
+        "deleting the session removes its launch record"
+    );
 }
