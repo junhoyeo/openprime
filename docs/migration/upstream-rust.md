@@ -84,8 +84,9 @@ The pinned base was checked from a detached, clean worktree at `/private/tmp/pa-
 | Spawn/list/observe/message | pass; the recorded child appeared in both rosters and `agent_message.send` reported delivered |
 | Child cancellation | pass; deletion returned `cancelled`, and a zero-time collect returned `settled=true` with the cancellation reason |
 | Positive-timeout collect immediately after spawn | **BLOCKED**; returned `running, settled=false` in about 1 ms for a 500 ms delayed child instead of waiting |
+| Packaged-layout real kernel receipt | pass after the test supplies an isolated product-current interpreter; 1 passed, 0 failed, 0 ignored; an incompatible interpreter fails at explicit staged-product validation |
 
-All of these native binary checks used synthetic data under `/tmp/pab-7d67ab19`; product shutdown stopped the isolated daemon afterward. The positive-timeout collect result is a pinned-base admission/observability race assigned to the session-lifecycle lane. The package-layout receipt test is also blocked pending a clean pinned-tip reproduction. These baseline results do **not** prove final integrated state, package, or migration parity.
+All of these native binary checks used synthetic data under `/tmp/pab-7d67ab19`; product shutdown stopped the isolated daemon afterward. The positive-timeout collect result is a pinned-base admission/observability race assigned to the session-lifecycle lane. The earlier package-fixture failure was kernel startup rejection of an incompatible interpreter, not dispatch or receipt execution; `bd192f4c4` makes the test and CI supply/validate isolated current state. Final staged-package receipts must still be repeated after all ports integrate. These baseline results do **not** prove final integrated state, package, or migration parity.
 
 ## Acceptance gates
 
@@ -119,4 +120,4 @@ After every blocker is closed, the integration lead will provide the tested Rust
 
 The scout inventory is fully recorded, but inventory disposition and verification outcome are separate. All 99 entries remain `BLOCKED` until a focused lane verifier and integrated-tip acceptance pass. Proposed final statuses currently contain 3 upstream-equivalent candidates, 19 obsolete candidates with concrete runtime/model/maintenance rationale, and 77 rows requiring a port or equivalence/invariant proof. PR #32 maps to the stronger upstream #3749 implementation but remains open and blocked through final Rust acceptance; PR #33 tracks both Aside indexing (`4af3c6d89`) and the Unicode smart-case fix (`5d4d1eb26`).
 
-Known native blockers are the immediate spawn-to-collect positive-timeout race and the packaged-layout kernel receipt failure. State compatibility, package assembly, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.
+The known pinned-base native blocker is the immediate spawn-to-collect positive-timeout race. State compatibility, final integrated package assembly and real-cell receipts, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.
