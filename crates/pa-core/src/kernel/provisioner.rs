@@ -1881,9 +1881,11 @@ mod tests {
 
         let dir = tempfile::TempDir::new().expect("temp dir");
         let python = dir.path().join("ready-but-not-reading");
+        // `-c` is the pre-spawn runtime probe: pass it like a supported
+        // runtime so the start reaches the non-reading kernel itself.
         std::fs::write(
             &python,
-            "#!/usr/bin/env python3\nimport json, time\nprint(json.dumps({'event': 'ready', 'protocol': 3, 'python': '3.13.0'}), flush=True)\ntime.sleep(30)\n",
+            "#!/usr/bin/env python3\nimport json, sys, time\nif sys.argv[1:2] == ['-c']:\n    sys.exit(0)\nprint(json.dumps({'event': 'ready', 'protocol': 3, 'python': '3.13.0'}), flush=True)\ntime.sleep(30)\n",
         )
         .expect("write fake kernel");
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
