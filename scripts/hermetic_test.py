@@ -142,15 +142,25 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--kernel-python")
     parser.add_argument("--allow-egress", action="store_true",
-                        help="do not wrap the command in the macOS loopback-only network sandbox")
+                        help="do not wrap the command in the macOS loopback-only network sandbox "
+                             "(requires --do-not-track)")
+    parser.add_argument("--do-not-track", action="store_true",
+                        help="set DO_NOT_TRACK=1 for the command (some telemetry tests then fail by design)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("missing command")
+    # Every product run needs a telemetry guard: the egress sandbox (macOS) or
+    # DO_NOT_TRACK=1. Refuse to start without one of the two.
+    sandbox_available = platform.system() == "Darwin" and not args.allow_egress
+    if not sandbox_available and not args.do_not_track:
+        parser.error("no telemetry guard: the egress sandbox is unavailable or disabled; pass --do-not-track")
     kernel_python = resolve_kernel_python(args.kernel_python, os.environ)
     root = make_root()
     env = build_env(root, kernel_python, os.environ)
+    if args.do_not_track:
+        env["DO_NOT_TRACK"] = "1"
     executable = shutil.which(command[0], path=env["PATH"]) or command[0]
     print(f"hermetic_test: root {root}", file=sys.stderr)
     argv = [executable, *command[1:]]

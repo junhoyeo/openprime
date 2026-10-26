@@ -81,6 +81,16 @@ class HermeticTest(unittest.TestCase):
             found = ht.leftovers(["/private/target", str(self.python)])
         self.assertEqual([row.split()[0] for row in found], ["10", "12"])
 
+    def test_a_run_without_any_telemetry_guard_is_refused(self):
+        with mock.patch.object(ht.platform, "system", return_value="Linux"):
+            with self.assertRaises(SystemExit):
+                ht.main(["--kernel-python", str(self.python), "--", sys.executable, "-c", "pass"])
+            out = self.tmp / "dnt"
+            code = ht.main(["--do-not-track", "--kernel-python", str(self.python), "--", sys.executable, "-c",
+                            f"import os; open({str(out)!r}, 'w').write(os.environ.get('DO_NOT_TRACK', ''))"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.read_text(), "1")
+
     def test_exit_code_passes_through(self):
         code = ht.main(["--kernel-python", str(self.python), "--", sys.executable, "-c", "raise SystemExit(7)"])
         self.assertEqual(code, 7)
