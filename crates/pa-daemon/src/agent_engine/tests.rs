@@ -404,3 +404,95 @@ fn custom_rows(events: &[EngineEvent]) -> Vec<serde_json::Value> {
         })
         .collect()
 }
+
+#[test]
+fn corrupt_side_pointer_stops_before_provider_admission() {
+    use crate::engine::{SessionEngine as _, SideQuestionOutcome, SideQuestionRequest};
+    use crate::session_store::{session_file_name, SessionFile};
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut parent = SessionFile::create(dir.path().to_str().unwrap(), None, 0);
+    parent.path = sessions.join(session_file_name(parent.session_id()));
+    parent.rewrite().unwrap();
+    let parent_path = parent.path.clone();
+    let malformed = serde_json::json!({
+        "type":"custom", "id":"bad-pointer", "parentId":null,
+        "timestamp":"2026-08-16T00:00:00.000Z", "customType":"side_question",
+        "data":{"btwId":"broken-pane","question":"old"}
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&parent_path)
+        .unwrap();
+    writeln!(file, "{malformed}").unwrap();
+    file.sync_all().unwrap();
+    let before = std::fs::read(&parent_path).unwrap();
+
+    let core = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::worker::SessionCore::test_core(Some(parent), dir.path().display().to_string()),
+    ));
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: agent_dir.clone(),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: Some(sessions),
+        session_file: Some(parent_path.clone()),
+        faux_script: Some(
+            serde_json::json!({"engine":"faux","responses":[{"text":"valid answer"}]}).to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: Some(true),
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    engine.set_side_question_recorders(std::sync::Arc::new(
+        crate::side_question_store::SideQuestionPaneRegistry::new(core, agent_dir),
+    ));
+    let sink: pa_core::session_engine::side_question::SideQuestionSink =
+        std::sync::Arc::new(|_| true);
+    let broken = engine.run_side_question(
+        SideQuestionRequest {
+            side_question_id: "turn-bad".into(),
+            question: "bad?".into(),
+            previous_turns: vec![],
+            recorder_key: "pane:broken-pane".into(),
+            btw_id: "broken-pane".into(),
+            reuse_recorder: true,
+        },
+        &pa_agent::abort::AbortSignal::never(),
+        &sink,
+    );
+    assert!(
+        matches!(broken, SideQuestionOutcome::Failed { ref answer, ref error }
+        if answer.is_empty() && error.contains("before admission")),
+        "{broken:?}"
+    );
+    assert_eq!(std::fs::read(&parent_path).unwrap(), before);
+
+    // The only scripted provider response remains available: the rejected
+    // corrupt pane made zero provider calls. A fresh valid pane consumes it.
+    let valid = engine.run_side_question(
+        SideQuestionRequest {
+            side_question_id: "turn-good".into(),
+            question: "good?".into(),
+            previous_turns: vec![],
+            recorder_key: "pane:good-pane".into(),
+            btw_id: "good-pane".into(),
+            reuse_recorder: true,
+        },
+        &pa_agent::abort::AbortSignal::never(),
+        &sink,
+    );
+    assert!(
+        matches!(valid, SideQuestionOutcome::Complete { ref answer } if answer == "valid answer"),
+        "{valid:?}"
+    );
+}
