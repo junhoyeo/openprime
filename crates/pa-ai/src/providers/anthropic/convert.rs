@@ -280,6 +280,45 @@ pub fn convert_messages(
     params
 }
 
+fn normalize_anthropic_tool_schema(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(normalize_anthropic_tool_schema).collect())
+        }
+        Value::Object(object) => {
+            let mut normalized: Map<String, Value> = object
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_anthropic_tool_schema(value)))
+                .collect();
+            let has_named_properties = normalized
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| !properties.is_empty());
+            let catch_all = normalized
+                .get("patternProperties")
+                .and_then(Value::as_object)
+                .filter(|patterns| patterns.len() == 1)
+                .and_then(|patterns| patterns.get("^.*$"))
+                .cloned();
+            if !has_named_properties {
+                if let Some(catch_all) = catch_all {
+                    normalized.remove("patternProperties");
+                    normalized.insert(
+                        "additionalProperties".into(),
+                        if catch_all.as_object().is_some_and(Map::is_empty) {
+                            Value::Bool(true)
+                        } else {
+                            catch_all
+                        },
+                    );
+                }
+            }
+            Value::Object(normalized)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
 pub fn convert_tools(
     tools: &[Tool],
     is_oauth_token: bool,
@@ -303,14 +342,25 @@ pub fn convert_tools(
             if supports_eager_tool_input_streaming {
                 entry.insert("eager_input_streaming".into(), json!(true));
             }
-            entry.insert(
-                "input_schema".into(),
-                json!({
-                    "type": "object",
-                    "properties": tool.parameters.get("properties").cloned().unwrap_or_else(|| json!({})),
-                    "required": tool.parameters.get("required").cloned().unwrap_or_else(|| json!([])),
-                }),
-            );
+            let mut schema = normalize_anthropic_tool_schema(&tool.parameters)
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter(|value| value.is_string())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            schema.insert("type".into(), json!("object"));
+            schema.entry("properties").or_insert_with(|| json!({}));
+            schema.insert("required".into(), Value::Array(required));
+            entry.insert("input_schema".into(), Value::Object(schema));
             if let Some(cache_control) = cache_control {
                 if index == tools.len() - 1 {
                     entry.insert("cache_control".into(), cache_control.to_json());
@@ -333,9 +383,69 @@ pub(crate) fn map_stop_reason(reason: &str) -> Result<StopReason, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::convert_messages;
-    use crate::types::{Context, Message, Model};
+    use super::{convert_messages, convert_tools};
+    use crate::types::{Context, Message, Model, Tool};
     use serde_json::{json, Value};
+
+    #[test]
+    fn tool_conversion_preserves_native_schema_keywords() {
+        let tool = Tool {
+            name: "report".into(),
+            description: "Report metadata".into(),
+            parameters: json!({
+                "type": "object",
+                "title": "Report",
+                "properties": {
+                    "metadata": {
+                        "type": "object",
+                        "properties": {"fixed": {"type": "string"}},
+                        "patternProperties": {"^.*$": {"type": "number"}}
+                    }
+                },
+                "required": ["metadata", 7],
+                "additionalProperties": false,
+                "$defs": {"label": {"type": "string"}}
+            }),
+        };
+        assert_eq!(
+            convert_tools(&[tool], false, false, None)[0]["input_schema"],
+            json!({
+                "type": "object",
+                "title": "Report",
+                "properties": {
+                    "metadata": {
+                        "type": "object",
+                        "properties": {"fixed": {"type": "string"}},
+                        "patternProperties": {"^.*$": {"type": "number"}}
+                    }
+                },
+                "required": ["metadata"],
+                "additionalProperties": false,
+                "$defs": {"label": {"type": "string"}}
+            })
+        );
+    }
+
+    #[test]
+    fn root_record_schema_normalizes_to_additional_properties() {
+        let tool = Tool {
+            name: "labels".into(),
+            description: "Submit labels".into(),
+            parameters: json!({
+                "type": "object",
+                "patternProperties": {"^.*$": {"type": "string"}}
+            }),
+        };
+        assert_eq!(
+            convert_tools(&[tool], false, false, None)[0]["input_schema"],
+            json!({
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "properties": {},
+                "required": []
+            })
+        );
+    }
 
     /// A model on a non-signing Anthropic-compatible endpoint (discussion #3391).
     fn mimo() -> Model {
