@@ -262,6 +262,11 @@ impl Client {
 
     fn request(&mut self, id: &str, command: &Value) -> Value {
         self.send_command(id, command);
+        self.read_response(id)
+    }
+
+    /// The response to an already-sent command.
+    fn read_response(&mut self, id: &str) -> Value {
         loop {
             let line = self.read_line();
             if line.get("id").and_then(Value::as_str) == Some(id) && line["type"] == "response" {
@@ -334,25 +339,44 @@ fn descriptor_field(agent_dir: &Path, active_session_id: &str, field: &str) -> O
 /// The product's idle passivation ask (the worker-side clock and gates are
 /// unit-covered): the worker's own token drives the supervisor's graceful
 /// stop, leaving only the saved file and the passive roster row.
+///
+/// A `success` answer does not prove the stop. The supervisor's eviction
+/// fence DEFERS the ask while any route to the worker (a client request or
+/// the supervisor's own background traffic) holds an in-flight permit; the
+/// deferral also answers success, and the worker re-asks at its next park
+/// (pinned by `supervisor::tests::idle_passivation_refuses_a_client_owned_worker`).
+/// Like the worker, the helper re-asks until the worker has left the live
+/// list, within a bounded deadline.
 fn passivate(client: &mut Client, agent_dir: &Path, active_session_id: &str, id: &str) {
     let token = descriptor_field(agent_dir, active_session_id, "authenticationToken")
         .and_then(|token| token.as_str().map(str::to_string))
         .expect("the worker's token");
-    let response = client.request(
-        id,
-        &json!({
-            "type": "worker_idle_passivation",
-            "workerToken": token,
-            "idleMinutes": 1,
-        }),
-    );
-    assert_eq!(response["success"], true, "passivation failed: {response}");
-    let list = client.request(&format!("{id}-list"), &json!({ "type": "list" }));
-    assert_eq!(
-        list["data"]["sessions"].as_array().map(Vec::len),
-        Some(0),
-        "the passivated worker left the live list: {list}"
-    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for attempt in 0_u32.. {
+        let response = client.request(
+            &format!("{id}-{attempt}"),
+            &json!({
+                "type": "worker_idle_passivation",
+                "workerToken": token,
+                "idleMinutes": 1,
+            }),
+        );
+        assert_eq!(response["success"], true, "passivation failed: {response}");
+        let list = client.request(&format!("{id}-list-{attempt}"), &json!({ "type": "list" }));
+        let still_live = list["data"]["sessions"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["activeSessionId"] == active_session_id || row["id"] == active_session_id
+            })
+        });
+        if !still_live {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the passivated worker never left the live list: {list}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn wait_until<T>(what: &str, budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
@@ -1541,4 +1565,85 @@ fn an_old_format_launch_record_never_replays_a_credential() {
             "an old record's credential or env reached the revival: {descriptor}"
         );
     }
+}
+
+/// The contract the `passivate` helper relies on, at the daemon boundary: an
+/// idle-passivation ask that arrives while a route to the worker is in flight
+/// is DEFERRED (it still answers success, and the session stays live); the
+/// same ask stops the worker once the route drains. A single ask plus an
+/// immediate `list` therefore races any in-flight traffic.
+#[test]
+fn an_idle_passivation_ask_defers_while_a_route_is_in_flight() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": project,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let token = descriptor_field(&agent_dir, &active, "authenticationToken")
+        .and_then(|token| token.as_str().map(str::to_string))
+        .expect("the worker's token");
+    let release = dir.path().join("release");
+    // A second client's bash route holds an in-flight permit until the test
+    // releases it (the bash waits on a file the test creates).
+    let mut holder = Client::connect(&socket);
+    holder.send_command(
+        "hold",
+        &json!({
+            "type": "execute_bash_and_wait",
+            "activeSessionId": active,
+            "command": format!("while [ ! -e '{}' ]; do sleep 0.05; done", release.display()),
+        }),
+    );
+    wait_until(
+        "the holding bash is running",
+        Duration::from_secs(20),
+        || {
+            let state = client.request(
+                "state",
+                &json!({ "type": "get_state", "activeSessionId": active }),
+            );
+            (state["data"]["isBashRunning"] == true).then_some(())
+        },
+    );
+    let ask = json!({
+        "type": "worker_idle_passivation",
+        "workerToken": token,
+        "idleMinutes": 1,
+    });
+    let deferred = client.request("ask-deferred", &ask);
+    assert_eq!(deferred["success"], true, "{deferred}");
+    assert!(
+        client
+            .live_active_id("list-deferred", &session_id)
+            .is_some(),
+        "a deferred ask answers success and leaves the session live"
+    );
+    std::fs::write(&release, "").expect("release the holding bash");
+    let drained = holder.read_response("hold");
+    assert_eq!(drained["success"], true, "{drained}");
+    passivate(&mut client, &agent_dir, &active, "ask-drained");
 }
