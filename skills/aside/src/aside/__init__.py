@@ -483,7 +483,7 @@ async def _probe_health(base_url: str) -> dict[str, Any]:
     if parsed is None or parsed.hostname is None:
         return {"ok": False, "status": "invalid local provider origin"}
     tls = parsed.scheme == "https"
-    port = parsed.port or (443 if tls else 80)
+    port = parsed.port if parsed.port is not None else (443 if tls else 80)
     writer = None
     try:
         ssl_context = ssl.create_default_context() if tls else None

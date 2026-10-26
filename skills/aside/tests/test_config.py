@@ -95,6 +95,28 @@ class AccountConfigTest(unittest.TestCase):
                 self.assertEqual(report["config_error"], "models.json must be a regular file")
                 open_connection.assert_not_called()
 
+    def test_health_reports_tls_context_failure_without_exposing_the_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "u" / "0"
+            config.mkdir(parents=True)
+            (config / "models.json").write_text(json.dumps({"providers": {
+                "local": {"baseUrl": "https://localhost:9443"},
+            }}))
+            with (
+                mock.patch.object(aside, "CONFIG_DIR", config),
+                mock.patch.object(aside, "_bin", return_value="/synthetic/aside"),
+                mock.patch.object(aside, "_app_running", return_value=True),
+                mock.patch.object(aside.ssl, "create_default_context",
+                                  side_effect=OSError("secret trust-store path")),
+                mock.patch.object(aside.asyncio, "open_connection") as open_connection,
+            ):
+                report = asyncio.run(aside.health(timeout=0.05))
+
+            open_connection.assert_not_called()
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["local_providers"]["local"]["status"], "unreachable")
+            self.assertNotIn("secret trust-store path", repr(report))
+
     def test_health_probes_only_exact_loopback_without_redirects_and_bounds_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "u" / "0"
