@@ -76,8 +76,15 @@ The pinned base was checked from a detached, clean worktree at `/private/tmp/pa-
 | `prime-agent --version` in isolated `HOME` | pass, `0.10.1` |
 | `prime-agent --help` in isolated `HOME` | pass; expected CLI command surface printed |
 | `prime-agent prompt --cwd <rust-worktree> --json` in isolated `HOME` | pass; 8 layers and a 53,520-byte JSON result |
+| Explicit-socket daemon `status --json` and `list --all --json` | pass in `/tmp/pab-7d67ab19`; protocol 7/schema 30 and zero cross-home sessions |
+| Synthetic-provider print session | pass; persisted JSONL and returned the scripted reply |
+| Python kernel tool call | pass with isolated venv and pinned source package; receipt contained `tool-ok` |
+| Persisted-session resume | pass; a second synthetic turn appended and returned the scripted resume reply |
+| Spawn/list/observe/message | pass; the recorded child appeared in both rosters and `agent_message.send` reported delivered |
+| Child cancellation | pass; deletion returned `cancelled`, and a zero-time collect returned `settled=true` with the cancellation reason |
+| Positive-timeout collect immediately after spawn | **BLOCKED**; returned `running, settled=false` in about 1 ms for a 500 ms delayed child instead of waiting |
 
-These checks prove only binary startup and prompt assembly. They do **not** prove daemon, state, provider, family, resume, or migration parity.
+All of these native binary checks used synthetic data under `/tmp/pab-7d67ab19`; product shutdown stopped the isolated daemon afterward. The positive-timeout collect result is a pinned-base admission/observability race assigned to the session-lifecycle lane. The package-layout receipt test is also blocked pending a clean pinned-tip reproduction. These baseline results do **not** prove final integrated state, package, or migration parity.
 
 ## Acceptance gates
 
@@ -107,4 +114,6 @@ After every blocker is closed, the integration lead will provide the tested Rust
 
 ## Current blockers
 
-The machine-readable ledger is intentionally all `BLOCKED` at the first checkpoint. It will be updated only from source mappings and passing verifiers. PR #32 and #33 remain blocked until their owners' exact-tip reports are integrated. Daemon, state, package, parity, combined gates, CI, and adversarial review are also pending.
+The machine-readable ledger is intentionally all `BLOCKED` at the first checkpoint. It will be updated only from source mappings and passing verifiers. PR #32 and #33 remain blocked until their owners' exact-tip reports are integrated.
+
+Known native blockers are the immediate spawn-to-collect positive-timeout race and the packaged-layout kernel receipt failure. State compatibility, package assembly, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.
