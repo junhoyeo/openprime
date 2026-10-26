@@ -521,11 +521,29 @@ impl Supervisor {
                     false,
                 );
             }
-            // The kill is the archive: a stopped session never revives
-            // through a stale passivation record.
-            let session_file = resident.descriptor.lock().await.session_file.clone();
-            if let Some(session_file) = session_file {
-                self.passivated_launches.forget(&session_file);
+            // The kill is the archive. TS revived a killed session on a later
+            // prompt with the window's revive config, so the archived session
+            // keeps its non-secret launch context for that user-driven revival,
+            // exactly like an idle passivation (no automatic path revives it).
+            let launch = {
+                let descriptor = resident.descriptor.lock().await;
+                descriptor.session_file.clone().map(|session_file| {
+                    (
+                        session_file,
+                        crate::passivated_launch::PassivatedLaunch::new(
+                            &descriptor.create_command,
+                            descriptor.telemetry_disabled,
+                        ),
+                    )
+                })
+            };
+            if let Some((session_file, launch)) = launch {
+                if let Err(error) = self.passivated_launches.remember(&session_file, &launch) {
+                    self.log_line(&format!(
+                        "session worker {} archived without a launch record (its revival falls back to the session header): {error:#}",
+                        resident.worker_id
+                    ));
+                }
             }
         }
         // A delete's deletion boundary persists BEFORE the teardown: a failed tombstone is

@@ -1398,3 +1398,65 @@ fn a_passivated_launch_record_holds_no_secrets_and_dies_with_its_session() {
         "deleting the session removes its launch record"
     );
 }
+
+/// Rows b2bb37bb2 / 48fae2a5a across an archive (the plain kill): TS revived
+/// a killed session on a later prompt with the window's revive config, so an
+/// archived session reopened by its durable id revives in the cwd it was
+/// opened with — never back on its missing recorded directory.
+#[test]
+fn an_archived_fallback_cwd_session_revives_in_its_opened_cwd() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let fallback = dir.path().join("fallback");
+    std::fs::create_dir_all(&fallback).expect("fallback dir");
+    let saved = write_missing_cwd_transcript(&sessions, &dir.path().join("gone"));
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "sessionPath": saved,
+            "config": {
+                "cwd": fallback,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "fallback open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = client.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    let killed = client.request(
+        "kill",
+        &json!({ "type": "kill", "activeSessionId": active }),
+    );
+    assert_eq!(killed["success"], true, "{killed}");
+    let attached = client.request(
+        "attach-durable",
+        &json!({ "type": "attach", "activeSessionId": session_id }),
+    );
+    assert_eq!(attached["success"], true, "{attached}");
+    let woken = client
+        .live_active_id("list", &session_id)
+        .expect("the archived session revived");
+    assert_eq!(
+        pwd_output(&client.pwd("pwd", &woken)),
+        canonical(&fallback),
+        "the archived session must revive in the cwd it was opened with"
+    );
+}
