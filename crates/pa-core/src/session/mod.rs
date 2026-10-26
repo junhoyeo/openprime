@@ -174,16 +174,17 @@ fn generate_id(existing: &std::collections::HashSet<String>) -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// v1 had no ids; threads are the whole file.
+/// v1 had no ids; threads are the whole file (TS `migrateV1ToV2`). A v1
+/// `compaction` row carries a top-level `firstKeptEntryIndex` and no
+/// `firstKeptEntryId`, so it loads as [`FileEntry::Unknown`]: its raw JSON
+/// takes the id and parent link, then parses again once the index resolves.
 fn migrate_v1_to_v2(entries: &mut [FileEntry]) {
     let mut ids = std::collections::HashSet::new();
     let mut prev_id: Option<String> = None;
     let mut compaction_fixes: Vec<(usize, usize)> = Vec::new();
-    let mut position = 0usize;
-    for entry in entries.iter_mut() {
+    for (position, entry) in entries.iter_mut().enumerate() {
         if let FileEntry::Header { header } = entry {
             header.version = Some(2);
-            position += 1;
             continue;
         }
         let id = generate_id(&ids);
@@ -191,32 +192,38 @@ fn migrate_v1_to_v2(entries: &mut [FileEntry]) {
         if let Some(base) = entry_base_mut(entry) {
             base.id = Some(id.clone());
             base.parent_id.clone_from(&prev_id);
-        }
-        prev_id = Some(id);
-        // Compaction firstKeptEntryIndex references an earlier entry whose id
-        // this pass just assigned; resolve after the loop.
-        if let FileEntry::Compaction { payload, .. } = entry {
-            if let Some(index) = payload
-                .details
-                .as_ref()
-                .and_then(|details| details.get("firstKeptEntryIndex"))
-                .and_then(serde_json::Value::as_u64)
-            {
-                compaction_fixes.push((position, index as usize));
+        } else if let FileEntry::Unknown { rest } = entry {
+            rest.insert("id".to_string(), serde_json::json!(id));
+            rest.insert("parentId".to_string(), serde_json::json!(prev_id));
+            // Compaction firstKeptEntryIndex references an earlier entry whose
+            // id this pass just assigned; resolve after the loop.
+            if rest.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+                if let Some(index) = rest
+                    .get("firstKeptEntryIndex")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    compaction_fixes.push((position, index as usize));
+                }
             }
         }
-        position += 1;
+        prev_id = Some(id);
     }
     for (compaction_position, target_index) in compaction_fixes {
-        let Some(target_id) = entries
+        let target_id = entries
             .get(target_index)
-            .and_then(|entry| entry.id())
-            .map(str::to_string)
-        else {
+            .filter(|entry| !matches!(entry, FileEntry::Header { .. }))
+            .and_then(FileEntry::id)
+            .map(str::to_string);
+        let FileEntry::Unknown { rest } = &entries[compaction_position] else {
             continue;
         };
-        if let FileEntry::Compaction { payload, .. } = &mut entries[compaction_position] {
-            payload.first_kept_entry_id = target_id;
+        let mut raw = rest.clone();
+        raw.remove("firstKeptEntryIndex");
+        if let Some(target_id) = target_id {
+            raw.insert("firstKeptEntryId".to_string(), serde_json::json!(target_id));
+        }
+        if let Ok(migrated) = serde_json::from_value::<FileEntry>(serde_json::Value::Object(raw)) {
+            entries[compaction_position] = migrated;
         }
     }
 }

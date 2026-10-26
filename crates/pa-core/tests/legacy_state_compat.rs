@@ -104,6 +104,28 @@ fn a_legacy_v1_session_migrates_to_a_linear_context() {
 }
 
 #[test]
+fn a_legacy_v1_compaction_keeps_its_summary_and_kept_turns() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = open_copied_session(temp.path(), "v1-compaction.jsonl");
+    // TS migrateV1ToV2 ids every row and resolves the top-level firstKeptEntryIndex.
+    let expected = pairs(&[
+        ("compactionSummary", "v1 compaction summary"),
+        ("user", "v1 q2"),
+        ("assistant", "v1 a2"),
+        ("user", "v1 q3"),
+        ("assistant", "v1 a3"),
+    ]);
+    assert_eq!(transcript(&manager.active_context().messages), expected);
+    // The open rewrites the migrated file; the reopened file keeps the same context.
+    let reopened = SessionManager::open(
+        Path::new("/legacy/project"),
+        &temp.path().join("sessions"),
+        &temp.path().join("sessions/v1-compaction.jsonl"),
+    );
+    assert_eq!(transcript(&reopened.active_context().messages), expected);
+}
+
+#[test]
 fn a_legacy_v2_hook_message_migrates_to_a_custom_message() {
     let temp = tempfile::tempdir().unwrap();
     let manager = open_copied_session(temp.path(), "v2-hook-message.jsonl");
