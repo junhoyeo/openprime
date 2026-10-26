@@ -343,7 +343,12 @@ jobs:
       # 36764911023). The installer's bootstrap handoff readies it first.
       - name: Bootstrap the kernel venv (ready before the kernel e2e units)
         if: steps.selection.outputs.units != '0'
-        run: ./target/debug/prime-agent --prime-agent-bootstrap
+        run: |
+          ./target/debug/prime-agent --prime-agent-bootstrap
+          # Package receipt tests never inspect an operator's ambient ~/.prime.
+          # Publish this CI-owned interpreter to subsequent shard steps so the
+          # live package test executes instead of taking its documented skip.
+          echo "PA_E2E_KERNEL_PYTHON=${HOME}/.prime/agent/kernel-venv/bin/python" >> "${GITHUB_ENV}"
       # The real-binary lifecycle checks drive the debug binary through owned
       # daemons, PTYs and loopback providers only. One leg is enough.
       - name: Run the rust lifecycle checks

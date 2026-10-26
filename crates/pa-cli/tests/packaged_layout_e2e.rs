@@ -132,38 +132,26 @@ fn set_executable(path: &Path) {
     let _ = path;
 }
 
-/// The kernel Python with prime-agent-runtime installed (skipped with a
-/// note without a live install).
+/// The explicitly prepared kernel Python for package e2e tests.
+///
+/// Never fall back to the operator's live `~/.prime` interpreter: package tests
+/// run only against an isolated fixture prepared by CI or the caller. The
+/// staged product validates the interpreter's full runtime/default-package
+/// contract before the test treats it as usable.
 fn kernel_python() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("PA_E2E_KERNEL_PYTHON") {
-        let explicit = PathBuf::from(explicit);
-        assert!(
-            explicit.exists(),
-            "PA_E2E_KERNEL_PYTHON {} not found",
-            explicit.display()
+    let Some(explicit) = std::env::var_os("PA_E2E_KERNEL_PYTHON") else {
+        eprintln!(
+            "PA_E2E_KERNEL_PYTHON is not set; skipping the live package kernel e2e (prepare an isolated kernel venv first)"
         );
-        return Some(explicit);
-    }
-    // The kernel venv's interpreter spelling is platform-shaped (the venv
-    // layout the product's own bootstrap creates: `bin/python` on unix,
-    // `Scripts\python.exe` on Windows).
-    let venv_python = if cfg!(windows) {
-        "kernel-venv/Scripts/python.exe"
-    } else {
-        "kernel-venv/bin/python"
+        return None;
     };
-    let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
-        |_| format!("/home/ubuntu/.prime/agent/{venv_python}"),
-        |home| format!("{home}/.prime/agent/{venv_python}"),
-    ));
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    eprintln!(
-        "kernel python {} not found; skipping live kernel e2e",
-        candidate.display()
+    let explicit = PathBuf::from(explicit);
+    assert!(
+        explicit.exists(),
+        "PA_E2E_KERNEL_PYTHON {} not found",
+        explicit.display()
     );
-    None
+    Some(explicit)
 }
 
 struct Sandbox {
@@ -268,10 +256,30 @@ fn packaged_session_boots_kernel_without_pi_package_dir() {
     let receipt = box_.home.path().join("kernel-receipt.json");
     let script = kernel_boot_script(&receipt);
 
+    // Validate the exact override through the staged product before running
+    // the cell. Existence alone is insufficient: an interpreter can import
+    // `rlm` while still missing current callables or the promised default
+    // packages, in which case the product correctly refuses kernel startup.
+    let validation = box_
+        .command(staged)
+        .arg("--prime-agent-bootstrap")
+        .env("PRIME_AGENT_KERNEL_PYTHON", &kernel_python)
+        .output()
+        .expect("validate isolated kernel interpreter");
+    assert_eq!(
+        validation.status.code(),
+        Some(0),
+        "PA_E2E_KERNEL_PYTHON is not product-ready; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&validation.stdout),
+        String::from_utf8_lossy(&validation.stderr)
+    );
+
     let mut command = box_.command(staged);
     command.env("PRIME_AGENT_KERNEL_PYTHON", &kernel_python);
     let (stdout, stderr, code) = run_json_turn(&mut command, &script);
     assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    // The marker is supplemental only: the faux tool-call source also contains
+    // this text. The receipt assertions below are the execution proof.
     assert!(
         stdout.contains("KERNEL_BOOT_OK"),
         "kernel cell output missing; stdout: {stdout}\nstderr: {stderr}"
