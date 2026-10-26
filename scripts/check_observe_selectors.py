@@ -185,7 +185,9 @@ def ready_children(snapshot, expected_child_ids, expected_tasks=MAIN_CHILD_TASKS
     for name, task in expected_tasks.items():
         row = rows[name]
         assert row['rlm_child_id'] == expected_child_ids[name], 'spawned child identity changed'
-        assert row['status'] == 'running', 'spawned child settled before identity proof'
+        # `queued` is the live pre-kickoff state (ABI2: the kickoff admits at the parent's turn
+        # boundary or a positive collect), `running` the admitted one; anything else settled.
+        assert row['status'] in ('queued', 'running'), 'spawned child settled before identity proof'
         assert row.get('label') == task, 'spawned child task/name mismatch'
     complete = True
     for key in ('active_session_id', 'session_id'):
