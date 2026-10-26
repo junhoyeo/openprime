@@ -91,7 +91,13 @@ impl TurnRunner {
                 // settle's `turn_end` verdict parks the session later. The item leaves
                 // the queue projection BEFORE its turn starts (a stale row would
                 // reject a browse edit).
-                let visible_index = items.iter().position(|item| item.queue_visible);
+                // TS `visibleSessionActionProjection`: a session command projects even when its
+                // admission was direct (an idle `/refine`), so attached clients see it running.
+                let visible_index = items.iter().position(|item| {
+                    item.queue_visible
+                        || crate::session_commands::parse_prompt_session_command(&item.message)
+                            .is_some()
+                });
                 let anchor = visible_index.map(|index| &items[index]);
                 {
                     let mut core = self.core.lock().unwrap();
@@ -366,6 +372,12 @@ impl TurnRunner {
                 }
             })
         };
+        // TS settles a cancelled `/refine` through the command's own catch arm: its
+        // `refine_failed` event, the `Command failed` row, and the settle are the command's
+        // result, not the interrupted turn's rows, so the abort gate passes them.
+        let refine_command_turn =
+            crate::session_commands::parse_prompt_session_command(&request.message)
+                .is_some_and(|command| command.name == "refine");
         let engine = engine.clone();
         let core = Arc::clone(&self.core);
         let events = self.events.clone();
@@ -494,7 +506,17 @@ impl TurnRunner {
                 }
                 // Durable model cleanup is independent of visual abort-row
                 // suppression and emits no client-facing frame.
-                if core.abort_requested && !matches!(&event, EngineEvent::ModelChange(_)) {
+                let refine_result_frame = refine_command_turn
+                    && matches!(
+                        &event,
+                        EngineEvent::CustomMessage(_)
+                            | EngineEvent::RefineComplete { .. }
+                            | EngineEvent::RefineFailed { .. }
+                    );
+                if core.abort_requested
+                    && !refine_result_frame
+                    && !matches!(&event, EngineEvent::ModelChange(_))
+                {
                     // The sighting arms the fallback's silence only when
                     // load-bearing: a sighting on a run that completed on its own
                     // cancels nothing.
