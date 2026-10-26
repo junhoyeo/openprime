@@ -11,6 +11,10 @@ rlm_module = importlib.import_module("rlm")
 
 
 class RlmSubagentRegistryTest(unittest.TestCase):
+    def test_runtime_abi_covers_queued_registry_rows(self) -> None:
+        self.assertIs(type(rlm_module.RLM_RUNTIME_ABI), int)
+        self.assertEqual(rlm_module.RLM_RUNTIME_ABI, 2)
+
     def test_lists_parent_scoped_subagents_from_host(self) -> None:
         host_request = AsyncMock(
             return_value={
@@ -51,6 +55,7 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                         "session_name": "failed-worker",
                         "session_dir": "/tmp/parent/sub-failed",
                         "status": "error",
+                        "error": "kernel startup failed",
                     }
                 ]
             }
@@ -60,6 +65,29 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             subagents = asyncio.run(rlm_module.rlm.list_subagents())
 
         self.assertEqual(subagents[0].status, "error")
+        self.assertEqual(subagents[0].error, "kernel startup failed")
+
+    def test_lists_queued_subagents_from_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "subagents": [
+                    {
+                        "rlm_child_id": "sub-queued",
+                        "active_session_id": None,
+                        "session_id": None,
+                        "session_name": "queued-worker",
+                        "session_dir": "/tmp/parent/sub-queued",
+                        "status": "queued",
+                    }
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            subagents = asyncio.run(rlm_module.rlm.list_subagents())
+
+        self.assertEqual(subagents[0].status, "queued")
+        self.assertIsNone(subagents[0].error)
 
     def test_forwards_orchestrator_chosen_name_and_model_to_host(self) -> None:
         host_request = AsyncMock(
@@ -93,6 +121,26 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(result.rlm_child_id, "sub-a1b2c3d4")
         self.assertEqual(result.name, "api-reviewer")
         self.assertEqual(result.model, "deepseek/deepseek-v4-flash")
+
+    def test_rejects_non_string_subagent_error(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "subagents": [
+                    {
+                        "rlm_child_id": "sub-error",
+                        "active_session_id": None,
+                        "session_id": None,
+                        "session_name": "error-worker",
+                        "session_dir": "/tmp/parent/sub-error",
+                        "status": "error",
+                        "error": 500,
+                    }
+                ]
+            }
+        )
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "invalid error"):
+                asyncio.run(rlm_module.list_subagents())
 
     def test_requires_an_explicit_child_name(self) -> None:
         host_request = AsyncMock()

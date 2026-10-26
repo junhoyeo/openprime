@@ -61,18 +61,28 @@ impl SupervisorChildSessionsInner {
     pub(super) async fn cancel_child_run(&self, child_id: &str) -> bool {
         let children = self.children.lock().await.clone();
         for record in &children {
-            let (matched, running, active_session_id) = {
+            let (matched, kickoff_lock) = {
                 let record = record.lock().await;
                 (
                     record.rlm_child_id == child_id,
-                    record.settled_status.is_none(),
-                    record.active_session_id.clone(),
+                    Arc::clone(&record.kickoff_lock),
                 )
             };
             // A fruitless match keeps walking: child ids are only
             // mkdir-unique among siblings, so a colliding live run
             // elsewhere must stay reachable.
-            if !matched || !running {
+            if !matched {
+                continue;
+            }
+            let _kickoff_guard = kickoff_lock.lock().await;
+            let (running, active_session_id) = {
+                let record = record.lock().await;
+                (
+                    record.settled_status.is_none(),
+                    record.active_session_id.clone(),
+                )
+            };
+            if !running {
                 continue;
             }
             let notice_was_delivered = {
@@ -240,8 +250,15 @@ impl SupervisorChildSessionsInner {
         let mut close_error = (!usage_persisted)
             .then(|| anyhow::anyhow!("RLM child usage remains owed after retirement; retry close"));
         for record in &children {
-            let rename_lock = record.lock().await.rename_lock.clone();
+            let (rename_lock, kickoff_lock) = {
+                let record = record.lock().await;
+                (
+                    Arc::clone(&record.rename_lock),
+                    Arc::clone(&record.kickoff_lock),
+                )
+            };
             let _guard = rename_lock.lock().await;
+            let _kickoff_guard = kickoff_lock.lock().await;
             if !self
                 .children
                 .lock()
@@ -315,6 +332,8 @@ impl SupervisorChildSessionsInner {
         // child is settled work, settled here by its removal).
         self.refresh_running().await;
         self.settle_notify.notify_waiters();
+        self.lifecycle_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         match close_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -433,6 +452,8 @@ impl SupervisorChildSessionsInner {
         };
         // No await follows the completion claim: cancellation cannot strand its notifications.
         self.settle_notify.notify_waiters();
+        self.lifecycle_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         if notify_hook {
             let hook = self
                 .settle_hook
@@ -619,6 +640,8 @@ fn ledger_child_records(
             direct_observation: Arc::new(Mutex::new(())),
             notice_delivered: true,
             prompt_admitted: true,
+            prompt_release: Arc::new(tokio::sync::Notify::new()),
+            kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
             error: None,
             closed_by_parent: false,
             retiring: false,

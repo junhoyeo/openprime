@@ -14,6 +14,17 @@ use super::{
     WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS, WATCH_WAIT_SLICE_MS,
 };
 
+pub(super) const CHILD_ERROR_MAX_CHARS: usize = 512;
+
+fn normalize_child_error(error: &str) -> String {
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "Subagent failed without an error message".to_string()
+    } else {
+        cap_text(&compact, CHILD_ERROR_MAX_CHARS)
+    }
+}
+
 /// Parsed ids of one created child session.
 struct CreatedSessionIds {
     active_session_id: String,
@@ -383,6 +394,66 @@ impl SupervisorChildSessionsInner {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
             .map(str::to_string))
+    }
+
+    /// Wait until the detached kickoff prompt is admitted or the child reaches
+    /// a terminal state. The caller supplies the shared collect deadline; a
+    /// zero/expired budget remains a nonblocking snapshot.
+    pub(super) async fn wait_for_prompt_admission(
+        &self,
+        record: &Arc<Mutex<ChildRecord>>,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle_epoch.subscribe();
+        #[cfg(test)]
+        self.admission_wait_started.notify_one();
+        loop {
+            let ready = {
+                let record = record.lock().await;
+                record.prompt_admitted || record.settled_status.is_some()
+            };
+            if ready {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                changed = lifecycle.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline.into()) => return false,
+            }
+        }
+    }
+
+    /// Wait for the terminal-notice/settle funnel after a terminal status is
+    /// observed. A positive collect returns a settled envelope when that funnel
+    /// completes inside its shared deadline.
+    pub(super) async fn wait_for_terminal_settlement(
+        &self,
+        record: &Arc<Mutex<ChildRecord>>,
+        deadline: std::time::Instant,
+    ) {
+        let mut lifecycle = self.lifecycle_epoch.subscribe();
+        loop {
+            if record.lock().await.settled {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::select! {
+                changed = lifecycle.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline.into()) => return,
+            }
+        }
     }
 
     /// Best-effort bounded wait for one child and its descendants to go
@@ -787,6 +858,7 @@ impl SupervisorChildSessionsInner {
         record: &Arc<Mutex<ChildRecord>>,
         error: String,
     ) -> bool {
+        let error = normalize_child_error(&error);
         // The exit capture (the M4 seam): a child that dies without
         // reporting still said something — the live worker's last
         // assistant text when it is still reachable, else the durable

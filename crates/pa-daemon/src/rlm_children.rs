@@ -192,6 +192,13 @@ struct ChildRecord {
     /// The task prompt was admitted; never settle a pre-prompt child (it
     /// is idle with an empty queue by construction).
     prompt_admitted: bool,
+    /// A positive-timeout collect explicitly releases the detached kickoff:
+    /// otherwise the kickoff waits for the parent turn boundary, which the
+    /// in-turn collect itself cannot reach until it returns.
+    prompt_release: Arc<tokio::sync::Notify>,
+    /// Serializes kickoff admission with cancel/delete/parent-close. This is
+    /// per child (never the registry/session mutex) and may span the one prompt RPC.
+    kickoff_lock: Arc<tokio::sync::Mutex<()>>,
     /// Terminal error text: the cancel reason for a cancelled run, the
     /// failure text for a failed one.
     error: Option<String>,
@@ -237,9 +244,14 @@ struct ChildRecord {
 }
 
 impl ChildRecord {
-    /// Raw run status: `running` | `done` | `error` | `cancelled`.
+    /// Raw run status: `queued` before kickoff admission, then `running` |
+    /// `done` | `error` | `cancelled`.
     fn status(&self) -> &'static str {
-        self.settled_status.unwrap_or("running")
+        self.settled_status.unwrap_or(if self.prompt_admitted {
+            "running"
+        } else {
+            "queued"
+        })
     }
 
     fn snapshot_value(&self) -> Value {
@@ -269,6 +281,8 @@ impl ChildRecord {
     /// registry row).
     fn roster_status(&self) -> &'static str {
         match self.status() {
+            "queued" => "queued",
+            "running" => "running",
             "done" => "completed",
             "error" => "error",
             "cancelled" => "cancelled",
@@ -411,6 +425,12 @@ struct SupervisorChildSessionsInner {
     /// and once per close walk, so a barrier parked behind descendant
     /// work re-reads the registry when the descendants settle.
     settle_notify: tokio::sync::Notify,
+    /// Changes whenever a child crosses prompt admission or terminal settlement.
+    /// `collect(timeout>0)` subscribes before inspecting the record, so an
+    /// admission that races the inspection cannot be missed.
+    lifecycle_epoch: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    admission_wait_started: tokio::sync::Notify,
     /// The model-allowlist refusal telemetry: `spawn`/`create_session`
     /// refusals emit through the engine's shared lazily-built client.
     model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
@@ -468,6 +488,9 @@ impl SupervisorChildSessions {
                 settle_hook: std::sync::Mutex::new(None),
                 running: tokio::sync::watch::Sender::new(false),
                 settle_notify: tokio::sync::Notify::new(),
+                lifecycle_epoch: tokio::sync::watch::channel(0).0,
+                #[cfg(test)]
+                admission_wait_started: tokio::sync::Notify::new(),
                 model_refusal_telemetry,
                 usage_sink: std::sync::Mutex::new(None),
                 delete_notifier: std::sync::Mutex::new(None),
@@ -756,6 +779,8 @@ impl SupervisorChildSessions {
                 direct_observation: Arc::new(Mutex::new(())),
                 notice_delivered: false,
                 prompt_admitted: true,
+                prompt_release: Arc::new(tokio::sync::Notify::new()),
+                kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
                 error: None,
                 closed_by_parent: false,
                 retiring: false,
@@ -815,7 +840,7 @@ impl SupervisorChildSessions {
     }
 
     fn entry(record: &ChildRecord) -> RlmSubagentEntry {
-        let running = record.settled_status.is_none();
+        let running = record.prompt_admitted && record.settled_status.is_none();
         RlmSubagentEntry {
             rlm_child_id: record.rlm_child_id.clone(),
             active_session_id: Some(record.active_session_id.clone()),
@@ -823,6 +848,7 @@ impl SupervisorChildSessions {
             session_name: record.session_name.clone(),
             session_dir: record.session_dir.clone(),
             status: record.roster_status(),
+            error: record.error.clone(),
             // Live tool introspection across worker processes is a follow-up;
             // a running child reports `executing`.
             activity: running.then_some(RlmSubagentActivity {
@@ -884,6 +910,8 @@ impl SupervisorChildSessionsInner {
         record.lock().await.settled = true;
         self.refresh_running().await;
         self.settle_notify.notify_waiters();
+        self.lifecycle_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         let hook = self
             .settle_hook
             .lock()

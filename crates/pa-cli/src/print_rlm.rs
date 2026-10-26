@@ -1058,6 +1058,7 @@ fn roster_entry(
                 other => other,
             }
         },
+        error: state.error.clone(),
         activity: None,
         tool_use_count: None,
         duration_ms: Some(crate::util_time::now_ms().saturating_sub(state.started_at_ms)),

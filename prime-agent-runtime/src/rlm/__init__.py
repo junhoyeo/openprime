@@ -20,6 +20,12 @@ from .factory import (
 )
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
+# Internal host-payload ABI. Exactly integer 2 is supported: it adds queued
+# list_subagents rows and bounded per-child error detail. The Rust kernel
+# bootstrap rejects absent, older, newer, or malformed values before a session
+# can encounter the closed enum; this is not a cumulative capability number.
+RLM_RUNTIME_ABI = 2
+
 _NOT_CALLABLE_MESSAGE = "'rlm' is not callable; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
 _RENAMED_RUN_MESSAGE = "rlm.run was renamed; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
 
@@ -57,9 +63,8 @@ class RLMSubagentActivity:
 
 @dataclass(frozen=True)
 class RLMSubagent:
-    """One direct child row: `status` is `running` | `completed` | `error` |
-    `cancelled` (a cancelled child keeps its status verbatim in the
-    registry row, the TS-era semantics)."""
+    """One direct child row: `status` is `queued` | `running` | `completed` |
+    `error` | `cancelled` (a cancelled child keeps its status verbatim)."""
 
     rlm_child_id: str
     active_session_id: str | None
@@ -67,6 +72,7 @@ class RLMSubagent:
     session_name: str
     session_dir: Path
     status: str
+    error: str | None = None
     activity: RLMSubagentActivity | None = None
     tool_use_count: int | None = None
     duration_ms: int | None = None
@@ -305,6 +311,7 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
     session_name = payload.get("session_name")
     session_dir = payload.get("session_dir")
     status = payload.get("status")
+    error = payload.get("error")
     if not isinstance(child_id, str) or not child_id:
         raise RuntimeError(f"{operation} entry is missing rlm_child_id")
     if active_session_id is not None and not isinstance(active_session_id, str):
@@ -315,8 +322,10 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         raise RuntimeError(f"{operation} entry is missing session_name")
     if not isinstance(session_dir, str) or not session_dir:
         raise RuntimeError(f"{operation} entry is missing session_dir")
-    if status not in {"running", "completed", "error", "cancelled"}:
+    if status not in {"queued", "running", "completed", "error", "cancelled"}:
         raise RuntimeError(f"{operation} entry has invalid status")
+    if error is not None and not isinstance(error, str):
+        raise RuntimeError(f"{operation} entry has invalid error")
     return RLMSubagent(
         rlm_child_id=child_id,
         active_session_id=active_session_id,
@@ -324,6 +333,7 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         session_name=session_name,
         session_dir=Path(session_dir),
         status=status,
+        error=error,
         activity=_optional_activity_field(payload, operation),
         tool_use_count=_optional_int_field(payload, "tool_use_count", operation),
         duration_ms=_optional_int_field(payload, "duration_ms", operation),
@@ -710,6 +720,7 @@ __all__ = [
     "RLMCreateSessionHandle",
     "RLMModel",
     "RLMProgressNoteResult",
+    "RLM_RUNTIME_ABI",
     "RLMSpawnHandle",
     "RLMSubagent",
     "RLMSubagentActivity",
