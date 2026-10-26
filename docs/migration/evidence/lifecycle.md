@@ -2,7 +2,7 @@
 
 > Reviewed source: `origin/port/rust-session-lifecycle@2e156424002bcfd7b1576e0ec8935144ac96db3f`.
 > Integrated source tip through `a02416f19`; all 40 lifecycle-owned paths byte-match the reviewed tree.
-> Combined hermetic evidence: RLM watch 54/54, engine corrupt-pointer zero-provider 1/1, agents-view partial/legacy warning 1/1, Python runtime registry 30/30. Kernel ABI2/provider safe metadata are integrated separately. Native app/daemon/collect remains paused pending the reviewed read-only path manifest.
+> Combined hermetic evidence: RLM watch 54/54, exact retry-boundary 1/1, engine corrupt-pointer zero-provider 1/1, agents-view partial/legacy warning 1/1, Python runtime registry 30/30. Kernel ABI2/provider safe metadata are integrated separately. Native app/daemon/collect remains paused pending the reviewed read-only path manifest.
 
 # Final re-review — `2e156424002bcfd7b1576e0ec8935144ac96db3f`
 
@@ -148,3 +148,13 @@ Native acceptance remains PAUSED.
 - **Static gate:** `git diff --check c4..2e` clean.
 - **Native:** app/daemon/collect acceptance is not run and remains PAUSED. This verdict makes no production/live-state claim.
 - **Combined seam hold:** exact kernel ABI2 successor and provider-consumer corrective integration are separate. Verify their final combined-tree SHAs and gates when integration assembles them.
+
+## Final reviewer-run hermetic receipts (exact `2e156424002bcfd7b1576e0ec8935144ac96db3f`)
+
+Approved isolated product roots plus explicit read-only `CARGO_HOME`/`RUSTUP_HOME`, private `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS=2`, offline Cargo; no daemon/app/collect native invocation:
+
+- `cargo test -p pa-daemon cancel_at_retry_dispatch_boundary_sends_no_second_prompt --lib` — **1 passed**.
+- `cargo test -p pa-daemon corrupt_side_pointer_stops_before_provider_admission --lib` — **1 passed**.
+- `cargo test -p pa-tui heartbeat_partial_and_legacy_failures_render_visible_stale_status --lib` — **1 passed**.
+
+A preliminary combined Cargo filter matched zero tests and is not counted; the three individual receipts above are the actual verifier results.
