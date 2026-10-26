@@ -650,6 +650,22 @@ impl Supervisor {
             DaemonCommand::Kill { .. } => RouteAdmission::SupervisorInternal,
             _ => RouteAdmission::ClientRequest,
         };
+        // The attach window (legacy `da68b1903` pending-binding hold and replay): the worker
+        // cuts its snapshot under the core lock and flushes every later event AHEAD of its
+        // response on this link, and the reader publishes each event the moment it reads it.
+        // The connection therefore subscribes BEFORE the route, so an event the snapshot does
+        // not contain reaches it; the client's snapshot cursor discards what the snapshot
+        // already covers. The subscription this attach created is retired below unless the
+        // worker accepts the attach under the same id.
+        let attach_family = matches!(
+            command,
+            DaemonCommand::Attach { .. } | DaemonCommand::Reattach { .. }
+        );
+        let window_subscription =
+            (attach_family && !attached.contains(&resident.worker_id)).then(|| {
+                attached.attach(&self.session_subscribers, &resident.worker_id);
+                resident.worker_id.clone()
+            });
         // TS daemon-supervisor's `routeClientCommand` wraps the live
         // `rename`/`set_session_name` forward in the name-reservation
         // ladder: name uniqueness is daemon-owned, so a session worker's
@@ -678,6 +694,30 @@ impl Supervisor {
                     .await
             }
         };
+        if let Some(window_id) = window_subscription {
+            // The accepted attach's id: the routing header's scalars, or the parsed reply
+            // when a relay carries none.
+            let accepted_id = match response.as_ref() {
+                Ok(WorkerReply::Relayed(relay)) if relay.success.is_some() => relay
+                    .success
+                    .filter(|ok| *ok)
+                    .map(|_| relay.active_session_id.clone()),
+                Ok(WorkerReply::Relayed(relay)) => {
+                    serde_json::from_slice::<DaemonResponse>(&relay.payload)
+                        .ok()
+                        .filter(|reply| reply.success)
+                        .map(|reply| reply_active_session_id(reply.data.as_ref()))
+                }
+                Ok(WorkerReply::Typed(reply)) => reply
+                    .success
+                    .then(|| reply_active_session_id(reply.data.as_ref())),
+                Err(_) => None,
+            }
+            .map(|id| id.unwrap_or_else(|| resident.worker_id.clone()));
+            if accepted_id.as_deref() != Some(window_id.as_str()) {
+                attached.detach(&self.session_subscribers, &window_id);
+            }
+        }
         // The byte relay: a routed response the supervisor neither edits nor
         // inspects goes to the client as the worker's own payload bytes with
         // the client's command id spliced in front. The worker serializes
@@ -701,10 +741,6 @@ impl Supervisor {
             }
             _ => false,
         };
-        let attach_family = matches!(
-            command,
-            DaemonCommand::Attach { .. } | DaemonCommand::Reattach { .. }
-        );
         let typed_needed = rebound_to.is_some()
             || client_wants_chunked
             || matches!(
@@ -1181,6 +1217,13 @@ impl Supervisor {
         self.push_roster_update(changed, removed);
         Ok(())
     }
+}
+
+/// The active id a worker's attach reply reports (`data.activeSessionId`), if any.
+fn reply_active_session_id(data: Option<&Value>) -> Option<String> {
+    data.and_then(|data| data.get("activeSessionId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// The ledger edge a delete addresses, as `(child_id, child_file)`. `rlmChildId` is the durable
