@@ -139,7 +139,7 @@ async fn model_metadata_projects_fast_capability_without_request_secrets() {
             "reasoning": true,
             "input": ["text"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 128000,
+            "contextWindow": 128_000,
             "maxTokens": 4096,
             "headers": {
                 "Authorization": "Bearer authorization-secret",

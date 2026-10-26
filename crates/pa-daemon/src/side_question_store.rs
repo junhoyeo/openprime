@@ -390,6 +390,8 @@ impl SideQuestionPaneRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
     use serde_json::Value;
 
     fn assistant(text: &str, total_tokens: u64) -> AssistantMessage {
@@ -552,7 +554,6 @@ mod tests {
                 "startedAt": "2026-08-16T00:00:00.000Z"
             }
         });
-        use std::io::Write as _;
         let mut parent = std::fs::OpenOptions::new()
             .append(true)
             .open(&parent_path)
