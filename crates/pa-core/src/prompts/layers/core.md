@@ -28,7 +28,7 @@ The harness often sends messages to the agent. These are user messages starting 
 
 These pre-imported Python skill modules are callable through their `run` entry point. Read the matching `SKILL.md` before use for the full argument contract and safety rules.
 
-- `agent_sessions`: callable cross-harness transcript and Aside-artifact reader (`await agent_sessions(...)` is `await agent_sessions.run(...)`)
+- `agent_sessions`: callable cross-harness transcript and Aside-artifact reader (`await agent_sessions(...)` is `await agent_sessions.run(...)`); its structured helpers below are synchronous
   - `agent_sessions.find_sessions(harness="all", project=None, days=None, limit=20, root=None) -> list[dict]`
   - `agent_sessions.grep_sessions(pattern, harness="all", project=None, session=None, kinds="all", days=None, fixed=False, ignore_case=None, max_sessions=200, max_hits=40, max_reported=10, max_per_session=5, context=0, width=220) -> list[dict]`
   - `agent_sessions.load_session(target, harness="all", use_cache=True) -> Session`
@@ -36,7 +36,7 @@ These pre-imported Python skill modules are callable through their `run` entry p
   - `agent_sessions.filter_events(session, kinds="chat") -> list[Event]`
   - `agent_sessions.resolve_session(target, harness="all") -> tuple[str, Path]`
   - `agent_sessions.compile_pattern(pattern, fixed=False, ignore_case=None) -> re.Pattern[str]`
-- `aside`: callable browser-use agent skill (`await aside(prompt, ...)` is `await aside.run(prompt, ...)`; `aside.agent` is the same function)
+- `aside`: callable browser-use agent skill (`await aside(prompt, ...)` is `await aside.run(prompt, ...)`; `aside.agent` is the same async function); `models`, `providers`, and `config_dir` below are synchronous, while the browser helpers are async
   - `aside.repl(js, *, timeout=120.0, parse=False, account=None) -> Any`
   - `aside.read(url=None, *, selector=None, limit=20000, keep_open=False, timeout=120.0) -> str`
   - `aside.screenshot(path, *, url=None, full_page=False, keep_open=False, timeout=120.0) -> str`
