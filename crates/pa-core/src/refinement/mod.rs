@@ -204,9 +204,30 @@ pub fn load_harness_state(harness_state_dir: &Path, scope: HarnessScope) -> Harn
             .and_then(|records| records.as_object())
         {
             for (id, raw_entry) in records {
-                let Ok(mut entry) =
-                    serde_json::from_value::<HarnessEntry>(normalize_stored_entry(raw_entry))
-                else {
+                // TS `loadHarnessState` normalization: a topic-era grouping moves to `path`
+                // (`topic` is dropped), non-object records become `{}`, and an unknown scope
+                // falls back to the loading scope.
+                let mut normalized = raw_entry.clone();
+                if let Some(fields) = normalized.as_object_mut() {
+                    let topic = fields.remove("topic");
+                    if !fields.get("path").is_some_and(serde_json::Value::is_string) {
+                        if let Some(topic) = topic.filter(serde_json::Value::is_string) {
+                            fields.insert("path".to_string(), topic);
+                        }
+                    }
+                    for field in ["reference", "arguments", "metadata"] {
+                        if !fields.get(field).is_some_and(serde_json::Value::is_object) {
+                            fields.insert(field.to_string(), serde_json::json!({}));
+                        }
+                    }
+                    if !matches!(
+                        fields.get("scope").and_then(serde_json::Value::as_str),
+                        Some("global" | "local")
+                    ) {
+                        fields.remove("scope");
+                    }
+                }
+                let Ok(mut entry) = serde_json::from_value::<HarnessEntry>(normalized) else {
                     state
                         .preserved_entries
                         .entry(kind_key)
@@ -233,34 +254,6 @@ pub fn load_harness_state(harness_state_dir: &Path, scope: HarnessScope) -> Harn
             .collect();
     }
     state
-}
-
-/// TS `loadHarnessState` normalization of one stored entry: a topic-era grouping moves to
-/// `path` (`topic` is dropped), non-object records become `{}`, and an unknown scope falls
-/// back to the loading scope.
-fn normalize_stored_entry(raw_entry: &serde_json::Value) -> serde_json::Value {
-    let Some(raw) = raw_entry.as_object() else {
-        return raw_entry.clone();
-    };
-    let mut entry = raw.clone();
-    let topic = entry.remove("topic");
-    if !entry.get("path").is_some_and(serde_json::Value::is_string) {
-        if let Some(topic) = topic.filter(serde_json::Value::is_string) {
-            entry.insert("path".to_string(), topic);
-        }
-    }
-    for field in ["reference", "arguments", "metadata"] {
-        if !entry.get(field).is_some_and(serde_json::Value::is_object) {
-            entry.insert(field.to_string(), serde_json::json!({}));
-        }
-    }
-    if !matches!(
-        entry.get("scope").and_then(serde_json::Value::as_str),
-        Some("global" | "local")
-    ) {
-        entry.remove("scope");
-    }
-    serde_json::Value::Object(entry)
 }
 
 /// Merge global + local states: local ids conflict-prefixed with their scope.
