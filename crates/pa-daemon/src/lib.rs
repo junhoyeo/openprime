@@ -63,6 +63,7 @@ pub(crate) mod model_catalog;
 pub(crate) mod model_switch;
 mod overflow_compaction;
 pub mod ownership;
+pub(crate) mod passivated_launch;
 pub mod paths;
 pub(crate) mod peer;
 pub(crate) mod peer_client;

@@ -253,21 +253,28 @@ impl Supervisor {
         // header depth rides `config.rlmDepth`, the key launch_worker
         // copies into the DURABLE create command's rest where the
         // passivation fence reads it.
-        let create = DaemonCommand::Create {
-            id: None,
-            session_path: Some(session_path.clone()),
-            continue_recent: Some(false),
-            no_session: None,
-            name: None,
-            config: Some(json!({ "cwd": info.cwd, "rlmDepth": info.rlm_depth })),
-            // Telemetry opt-out only ever rides an explicit user create;
-            // the wake create inherits the daemon default (absent).
-            telemetry_disabled: None,
-            runtime_metadata: None,
-            lifecycle: None,
-            env: None,
-            launch_env: None,
-            rest: Map::default(),
+        // A session the idle passivation stopped replays the launch context
+        // it was opened with (its fallback cwd, runtime config, telemetry
+        // opt-out); only a session with no recorded context falls back to
+        // its header.
+        let create = match self.passivated_launches.get(&session_path) {
+            Some(launch) => launch.wake_create(&session_path, u64::from(info.rlm_depth), None),
+            None => DaemonCommand::Create {
+                id: None,
+                session_path: Some(session_path.clone()),
+                continue_recent: Some(false),
+                no_session: None,
+                name: None,
+                config: Some(json!({ "cwd": info.cwd, "rlmDepth": info.rlm_depth })),
+                // Telemetry opt-out only ever rides an explicit user create;
+                // the wake create inherits the daemon default (absent).
+                telemetry_disabled: None,
+                runtime_metadata: None,
+                lifecycle: None,
+                env: None,
+                launch_env: None,
+                rest: Map::default(),
+            },
         };
         // The caller's route budget bounds the WAIT, not the launch (dropping
         // the future skipped the cleanup): the launch detaches, runs to completion.

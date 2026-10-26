@@ -493,6 +493,9 @@ impl Supervisor {
                 .filter(|file| !file.is_empty())
             {
                 descriptor.session_file = Some(session_file.clone());
+                // A worker hosts the session again: its own descriptor carries the
+                // launch context from here on, so a passivation record is spent.
+                self.passivated_launches.forget(&session_file);
                 // The durable create command must reopen the same session file on relaunch,
                 // or a respawned worker would create a fresh session and lose history.
                 descriptor.create_command.session_path = Some(session_file);
@@ -702,8 +705,25 @@ impl Supervisor {
         ) else {
             return response_success(Some(command_id), type_name, None);
         };
+        // The opened-with launch context outlives the retired descriptor: a
+        // later wake recreates the session the way it was opened.
+        let launch = {
+            let descriptor = resident.descriptor.lock().await;
+            descriptor.session_file.clone().map(|file| {
+                (
+                    file,
+                    crate::passivated_launch::PassivatedLaunch::new(
+                        descriptor.create_command.clone(),
+                        descriptor.telemetry_disabled,
+                    ),
+                )
+            })
+        };
         match self.stop_worker_releasing(&resident, Some(fence)).await {
             Ok(()) => {
+                if let Some((session_file, launch)) = launch {
+                    self.passivated_launches.remember(&session_file, launch);
+                }
                 self.log_line(&format!(
                     "session worker {} passivated idle (idleEvictionMinutes={threshold})",
                     resident.worker_id
