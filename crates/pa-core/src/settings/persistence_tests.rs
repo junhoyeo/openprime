@@ -271,3 +271,28 @@ fn project_percentage_overrides_global_and_stale_writes_preserve_external_settin
     first.reload().unwrap();
     assert_eq!(first.get_compaction_threshold_percent(), 60.5);
 }
+
+#[test]
+fn retry_max_backoff_defaults_caps_and_zero_disables_the_cap() {
+    let (_, defaults) = fixture("{}");
+    assert_eq!(defaults.get_provider_retry_policy().max_delay_ms, 60_000);
+
+    let (_, capped) = fixture(r#"{"retry":{"baseDelayMs":1000,"maxBackoffMs":4000}}"#);
+    let capped = capped.get_provider_retry_policy();
+    assert_eq!(capped.base_delay_ms, 1000);
+    assert_eq!(capped.max_delay_ms, 4000);
+
+    let (_, uncapped) = fixture(r#"{"retry":{"maxBackoffMs":0}}"#);
+    assert_eq!(
+        uncapped.get_provider_retry_policy().max_delay_ms,
+        crate::session_engine::provider_retry::UNBOUNDED_BACKOFF_MS
+    );
+}
+
+#[test]
+fn legacy_retry_max_delay_remains_the_provider_retry_after_cap() {
+    let (_, manager) = fixture(r#"{"retry":{"maxDelayMs":12345}}"#);
+    let policy = manager.get_provider_retry_policy();
+    assert_eq!(policy.max_retry_delay_ms, 12345);
+    assert_eq!(policy.max_delay_ms, 60_000);
+}

@@ -14,8 +14,8 @@ pub struct ProviderRetryPolicy {
     pub base_delay_ms: u64,
     /// Max server-requested retry delay before giving up; 0 disables the cap.
     pub max_retry_delay_ms: u64,
-    /// Ceiling on the exponential backoff; the default is unbounded
-    /// (the TS quick-retry loop grows without bound).
+    /// Agent-level exponential backoff ceiling (`retry.maxBackoffMs`). A value of
+    /// [`UNBOUNDED_BACKOFF_MS`] means the user explicitly configured zero (no ceiling).
     pub max_delay_ms: u64,
 }
 
@@ -28,7 +28,7 @@ pub const DEFAULT_PROVIDER_RETRY_POLICY: ProviderRetryPolicy = ProviderRetryPoli
     max_retries: 3,
     base_delay_ms: 2000,
     max_retry_delay_ms: 60000,
-    max_delay_ms: UNBOUNDED_BACKOFF_MS,
+    max_delay_ms: 60_000,
 };
 
 /// Resolution of one retry-delay decision.
@@ -376,6 +376,46 @@ mod tests {
         assert_eq!(
             provider_retry_delay(1, Some(9000), &policy),
             ProviderRetryDelay::Wait { delay_ms: 9000 }
+        );
+    }
+
+    #[test]
+    fn retry_max_backoff_caps_the_agent_ladder_and_zero_is_uncapped() {
+        let capped = ProviderRetryPolicy {
+            enabled: true,
+            max_retries: 5,
+            base_delay_ms: 1,
+            max_retry_delay_ms: 60_000,
+            max_delay_ms: 4,
+        };
+        let delays = (1..=5)
+            .map(|attempt| provider_retry_delay(attempt, None, &capped))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            vec![
+                ProviderRetryDelay::Wait { delay_ms: 1 },
+                ProviderRetryDelay::Wait { delay_ms: 2 },
+                ProviderRetryDelay::Wait { delay_ms: 4 },
+                ProviderRetryDelay::Wait { delay_ms: 4 },
+                ProviderRetryDelay::Wait { delay_ms: 4 },
+            ]
+        );
+
+        let uncapped = ProviderRetryPolicy {
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
+            ..capped
+        };
+        assert_eq!(
+            (1..=4)
+                .map(|attempt| provider_retry_delay(attempt, None, &uncapped))
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderRetryDelay::Wait { delay_ms: 1 },
+                ProviderRetryDelay::Wait { delay_ms: 2 },
+                ProviderRetryDelay::Wait { delay_ms: 4 },
+                ProviderRetryDelay::Wait { delay_ms: 8 },
+            ]
         );
     }
 
