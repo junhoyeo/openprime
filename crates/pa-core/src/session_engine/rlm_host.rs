@@ -60,9 +60,12 @@ pub struct RlmSubagentEntry {
     pub session_id: Option<String>,
     pub session_name: String,
     pub session_dir: String,
-    /// `running` | `completed` | `error` | `cancelled` (a cancelled run
-    /// keeps its status verbatim in the registry row).
+    /// `queued` | `running` | `completed` | `error` | `cancelled` (a
+    /// cancelled run keeps its status verbatim in the registry row).
     pub status: &'static str,
+    /// Bounded failure detail for an errored child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<RlmSubagentActivity>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -945,6 +948,7 @@ mod tests {
                     session_name: "worker".into(),
                     session_dir: "/tmp/sub-1".into(),
                     status: "running",
+                    error: None,
                     activity: Some(RlmSubagentActivity {
                         kind: "executing",
                         tool_name: Some("bash".into()),
@@ -972,6 +976,7 @@ mod tests {
                         session_name: "worker".into(),
                         session_dir: "/tmp/sub-1".into(),
                         status: "completed",
+                        error: None,
                         activity: None,
                         tool_use_count: None,
                         duration_ms: None,

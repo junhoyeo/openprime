@@ -150,6 +150,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         Some(pa_types::daemon::launch_env::collect_process_launch_env()),
                     )
                     .await?;
+                let prompt_release = Arc::new(tokio::sync::Notify::new());
                 let record = ChildRecord {
                     rlm_child_id: child_id.clone(),
                     session_name: created.session_name.clone().unwrap_or_else(|| name.clone()),
@@ -171,6 +172,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     direct_observation: Arc::new(Mutex::new(())),
                     notice_delivered: false,
                     prompt_admitted: false,
+                    prompt_release: Arc::clone(&prompt_release),
+                    kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
                     error: None,
                     closed_by_parent: false,
                     retiring: false,
@@ -243,12 +246,27 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // admission happens mid-turn, so the parent's continuation
             // request reaches the provider first (see `wait_turn_done`).
             let turn_generation = *this.turn_done.subscribe().borrow();
+            let (prompt_release, kickoff_lock) = {
+                let record = record.lock().await;
+                (
+                    Arc::clone(&record.prompt_release),
+                    Arc::clone(&record.kickoff_lock),
+                )
+            };
             tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
-                // The parent closed before the prompt admitted: the
-                // child is closed with it, so the detached task prompt
-                // never fires.
-                if watcher_record.lock().await.closed_by_parent {
+                tokio::select! {
+                    () = watcher_this.wait_turn_done(turn_generation) => {}
+                    () = prompt_release.notified() => {}
+                }
+                let kickoff_guard = kickoff_lock.lock().await;
+                // Cancel/delete/parent-close owns the same per-child gate. A
+                // terminal or retiring child can never be resurrected by a late
+                // collect release or parent boundary.
+                let prompt_allowed = {
+                    let record = watcher_record.lock().await;
+                    !record.closed_by_parent && !record.retiring && record.settled_status.is_none()
+                };
+                if !prompt_allowed {
                     return;
                 }
                 if let Err(error) = watcher_this
@@ -294,6 +312,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 // The worker accepted the task: from here an idle read is a
                 // finished run, never the pre-prompt idle worker.
                 watcher_record.lock().await.prompt_admitted = true;
+                watcher_this
+                    .lifecycle_epoch
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                drop(kickoff_guard);
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -462,6 +484,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                                     session_name: deleted.session_name.clone(),
                                     session_dir: deleted.session_dir.clone(),
                                     status: deleted.status,
+                                    error: Some(deleted.error.clone()),
                                     activity: None,
                                     tool_use_count: None,
                                     duration_ms: Some(
@@ -483,8 +506,15 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     }
                 }
             };
-            let rename_lock = record.lock().await.rename_lock.clone();
+            let (rename_lock, kickoff_lock) = {
+                let record = record.lock().await;
+                (
+                    Arc::clone(&record.rename_lock),
+                    Arc::clone(&record.kickoff_lock),
+                )
+            };
             let _rename_guard = rename_lock.lock().await;
+            let _kickoff_guard = kickoff_lock.lock().await;
             let already_terminated = this.has_retired_usage(&record);
             let no_longer_matches = {
                 let record = record.lock().await;
@@ -615,13 +645,41 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     }
                 }
                 let still_running = record.lock().await.settled_status.is_none();
-                if still_running {
-                    // Wait inside the shared budget, then re-read the child:
-                    // a timeout yields the current snapshot, never an error.
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let active_session_id = record.lock().await.active_session_id.clone();
-                    this.wait_for_child(&active_session_id, remaining).await;
-                    this.refresh_record(record).await;
+                if still_running && timeout_ms > 0 && Instant::now() < deadline {
+                    // Spawn returns before its detached kickoff is admitted. An idle
+                    // worker in that window is not a settled child: wait for admission
+                    // inside the SAME deadline before issuing wait_for_idle.
+                    let prompt_release = Arc::clone(&record.lock().await.prompt_release);
+                    prompt_release.notify_one();
+                    let admitted_or_terminal =
+                        this.wait_for_prompt_admission(record, deadline).await;
+                    if admitted_or_terminal {
+                        this.refresh_record(record).await;
+                    }
+                    let (still_running, prompt_admitted, active_session_id) = {
+                        let record = record.lock().await;
+                        (
+                            record.settled_status.is_none(),
+                            record.prompt_admitted,
+                            record.active_session_id.clone(),
+                        )
+                    };
+                    if still_running && prompt_admitted {
+                        // Wait inside the shared budget, then re-read the child:
+                        // a timeout yields the current snapshot, never an error.
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        this.wait_for_child(&active_session_id, remaining).await;
+                        this.refresh_record(record).await;
+                    }
+                }
+                if timeout_ms > 0 {
+                    let terminal_unsettled = {
+                        let record = record.lock().await;
+                        record.settled_status.is_some() && !record.settled
+                    };
+                    if terminal_unsettled {
+                        this.wait_for_terminal_settlement(record, deadline).await;
+                    }
                 }
                 let result = {
                     let record = record.lock().await;

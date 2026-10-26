@@ -177,6 +177,7 @@ async fn spawn_fake_supervisor(
                             })),
                         ),
                         "prompt" => {
+                            child_subagents.prompt_calls.fetch_add(1, Ordering::SeqCst);
                             if matches!(child, FakeChild::FinalTurnFails) {
                                 use super::lifecycle::exit_capture_tests::{
                                     assistant_row_ending, retry_outcome_row,
@@ -357,6 +358,7 @@ struct FakeChildSubagents {
     running: AtomicBool,
     quiescent_waits: std::sync::atomic::AtomicUsize,
     answer_reads: AtomicU32,
+    prompt_calls: AtomicU32,
     /// The fake answers `abort` with a real refusal (the cancel path's
     /// failed-abort lane).
     abort_fails: AtomicBool,
@@ -421,17 +423,21 @@ async fn sessions_with_fake_child_subagents(
     (sessions, kill_rx)
 }
 
-async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
+async fn spawn_named_child(sessions: &SupervisorChildSessions, name: &str) -> RlmSpawnHandle {
     sessions
         .spawn(RlmSpawnRequest {
             prompt: "f20 child task".to_string(),
-            name: Some("f20-worker".to_string()),
+            name: Some(name.to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
         })
         .await
         .expect("spawn must succeed against the fake supervisor")
+}
+
+async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
+    spawn_named_child(sessions, "f20-worker").await
 }
 
 /// [`sessions_with_fake_supervisor`] whose fake answers `list_agent_peers`
@@ -517,7 +523,7 @@ async fn a_running_childs_roster_row_carries_its_live_note_and_tool_count() {
         "toolUseCount": 3,
     })];
     let roster = sessions.list_subagents().await.expect("child roster");
-    assert_eq!(roster[0].status, "running");
+    assert_eq!(roster[0].status, "queued");
     assert_eq!(
         roster[0].progress_note.as_deref(),
         Some("halfway through the task"),
@@ -849,6 +855,310 @@ async fn a_collect_while_the_task_prompt_is_in_flight_does_not_settle_the_child(
     );
 }
 
+/// Cancellation wins before release. A later positive collect and the parent
+/// boundary observe the terminal snapshot and never resurrect the kickoff.
+#[tokio::test]
+async fn cancellation_before_release_cannot_resurrect_the_kickoff() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let child = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+    assert!(sessions.cancel_child_run(&handle.rlm_child_id).await);
+
+    let rows = sessions
+        .collect(vec![handle.rlm_child_id], 10_000)
+        .await
+        .expect("collect cancelled child");
+    assert_eq!(rows[0].status, "cancelled");
+    assert!(rows[0].settled);
+    sessions.notify_turn_done();
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Cancellation requested while the released prompt RPC is in flight queues
+/// behind the per-child admission gate, then aborts the admitted run before a
+/// natural settle can overwrite the cancellation.
+#[tokio::test]
+async fn cancellation_during_collect_release_wins_without_resurrection() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&gate)),
+        ..FakeChildSubagents::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+    let collect = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.collect(vec![child_id], 10_000).await })
+    };
+    gate.copied.notified().await;
+    let cancel = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.cancel_child_run(&child_id).await })
+    };
+    gate.release.notify_one();
+
+    assert!(cancel.await.expect("cancel task"));
+    let rows = collect
+        .await
+        .expect("collect task")
+        .expect("collect response");
+    assert_eq!(rows[0].status, "cancelled");
+    assert!(rows[0].settled);
+    sessions.notify_turn_done();
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Deletion requested during the released prompt RPC owns the same per-child
+/// admission gate. The collect wakes on retirement and the boundary cannot
+/// resurrect the deleted child.
+#[tokio::test]
+async fn deletion_during_collect_release_wins_without_resurrection() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&gate)),
+        ..FakeChildSubagents::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+    let collect = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.collect(vec![child_id], 10_000).await })
+    };
+    gate.copied.notified().await;
+    let deletion = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.delete_subagent(child_id).await })
+    };
+    gate.release.notify_one();
+
+    deletion
+        .await
+        .expect("delete task")
+        .expect("delete response");
+    let rows = collect
+        .await
+        .expect("collect task")
+        .expect("collect response");
+    assert_eq!(rows[0].status, "cancelled");
+    assert!(rows[0].settled);
+    sessions.notify_turn_done();
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A zero-timeout collect is a pure snapshot: it reports queued and does not
+/// release the kickoff. The ordinary parent turn boundary still starts it once.
+#[tokio::test]
+async fn zero_timeout_collect_does_not_release_the_queued_kickoff() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&gate)),
+        ..FakeChildSubagents::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+
+    let rows = sessions
+        .collect(vec![handle.rlm_child_id], 0)
+        .await
+        .expect("zero-timeout snapshot");
+    assert_eq!(rows[0].status, "queued");
+    assert!(!rows[0].settled);
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 0);
+
+    sessions.notify_turn_done();
+    gate.copied.notified().await;
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
+    gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
+        .await
+        .expect("normal boundary kickoff settles")
+        .expect("follow-up channel open");
+}
+
+/// A positive-timeout collect owns the detached kickoff admission window.
+/// The pre-prompt worker is idle, but that is not a completed child; zero-timeout
+/// snapshots remain covered by the adjacent test above.
+#[tokio::test]
+async fn positive_timeout_collect_waits_for_kickoff_admission_before_idle() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::new(FakeChildSubagents {
+            prompt_gate: Some(Arc::clone(&gate)),
+            ..FakeChildSubagents::default()
+        }),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+
+    let collect_sessions = sessions.clone();
+    let child_id = handle.rlm_child_id.clone();
+    let collect = tokio::spawn(async move {
+        collect_sessions
+            .collect(vec![child_id], 10_000)
+            .await
+            .expect("positive-timeout collect")
+    });
+    sessions.inner.admission_wait_started.notified().await;
+    gate.copied.notified().await;
+    assert!(
+        !collect.is_finished(),
+        "collect returned while the kickoff prompt was still unadmitted"
+    );
+
+    gate.release.notify_one();
+    let results = collect.await.expect("collect task");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, "done");
+    assert!(results[0].settled);
+    assert_eq!(
+        results[0].answer_text.as_deref(),
+        Some("the child final answer")
+    );
+}
+
+/// A targeted positive collect releases only that owned child. Its queued
+/// sibling remains queued until the ordinary parent boundary.
+#[tokio::test]
+async fn positive_collect_release_is_target_scoped() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let child = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child),
+    )
+    .await;
+    let first = spawn_named_child(&sessions, "first").await;
+    let second = spawn_named_child(&sessions, "second").await;
+
+    let rows = sessions
+        .collect(vec![first.rlm_child_id], 10_000)
+        .await
+        .expect("collect first child");
+    assert_eq!(rows[0].status, "done");
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
+    let roster = sessions.list_subagents().await.expect("child roster");
+    let second_row = roster
+        .iter()
+        .find(|row| row.rlm_child_id == second.rlm_child_id)
+        .expect("queued sibling");
+    assert_eq!(second_row.status, "queued");
+
+    sessions.notify_turn_done();
+    let settled = sessions
+        .collect(vec![second.rlm_child_id], 10_000)
+        .await
+        .expect("collect second after boundary");
+    assert_eq!(settled[0].status, "done");
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 2);
+}
+
+/// Concurrent positive collects and the later parent boundary all share the
+/// same one-shot kickoff task. The worker receives exactly one prompt.
+#[tokio::test]
+async fn concurrent_collect_release_and_turn_done_never_double_prompt() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&gate)),
+        ..FakeChildSubagents::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child),
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+
+    let collect_a = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.collect(vec![child_id], 10_000).await })
+    };
+    let collect_b = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.collect(vec![child_id], 10_000).await })
+    };
+    gate.copied.notified().await;
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
+    gate.release.notify_one();
+
+    let (a, b) = tokio::join!(collect_a, collect_b);
+    for result in [a, b] {
+        let rows = result.expect("collect task").expect("collect response");
+        assert_eq!(rows[0].status, "done");
+        assert!(rows[0].settled);
+    }
+    sessions.notify_turn_done();
+    assert_eq!(
+        child.prompt_calls.load(Ordering::SeqCst),
+        1,
+        "the later parent boundary must not redeliver the kickoff"
+    );
+}
+
 /// The settle grace re-marks only a BUSY child as running: a worker that
 /// leaves inside the grace (the idle passivation's stop, a crash) keeps
 /// the settled verdict, and the settle tail (notice, funnel) still runs.
@@ -905,7 +1215,7 @@ async fn child_updates_surface_through_the_sink() {
     assert!(
         rows.iter().any(|row| {
             row["id"] == json!(handle.rlm_child_id)
-                && row["status"] == json!("running")
+                && row["status"] == json!("queued")
                 && row["sessionName"] == json!("f20-worker")
                 && row["model"] == json!("mock/mock-1")
                 && row["sessionDir"].is_string()
@@ -935,9 +1245,22 @@ async fn child_updates_surface_through_the_sink() {
 #[tokio::test]
 async fn a_cancelled_child_keeps_its_display_running_through_the_watcher_settle() {
     let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
-    let (sessions, _kill_rx) =
-        sessions_with_fake_supervisor(follow_up_tx, 500, FakeKill::Success, FakeChild::Healthy)
-            .await;
+    let prompt_gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child_subagents = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&prompt_gate)),
+        ..FakeChildSubagents::default()
+    });
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        500,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child_subagents),
+    )
+    .await;
     let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
     sessions.set_settle_hook(Arc::new(move || {
         let _ = hook_tx.send(());
@@ -952,7 +1275,14 @@ async fn a_cancelled_child_keeps_its_display_running_through_the_watcher_settle(
     )
     .unwrap();
     sessions.notify_turn_done();
-    assert!(sessions.cancel_child_run(&handle.rlm_child_id).await);
+    prompt_gate.copied.notified().await;
+    let cancel = {
+        let sessions = sessions.clone();
+        let child_id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.cancel_child_run(&child_id).await })
+    };
+    prompt_gate.release.notify_one();
+    assert!(cancel.await.expect("cancel task"));
     // One settle hook from the cancel, one from the watcher's settle tail.
     for _ in 0..2 {
         tokio::time::timeout(Duration::from_secs(10), hook_rx.recv())
@@ -1003,6 +1333,10 @@ async fn a_child_whose_task_prompt_cannot_be_routed_delivers_the_failure_notice(
     );
     let entries = sessions.list_subagents().await.expect("child roster");
     assert_eq!(entries[0].status, "error");
+    assert_eq!(
+        entries[0].error.as_deref(),
+        Some("prompt RLM child session child-live: refused by the fake supervisor")
+    );
     tokio::time::timeout(Duration::from_secs(10), hook_rx.recv())
         .await
         .expect("the failed child releases the owed continuation")
@@ -1016,6 +1350,27 @@ async fn a_child_whose_task_prompt_cannot_be_routed_delivers_the_failure_notice(
     // Exactly one failure row lands: the claim admits one writer.
     let extra = tokio::time::timeout(Duration::from_millis(300), follow_up_rx.recv()).await;
     assert!(extra.is_err(), "no second notice may arrive");
+}
+
+/// A positive collect releases a queued kickoff whose startup fails and wakes
+/// with the bounded terminal error instead of waiting to its deadline.
+#[tokio::test]
+async fn positive_collect_wakes_on_kickoff_failure() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::PromptFails)
+            .await;
+    let handle = spawn_child(&sessions).await;
+
+    let rows = sessions
+        .collect(vec![handle.rlm_child_id], 10_000)
+        .await
+        .expect("collect failed kickoff");
+    assert_eq!(rows[0].status, "error");
+    assert!(rows[0].settled);
+    let error = rows[0].error.as_deref().expect("bounded startup error");
+    assert!(error.contains("refused by the fake supervisor"), "{error}");
+    assert!(error.chars().count() <= super::lifecycle::CHILD_ERROR_MAX_CHARS);
 }
 
 /// #3366: a child whose model calls all failed settles `error`, not
@@ -1282,7 +1637,11 @@ async fn one_running_child(sessions: &SupervisorChildSessions) {
     loop {
         let entries = sessions.list_subagents().await.expect("child roster");
         if let Some(row) = entries.first() {
-            assert_eq!(row.status, "running");
+            assert!(
+                matches!(row.status, "queued" | "running"),
+                "unsettled child status: {}",
+                row.status
+            );
             return;
         }
         assert!(Instant::now() < deadline, "child row never appeared");
@@ -1560,8 +1919,8 @@ async fn a_failed_delete_leaves_the_child_running_and_can_still_record_its_cance
     let entries = sessions.list_subagents().await.expect("child roster");
     assert_eq!(entries.len(), 1, "the failed child stays tracked for retry");
     assert_eq!(
-        entries[0].status, "running",
-        "a failed delete must not mark the still-live child cancelled: {entries:?}"
+        entries[0].status, "queued",
+        "a failed delete must not mark the still-queued child cancelled: {entries:?}"
     );
     assert!(
         cancelled_lines(&ledger_path).is_empty(),
@@ -2105,8 +2464,8 @@ async fn a_refused_abort_leaves_the_child_running_and_a_later_cancel_records_the
     // still-running child is not misreported cancelled.
     let entries = sessions.list_subagents().await.expect("child roster");
     assert_eq!(
-        entries[0].status, "running",
-        "a refused abort must leave the live child running: {entries:?}"
+        entries[0].status, "queued",
+        "a refused abort must leave the queued child queued: {entries:?}"
     );
     assert_eq!(
         cancelled_lines(&ledger_path),
@@ -2125,8 +2484,8 @@ async fn a_refused_abort_leaves_the_child_running_and_a_later_cancel_records_the
         let published = rows.lock().unwrap();
         assert_eq!(
             published.last().and_then(|row| row["status"].as_str()),
-            Some("running"),
-            "the refused abort must republish the live row: {published:?}"
+            Some("queued"),
+            "the refused abort must republish the queued row: {published:?}"
         );
     }
     assert!(
@@ -2177,7 +2536,14 @@ async fn a_refused_abort_leaves_the_child_running_and_a_later_cancel_records_the
 #[tokio::test]
 async fn a_cancelled_rows_settle_survives_the_watcher_grace_recheck() {
     let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
-    let child_subagents = Arc::new(FakeChildSubagents::default());
+    let prompt_gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let child_subagents = Arc::new(FakeChildSubagents {
+        prompt_gate: Some(Arc::clone(&prompt_gate)),
+        ..FakeChildSubagents::default()
+    });
     // The child reads busy for the whole cancel window: the parked watcher
     // provably hits its grace re-check with the row already settled
     // `cancelled` by the registry and the child still busy — the exact
@@ -2216,6 +2582,9 @@ async fn a_cancelled_rows_settle_survives_the_watcher_grace_recheck() {
     )
     .expect("write the child ledger");
     sessions.notify_turn_done();
+    prompt_gate.copied.notified().await;
+    prompt_gate.release.notify_one();
+    wait_for_quiescent_wait(&child_subagents).await;
 
     assert!(
         sessions.cancel_child_run(&handle.rlm_child_id).await,
@@ -2686,6 +3055,8 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
         direct_observation: Arc::new(Mutex::new(())),
         notice_delivered: false,
         prompt_admitted: true,
+        prompt_release: Arc::new(tokio::sync::Notify::new()),
+        kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
         error: None,
         closed_by_parent: false,
         retiring: false,
@@ -2759,6 +3130,8 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
         direct_observation: Arc::new(Mutex::new(())),
         notice_delivered: false,
         prompt_admitted: true,
+        prompt_release: Arc::new(tokio::sync::Notify::new()),
+        kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
         error: None,
         closed_by_parent: false,
         retiring: false,
