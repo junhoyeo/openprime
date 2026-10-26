@@ -30,6 +30,18 @@
         "owner": "rust-port-sessions",
         "summary": "pinned Rust: immediate spawn→collect race — positive timeout returns `running` ~1ms after spawn, before the initial prompt becomes observably busy",
         "fork_reference": "adde4cc6b (queued state + startup failures); runtime test_subagent_registry.py; TS agent-session-recursion.test.ts"
+      },
+      {
+        "id": "kernel-generation-bootstrap-gaps",
+        "found_by": "openprime-pr32 (kernel lane)",
+        "owner": "openprime-pr32",
+        "summary": "medium-confidence covered-by-rewrite claims on the generation/bootstrap (venv/stderr) cluster disproved by tests/source review — real gaps behind the rewrite"
+      },
+      {
+        "id": "bd15cf317-fast-mode-compat-missing",
+        "found_by": "rust-port-providers",
+        "owner": "rust-port-providers",
+        "summary": "custom-model fast-mode compat (bd15cf317 scope) proven missing on the frozen tip despite service-tier generalization"
       }
     ],
     "target_repository": "https://github.com/junhoyeo/openprime",
@@ -47,7 +59,10 @@
     "migration_status_counts": {
       "BLOCKED": 99
     },
-    "classification_policy": "Inventory disposition and verification outcome are separate. Every row remains BLOCKED until its focused lane verifier and integrated-tip acceptance pass; confidence alone never proves parity. Proposed final statuses are review candidates, not acceptance claims."
+    "classification_policy": "Inventory disposition and verification outcome are separate. Every row remains BLOCKED until its focused lane verifier and integrated-tip acceptance pass; confidence alone never proves parity. Proposed final statuses are review candidates, not acceptance claims.",
+    "revision": "r2 (2026-10-26): behavioral-acceptance note, lane disproofs, PR row updates; dispositions unchanged from lead-integrated copy except notes",
+    "behavioral_acceptance_note": "Source disposition != behavioral acceptance. covered-by-rewrite / already-covered are source-level readings of the frozen tip. Medium/low-confidence rows stay BLOCKED until lane verifiers pass. Disproved so far: kernel generation/bootstrap rewrite claims (venv/stderr cluster — real gaps per kernel lane tests+source review); bd15cf317 custom fast-mode compat (provider lane: missing); adde4cc6b queued/admission state (session lane: measured spawn->collect race; already re-dispositioned must-port in this ledger).",
+    "cutover_policy": "CONDITIONAL cutover only: never run unqualified `prime-agent update` on the fork install — the updater resolves latest.json under PRIME_AGENT_DOWNLOAD_BASE_URL or the DEFAULT upstream bucket and may install upstream artifacts. Use a fork-artifact channel (publish jobs pinned to fork origin, 93c2a3f6a) or isolated manual install, after URL/channel + checksum verification."
   },
   "commits": [
     {
@@ -3621,7 +3636,7 @@
         }
       ],
       "port_target": null,
-      "notes": "DO NOT re-port — fork PR would regress the reviewed upstream implementation. Close PR #32 with a pointer to #3749.",
+      "notes": "DO NOT re-port — fork PR would regress the reviewed upstream implementation (63bdb5ad0 #3749). Keep PR#32 OPEN until final migration acceptance/merge (TS rollback branch may still need it), then close citing #3749.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
@@ -3677,7 +3692,12 @@
       "related_legacy_commits": [
         "4af3c6d89",
         "5d4d1eb26f0e63ed8946bad39746412d00f6acd0"
-      ]
+      ],
+      "commits": [
+        "4af3c6d89",
+        "5d4d1eb26f0e63ed8946bad39746412d00f6acd0"
+      ],
+      "scout_notes_r2": "Pure Python skill content + tests; carries over verbatim when agent-sessions is bundled from latest fork source. INCLUDE 5d4d1eb26 \"fix(agent-sessions): preserve Unicode smart-case matches\" (2026-10-26) in the copied source. No TS dependency."
     }
   ]
 }

@@ -107,6 +107,8 @@ A synthetic provider is the CI/default smoke path. A paid gateway smoke is optio
 
 During migration, the branch and draft PR may build verification artifacts only. No release tag, default-branch switch, installer update, publish job, or live runtime restart is authorized. Fork workflow changes must make `junhoyeo/openprime` the explicit target and prevent a migration PR or an upstream-shaped workflow from publishing accidentally.
 
+Never use an unqualified `prime-agent update` for cutover. The updater resolves channel metadata from `PRIME_AGENT_DOWNLOAD_BASE_URL` or its default upstream bucket and can install an upstream artifact. Cutover must use an isolated manual install or a reviewed fork artifact channel only after the served URL, artifact identity, checksum, and rollback input are verified.
+
 ## Rollback and cutover plan
 
 Rollback evidence is the untouched `origin/develop` tip `703367badf5c84e48e8c8cd986fbcda882b6378c` and the currently installed TypeScript runtime. The migration does not rewrite or delete either.
