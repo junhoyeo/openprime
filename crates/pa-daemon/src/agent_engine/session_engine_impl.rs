@@ -572,7 +572,23 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn model_metadata(&self) -> Option<Value> {
-        serde_json::to_value(self.resolve_model().ok()?).ok()
+        let model = self.resolve_model().ok()?;
+        let supports_fast_mode = model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.raw.get("supportsFastMode"))
+            .and_then(Value::as_bool);
+        let mut metadata = json!({
+            "id": model.id,
+            "name": model.name,
+            "api": model.api,
+            "provider": model.provider,
+            "reasoning": model.reasoning,
+        });
+        if let Some(supports_fast_mode) = supports_fast_mode {
+            metadata["supportsFastMode"] = json!(supports_fast_mode);
+        }
+        Some(metadata)
     }
 
     fn is_quota_parked(&self) -> bool {
