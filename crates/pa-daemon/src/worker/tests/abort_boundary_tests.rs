@@ -1193,3 +1193,131 @@ async fn abort_cancels_a_planning_refine_and_settles_its_failure() {
     assert!(worker.core.lock().unwrap().queued_input_suspended);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Await the first session event `matches` accepts (the frames `session_events_since` reads).
+async fn await_session_event(
+    subscription: &mut tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+    matches: impl Fn(&Value) -> bool,
+) -> Value {
+    loop {
+        let frame = subscription.recv().await.expect("the event pump is live");
+        if frame.outbound_type != "session_event" {
+            continue;
+        }
+        let Ok(outbound) = serde_json::from_slice::<Value>(&frame.payload) else {
+            continue;
+        };
+        if matches(&outbound["event"]) {
+            return outbound["event"].clone();
+        }
+    }
+}
+
+fn is_aborted_refine_failure(event: &Value) -> bool {
+    event["type"] == "refine_failed"
+        && event["error"] == json!(pa_agent::abort::ABORT_ERROR_MESSAGE)
+}
+
+/// The abort reaches a planning refine through the engine's shared slot even while another
+/// holder keeps the session slot's lock across an await (`get_commands`,
+/// `get_resource_snapshot`, `get_tool_definition` do): the refine settles at once.
+#[tokio::test]
+// the faux registry is process-global: the guard must span the async flow
+#[allow(clippy::await_holding_lock)]
+async fn an_abort_reaches_a_planning_refine_while_the_session_slot_is_held() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let late_plan = r#"{"summary":"late","edits":[{"action":"create","kind":"memory","id":"late","title":"Late","content":"never applied"}]}"#;
+    let (worker, dir, requested) =
+        held_turn_worker("refine-held-session", "refine-held", late_plan).await;
+    let mut subscription = worker.events.subscribe();
+    let prompt = worker
+        .dispatch(
+            "prompt",
+            &json!({ "activeSessionId": "refine-held-session", "message": "/refine --global" }),
+        )
+        .await;
+    assert!(prompt.success, "prompt failed: {prompt:?}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified())
+        .await
+        .expect("the refine planning request never started");
+    let engine = std::sync::Arc::clone(worker.agent_engine.as_ref().expect("the faux engine"));
+    let held = engine.session.lock().await;
+    let aborted = worker.dispatch("abort", &json!({})).await;
+    assert!(aborted.success, "abort failed: {aborted:?}");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        await_session_event(&mut subscription, is_aborted_refine_failure),
+    )
+    .await
+    .expect("the refine cancels while the session slot is held");
+    drop(held);
+    let idle = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        worker.dispatch("wait_for_idle", &json!({})),
+    )
+    .await
+    .expect("the cancelled refine settles");
+    assert!(idle.success, "wait_for_idle failed: {idle:?}");
+    assert!(!pa_core::refinement::get_harness_state_path(&dir.join("agent")).exists());
+    assert!(futures::FutureExt::now_or_never(requested.notified()).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An abort that lands after the `/refine` delivery's pickup but before the refine registers
+/// (gated here at the session slot the model resolve and the first-use build wait on) cancels
+/// the delivery's armed abort: the refine refuses before any planning request.
+#[tokio::test]
+// the faux registry is process-global: the guard must span the async flow
+#[allow(clippy::await_holding_lock)]
+async fn an_abort_before_the_refine_registers_cancels_it_unplanned() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let late_plan = r#"{"summary":"late","edits":[{"action":"create","kind":"memory","id":"late","title":"Late","content":"never applied"}]}"#;
+    let (worker, dir, requested) =
+        held_turn_worker("refine-gated-session", "refine-gated", late_plan).await;
+    let engine = std::sync::Arc::clone(worker.agent_engine.as_ref().expect("the faux engine"));
+    let mut subscription = worker.events.subscribe();
+    let gate = engine.session.lock().await;
+    let prompt = worker
+        .dispatch(
+            "prompt",
+            &json!({ "activeSessionId": "refine-gated-session", "message": "/refine --global" }),
+        )
+        .await;
+    assert!(prompt.success, "prompt failed: {prompt:?}");
+    // The delivery picked the refine up and parks at the gate before registering.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        await_session_event(&mut subscription, |event| {
+            event["type"] == "session_action_update"
+                && event["actions"]["active"]["kind"] == "session_command"
+        }),
+    )
+    .await
+    .expect("the refine delivery never started");
+    let aborted = worker.dispatch("abort", &json!({})).await;
+    assert!(aborted.success, "abort failed: {aborted:?}");
+    drop(gate);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        await_session_event(&mut subscription, is_aborted_refine_failure),
+    )
+    .await
+    .expect("the gated refine refuses with the abort");
+    let idle = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        worker.dispatch("wait_for_idle", &json!({})),
+    )
+    .await
+    .expect("the cancelled refine settles");
+    assert!(idle.success, "wait_for_idle failed: {idle:?}");
+    assert!(
+        futures::FutureExt::now_or_never(requested.notified()).is_none(),
+        "the refine never planned"
+    );
+    assert!(!pa_core::refinement::get_harness_state_path(&dir.join("agent")).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

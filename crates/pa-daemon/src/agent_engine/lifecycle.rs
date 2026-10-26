@@ -162,6 +162,7 @@ impl AgentSessionEngine {
                 false,
             )),
             session_build: tokio::sync::Mutex::new(()),
+            refine_abort: Arc::default(),
             pending_branch: std::sync::Mutex::new(None),
             prompt_context_boundary: std::sync::Mutex::new(None),
             provider_target: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -351,6 +352,9 @@ impl AgentSessionEngine {
     }
 
     async fn adopt_built_session(&self, built: &Arc<CoreSessionEngine>) -> anyhow::Result<()> {
+        built
+            .session
+            .share_refine_abort_slot(Arc::clone(&self.refine_abort));
         self.mirror_goal_runtime(built).await;
         *self
             .progress_notes
