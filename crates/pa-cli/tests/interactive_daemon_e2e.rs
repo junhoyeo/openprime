@@ -3307,8 +3307,24 @@ async fn tui_side_question_pane_flow() {
         !last.contains("esc to return to session"),
         "esc closed the pane:\n{last}"
     );
-    // Side questions are not durable: the session file has no side-question user rows.
-    let mut leaked = false;
+    // `/btw` is durable as a linked side transcript: the parent records one immutable
+    // `side_question` pointer row and never a user row for a side question; the linked file under
+    // the parent's artifact tree holds both side turns in order.
+    let questions = ["what is the capital of France", "and its largest city"];
+    let rows_of = |path: &std::path::Path| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    };
+    let user_texts = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row["type"] == "message" && row["message"]["role"] == "user")
+            .map(|row| row["message"]["content"].to_string())
+            .collect()
+    };
+    let mut pointers = Vec::new();
     for entry in std::fs::read_dir(&session_dir)
         .expect("read session dir")
         .flatten()
@@ -3317,10 +3333,46 @@ async fn tui_side_question_pane_flow() {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        leaked |= content.contains("what is the capital of France");
+        let rows = rows_of(&path);
+        for text in user_texts(&rows) {
+            assert!(
+                !questions.iter().any(|question| text.contains(question)),
+                "a side question became a parent user row: {text}"
+            );
+        }
+        pointers.extend(
+            rows.into_iter()
+                .filter(|row| row["type"] == "custom" && row["customType"] == "side_question"),
+        );
     }
-    assert!(!leaked, "the side question stayed out of the session file");
+    assert_eq!(pointers.len(), 1, "one pane, one pointer: {pointers:?}");
+    let pointer = &pointers[0]["data"];
+    assert_eq!(pointer["question"], questions[0], "{pointer}");
+    let linked = std::path::PathBuf::from(pointer["sessionFile"].as_str().expect("linked file"));
+    let artifacts =
+        std::fs::canonicalize(agent_dir.join("session-artifacts")).expect("artifact tree");
+    assert!(
+        std::fs::canonicalize(&linked)
+            .expect("the linked side transcript exists")
+            .starts_with(&artifacts),
+        "the side transcript lives under the artifact tree: {}",
+        linked.display()
+    );
+    let side_rows = rows_of(&linked);
+    let side_questions = user_texts(&side_rows);
+    assert_eq!(side_questions.len(), questions.len(), "{side_questions:?}");
+    for (text, question) in side_questions.iter().zip(questions) {
+        assert!(text.contains(question), "{side_questions:?}");
+    }
+    let side_answers: Vec<String> = side_rows
+        .iter()
+        .filter(|row| row["type"] == "message" && row["message"]["role"] == "assistant")
+        .map(|row| row["message"]["content"].to_string())
+        .collect();
+    assert!(
+        side_answers[0].contains("Paris, obviously") && side_answers[1].contains("Second answer"),
+        "{side_answers:?}"
+    );
 }
 
 #[tokio::test]
