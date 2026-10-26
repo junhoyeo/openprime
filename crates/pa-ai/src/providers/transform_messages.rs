@@ -111,6 +111,27 @@ pub(crate) fn repair_unnamed_tool_calls(output: &mut AssistantMessage) {
 
 type Normalizer<'a> = dyn Fn(&str, &Model, &AssistantMessage) -> Option<String> + 'a;
 
+fn append_real_tool_result(
+    result: &mut Vec<Message>,
+    pending_tool_calls: &[ToolCall],
+    existing_tool_result_ids: &mut HashSet<String>,
+    message: &Message,
+) -> bool {
+    let Message::ToolResult(tool_result) = message else {
+        return false;
+    };
+    if !pending_tool_calls
+        .iter()
+        .any(|tool_call| tool_call.id == tool_result.tool_call_id)
+        || existing_tool_result_ids.contains(&tool_result.tool_call_id)
+    {
+        return false;
+    }
+    existing_tool_result_ids.insert(tool_result.tool_call_id.clone());
+    result.push(message.clone());
+    true
+}
+
 /// Tool-call ID normalization plus synthetic tool results for unanswered calls, dropping errored
 /// assistant turns (TS `transformMessages`). Unnamed tool calls already stored in a session (written
 /// before the stream dropped them) are stripped here, and their results go with them as orphans, so
@@ -218,8 +239,11 @@ pub fn transform_messages_with_normalizer(
         })
         .collect();
 
-    // This preserves thinking signatures and satisfies API requirements
+    // Pair every emitted tool result with a currently pending tool call. A persisted user message
+    // can race an abort result; recover that result from the remainder of the same turn before
+    // synthesizing anything at the user boundary.
     let mut result: Vec<Message> = Vec::new();
+    let mut consumed_tool_result_indexes: HashSet<usize> = HashSet::new();
     let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
     let mut existing_tool_result_ids: HashSet<String> = HashSet::new();
     // Epoch millis fit u64 for ~584 million years; the u128 duration's millis are the timestamp's convention.
@@ -250,7 +274,10 @@ pub fn transform_messages_with_normalizer(
             existing.clear();
         };
 
-    for msg in transformed {
+    for (index, msg) in transformed.iter().enumerate() {
+        if consumed_tool_result_indexes.contains(&index) {
+            continue;
+        }
         let Some(msg) = msg else {
             insert_synthetic_tool_results(
                 &mut result,
@@ -259,7 +286,7 @@ pub fn transform_messages_with_normalizer(
             );
             continue;
         };
-        match &msg {
+        match msg {
             Message::Assistant(assistant) => {
                 insert_synthetic_tool_results(
                     &mut result,
@@ -288,25 +315,42 @@ pub fn transform_messages_with_normalizer(
                     pending_tool_calls = tool_calls;
                     existing_tool_result_ids.clear();
                 }
-                result.push(msg);
+                result.push(msg.clone());
             }
-            Message::ToolResult(tool_result) => {
-                if !pending_tool_calls
-                    .iter()
-                    .any(|tool_call| tool_call.id == tool_result.tool_call_id)
-                {
-                    continue;
-                }
-                existing_tool_result_ids.insert(tool_result.tool_call_id.clone());
-                result.push(msg);
+            Message::ToolResult(_) => {
+                // Unmatched and duplicate results are invalid at every provider boundary.
+                append_real_tool_result(
+                    &mut result,
+                    &pending_tool_calls,
+                    &mut existing_tool_result_ids,
+                    msg,
+                );
             }
             Message::User(_) => {
+                if !pending_tool_calls.is_empty() {
+                    for (lookahead, later) in transformed.iter().enumerate().skip(index + 1) {
+                        let Some(later) = later else {
+                            break;
+                        };
+                        if matches!(later, Message::Assistant(_)) {
+                            break;
+                        }
+                        if append_real_tool_result(
+                            &mut result,
+                            &pending_tool_calls,
+                            &mut existing_tool_result_ids,
+                            later,
+                        ) {
+                            consumed_tool_result_indexes.insert(lookahead);
+                        }
+                    }
+                }
                 insert_synthetic_tool_results(
                     &mut result,
                     &mut pending_tool_calls,
                     &mut existing_tool_result_ids,
                 );
-                result.push(msg);
+                result.push(msg.clone());
             }
         }
     }
@@ -483,6 +527,96 @@ mod tests {
             timestamp: 0,
             rest: Map::default(),
         })
+    }
+
+    #[test]
+    fn hoists_a_late_abort_result_before_an_interposed_user_notice() {
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![tool_call("call-1", "bash")],
+                StopReason::ToolUse,
+            )),
+            user("<prime_agent_update_interrupted>"),
+            tool_result("call-1", "bash", "Request was aborted"),
+        ];
+
+        let transformed =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        let expected = vec![
+            messages[0].clone(),
+            messages[2].clone(),
+            messages[1].clone(),
+        ];
+        assert_eq!(transformed, expected);
+    }
+
+    #[test]
+    fn anchors_real_results_from_both_sides_of_a_parallel_tool_boundary() {
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![
+                    tool_call("call-1", "bash"),
+                    tool_call("call-2", "bash"),
+                    tool_call("call-3", "bash"),
+                ],
+                StopReason::ToolUse,
+            )),
+            tool_result("call-1", "bash", "one"),
+            user("restart"),
+            tool_result("call-2", "bash", "two"),
+        ];
+
+        let transformed =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        assert_eq!(transformed.len(), 5);
+        assert_eq!(transformed[0], messages[0]);
+        assert_eq!(transformed[1], messages[1]);
+        assert_eq!(transformed[2], messages[3]);
+        assert!(matches!(
+            &transformed[3],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-3"
+                    && result.is_error
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
+        ));
+        assert_eq!(transformed[4], messages[2]);
+    }
+
+    #[test]
+    fn an_assistant_boundary_prevents_hoisting_a_result_from_a_later_turn() {
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![tool_call("call-1", "bash")],
+                StopReason::ToolUse,
+            )),
+            user("stop"),
+            Message::Assistant(assistant(
+                vec![tool_call("call-2", "bash")],
+                StopReason::ToolUse,
+            )),
+            tool_result("call-1", "bash", "late orphan"),
+            tool_result("call-2", "bash", "two"),
+        ];
+
+        let transformed =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        assert!(matches!(
+            &transformed[1],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-1"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
+        ));
+        assert!(!transformed.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "late orphan")
+        )));
+        assert!(transformed.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-2"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "two")
+        )));
     }
 
     #[test]
