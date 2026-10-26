@@ -99,7 +99,7 @@ class AsideTest(unittest.TestCase):
         self.chat = self.root / "messages.jsonl"
         records = [
             {"role": "turn-lifecycle", "event": "started", "timestamp": 1792500000000},
-            {"role": "user", "content": "Find 강의 notes", "timestamp": 1792500000001},
+            {"role": "user", "content": "Find 강의 notes at École", "timestamp": 1792500000001},
             {"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "Read source", "thinkingSignature": "opaque-secret"},
                 {"type": "toolCall", "name": "ipython", "arguments": {"code": "print('강의')"}},
@@ -119,7 +119,7 @@ class AsideTest(unittest.TestCase):
         ]
         self.chat.write_text("\n".join(json.dumps(row) for row in records) + '\n{"role":', encoding="utf-8")
         self.text = self.artifacts / "강의.txt"
-        self.text.write_text("Heading\n\n[00:01] 강의 artifact-only\nNext line\n", encoding="utf-8")
+        self.text.write_text("Heading École\n\n[00:01] 강의 artifact-only\nNext line\n", encoding="utf-8")
         (self.artifacts / "강의.vtt").write_text("WEBVTT\n\n00:00.000 --> 00:01.000\n강의 artifact-only\n", encoding="utf-8")
         (self.artifacts / "notes.MD").write_text("# nested notes", encoding="utf-8")
         (self.artifacts / "image.png").write_bytes(b"artifact-only")
@@ -147,6 +147,7 @@ class AsideTest(unittest.TestCase):
         self.assertEqual(sessions.grep_sessions("old needle", session=self.chat, kinds="system")[0]["hits"][0]["name"], "compaction")
         hits = sessions.grep_sessions("강의", session=self.chat)[0]["hits"]
         self.assertEqual({hit["kind"] for hit in hits}, {"user", "tool_call", "tool_result", "assistant"})
+        self.assertEqual(len(sessions.grep_sessions("école", session=self.chat)), 1)
 
     def test_discovery_and_scoped_grep_include_artifact_only_sessions_and_profiles(self) -> None:
         orphan = self.home / ".aside/u/1/sessions/2026-10-20_Orphan/artifacts/notes.md"
@@ -165,6 +166,7 @@ class AsideTest(unittest.TestCase):
         self.assertEqual(sessions.resolve_session("AsideSession")[1], self.chat)
         self.assertEqual(sessions.resolve_session(self.root)[1], self.chat)
         self.assertEqual(len(sessions.grep_sessions("강의", session=self.text)), 1)
+        self.assertEqual(len(sessions.grep_sessions("école", session=self.text, fixed=True)), 1)
         self.assertEqual(sessions.grep_sessions("강의", session=self.text, kinds="chat"), [])
         self.assertEqual(len(sessions.find_sessions(harness="aside", project="lecture-transcripts")), 3)
         os.utime(self.text, (0, 0))

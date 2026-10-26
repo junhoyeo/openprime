@@ -1598,29 +1598,31 @@ def _split_alternation(pattern: str) -> list[str]:
     return branches
 
 
-def _probe_terms(literal: str) -> list[str]:
+def _probe_terms(literal: str, ignore_case: bool = False) -> list[str]:
     literal = literal.strip()
-    if len(literal) < 3:
+    if len(literal) < 3 or (ignore_case and not literal.isascii()):
+        # bytes.lower() cannot reproduce Unicode case folding, so a Unicode
+        # smart-case probe could reject a file that the parsed regex matches.
         return []
     # JSONL stores text escaped (\n, \uXXXX for non-ASCII), so probe the raw
     # literal and its JSON-escaped form.
     return [literal.lower(), json.dumps(literal, ensure_ascii=True)[1:-1].lower()]
 
 
-def _prefilter_terms(pattern: str, fixed: bool) -> list[str]:
+def _prefilter_terms(pattern: str, fixed: bool, ignore_case: bool = False) -> list[str]:
     """Cheap literal probes used to skip whole transcripts before parsing.
 
     Returns an empty list when the pattern cannot be probed safely, which means
     "do not skip any file".
     """
     if fixed:
-        return _probe_terms(pattern)
+        return _probe_terms(pattern, ignore_case)
     terms: list[str] = []
     for branch in _split_alternation(pattern):
         runs = _mandatory_literals(branch)
         if not runs:
             return []  # one un-probeable branch makes the whole filter unsafe
-        probes = _probe_terms(max(runs, key=len))
+        probes = _probe_terms(max(runs, key=len), ignore_case)
         if not probes:
             return []
         terms.extend(probes)
@@ -1697,7 +1699,7 @@ def grep_sessions(
     """Grep parsed events across transcripts. Returns one dict per session with
     a ``hits`` list of {index, kind, name, text, context}."""
     regex = compile_pattern(pattern, fixed=fixed, ignore_case=ignore_case)
-    terms = _prefilter_terms(pattern, fixed)
+    terms = _prefilter_terms(pattern, fixed, bool(regex.flags & re.IGNORECASE))
 
     if session is not None:
         candidates = _grep_paths(session, harness)
