@@ -136,6 +136,7 @@ impl SessionUi {
             scoped_agents_view: None,
             roster: Vec::new(),
             heartbeat_catalog: Vec::new(),
+            heartbeat_catalog_error: None,
             heartbeat_refresh_in_flight: false,
             heartbeat_refresh_queued: false,
             heartbeat_refresh_epoch: 0,
@@ -441,7 +442,10 @@ impl SessionUi {
         // The dock's heartbeat rows follow `dock_fold`: a first-content-frame attach folds the
         // fresh fetch BEFORE the attach returns (the operator's 2026-09-26 zero-shift ruling).
         match dock_fold {
-            DockFold::FirstFrame | DockFold::Fresh => self.heartbeat_catalog.clear(),
+            DockFold::FirstFrame | DockFold::Fresh => {
+                self.heartbeat_catalog.clear();
+                self.heartbeat_catalog_error = None;
+            }
             // The held dock keeps its data: an already-up surface's dock
             // must not flicker away while the background refresh runs.
             DockFold::Held => {}

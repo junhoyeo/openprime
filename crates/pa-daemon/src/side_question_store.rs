@@ -40,10 +40,20 @@ pub(crate) struct SideQuestionRecorder {
     state: Mutex<RecorderState>,
 }
 
-#[derive(Default)]
 struct RecorderState {
     transcript: Option<SessionFile>,
     disabled: bool,
+    usage_known: bool,
+}
+
+impl Default for RecorderState {
+    fn default() -> Self {
+        Self {
+            transcript: None,
+            disabled: false,
+            usage_known: true,
+        }
+    }
 }
 
 fn assistant_message_value(message: &AssistantMessage) -> serde_json::Value {
@@ -63,35 +73,49 @@ fn resume_linked_transcript(
         return Ok(None);
     }
     let content = std::fs::read_to_string(&parent.path)?;
-    let mut linked = content.lines().filter_map(|line| {
-        let row: serde_json::Value = serde_json::from_str(line).ok()?;
-        (row.get("type").and_then(serde_json::Value::as_str) == Some("custom")
-            && row.get("customType").and_then(serde_json::Value::as_str)
-                == Some(SIDE_QUESTION_POINTER_TYPE)
-            && row
+    let mut matching_pointer = None;
+    for line in content.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(serde_json::Value::as_str) != Some("custom")
+            || row.get("customType").and_then(serde_json::Value::as_str)
+                != Some(SIDE_QUESTION_POINTER_TYPE)
+            || row
                 .get("data")
                 .and_then(|data| data.get("btwId"))
                 .and_then(serde_json::Value::as_str)
-                == Some(btw_id))
-        .then(|| {
-            row.get("data")
-                .and_then(|data| data.get("sessionFile"))
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from)
-        })
-        .flatten()
-    });
-    let Some(path) = linked.next_back() else {
+                != Some(btw_id)
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            matching_pointer.is_none(),
+            "multiple immutable side-question pointers exist for pane {btw_id}"
+        );
+        let path = row
+            .get("data")
+            .and_then(|data| data.get("sessionFile"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("side-question pointer {btw_id} has no sessionFile"))?;
+        matching_pointer = Some(PathBuf::from(path));
+    }
+    let Some(path) = matching_pointer else {
         return Ok(None);
     };
     let expected_root = agent_dir
         .join("session-artifacts")
         .join(parent.session_id());
+    let canonical_root = std::fs::canonicalize(&expected_root)
+        .map_err(|error| anyhow::anyhow!("resolve side-question artifact root: {error}"))?;
+    let canonical_path = std::fs::canonicalize(&path)
+        .map_err(|error| anyhow::anyhow!("resolve linked side-question transcript: {error}"))?;
     anyhow::ensure!(
-        path.starts_with(&expected_root),
+        canonical_path.starts_with(&canonical_root),
         "linked side-question transcript escapes the parent artifact directory"
     );
-    let transcript = SessionFile::open(&path)?;
+    let transcript = SessionFile::open(&canonical_path)?;
     anyhow::ensure!(
         transcript.header.parent_session.as_deref() == Some(parent.path.to_string_lossy().as_ref()),
         "linked side-question transcript has the wrong parent"
@@ -110,6 +134,23 @@ impl SideQuestionRecorder {
             agent_dir,
             btw_id,
             state: Mutex::new(RecorderState::default()),
+        }
+    }
+
+    pub(crate) fn ensure_started(&self, question: &str, provider: &str, model_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.disabled || state.transcript.is_some() {
+            return;
+        }
+        if let Err(error) = self.ensure_started_inner(&mut state, question, provider, model_id) {
+            state.disabled = true;
+            eprintln!(
+                "pa-daemon: side-question pointer {} disabled: {error:#}",
+                self.btw_id
+            );
         }
     }
 
@@ -136,12 +177,12 @@ impl SideQuestionRecorder {
         }
     }
 
-    fn record_turn_inner(
+    fn ensure_started_inner(
         &self,
         state: &mut RecorderState,
         question: &str,
-        assistant: &AssistantMessage,
-        auxiliary: &[AssistantMessage],
+        provider: &str,
+        model_id: &str,
     ) -> anyhow::Result<()> {
         if state.transcript.is_none() {
             let mut core = self
@@ -183,13 +224,34 @@ impl SideQuestionRecorder {
                 parent.persist_entry("custom", pointer)?;
                 transcript.persist_entry(
                     "model_change",
-                    json!({ "provider": assistant.provider, "modelId": assistant.model }),
+                    json!({ "provider": provider, "modelId": model_id }),
                 )?;
                 state.transcript = Some(transcript);
             }
         }
+        Ok(())
+    }
+
+    fn record_turn_inner(
+        &self,
+        state: &mut RecorderState,
+        question: &str,
+        assistant: &AssistantMessage,
+        auxiliary: &[AssistantMessage],
+    ) -> anyhow::Result<()> {
+        self.ensure_started_inner(state, question, &assistant.provider, &assistant.model)?;
 
         let transcript = state.transcript.as_mut().expect("initialized above");
+        let reports_usage = |message: &AssistantMessage| {
+            message.usage.total_tokens > 0
+                || message.usage.input > 0
+                || message.usage.output > 0
+                || message.usage.cache_read > 0
+                || message.usage.cache_write > 0
+        };
+        if !reports_usage(assistant) || auxiliary.iter().any(|message| !reports_usage(message)) {
+            state.usage_known = false;
+        }
         transcript.persist_entry(
             "message",
             json!({
@@ -225,10 +287,11 @@ impl SideQuestionRecorder {
         if state.disabled {
             return;
         }
+        let usage_known = state.usage_known;
         let Some(transcript) = state.transcript.as_mut() else {
             return;
         };
-        let mut data = json!({ "status": status.as_str() });
+        let mut data = json!({ "status": status.as_str(), "usageKnown": usage_known });
         if let Some(error) = error_message.filter(|value| !value.is_empty()) {
             data["errorMessage"] = json!(error);
         }
@@ -329,8 +392,8 @@ mod tests {
             "provider": "test-provider",
             "model": "test-model",
             "usage": {
-                "input": total_tokens - 1,
-                "output": 1,
+                "input": total_tokens.saturating_sub(1),
+                "output": u64::from(total_tokens > 0),
                 "cacheRead": 0,
                 "cacheWrite": 0,
                 "totalTokens": total_tokens,
@@ -368,6 +431,36 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn append_pointer(
+        parent: &std::path::Path,
+        btw_id: &str,
+        side: &std::path::Path,
+        session_id: &str,
+    ) {
+        use std::io::Write as _;
+        let row = json!({
+            "type":"custom", "id":format!("pointer-{btw_id}"), "parentId":null,
+            "timestamp":"2026-08-16T00:00:00.000Z",
+            "customType":SIDE_QUESTION_POINTER_TYPE,
+            "data":{"btwId":btw_id,"sessionFile":side.display().to_string(),"sessionId":session_id,"question":"old","startedAt":"2026-08-16T00:00:00.000Z"}
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(parent)
+            .unwrap();
+        writeln!(file, "{row}").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn pointer_count(parent: &std::path::Path, btw_id: &str) -> usize {
+        jsonl(parent)
+            .iter()
+            .filter(|row| {
+                row["customType"] == SIDE_QUESTION_POINTER_TYPE && row["data"]["btwId"] == btw_id
+            })
+            .count()
     }
 
     #[test]
@@ -479,6 +572,135 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1]["message"]["usage"]["totalTokens"], 13);
         assert_eq!(messages[3]["message"]["usage"]["totalTokens"], 17);
+    }
+
+    #[test]
+    fn traversal_pointer_never_appends_outside_the_parent_artifact_root() {
+        let (temp, core, registry) = fixture();
+        let (parent_path, parent_id) = {
+            let core = core.lock().unwrap();
+            let parent = core.store.as_ref().unwrap();
+            (parent.path.clone(), parent.session_id().to_string())
+        };
+        let external = temp.path().join("external.jsonl");
+        let mut victim = SessionFile::create("/work", Some(&parent_path.display().to_string()), 0);
+        victim.path = external.clone();
+        victim
+            .persist_entry(
+                "message",
+                json!({"message":{"role":"user","content":"sentinel","timestamp":1}}),
+            )
+            .unwrap();
+        let before = std::fs::read(&external).unwrap();
+        let root = temp.path().join("session-artifacts").join(&parent_id);
+        let lexical_child = root.join("btw-escape");
+        std::fs::create_dir_all(&lexical_child).unwrap();
+        let escaped = lexical_child.join("../../../external.jsonl");
+        append_pointer(&parent_path, "escape-pane", &escaped, victim.session_id());
+
+        registry
+            .resolve("pane:escape-pane", "escape-pane", true)
+            .record_turn("never append", &assistant("no", 9), &[]);
+        assert_eq!(std::fs::read(&external).unwrap(), before);
+        assert_eq!(pointer_count(&parent_path, "escape-pane"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_pointer_never_appends_to_an_external_transcript() {
+        use std::os::unix::fs::symlink;
+        let (temp, core, registry) = fixture();
+        let (parent_path, parent_id) = {
+            let core = core.lock().unwrap();
+            let parent = core.store.as_ref().unwrap();
+            (parent.path.clone(), parent.session_id().to_string())
+        };
+        let external = temp.path().join("external-symlink-target.jsonl");
+        let mut victim = SessionFile::create("/work", Some(&parent_path.display().to_string()), 0);
+        victim.path = external.clone();
+        victim
+            .persist_entry(
+                "message",
+                json!({"message":{"role":"user","content":"sentinel","timestamp":1}}),
+            )
+            .unwrap();
+        let before = std::fs::read(&external).unwrap();
+        let root = temp.path().join("session-artifacts").join(&parent_id);
+        std::fs::create_dir_all(&root).unwrap();
+        let linked = root.join("linked.jsonl");
+        symlink(&external, &linked).unwrap();
+        append_pointer(&parent_path, "symlink-pane", &linked, victim.session_id());
+
+        registry
+            .resolve("pane:symlink-pane", "symlink-pane", true)
+            .record_turn("never append", &assistant("no", 9), &[]);
+        assert_eq!(std::fs::read(&external).unwrap(), before);
+        assert_eq!(pointer_count(&parent_path, "symlink-pane"), 1);
+    }
+
+    #[test]
+    fn malformed_immutable_pointer_is_never_replaced_or_duplicated() {
+        let (_temp, core, registry) = fixture();
+        let parent_path = core.lock().unwrap().store.as_ref().unwrap().path.clone();
+        use std::io::Write as _;
+        let malformed = json!({
+            "type":"custom", "id":"bad", "parentId":null,
+            "timestamp":"2026-08-16T00:00:00.000Z",
+            "customType":SIDE_QUESTION_POINTER_TYPE,
+            "data":{"btwId":"broken-pane","question":"old"}
+        });
+        let mut parent = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent_path)
+            .unwrap();
+        writeln!(parent, "{malformed}").unwrap();
+        parent.sync_all().unwrap();
+        let before = std::fs::read(&parent_path).unwrap();
+
+        let reconnected = SideQuestionPaneRegistry::new(
+            Arc::clone(&core),
+            parent_path
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        );
+        for registry in [&registry, &reconnected] {
+            registry
+                .resolve("pane:broken-pane", "broken-pane", true)
+                .record_turn("retry", &assistant("no", 7), &[]);
+            assert_eq!(std::fs::read(&parent_path).unwrap(), before);
+        }
+        assert_eq!(pointer_count(&parent_path, "broken-pane"), 1);
+    }
+
+    #[test]
+    fn cancelled_partial_turn_has_pointer_message_usage_label_and_status() {
+        let (_temp, core, registry) = fixture();
+        let recorder = registry.resolve("pane:cancel", "cancel", true);
+        recorder.ensure_started("long?", "test-provider", "test-model");
+        let mut partial = assistant("partial", 0);
+        partial.stop_reason = pa_agent::types::StopReason::Aborted;
+        recorder.record_turn("long?", &partial, &[]);
+        recorder.record_status(SideQuestionRecordStatus::Cancelled, None);
+
+        let parent_path = core.lock().unwrap().store.as_ref().unwrap().path.clone();
+        let parent_rows = jsonl(&parent_path);
+        let pointer = parent_rows
+            .iter()
+            .find(|row| row["data"]["btwId"] == "cancel")
+            .expect("pointer before chargeable work");
+        let side = PathBuf::from(pointer["data"]["sessionFile"].as_str().unwrap());
+        let rows = jsonl(&side);
+        assert!(rows.iter().any(|row| row["message"]["role"] == "assistant"
+            && row["message"]["content"][0]["text"] == "partial"
+            && row["message"]["stopReason"] == "aborted"));
+        assert!(rows
+            .iter()
+            .any(|row| row["customType"] == SIDE_QUESTION_STATUS_TYPE
+                && row["data"]["status"] == "cancelled"
+                && row["data"]["usageKnown"] == false));
     }
 
     #[test]

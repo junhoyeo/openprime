@@ -629,7 +629,15 @@ async fn run_attempts(
 
     let message = match final_message {
         Ok(Some(message)) => message,
-        Ok(None) => return SideQuestionResult::cancelled(answer),
+        Ok(None) => {
+            return SideQuestionResult {
+                status: SideQuestionStatus::Cancelled,
+                answer,
+                error_message: None,
+                assistant: latest_streamed_message,
+                auxiliary_completions: Vec::new(),
+            }
+        }
         Err(error) => return SideQuestionResult::failed(answer, error.to_string()),
     };
     if message.stop_reason == StopReason::Error {
@@ -736,6 +744,16 @@ async fn run_attempt(
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let result = attempt.await;
+    // The terminal aborted assistant (with its provider usage) can queue
+    // between the last poll and the task join. Drain it before returning the
+    // cancelled outcome so persistence never loses paid partial work.
+    while let Ok(message) = update_rx.try_recv() {
+        let text = assistant_text(&message);
+        *latest_streamed_message = Some(message);
+        if !text.is_empty() {
+            answer.clone_from(&text);
+        }
+    }
     if aborted {
         return AttemptOutcome::Aborted;
     }
@@ -1183,6 +1201,9 @@ mod tests {
         assert_eq!(result.status, SideQuestionStatus::Cancelled);
         assert_eq!(result.answer, "partial answer");
         assert_eq!(result.error_message, None);
+        let assistant = result.assistant.expect("cancelled partial assistant");
+        assert_eq!(assistant_text(&assistant), "partial answer");
+        assert_eq!(assistant.stop_reason, StopReason::Aborted);
     }
 
     #[tokio::test]

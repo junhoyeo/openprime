@@ -61,20 +61,13 @@ impl SupervisorChildSessionsInner {
     pub(super) async fn cancel_child_run(&self, child_id: &str) -> bool {
         let children = self.children.lock().await.clone();
         for record in &children {
-            let (matched, kickoff_lock) = {
-                let record = record.lock().await;
-                (
-                    record.rlm_child_id == child_id,
-                    Arc::clone(&record.kickoff_lock),
-                )
-            };
+            let matched = record.lock().await.rlm_child_id == child_id;
             // A fruitless match keeps walking: child ids are only
             // mkdir-unique among siblings, so a colliding live run
             // elsewhere must stay reachable.
             if !matched {
                 continue;
             }
-            let _kickoff_guard = kickoff_lock.lock().await;
             let (running, active_session_id) = {
                 let record = record.lock().await;
                 (
@@ -250,15 +243,8 @@ impl SupervisorChildSessionsInner {
         let mut close_error = (!usage_persisted)
             .then(|| anyhow::anyhow!("RLM child usage remains owed after retirement; retry close"));
         for record in &children {
-            let (rename_lock, kickoff_lock) = {
-                let record = record.lock().await;
-                (
-                    Arc::clone(&record.rename_lock),
-                    Arc::clone(&record.kickoff_lock),
-                )
-            };
+            let rename_lock = Arc::clone(&record.lock().await.rename_lock);
             let _guard = rename_lock.lock().await;
-            let _kickoff_guard = kickoff_lock.lock().await;
             if !self
                 .children
                 .lock()
@@ -296,8 +282,13 @@ impl SupervisorChildSessionsInner {
                         // a later successful stop can still record its cancel
                         // edge (the recorder's dedup never saw this attempt).
                         if was_running {
-                            record.lock().await.settled_status = None;
+                            let mut row = record.lock().await;
+                            row.settled_status = None;
+                            row.closed_by_parent = false;
+                            row.notice_delivered = false;
                         }
+                        self.lifecycle_epoch
+                            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
                         close_error.get_or_insert(error);
                         continue;
                     }
@@ -641,7 +632,7 @@ fn ledger_child_records(
             notice_delivered: true,
             prompt_admitted: true,
             prompt_release: Arc::new(tokio::sync::Notify::new()),
-            kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
+            kickoff_started: true,
             error: None,
             closed_by_parent: false,
             retiring: false,

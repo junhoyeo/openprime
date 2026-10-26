@@ -74,8 +74,8 @@ use crate::effort_picker;
 use crate::export_share::{self, GhAuthStatus, GistOutcome};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalPanel, GoalView};
 use crate::heartbeats_picker::{
-    parse_heartbeats, scope_heartbeats, sort_heartbeats, HeartbeatAction, HeartbeatEntry,
-    HeartbeatsPicker, HeartbeatsPickerAction,
+    heartbeat_worker_error, parse_heartbeats, scope_heartbeats, sort_heartbeats, HeartbeatAction,
+    HeartbeatEntry, HeartbeatsPicker, HeartbeatsPickerAction,
 };
 use crate::image_load::LoadedImage;
 use crate::image_markers::{
@@ -284,6 +284,8 @@ pub(crate) struct SessionUi {
     pub(crate) scoped_agents_view: Option<crate::agents_view::AgentsViewScope>,
     roster: Vec<Value>,
     heartbeat_catalog: Vec<HeartbeatEntry>,
+    /// Partial-catalog warning from negotiated per-worker isolation.
+    heartbeat_catalog_error: Option<String>,
     heartbeat_refresh_in_flight: bool,
     heartbeat_refresh_queued: bool,
     heartbeat_refresh_epoch: u64,

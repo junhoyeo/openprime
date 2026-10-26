@@ -1015,6 +1015,9 @@ impl SessionEngine for AgentSessionEngine {
                     request.reuse_recorder,
                 )
             });
+        if let Some(recorder) = &recorder {
+            recorder.ensure_started(&question, &model.provider, &model.id);
+        }
         let previous_turns = request.previous_turns;
         let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;
         // TS `unwrapSemanticEdgeStreamFn`: the side call runs on the

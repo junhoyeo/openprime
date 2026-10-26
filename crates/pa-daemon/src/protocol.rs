@@ -335,6 +335,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "delete_rlm_subagent",
                 "heartbeat_catalog",
                 "heartbeat_management",
+                "heartbeat_partial_errors",
                 "model_catalog",
                 "side_question_transcript",
                 "side_question_pane_id",
@@ -1112,6 +1113,7 @@ mod tests {
         };
         assert_eq!(pane_id, None);
         assert!(default_server_capabilities().contains(&"side_question_pane_id".to_string()));
+        assert!(default_server_capabilities().contains(&"heartbeat_partial_errors".to_string()));
     }
 
     #[test]

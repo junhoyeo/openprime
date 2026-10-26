@@ -916,8 +916,7 @@ async fn cancellation_during_collect_release_wins_without_resurrection() {
         let child_id = handle.rlm_child_id.clone();
         tokio::spawn(async move { sessions.cancel_child_run(&child_id).await })
     };
-    gate.release.notify_one();
-
+    // The prompt RPC remains held, but cancellation must settle immediately.
     assert!(cancel.await.expect("cancel task"));
     let rows = collect
         .await
@@ -925,6 +924,7 @@ async fn cancellation_during_collect_release_wins_without_resurrection() {
         .expect("collect response");
     assert_eq!(rows[0].status, "cancelled");
     assert!(rows[0].settled);
+    gate.release.notify_one();
     sessions.notify_turn_done();
     assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
 }
@@ -963,8 +963,7 @@ async fn deletion_during_collect_release_wins_without_resurrection() {
         let child_id = handle.rlm_child_id.clone();
         tokio::spawn(async move { sessions.delete_subagent(child_id).await })
     };
-    gate.release.notify_one();
-
+    // Deletion owns the terminal state without waiting for prompt admission.
     deletion
         .await
         .expect("delete task")
@@ -975,6 +974,7 @@ async fn deletion_during_collect_release_wins_without_resurrection() {
         .expect("collect response");
     assert_eq!(rows[0].status, "cancelled");
     assert!(rows[0].settled);
+    gate.release.notify_one();
     sessions.notify_turn_done();
     assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
 }
@@ -1283,13 +1283,12 @@ async fn a_cancelled_child_keeps_its_display_running_through_the_watcher_settle(
     };
     prompt_gate.release.notify_one();
     assert!(cancel.await.expect("cancel task"));
-    // One settle hook from the cancel, one from the watcher's settle tail.
-    for _ in 0..2 {
-        tokio::time::timeout(Duration::from_secs(10), hook_rx.recv())
-            .await
-            .expect("both settle hooks fire")
-            .expect("hook channel open");
-    }
+    // The cancel owns the terminal funnel; a late kickoff completion is
+    // aborted and never starts a second watcher/funnel.
+    tokio::time::timeout(Duration::from_secs(10), hook_rx.recv())
+        .await
+        .expect("cancel settle hook fires")
+        .expect("hook channel open");
     let display = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&handle.session_dir))
         .expect("display entry stays readable");
     assert_eq!(display.status, "running");
@@ -1768,9 +1767,9 @@ async fn a_failed_close_leaves_the_child_running_and_can_still_record_its_cancel
     // still-live child is not misreported cancelled.
     let entries = sessions.list_subagents().await.expect("child roster");
     assert_eq!(entries.len(), 1, "the failed child stays tracked for retry");
-    assert_eq!(
-        entries[0].status, "running",
-        "a failed close must not mark the still-live child cancelled: {entries:?}"
+    assert!(
+        matches!(entries[0].status, "queued" | "running"),
+        "a failed close must not mark the unsettled child cancelled: {entries:?}"
     );
     assert!(
         cancelled_lines(&ledger_path).is_empty(),
@@ -1989,8 +1988,9 @@ async fn a_failed_delete_leaves_the_child_watched_and_its_later_return_able_to_l
         "the delete error must surface the kill failure: {error:#}"
     );
 
-    // The child finishes naturally afterwards: its watcher is still live,
-    // so the return edge lands instead of being dropped by a stale mark.
+    // The failed delete releases the reserved kickoff; wait until its watcher
+    // is observably live before letting the child finish naturally.
+    wait_for_quiescent_wait(&child_subagents).await;
     child_subagents.running.store(false, Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_secs(10);
     while returned_children(&ledger_path).is_empty() {
@@ -3056,7 +3056,7 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
         notice_delivered: false,
         prompt_admitted: true,
         prompt_release: Arc::new(tokio::sync::Notify::new()),
-        kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
+        kickoff_started: true,
         error: None,
         closed_by_parent: false,
         retiring: false,
@@ -3131,7 +3131,7 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
         notice_delivered: false,
         prompt_admitted: true,
         prompt_release: Arc::new(tokio::sync::Notify::new()),
-        kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
+        kickoff_started: true,
         error: None,
         closed_by_parent: false,
         retiring: false,
