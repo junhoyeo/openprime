@@ -308,8 +308,9 @@ pub trait SessionEngine: Send + Sync {
         (None, None)
     }
 
-    /// The engine's resolved model as connection-state wire data
-    /// (`{ id, provider, reasoning }`), for the splash and tray labels.
+    /// The engine's complete resolved model as connection-state wire data.
+    /// Existing consumers project `id`/`provider`/`reasoning`; capability
+    /// consumers also need fields such as `compat` and service tiers.
     fn model_metadata(&self) -> Option<Value> {
         None
     }

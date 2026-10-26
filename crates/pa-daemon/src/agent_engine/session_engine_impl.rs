@@ -572,14 +572,7 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn model_metadata(&self) -> Option<Value> {
-        let model = self.resolve_model().ok()?;
-        Some(json!({
-            "id": model.id,
-            "name": model.name,
-            "api": model.api,
-            "provider": model.provider,
-            "reasoning": model.reasoning,
-        }))
+        serde_json::to_value(self.resolve_model().ok()?).ok()
     }
 
     fn is_quota_parked(&self) -> bool {
