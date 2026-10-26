@@ -173,7 +173,7 @@ async fn an_untrusted_opencode_endpoint_never_receives_the_public_literal() {
         {
             Ok(Ok(message)) => message,
             Ok(Err(error)) => panic!("{api} failed before request inspection: {error}"),
-            Err(_) => panic!("{api} attempted the untrusted endpoint"),
+            Err(error) => panic!("{api} attempted the untrusted endpoint: {error}"),
         };
         assert_eq!(
             message.stop_reason,
