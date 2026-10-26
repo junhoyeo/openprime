@@ -589,6 +589,9 @@ impl Supervisor {
                 );
             }
         }
+        // The session is going away: its passivation launch record goes first,
+        // so no later wake can recreate a deleted transcript's context.
+        self.passivated_launches.forget(session_path);
         // A worker still hosting the file owns the delete; another
         // client's worker is invisible (the unknown-target error).
         if let Some(owner) = self.registry.find_by_session_file(session_path).await {

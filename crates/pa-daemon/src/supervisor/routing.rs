@@ -521,6 +521,12 @@ impl Supervisor {
                     false,
                 );
             }
+            // The kill is the archive: a stopped session never revives
+            // through a stale passivation record.
+            let session_file = resident.descriptor.lock().await.session_file.clone();
+            if let Some(session_file) = session_file {
+                self.passivated_launches.forget(&session_file);
+            }
         }
         // A delete's deletion boundary persists BEFORE the teardown: a failed tombstone is
         // a failed, retryable deletion; a plain stop must not tombstone the child.
