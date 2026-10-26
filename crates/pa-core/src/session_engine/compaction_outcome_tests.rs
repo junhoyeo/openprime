@@ -650,3 +650,159 @@ async fn refinement_and_auto_review_preserve_conversation_identity() {
         vec![(Some(expected), Some(pa_ai::types::Transport::Sse)); 2]
     );
 }
+
+/// A refiner whose model request never answers: it reports the request start and flags its
+/// own drop (the cancelled request).
+fn stalled_refine_call(
+    started: Arc<tokio::sync::Notify>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+) -> crate::refinement::executor::RefinerFn {
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    Box::new(move |_model, _system, _prompt| {
+        Box::pin(async move {
+            let _flag = DropFlag(dropped);
+            started.notify_one();
+            std::future::pending::<anyhow::Result<pa_types::ai::AssistantMessage>>().await
+        })
+    })
+}
+
+fn global_refine() -> refine::RefineOptions {
+    refine::RefineOptions {
+        global: true,
+        ..refine::RefineOptions::default()
+    }
+}
+
+/// TS `requestAbort` mid-plan: the planning request drops, nothing is written, the run fails
+/// with the typed abort, and no outcome row reaches the live context.
+#[tokio::test]
+async fn refine_aborted_mid_plan_drops_the_request_and_writes_nothing() {
+    let (session, tmp) = refine_test_session().await;
+    let global_dir = tmp.path().join("harness");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let before = session.agent().state().await.messages.len();
+    let options = global_refine();
+    let model = session_ai_model();
+    let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            session.refine_with_refiner(
+                &options,
+                refine::RefinementSource::User,
+                &model,
+                stalled_refine_call(Arc::clone(&started), Arc::clone(&dropped)),
+                global_dir.clone(),
+            ),
+            async {
+                started.notified().await;
+                session.abort_refinement();
+            },
+        )
+    })
+    .await
+    .expect("the abort settles the stalled refine");
+    let error = outcome.expect_err("an aborted refine fails");
+    assert!(pa_agent::abort::is_abort_error(&error), "{error:#}");
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!crate::refinement::get_harness_state_path(&global_dir).exists());
+    assert_eq!(session.agent().state().await.messages.len(), before);
+}
+
+/// The commit point: an abort that lands after the plan returned but before the harness write
+/// (the write is parked on the state lock) discards the plan; nothing is written.
+#[tokio::test]
+async fn refine_aborted_before_the_commit_point_discards_the_plan() {
+    let (session, tmp) = refine_test_session().await;
+    let global_dir = tmp.path().join("harness");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    let state_path = crate::refinement::get_harness_state_path(&global_dir);
+    let held = crate::platform::lock_dir::LockDir::acquire_owned_retrying(
+        &state_path,
+        std::time::Duration::from_secs(10),
+        1,
+        std::time::Duration::from_millis(1),
+    )
+    .unwrap();
+    let planned = Arc::new(tokio::sync::Notify::new());
+    let planned_signal = Arc::clone(&planned);
+    let plan_call: crate::refinement::executor::RefinerFn =
+        Box::new(move |model, system, prompt| {
+            let answer = refine_plan_call(APPLIED_PLAN)(model, system, prompt);
+            Box::pin(async move {
+                // The plan is complete in the same poll that reports it.
+                planned_signal.notify_one();
+                answer.await
+            })
+        });
+    let mut held = Some(held);
+    let options = global_refine();
+    let model = session_ai_model();
+    let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            session.refine_with_refiner(
+                &options,
+                refine::RefinementSource::User,
+                &model,
+                plan_call,
+                global_dir.clone(),
+            ),
+            async {
+                planned.notified().await;
+                session.abort_refinement();
+                drop(held.take());
+            },
+        )
+    })
+    .await
+    .expect("the parked write resumes once the lock releases");
+    let error = outcome.expect_err("the plan is discarded at the commit point");
+    assert!(pa_agent::abort::is_abort_error(&error), "{error:#}");
+    assert!(!state_path.exists(), "nothing was written");
+    assert!(custom_types(&session.agent().state().await.messages).is_empty());
+}
+
+/// After the commit nothing can cancel: a completed run keeps its applied result, and an abort
+/// that arrives after it ended reaches no run — the next refine is not born aborted.
+#[tokio::test]
+async fn an_abort_after_a_committed_refine_reaches_nothing() {
+    let (session, tmp) = refine_test_session().await;
+    let global_dir = tmp.path().join("harness");
+    let first = session
+        .refine_with_refiner(
+            &global_refine(),
+            refine::RefinementSource::User,
+            &session_ai_model(),
+            refine_plan_call(APPLIED_PLAN),
+            global_dir.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(first.applied_edits.iter().any(|edit| edit.applied));
+    session.abort_refinement();
+    let second = session
+        .refine_with_refiner(
+            &global_refine(),
+            refine::RefinementSource::User,
+            &session_ai_model(),
+            refine_plan_call(EMPTY_PLAN),
+            global_dir.clone(),
+        )
+        .await
+        .expect("a late abort never leaks into the next run");
+    assert!(second.applied_edits.iter().all(|edit| !edit.applied));
+    assert!(crate::refinement::get_harness_state_path(&global_dir).exists());
+    assert_eq!(
+        custom_types(&session.agent().state().await.messages),
+        vec![
+            "refinement_outcome",
+            "refinement_notice",
+            "refinement_outcome"
+        ]
+    );
+}

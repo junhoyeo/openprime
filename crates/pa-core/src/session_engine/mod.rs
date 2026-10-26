@@ -30,6 +30,7 @@ pub mod provider_failover;
 pub mod provider_park;
 pub mod provider_retry;
 pub mod refine;
+mod refine_abort;
 mod refinement_gate;
 pub mod request_timing;
 pub mod rlm_host;
@@ -166,6 +167,8 @@ pub struct AgentSession {
     /// in-flight run and prepares against its result; reads and writes
     /// keep using the session lock meanwhile.
     compaction_flight: tokio::sync::Mutex<()>,
+    /// The in-flight refine run's abort controller (TS `_refineAbortController`).
+    refine_abort: refine_abort::RefineAbortSlot,
     /// The session's semantic-edge recorder (TS
     /// `AgentSession._semanticEdges`): `None` in sessions the engine
     /// built without a semantic identity (verification harnesses
@@ -254,6 +257,7 @@ impl AgentSession {
             side_question_stream_fn: std::sync::Mutex::new(None),
             agent_dir: None,
             compaction_flight: tokio::sync::Mutex::new(()),
+            refine_abort: refine_abort::RefineAbortSlot::default(),
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)

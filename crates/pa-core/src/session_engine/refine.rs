@@ -277,6 +277,7 @@ pub async fn execute_refinement(
         source,
         refine_call,
         agent_dir,
+        &pa_agent::abort::AbortSignal::never(),
     )
     .await?
     .0)
@@ -298,6 +299,12 @@ pub async fn execute_refinement(
 /// (`rlm.factory.require_factory_enabled`), so a refinement cannot
 /// author factories the user has not opted into. `None` (a session
 /// without a wired agent dir) keeps the fail-closed disabled default.
+///
+/// `abort` is the run's cancel (TS `_refineAbortController`): it drops the in-flight planning
+/// request at once, and the harness write re-checks it under the state lock. That check is the
+/// commit point: an abort observed there discards the plan with nothing written; an abort after
+/// it is too late, so the write, history, and audit/outcome rows complete and the run reports
+/// its applied result. Every cancel surfaces as the typed abort error ("Request was aborted").
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_refinement_with_rows(
     session: &mut SessionManager,
@@ -308,6 +315,7 @@ pub async fn execute_refinement_with_rows(
     source: RefinementSource,
     refine_call: crate::refinement::executor::RefinerFn,
     agent_dir: Option<&Path>,
+    abort: &pa_agent::abort::AbortSignal,
 ) -> anyhow::Result<(RefinementResult, Vec<String>)> {
     let settings = match agent_dir {
         Some(dir) => {
@@ -377,15 +385,19 @@ pub async fn execute_refinement_with_rows(
     };
     let baseline_state = load_harness_state(&baseline_dir, baseline_scope);
 
-    let mut plan = plan_refinement(
-        messages,
-        &planning_state,
-        &history,
-        model,
-        &core_options,
-        refine_call,
+    // The planning request (the long model call) drops at the abort.
+    let mut plan = pa_agent::abort::race_with_abort(
+        plan_refinement(
+            messages,
+            &planning_state,
+            &history,
+            model,
+            &core_options,
+            refine_call,
+        ),
+        abort,
     )
-    .await?;
+    .await??;
     plan = strip_display_prefixes(plan);
 
     let target_scope = plan.rollback_scope.unwrap_or(requested_scope);
@@ -411,8 +423,11 @@ pub async fn execute_refinement_with_rows(
         }
         None => false,
     };
+    let commit_abort = abort.clone();
     let (mut result, state_path) = tokio::task::spawn_blocking(move || {
         try_update_harness_state(&target_dir, target_scope, |state| {
+            // The commit point: under the harness-state lock, before anything is written.
+            pa_agent::abort::throw_if_aborted(&commit_abort)?;
             anyhow::ensure!(
                 super::refinement_gate::enabled(settings.as_ref()),
                 "Harness refinements were disabled during planning; the result was discarded"
