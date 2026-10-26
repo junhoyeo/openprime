@@ -85,9 +85,8 @@ fn responses_compat_can_opt_a_custom_gateway_into_fast_mode() {
             supports_fast_mode: Some(false),
             ..Default::default()
         }));
-    let mut explicitly_disabled = custom.clone();
-    explicitly_disabled.compat = Some(disabled_compat.clone());
-    assert!(!supports_fast_mode(&explicitly_disabled));
+    custom.compat = Some(disabled_compat.clone());
+    assert!(!supports_fast_mode(&custom));
 
     // An explicit Responses compat object is authoritative even for a provider/id that the modern
     // built-in table otherwise marks eligible. This lets a gateway override opt back out.
