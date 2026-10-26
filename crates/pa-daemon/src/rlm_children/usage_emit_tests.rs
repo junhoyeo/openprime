@@ -66,6 +66,7 @@ fn record_with_file(child_id: &str, session_file: &Path) -> Arc<Mutex<ChildRecor
         prompt_release: Arc::new(tokio::sync::Notify::new()),
         kickoff_started: true,
         kickoff_epoch: 0,
+        kickoff_phase: KickoffAttemptPhase::Admitted(0),
         kickoff_cancel: None,
         error: None,
         closed_by_parent: false,

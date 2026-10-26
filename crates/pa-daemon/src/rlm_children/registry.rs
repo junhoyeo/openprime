@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     bail, json, rlm_child_label, Arc, ChildCloseReason, ChildRecord, Context, DaemonCommand,
-    DeletedChild, Map, Mutex, Result, SupervisorChildSessionsInner, KILL_TIMEOUT_MS,
+    DeletedChild, KickoffAttemptPhase, Map, Mutex, Result, SupervisorChildSessionsInner,
+    KILL_TIMEOUT_MS,
 };
 
 use pa_core::session_engine::semantic_edges::ChildCancelledReason;
@@ -88,6 +89,7 @@ impl SupervisorChildSessionsInner {
                 record.settled_status = Some("cancelled");
                 record.error = Some("Cancelled by user".to_string());
                 record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
+                record.kickoff_phase = KickoffAttemptPhase::Terminal;
                 if let Some(cancel) = record.kickoff_cancel.take() {
                     cancel.cancel();
                 }
@@ -264,6 +266,7 @@ impl SupervisorChildSessionsInner {
                     record.closed_by_parent = true;
                     record.notice_delivered = true;
                     record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
+                    record.kickoff_phase = KickoffAttemptPhase::Terminal;
                     if let Some(cancel) = record.kickoff_cancel.take() {
                         cancel.cancel();
                     }
@@ -642,6 +645,7 @@ fn ledger_child_records(
             prompt_release: Arc::new(tokio::sync::Notify::new()),
             kickoff_started: true,
             kickoff_epoch: 0,
+            kickoff_phase: KickoffAttemptPhase::Admitted(0),
             kickoff_cancel: None,
             error: None,
             closed_by_parent: false,

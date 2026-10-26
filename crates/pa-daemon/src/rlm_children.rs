@@ -148,6 +148,15 @@ struct ChildObservation {
 }
 
 /// One tracked child session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KickoffAttemptPhase {
+    Queued,
+    Reserved(u64),
+    Dispatched(u64),
+    Admitted(u64),
+    Terminal,
+}
+
 #[derive(Debug)]
 struct ChildRecord {
     rlm_child_id: String,
@@ -199,6 +208,7 @@ struct ChildRecord {
     /// Claimed under the record mutex before the detached kickoff RPC starts.
     kickoff_started: bool,
     kickoff_epoch: u64,
+    kickoff_phase: KickoffAttemptPhase,
     kickoff_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Terminal error text: the cancel reason for a cancelled run, the
     /// failure text for a failed one.
@@ -782,6 +792,7 @@ impl SupervisorChildSessions {
                 prompt_release: Arc::new(tokio::sync::Notify::new()),
                 kickoff_started: true,
                 kickoff_epoch: 0,
+                kickoff_phase: KickoffAttemptPhase::Admitted(0),
                 kickoff_cancel: None,
                 error: None,
                 closed_by_parent: false,
