@@ -282,7 +282,6 @@ impl ChildRecord {
     fn roster_status(&self) -> &'static str {
         match self.status() {
             "queued" => "queued",
-            "running" => "running",
             "done" => "completed",
             "error" => "error",
             "cancelled" => "cancelled",
