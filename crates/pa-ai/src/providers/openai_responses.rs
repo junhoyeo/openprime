@@ -290,12 +290,15 @@ async fn run_stream(
     writer: &AssistantMessageEventWriter,
 ) -> Result<(), ProviderError> {
     let options = options.cloned().unwrap_or_default();
-    let api_key = options
-        .base
-        .api_key
-        .clone()
-        .or_else(|| get_env_api_key(&model.provider))
-        .unwrap_or_default();
+    let api_key = crate::models::opencode_public_api_key(
+        model,
+        options
+            .base
+            .api_key
+            .clone()
+            .or_else(|| get_env_api_key(&model.provider)),
+    )
+    .unwrap_or_default();
     let cache_retention = resolve_cache_retention(options.base.cache_retention);
     let cache_session_id = if cache_retention == CacheRetention::None {
         None
@@ -429,9 +432,12 @@ pub fn stream_simple_openai_responses(
     context: &Context,
     options: Option<&SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let api_key = options
-        .and_then(|options| options.base.api_key.clone())
-        .or_else(|| get_env_api_key(&model.provider));
+    let api_key = crate::models::opencode_public_api_key(
+        model,
+        options
+            .and_then(|options| options.base.api_key.clone())
+            .or_else(|| get_env_api_key(&model.provider)),
+    );
     let Some(api_key) = api_key else {
         let (writer, reader) = create_assistant_message_event_stream();
         let message = AssistantMessage {
