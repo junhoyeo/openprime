@@ -19,14 +19,14 @@ Inventory disposition and verification outcome are separate. A row closes only a
 - `truly-obsolete`: **2**
 - `BLOCKED`: **83**
 
-Accepted rows currently come from the independently reviewed provider lane and its combined safe metadata producer/consumer tests. Skills are integrated and reviewed but remain blocked on the post-kernel staged package rerun. Lifecycle and kernel remain unintegrated/review-blocked.
+Provider, skills, kernel, and lifecycle source are integrated and independently reviewed. Accepted provider rows reflect combined seam tests; skills/kernel/lifecycle rows remain acceptance-blocked on final combined package/native/state/CI gates.
 
 ## Pull requests
 
 | PR | Surface | Scout disposition | Proposed final | Current outcome | Owner | Evidence / next action |
 | --- | --- | --- | --- | --- | --- | --- |
 | PR#32 | fix(kernel): never reopen saved file handles when restoring a snapshot (branch fix/kernel-restore-file-handles, 21316aaa4) | `already-covered` | `verified-upstream-equivalent` | **BLOCKED** | `openprime-pr32` | DO NOT re-port — fork PR would regress the reviewed upstream implementation (63bdb5ad0 #3749). Keep PR#32 OPEN until final migration acceptance/merge (TS rollback branch may still need it), then close citing #3749. |
-| PR#33 | agent-sessions Aside indexing and Unicode smart-case fixes (PR #33) | `must-port` | `ported` | **BLOCKED** | `openprime-pr33` | Port both the Aside transcript/artifact indexing work and the later Unicode smart-case fix into the Rust-era top-level bundled skill, with package-layout execution evidence. |
+| PR#33 | agent-sessions Aside indexing and Unicode smart-case fixes (PR #33) | `must-port` | `ported` | **BLOCKED** | `openprime-pr33` | Source is integrated and reviewed; keep acceptance blocked until the final post-kernel staged package/ABI2/skills real-cell smoke and migration landing. |
 
 PR #33 includes both `4af3c6d89` (Aside indexing) and `5d4d1eb26f0e63ed8946bad39746412d00f6acd0` (Unicode smart-case). The PR remains open until final migration landing.
 

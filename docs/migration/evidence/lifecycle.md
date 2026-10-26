@@ -43,8 +43,8 @@ Native acceptance remains PAUSED.
 
 # Re-review addendum — blocker-fix tip
 
-**Re-reviewed final tip:** `cb725539479f6fed9e349e30cfa63fd1e23ba4bf`  
-**Base:** `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`  
+**Re-reviewed final tip:** `cb725539479f6fed9e349e30cfa63fd1e23ba4bf`
+**Base:** `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`
 **Verdict:** **BLOCK** (two P1 lifecycle regressions remain; all native acceptance remains paused).
 
 ## Closed from the prior review
@@ -85,8 +85,8 @@ Native acceptance remains PAUSED.
 
 # OpenPrime Rust lifecycle migration — adversarial review
 
-**Reviewed final tip:** `fbefc018bbd861b051b867a56d32b0a8574b228c`  
-**Frozen base:** `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`  
+**Reviewed final tip:** `fbefc018bbd861b051b867a56d32b0a8574b228c`
+**Frozen base:** `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`
 **Scope:** final `c4..fbef` tree (32 files, 1,979 insertions / 80 deletions). The unsafe intermediate `b4445ed1788374a091870198c3cc5d49fbe0572b` was not assessed as shipped; its safe metadata successor is `dae6c891652bb50156a7dd8a5ab2192495fc5fd4`.
 
 ## Verdict: BLOCK

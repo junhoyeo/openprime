@@ -4283,7 +4283,7 @@
         }
       ],
       "port_target": "skills/agent-sessions/ (top-level, Rust-era layout)",
-      "notes": "Port both the Aside transcript/artifact indexing work and the later Unicode smart-case fix into the Rust-era top-level bundled skill, with package-layout execution evidence.",
+      "notes": "Source port is integrated and independently reviewed. Keep acceptance BLOCKED until the final post-kernel staged package/ABI2/skills real-cell smoke and migration landing; keep legacy PR #33 open until then.",
       "migration_status": "BLOCKED",
       "port_commits": [
         "d46fe9be5",
@@ -4302,7 +4302,7 @@
         }
       ],
       "proposed_final_status": "ported",
-      "verification_outcome": "source port integrated and focused gates pass; final combined staged package after kernel changes pending",
+      "verification_outcome": "integrated source and focused/package lane evidence pass; final combined packaged self-bootstrap and native acceptance pending",
       "related_legacy_commits": [
         "4af3c6d89",
         "5d4d1eb26f0e63ed8946bad39746412d00f6acd0"

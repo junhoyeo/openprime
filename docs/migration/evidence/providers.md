@@ -6,8 +6,8 @@
 
 # OpenPrime Rust Provider/Model/Auth Port — Adversarial Review
 
-**Review target:** `origin/port/rust-providers` `befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c`  
-**Base:** `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`  
+**Review target:** `origin/port/rust-providers` `befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c`
+**Base:** `c4c238ca025e382d96fb5f37e6328ca77fb82ef3`
 **Verdict: BLOCK**
 
 ## Scope and method
@@ -72,7 +72,7 @@ Separately, a model with input `0` but output/cache pricing nonzero is still cal
 
 ### P1 — proposed complete-model metadata seam is an unsafe outbound boundary and does not prove Fast mode end-to-end
 
-**Producer:** `crates/pa-daemon/src/agent_engine/session_engine_impl.rs` at sibling session commit `b4445ed1788374a091870198c3cc5d49fbe0572b` returns `serde_json::to_value(self.resolve_model()?)`.  
+**Producer:** `crates/pa-daemon/src/agent_engine/session_engine_impl.rs` at sibling session commit `b4445ed1788374a091870198c3cc5d49fbe0572b` returns `serde_json::to_value(self.resolve_model()?)`.
 **Consumer:** provider tip `crates/pa-daemon/src/setting_switches.rs` deserializes metadata as `pa_types::ai::Model`.
 
 That serializes entire resolved model data to connection-state metadata, including `baseUrl`, arbitrary model headers, and raw compat/config content. It is an outward wire boundary and must not publish endpoint query/userinfo, provider-config headers, authorization-like values, or unknown nested config. The supplied producer test only round-trips a safe synthetic model and uses `sendSessionIdHeader`, not `supportsFastMode`; the consumer test uses a manually constructed JSON `Value`, not the real engine→connection-state projection.
@@ -104,8 +104,8 @@ Parent verified canonical object IDs with `git rev-parse`: unsafe full-model pro
 
 # Corrective-delta review (local committed, not yet remote-approved)
 
-**Provider correction tip reviewed:** `f597f13f56eeb690c8c17aca32bfc9c5ca78ef87`  
-**Baseline:** `befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c`  
+**Provider correction tip reviewed:** `f597f13f56eeb690c8c17aca32bfc9c5ca78ef87`
+**Baseline:** `befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c`
 **Safe producer paired for source inspection:** `dae6c891652bb50156a7dd8a5ab2192495fc5fd4`.
 
 ## New P1 — cross-model raw-ID normalization still aliases a late result into the next epoch
@@ -138,7 +138,7 @@ The pending B ownership sees no unresolved `(B1, tool)` (only `(A1, tool)`) and 
 
 # Final corrective review verdict
 
-**Reviewed/pushed provider tip:** `89d9310592c640f6cdb5ef666122c2f12eef7931` (`origin/port/rust-providers`, verified locally with `git rev-parse`).  
+**Reviewed/pushed provider tip:** `89d9310592c640f6cdb5ef666122c2f12eef7931` (`origin/port/rust-providers`, verified locally with `git rev-parse`).
 **Safe metadata producer reviewed:** `dae6c891652bb50156a7dd8a5ab2192495fc5fd4` (not unsafe `b4445ed1788374a091870198c3cc5d49fbe0572b` alone). `dae6...` is an ancestor of the currently advanced sessions ref; subsequent sessions commits are outside this provider review.
 
 **Verdict: CLEAR-FOR-INTEGRATION, with a remaining combined metadata-seam caveat.**

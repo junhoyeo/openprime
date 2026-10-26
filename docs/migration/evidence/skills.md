@@ -101,12 +101,12 @@ index 68ac9d2a6..4e9665d57 100644
 --- a/crates/pa-core/src/prompts/layers/core.md
 +++ b/crates/pa-core/src/prompts/layers/core.md
 @@ -172,6 +172,8 @@ prime-agent has support for programmatic tools that are defined in the MCP forma
- 
+
  ## Skills
- 
+
 -prime-agent provides multiple executable skills, described by their SKILL.md and executable code. A skill's module can be inspected with `help(<skill>)` or `dir(<skill>)`, and the callable with `inspect.signature(<skill>.<function>)`, if information is missing. The executable code is always pre-imported in the REPL as a programmatic tool, and a callable skill module can be called directly (`await <skill>(...)`).
 +prime-agent resolves bundled, user, and project skills by precedence and lists the winning skill for each name in the dynamic tail of this prompt. That winning `SKILL.md` is the API and safety contract; never infer an API from a shadowed built-in with the same name.
- 
+
 -All programmatic tools described above except for `bash`, `rlm.*`, and `mcp.*` are implemented as executable skills and will be listed again in the dynamic tail of this prompt. Additional executable and non-executable skills may exist as well; non-executable (markdown) skills are documentation read from disk, and each skill is also available as a shell command by the same name.
 +When a winning skill is Python-backed and its runtime is available, its listed Python import is pre-imported in the REPL as a programmatic tool. Inspect it with `help(<skill>)`, `dir(<skill>)`, or `inspect.signature(<skill>.<function>)`; a callable module can be invoked directly (`await <skill>(...)`). If preparation fails, the session reports the unavailable import instead of claiming it works. Markdown skills provide documentation only. A Python skill has a shell command only when its winning `SKILL.md` documents one.
 +
