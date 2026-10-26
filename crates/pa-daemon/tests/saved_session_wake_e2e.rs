@@ -122,6 +122,9 @@ fn spawn_daemon(socket: &Path, agent_dir: &Path) -> Daemon {
         // process pair (like the TS daemon's default session config).
         .env("PRIME_AGENT_MODEL_PROVIDER", "prime-inference")
         .env("PRIME_AGENT_MODEL", "mock-1")
+        // The catalog honors the session-dir override; pin it to this test's store so an
+        // ambient override never redirects the saved-session scan.
+        .env("PRIME_AGENT_SESSION_DIR", agent_dir.join("sessions"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         // A supervisor killed at teardown must not leak its session workers
@@ -474,5 +477,81 @@ fn saved_session_wake(location: SavedLocation) {
     assert_eq!(
         by_id["data"]["target"]["activeSessionId"], woken_id,
         "the session-id prefix resolved to the resident worker: {by_id}"
+    );
+}
+
+/// A root the TS daemon archived (`session_state {status:"archived"}` appended in the live
+/// sessions dir) reopens on a send by name: the worker wakes over the legacy file, the
+/// historical turn stays visible, and the legacy bytes stay a prefix of the file.
+#[test]
+fn send_to_a_ts_archived_session_reopens_it_with_its_history() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let sessions = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let url = spawn_mock("wake reply");
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({
+            "providers": {
+                "prime-inference": {
+                    "api": "openai-completions",
+                    "baseUrl": url.to_string_lossy(),
+                    "apiKey": "sk-wake",
+                    "models": [
+                        {
+                            "id": "mock-1",
+                            "name": "Mock 1",
+                            "api": "openai-completions",
+                            "contextWindow": 128_000,
+                            "maxTokens": 4096
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write models.json");
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).expect("project dir");
+    let session_path = sessions.join("01a0b200-0000-7000-8000-0000000a4c1d.jsonl");
+    let legacy = include_str!("fixtures/legacy-state/archived/session.jsonl")
+        .replace("{{CWD}}", &cwd.to_string_lossy());
+    std::fs::write(&session_path, &legacy).expect("write legacy archived session");
+
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+
+    client.send_command(
+        "s1",
+        &json!({ "type": "send_message", "targetActiveSessionId": "legacy-archived", "message": "wake up" }),
+    );
+    let sent = client.read_response("s1");
+    assert_eq!(
+        sent["success"], true,
+        "send to the archived root failed: {sent}"
+    );
+    assert_eq!(sent["data"]["deliveryStatus"], "delivered", "{sent}");
+    let woken_id = sent["data"]["target"]["activeSessionId"]
+        .as_str()
+        .expect("woken active id")
+        .to_string();
+
+    let history = wait_until(Duration::from_secs(30), || {
+        let text = messages(&mut client, "gm1", &woken_id);
+        text.contains("wake reply").then_some(text)
+    });
+    assert!(
+        history.contains("legacy archived question") && history.contains("legacy archived answer"),
+        "the reopened root shows its TS-era turn: {history}"
+    );
+    assert!(
+        std::fs::read_to_string(&session_path)
+            .expect("reread session")
+            .starts_with(&legacy),
+        "the reopen appends after the legacy bytes"
     );
 }
