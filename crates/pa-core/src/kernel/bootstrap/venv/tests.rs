@@ -1213,3 +1213,40 @@ async fn unwritable_stale_venv_names_the_venv_and_both_env_overrides() {
         "no raw lock-candidate path: {message}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bootstrap_command_failure_drains_and_exposes_only_a_bounded_safe_tail() {
+    let script = concat!(
+        "i=0; while [ $i -lt 2500 ]; do printf 'noise-%04d %080d\n' \"$i\" 0 >&2; i=$((i+1)); done; ",
+        "printf 'Authorization: Bea' >&2; printf 'rer split-secret-sentinel\n' >&2; ",
+        "printf 'Authorization: Bearer ' >&2; head -c 9000 /dev/zero | tr '\\0' s >&2; printf '\n' >&2; ",
+        "printf 'client_secret=oauth-secret-sentinel\nnewest-safe-sentinel\n' >&2; exit 9",
+    );
+    let error = run_async(
+        "sh",
+        &[
+            "-c".to_string(),
+            script.to_string(),
+            "--token=cli-secret-sentinel".to_string(),
+        ],
+    )
+    .await
+    .expect_err("the synthetic bootstrap command fails");
+    let message = error.to_string();
+    for secret in [
+        "split-secret-sentinel",
+        "oauth-secret-sentinel",
+        "cli-secret-sentinel",
+        "ssssssssssssssssssss",
+    ] {
+        assert!(!message.contains(secret), "leaked {secret}: {message}");
+    }
+    assert!(message.contains("newest-safe-sentinel"), "{message}");
+    assert!(message.lines().count() <= 24, "{}", message.lines().count());
+    assert!(
+        message.chars().count() <= 2_400,
+        "{}",
+        message.chars().count()
+    );
+}
