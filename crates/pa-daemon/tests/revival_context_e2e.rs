@@ -1,14 +1,17 @@
 //! Revival launch-context e2e: a session the daemon brings back after its
 //! worker went away — the idle-passivation wake on a client prompt or
-//! attach — runs with the launch context it was opened with, never with
-//! daemon defaults. Legacy TS parity rows, one invariant per test:
+//! attach, or the supervisor's crash respawn — runs with the launch context
+//! it was opened with, never with daemon defaults or a stale transcript's
+//! directory. Legacy TS parity rows, one invariant per test:
 //!
 //! - b2bb37bb2 / 48fae2a5a / 843615757 / 837be6824 (+ 502e7a496): a
 //!   transcript opened with an explicit fallback cwd (its recorded
 //!   directory is missing) revives in that fallback instead of dead-ending;
 //! - e32bce384 (+ 837be6824): the opened-with runtime config (system prompt
 //!   append, telemetry opt-out) survives the wake, so an opted-out client
-//!   can still attach and the revived worker never reports telemetry.
+//!   can still attach and the revived worker never reports telemetry;
+//! - c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched in over a
+//!   fileless or foreign launch never inherits the launch cwd on respawn.
 // Stack-resident futures by design on the daemon's hot paths.
 #![allow(clippy::large_futures)]
 // Narrowing casts sit at OS boundaries (pid/fd/time/size) where the kernel
@@ -323,6 +326,17 @@ fn passivate(client: &mut Client, agent_dir: &Path, active_session_id: &str, id:
     );
 }
 
+fn wait_until<T>(budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "condition never became true");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// A saved transcript whose recorded directory no longer exists.
 fn write_missing_cwd_transcript(sessions: &Path, gone: &Path) -> PathBuf {
     let saved = sessions.join("missing-cwd.jsonl");
@@ -525,4 +539,114 @@ fn a_passivated_session_revives_with_its_opened_runtime_config() {
             .is_some_and(|text| text.contains(marker)),
         "the revival must keep the opened-with system prompt append: {prompt}"
     );
+}
+
+/// Rows c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched into a
+/// worker whose launch was fileless (`noSession`) or another transcript is
+/// respawned in ITS OWN directory — the recorded cwd, or the fallback the
+/// switch selected for a missing one — never the launch cwd.
+#[test]
+fn a_switched_transcript_respawns_in_its_own_cwd_not_the_launch_cwd() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let launch = dir.path().join("launch");
+    let recorded = dir.path().join("recorded");
+    let fallback = dir.path().join("fallback");
+    for path in [&launch, &recorded, &fallback] {
+        std::fs::create_dir_all(path).expect("dir");
+    }
+    let intact = sessions.join("intact-cwd.jsonl");
+    std::fs::write(
+        &intact,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session", "version": 3, "id": "intact-cwd-session",
+                "timestamp": "2026-10-12T00:00:00.000Z", "cwd": recorded,
+            })
+        ),
+    )
+    .expect("write intact transcript");
+    let missing = write_missing_cwd_transcript(&sessions, &dir.path().join("gone"));
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+
+    for (index, (transcript, cwd_override, expected)) in [
+        (&intact, None, &recorded),
+        (&missing, Some(&fallback), &fallback),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A fileless (`--no-session`) launch in the launch directory.
+        let created = client.request(
+            &format!("open-{index}"),
+            &json!({
+                "type": "create",
+                "noSession": true,
+                "config": {
+                    "cwd": launch,
+                    "sessionDir": sessions,
+                    "provider": "prime-inference",
+                    "model": "mock-1",
+                },
+            }),
+        );
+        assert_eq!(created["success"], true, "fileless open failed: {created}");
+        let active = created["data"]["id"]
+            .as_str()
+            .expect("active id")
+            .to_string();
+        let mut switch = json!({
+            "type": "switch_session",
+            "activeSessionId": active,
+            "sessionPath": transcript,
+        });
+        if let Some(cwd) = cwd_override {
+            switch["cwdOverride"] = json!(cwd);
+        }
+        let switched = client.request(&format!("switch-{index}"), &switch);
+        assert_eq!(switched["success"], true, "switch failed: {switched}");
+        assert_eq!(
+            pwd_output(&client.pwd(&format!("pwd-before-{index}"), &active)),
+            canonical(expected)
+        );
+        // The roster follow moves the durable record onto the switched-in
+        // transcript before the crash.
+        wait_until(Duration::from_secs(15), || {
+            descriptor_field(&agent_dir, &active, "sessionFile")
+                .and_then(|file| file.as_str().map(str::to_string))
+                .filter(|file| Path::new(file) == transcript.as_path())
+        });
+        let pid = descriptor_field(&agent_dir, &active, "pid")
+            .and_then(|pid| pid.as_u64())
+            .expect("the worker pid");
+        let killed = Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill");
+        assert!(killed.success(), "kill -9 {pid} failed");
+        // The supervisor's crash respawn replays the durable create; the
+        // respawned worker answers on the same active id.
+        let respawned = wait_until(Duration::from_secs(60), || {
+            let response = client.pwd(&format!("pwd-after-{index}"), &active);
+            (response["success"] == true
+                && descriptor_field(&agent_dir, &active, "pid").and_then(|p| p.as_u64())
+                    != Some(pid))
+            .then_some(response)
+        });
+        assert_eq!(
+            pwd_output(&respawned),
+            canonical(expected),
+            "the respawn must run the switched-in transcript in its own directory"
+        );
+        let killed = client.request(
+            &format!("kill-{index}"),
+            &json!({ "type": "kill", "activeSessionId": active }),
+        );
+        assert_eq!(killed["success"], true, "{killed}");
+    }
 }
