@@ -393,7 +393,13 @@ impl Supervisor {
                                 | DaemonCommand::Rename { .. }
                                 | DaemonCommand::WaitForIdle { .. }
                         ) {
-                            match self.wake_saved_session(&selector).await {
+                            match self
+                                .wake_saved_session(
+                                    &selector,
+                                    crate::messaging::WakeTelemetry::of_command(command),
+                                )
+                                .await
+                            {
                                 WakeRoute::Woken(resident) => {
                                     rebound_to = Some(
                                         self.rebind_connection(&selector, &resident, attached)
@@ -966,14 +972,21 @@ impl Supervisor {
 
     /// The saved-session wake for a passivated session (TS's tier-2 relaunch); a selector
     /// that resolves to no saved session falls through to the unknown-session error.
-    pub(super) async fn wake_saved_session(self: &Arc<Self>, selector: &str) -> WakeRoute {
+    pub(super) async fn wake_saved_session(
+        self: &Arc<Self>,
+        selector: &str,
+        telemetry: crate::messaging::WakeTelemetry,
+    ) -> WakeRoute {
         let resolve_error = anyhow!("Unknown active session: {selector}");
-        match self.wake_saved_target(&resolve_error, selector, None).await {
+        match self
+            .wake_saved_target(&resolve_error, selector, None, telemetry)
+            .await
+        {
             crate::messaging::WakeOutcome::Woken(resident) => WakeRoute::Woken(resident),
             crate::messaging::WakeOutcome::Unknown => {
                 // The routing selector is the session's ACTIVE id (the registry key), which
                 // the catalog and ledger edges do not carry — the ROSTER row does.
-                match self.wake_roster_session(selector).await {
+                match self.wake_roster_session(selector, telemetry).await {
                     Some(crate::messaging::WakeOutcome::Woken(resident)) => {
                         WakeRoute::Woken(resident)
                     }
@@ -997,6 +1010,7 @@ impl Supervisor {
     async fn wake_roster_session(
         self: &Arc<Self>,
         selector: &str,
+        telemetry: crate::messaging::WakeTelemetry,
     ) -> Option<crate::messaging::WakeOutcome> {
         let mut files: Vec<String> = {
             let roster = self.roster.lock().unwrap();
@@ -1041,7 +1055,7 @@ impl Supervisor {
         // the keys launch_worker copies into the DURABLE create command's rest.
         // A passivated session replays its opened-with launch context (see
         // `passivated_launch`); the header cwd is the no-record fallback.
-        let create = match self.passivated_launches.get(&session_file) {
+        let mut create = match self.passivated_launches.get(&session_file) {
             Some(launch) => launch.wake_create(
                 &session_file,
                 depth,
@@ -1062,6 +1076,7 @@ impl Supervisor {
                 rest: serde_json::Map::default(),
             },
         };
+        telemetry.apply(&mut create);
         // Reuse before launching (TS `createOrReuseWorker`): a concurrent revival
         // may already host the file.
         if let Some(resident) = self.registry.find_by_session_file(&session_file).await {

@@ -1647,3 +1647,108 @@ fn an_idle_passivation_ask_defers_while_a_route_is_in_flight() {
     assert_eq!(drained["success"], true, "{drained}");
     passivate(&mut client, &agent_dir, &active, "ask-drained");
 }
+
+/// Row 966c11aa7 (telemetry half), the waking client's stance: a session opened
+/// WITH telemetry and passivated is woken for an opted-out client (the TUI sends
+/// its opt-out on every attach). The woken worker must opt out too, or the daemon
+/// refuses the attach after launching a worker that reports telemetry the waking
+/// user refused. The TS revival create carried the invocation's opt-out.
+#[test]
+fn an_opted_out_client_revives_a_session_opened_with_telemetry() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path(),
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = client.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    passivate(&mut client, &agent_dir, &active, "passivate");
+    let attached = client.request(
+        "attach",
+        &json!({ "type": "attach", "activeSessionId": session_id, "telemetryDisabled": true }),
+    );
+    assert_eq!(
+        attached["success"], true,
+        "the waking client's opt-out must reach the revived worker: {attached}"
+    );
+    let woken = client
+        .live_active_id("list", &session_id)
+        .expect("the revived session is live");
+    assert_eq!(
+        descriptor_field(&agent_dir, &woken, "telemetryDisabled"),
+        Some(json!(true)),
+        "the revived worker runs opted out"
+    );
+}
+
+/// The same stance with NO launch record: a saved transcript this daemon never
+/// ran (a session saved before the upgrade) is woken for an opted-out client's
+/// attach by its durable id, and the woken worker opts out.
+#[test]
+fn an_opted_out_client_revives_a_session_with_no_launch_record() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        sessions.join("saved-before-upgrade.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "session", "version": 3, "id": "saved-before-upgrade",
+                "timestamp": "2026-10-12T00:00:00.000Z", "cwd": project,
+            })
+        ),
+    )
+    .expect("write saved transcript");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let attached = client.request(
+        "attach",
+        &json!({
+            "type": "attach",
+            "activeSessionId": "saved-before-upgrade",
+            "telemetryDisabled": true,
+        }),
+    );
+    assert_eq!(
+        attached["success"], true,
+        "the waking client's opt-out must reach a record-less revival: {attached}"
+    );
+    let woken = client
+        .live_active_id("list", "saved-before-upgrade")
+        .expect("the saved session is live");
+    assert_eq!(
+        descriptor_field(&agent_dir, &woken, "telemetryDisabled"),
+        Some(json!(true)),
+        "the revived worker runs opted out"
+    );
+}

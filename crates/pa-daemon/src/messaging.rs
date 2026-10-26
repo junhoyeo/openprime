@@ -15,6 +15,49 @@ use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::registry::ResidentWorker;
 use crate::supervisor::Supervisor;
 
+/// The waking request's telemetry stance. A saved session woken for a client that
+/// opted out of telemetry launches opted out too (legacy `966c11aa7`: the TS revival
+/// create carried the invocation's opt-out); otherwise the wake keeps what the
+/// session's launch record says. A client never turns a recorded opt-out off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WakeTelemetry {
+    /// The wake keeps the launch record's opt-out (or the daemon default).
+    Inherit,
+    /// The waking client opted out: the woken worker opts out.
+    OptedOut,
+}
+
+impl WakeTelemetry {
+    /// The stance an attach carries: its `telemetryDisabled` flag. Every other
+    /// command inherits.
+    pub(crate) fn of_command(command: &DaemonCommand) -> Self {
+        match command {
+            DaemonCommand::Attach {
+                telemetry_disabled: Some(true),
+                ..
+            }
+            | DaemonCommand::Reattach {
+                telemetry_disabled: Some(true),
+                ..
+            } => WakeTelemetry::OptedOut,
+            _ => WakeTelemetry::Inherit,
+        }
+    }
+
+    /// Fold the stance into a wake create: an opted-out waker sets the opt-out.
+    pub(crate) fn apply(self, create: &mut DaemonCommand) {
+        if let (
+            WakeTelemetry::OptedOut,
+            DaemonCommand::Create {
+                telemetry_disabled, ..
+            },
+        ) = (self, create)
+        {
+            *telemetry_disabled = Some(true);
+        }
+    }
+}
+
 /// Worker round-trip budget for the sender-summary read and the delivery
 /// route (TS `WORKER_REQUEST_TIMEOUT_MS`).
 pub(crate) const WORKER_REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -72,6 +115,7 @@ impl Supervisor {
                         wake_source
                             .as_ref()
                             .map(|(resident, summary)| (resident, summary)),
+                        WakeTelemetry::Inherit,
                     )
                     .await
                 {
@@ -179,6 +223,7 @@ impl Supervisor {
         resolve_error: &anyhow::Error,
         selector: &str,
         source: Option<(&Arc<ResidentWorker>, &Value)>,
+        telemetry: WakeTelemetry,
     ) -> WakeOutcome {
         let rendered = resolve_error.to_string();
         if !rendered.starts_with("Unknown active session:") {
@@ -257,7 +302,7 @@ impl Supervisor {
         // it was opened with (its fallback cwd, runtime config, telemetry
         // opt-out); only a session with no recorded context falls back to
         // its header.
-        let create = match self.passivated_launches.get(&session_path) {
+        let mut create = match self.passivated_launches.get(&session_path) {
             Some(launch) => launch.wake_create(&session_path, u64::from(info.rlm_depth), None),
             None => DaemonCommand::Create {
                 id: None,
@@ -266,8 +311,8 @@ impl Supervisor {
                 no_session: None,
                 name: None,
                 config: Some(json!({ "cwd": info.cwd, "rlmDepth": info.rlm_depth })),
-                // Telemetry opt-out only ever rides an explicit user create;
-                // the wake create inherits the daemon default (absent).
+                // No launch record: the daemon default, unless the waking
+                // client opted out (folded in below).
                 telemetry_disabled: None,
                 runtime_metadata: None,
                 lifecycle: None,
@@ -276,6 +321,7 @@ impl Supervisor {
                 rest: Map::default(),
             },
         };
+        telemetry.apply(&mut create);
         // The caller's route budget bounds the WAIT, not the launch (dropping
         // the future skipped the cleanup): the launch detaches, runs to completion.
         let launch = tokio::spawn({
