@@ -2929,10 +2929,17 @@
       "notes": "TS refine-cancel test update",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "refine-cancel-evidence",
+          "ref": "docs/migration/evidence/refine-cancel.md",
+          "note": "port/rust-refine-cancel-v2 8d76aea05, lifecycle-review-opus CLEAR; integrated ..53b5d0ef6; test update for the superseded 9aca6ba2a behavior"
+        }
+      ],
       "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "refine-cancel lane integrated and CLEAR: test update for the superseded 9aca6ba2a behavior; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "9aca6ba2a1b5a27cab3a66bb43fa5d4f9ba70734",
@@ -2957,10 +2964,17 @@
       "notes": "Restore queued prompts after canceling refine — verify Rust behavior first.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "refine-cancel-evidence",
+          "ref": "docs/migration/evidence/refine-cancel.md",
+          "note": "port/rust-refine-cancel-v2 8d76aea05, lifecycle-review-opus CLEAR; integrated ..53b5d0ef6; superseded within the fork tip: 703367bad interactive-mode.ts:7554-7561 plain abort; upstream #838/#2426 removed restoreQueuedMessagesToEditor"
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "refine-cancel lane integrated and CLEAR: superseded within the fork tip: 703367bad interactive-mode.ts:7554-7561 plain abort; upstream #838/#2426 removed restoreQueuedMessagesToEditor; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "50ffa44c24414458516153aba6f60dafe183bb39",
@@ -4290,10 +4304,17 @@
       "notes": "Refine loader reconcile on attach; verify equivalent in Rust attach flow.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "refine-cancel-evidence",
+          "ref": "docs/migration/evidence/refine-cancel.md",
+          "note": "port/rust-refine-cancel-v2 8d76aea05, lifecycle-review-opus CLEAR; integrated ..53b5d0ef6; refine session action survives attach rebuild and live update"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "refine-cancel lane integrated and CLEAR: refine session action survives attach rebuild and live update; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "3f747ebbe16d94fe4341f4e204d1befc178fd72c",
@@ -4312,10 +4333,17 @@
       "notes": "TS docs note.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "refine-cancel-evidence",
+          "ref": "docs/migration/evidence/refine-cancel.md",
+          "note": "port/rust-refine-cancel-v2 8d76aea05, lifecycle-review-opus CLEAR; integrated ..53b5d0ef6; docs note only"
+        }
+      ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "refine-cancel lane integrated and CLEAR: docs note only; final combined acceptance pending",
+      "candidate_verification_status": "truly-obsolete"
     },
     {
       "hash": "2ac5eed4249acca319009e37870749c4e8b473e2",
@@ -4342,10 +4370,17 @@
       "notes": "Show progress while refine runs.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "refine-cancel-evidence",
+          "ref": "docs/migration/evidence/refine-cancel.md",
+          "note": "port/rust-refine-cancel-v2 8d76aea05, lifecycle-review-opus CLEAR; integrated ..53b5d0ef6; refine loader visible with the configured cancel key; plain abort cancels the run (engine-owned abort slot)"
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "refine-cancel lane integrated and CLEAR: refine loader visible with the configured cancel key; plain abort cancels the run (engine-owned abort slot); final combined acceptance pending",
+      "candidate_verification_status": "ported"
     }
   ],
   "pull_requests": [
