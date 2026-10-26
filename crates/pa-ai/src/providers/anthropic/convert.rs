@@ -280,45 +280,6 @@ pub fn convert_messages(
     params
 }
 
-fn normalize_anthropic_tool_schema(value: &Value) -> Value {
-    match value {
-        Value::Array(values) => {
-            Value::Array(values.iter().map(normalize_anthropic_tool_schema).collect())
-        }
-        Value::Object(object) => {
-            let mut normalized: Map<String, Value> = object
-                .iter()
-                .map(|(key, value)| (key.clone(), normalize_anthropic_tool_schema(value)))
-                .collect();
-            let has_named_properties = normalized
-                .get("properties")
-                .and_then(Value::as_object)
-                .is_some_and(|properties| !properties.is_empty());
-            let catch_all = normalized
-                .get("patternProperties")
-                .and_then(Value::as_object)
-                .filter(|patterns| patterns.len() == 1)
-                .and_then(|patterns| patterns.get("^.*$"))
-                .cloned();
-            if !has_named_properties {
-                if let Some(catch_all) = catch_all {
-                    normalized.remove("patternProperties");
-                    normalized.insert(
-                        "additionalProperties".into(),
-                        if catch_all.as_object().is_some_and(Map::is_empty) {
-                            Value::Bool(true)
-                        } else {
-                            catch_all
-                        },
-                    );
-                }
-            }
-            Value::Object(normalized)
-        }
-        scalar => scalar.clone(),
-    }
-}
-
 pub fn convert_tools(
     tools: &[Tool],
     is_oauth_token: bool,
@@ -342,10 +303,7 @@ pub fn convert_tools(
             if supports_eager_tool_input_streaming {
                 entry.insert("eager_input_streaming".into(), json!(true));
             }
-            let mut schema = normalize_anthropic_tool_schema(&tool.parameters)
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
+            let mut schema = tool.parameters.as_object().cloned().unwrap_or_default();
             let required = schema
                 .get("required")
                 .and_then(Value::as_array)
@@ -426,8 +384,11 @@ mod tests {
         );
     }
 
+    /// `^.*$` does not match embedded-newline property names under JSON Schema regex semantics;
+    /// replacing it with `additionalProperties` would narrow those names from unconstrained to the
+    /// record value schema. Provider conversion therefore preserves the keyword byte-for-byte.
     #[test]
-    fn root_record_schema_normalizes_to_additional_properties() {
+    fn root_record_schema_preserves_pattern_properties() {
         let tool = Tool {
             name: "labels".into(),
             description: "Submit labels".into(),
@@ -440,8 +401,46 @@ mod tests {
             convert_tools(&[tool], false, false, None)[0]["input_schema"],
             json!({
                 "type": "object",
-                "additionalProperties": {"type": "string"},
+                "patternProperties": {"^.*$": {"type": "string"}},
                 "properties": {},
+                "required": []
+            })
+        );
+    }
+
+    /// With an explicit `additionalProperties`, replacing the pattern can also broaden newline-key
+    /// values by discarding that fallback. Preserve both keywords at root and nested object levels.
+    #[test]
+    fn root_and_nested_schemas_preserve_pattern_and_additional_properties() {
+        let tool = Tool {
+            name: "records".into(),
+            description: "Submit records".into(),
+            parameters: json!({
+                "type": "object",
+                "patternProperties": {"^.*$": {"type": "string"}},
+                "additionalProperties": {"maxLength": 2},
+                "properties": {
+                    "nested": {
+                        "type": "object",
+                        "patternProperties": {"^.*$": {"type": "number"}},
+                        "additionalProperties": {"minimum": 0}
+                    }
+                }
+            }),
+        };
+        assert_eq!(
+            convert_tools(&[tool], false, false, None)[0]["input_schema"],
+            json!({
+                "type": "object",
+                "patternProperties": {"^.*$": {"type": "string"}},
+                "additionalProperties": {"maxLength": 2},
+                "properties": {
+                    "nested": {
+                        "type": "object",
+                        "patternProperties": {"^.*$": {"type": "number"}},
+                        "additionalProperties": {"minimum": 0}
+                    }
+                },
                 "required": []
             })
         );
