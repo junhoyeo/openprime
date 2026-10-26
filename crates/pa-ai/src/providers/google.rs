@@ -201,8 +201,6 @@ fn build_params(model: &Model, context: &Context, options: &GoogleOptions) -> Va
     Value::Object(body)
 }
 
-// Long by design: mirrors the provider's stream shape.
-#[allow(clippy::too_many_lines)]
 pub(super) fn build_resolved_headers(
     model: &Model,
     configured_api_key: Option<String>,
@@ -227,6 +225,8 @@ pub(super) fn build_resolved_headers(
     Some(headers)
 }
 
+// Long by design: mirrors the provider's stream shape.
+#[allow(clippy::too_many_lines)]
 async fn run_stream(
     model: &Model,
     context: &Context,
