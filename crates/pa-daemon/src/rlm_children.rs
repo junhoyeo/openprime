@@ -198,6 +198,8 @@ struct ChildRecord {
     prompt_release: Arc<tokio::sync::Notify>,
     /// Claimed under the record mutex before the detached kickoff RPC starts.
     kickoff_started: bool,
+    kickoff_epoch: u64,
+    kickoff_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Terminal error text: the cancel reason for a cancelled run, the
     /// failure text for a failed one.
     error: Option<String>,
@@ -779,6 +781,8 @@ impl SupervisorChildSessions {
                 prompt_admitted: true,
                 prompt_release: Arc::new(tokio::sync::Notify::new()),
                 kickoff_started: true,
+                kickoff_epoch: 0,
+                kickoff_cancel: None,
                 error: None,
                 closed_by_parent: false,
                 retiring: false,
