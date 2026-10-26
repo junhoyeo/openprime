@@ -3,6 +3,7 @@
 //! file is a cross-session cache, not a per-session manifest.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -17,6 +18,7 @@ use super::{
 
 // The concern children (the flows + the shared record stay in the
 // composition root).
+mod diagnostics;
 mod layout;
 mod probe;
 mod runtime_source;
@@ -24,6 +26,9 @@ mod skills;
 mod uv;
 mod version;
 
+use diagnostics::{
+    ambient_secret_values, bounded_stderr_tail, sanitize_bootstrap_diagnostic, STDERR_BUFFER_BYTES,
+};
 use layout::home_dir;
 pub(crate) use layout::{expand_home, resolve_writable_kernel_venv_dir};
 pub use layout::{kernel_venv_dir, kernel_venv_python};
@@ -74,36 +79,93 @@ pub(crate) struct BootstrapVersion {
     python_skills: Option<Vec<BootstrapPythonSkill>>,
 }
 
+struct RetainedStderr {
+    bytes: Vec<u8>,
+    leading_record_truncated: bool,
+}
+
+fn drain_stderr_tail(mut stderr: impl Read) -> std::io::Result<RetainedStderr> {
+    let mut retained = Vec::with_capacity(STDERR_BUFFER_BYTES);
+    let mut leading_record_truncated = false;
+    let mut chunk = [0u8; 4 * 1024];
+    loop {
+        let count = stderr.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let mut combined = Vec::with_capacity(retained.len() + count);
+        combined.extend_from_slice(&retained);
+        combined.extend_from_slice(&chunk[..count]);
+        if combined.len() > STDERR_BUFFER_BYTES {
+            let split = combined.len() - STDERR_BUFFER_BYTES;
+            leading_record_truncated = combined[split - 1] != b'\n';
+            retained = combined.split_off(split);
+        } else {
+            retained = combined;
+        }
+    }
+    Ok(RetainedStderr {
+        bytes: retained,
+        leading_record_truncated,
+    })
+}
+
 async fn run_async(command: &str, args: &[String]) -> anyhow::Result<()> {
     // Run on a blocking thread: the bootstrap is an IO-bound child process.
     let command = command.to_string();
     let args = args.to_vec();
+    let secrets = ambient_secret_values();
     tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new(&command);
-        child.args(&args).stdin(Stdio::null());
+        let command_label = sanitize_bootstrap_diagnostic(&command, &secrets);
+        let mut process = std::process::Command::new(&command);
+        process
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         // Hidden window on Windows (TS `spawnHidden`).
-        crate::platform::process::set_no_window(&mut child);
+        crate::platform::process::set_no_window(&mut process);
         // CPython must read UTF-8 .pth files even under a Windows legacy
         // code page (TS bootstrap.ts:429).
         if cfg!(windows) {
-            child.env("PYTHONUTF8", "1");
+            process.env("PYTHONUTF8", "1");
         }
+        let mut child = process
+            .spawn()
+            .with_context(|| format!("failed to spawn bootstrap command {command_label}"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("bootstrap command {command_label} did not expose stderr"))?;
+        // Drain concurrently with wait(): waiting first can deadlock once the
+        // child fills the pipe. The reader retains only the newest bounded bytes.
+        let reader = std::thread::spawn(move || drain_stderr_tail(stderr));
         let status = child
-            .status()
-            .with_context(|| format!("failed to spawn {command}"))?;
+            .wait()
+            .with_context(|| format!("failed to wait for bootstrap command {command_label}"))?;
+        let retained = reader
+            .join()
+            .map_err(|_| anyhow!("bootstrap command {command_label} stderr reader panicked"))?
+            .with_context(|| format!("failed to drain bootstrap command {command_label} stderr"))?;
         if status.success() {
-            Ok(())
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&retained.bytes);
+        let tail = bounded_stderr_tail(&stderr, retained.leading_record_truncated, &secrets);
+        let reason = status.code().map_or_else(
+            || "terminated by a signal".to_string(),
+            |code| format!("failed with exit code {code}"),
+        );
+        if tail.is_empty() {
+            Err(anyhow!("bootstrap command {command_label} {reason}"))
         } else {
             Err(anyhow!(
-                "{} {} failed with exit code {}",
-                command,
-                args.join(" "),
-                status.code().unwrap_or(-1)
+                "bootstrap command {command_label} {reason}\nstderr (safe tail):\n{tail}"
             ))
         }
     })
     .await
-    .map_err(|e| anyhow!("bootstrap task join failed: {e}"))?
+    .map_err(|error| anyhow!("bootstrap task join failed: {error}"))?
 }
 
 pub(crate) async fn bootstrap_venv(
