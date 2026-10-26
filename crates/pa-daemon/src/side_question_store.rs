@@ -737,4 +737,147 @@ mod tests {
                 && row["data"]["errorMessage"] == "provider failed"
         }));
     }
+
+    /// The pane shape the TS `createSideQuestionStore` wrote (`btw-<paneId>` dir, TS header and
+    /// assistant rows, auxiliary completions, a failed turn's status row) with its parent pointer.
+    /// Sources: `tests/fixtures/legacy-state/README.md`.
+    fn copied_legacy_pane(agent_dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let parent_id = "01a0b100-0000-7000-8000-0000000000aa";
+        let parent = agent_dir
+            .join("sessions")
+            .join(format!("{parent_id}.jsonl"));
+        let side = agent_dir
+            .join("session-artifacts")
+            .join(parent_id)
+            .join("btw-3f2a9c1e")
+            .join("01a0b100-0000-7000-8000-0000000051de.jsonl");
+        let fill = |template: &str| {
+            template
+                .replace("{{PARENT_FILE}}", &parent.display().to_string())
+                .replace("{{SIDE_FILE}}", &side.display().to_string())
+        };
+        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(side.parent().unwrap()).unwrap();
+        std::fs::write(
+            &parent,
+            fill(include_str!(
+                "../tests/fixtures/legacy-state/btw/parent.jsonl"
+            )),
+        )
+        .unwrap();
+        std::fs::write(
+            &side,
+            fill(include_str!(
+                "../tests/fixtures/legacy-state/btw/side.jsonl"
+            )),
+        )
+        .unwrap();
+        (parent, side)
+    }
+
+    fn visible(store: &SessionFile) -> Vec<(String, String)> {
+        store
+            .messages()
+            .iter()
+            .map(|message| {
+                let text = message["content"]
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                (message["role"].as_str().unwrap().to_string(), text)
+            })
+            .collect()
+    }
+
+    fn spend(store: &SessionFile) -> (Value, f64) {
+        let stats = crate::session_stats::session_stats(store, None);
+        (stats["tokens"].clone(), stats["cost"].as_f64().unwrap())
+    }
+
+    fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(role, text)| ((*role).to_string(), (*text).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_ts_written_side_conversation_opens_with_its_history_and_full_spend() {
+        let temp = tempfile::tempdir().unwrap();
+        let (parent_path, side_path) = copied_legacy_pane(temp.path());
+
+        let parent = SessionFile::open(&parent_path).unwrap();
+        assert_eq!(
+            visible(&parent),
+            rows(&[("user", "main question"), ("assistant", "main answer")]),
+            "the side conversation never enters the parent context"
+        );
+
+        let side = SessionFile::open(&side_path).unwrap();
+        assert_eq!(
+            side.header.parent_session.as_deref(),
+            Some(parent_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(side.header.rlm_depth, Some(0));
+        assert_eq!(
+            visible(&side),
+            rows(&[
+                ("user", "what is the codename?"),
+                ("assistant", "side compaction summary"),
+                ("assistant", "overflowing answer"),
+                ("assistant", "the codename is synthetic"),
+                ("user", "and the second one?"),
+                ("assistant", "partial second answer"),
+            ])
+        );
+        // Full spend: the auxiliary summary and the replaced overflow answer count with the
+        // kept answers (6567e228f), including the failed turn that still billed.
+        let (tokens, cost) = spend(&side);
+        assert_eq!(
+            tokens,
+            json!({ "input": 1050, "output": 85, "cacheRead": 40, "cacheWrite": 0, "total": 1175 })
+        );
+        assert!((cost - 0.004_425).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn a_ts_written_side_conversation_resumes_into_the_same_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let (parent_path, side_path) = copied_legacy_pane(temp.path());
+        let parent_before = std::fs::read(&parent_path).unwrap();
+        let side_before = std::fs::read(&side_path).unwrap();
+        let core = Arc::new(Mutex::new(SessionCore::test_core(
+            Some(SessionFile::open(&parent_path).unwrap()),
+            "/legacy/project".to_string(),
+        )));
+        let registry = SideQuestionPaneRegistry::new(core, temp.path().to_path_buf());
+
+        registry
+            .resolve("pane:3f2a9c1e", "3f2a9c1e", true)
+            .record_turn("third?", &assistant("third answer", 17), &[]);
+
+        assert_eq!(
+            std::fs::read(&parent_path).unwrap(),
+            parent_before,
+            "resume reuses the immutable legacy pointer"
+        );
+        assert!(std::fs::read(&side_path).unwrap().starts_with(&side_before));
+        let side = SessionFile::open(&side_path).unwrap();
+        let history = visible(&side);
+        assert_eq!(
+            history[history.len() - 3..].to_vec(),
+            rows(&[
+                ("assistant", "partial second answer"),
+                ("user", "third?"),
+                ("assistant", "third answer"),
+            ]),
+            "the follow-up chains onto the legacy leaf"
+        );
+        assert_eq!(spend(&side).0["total"], 1175 + 17);
+    }
 }
