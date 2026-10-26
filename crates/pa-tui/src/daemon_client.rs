@@ -59,11 +59,13 @@ pub struct DaemonClosingUpdate {
 #[derive(Debug, Clone)]
 pub enum DaemonClientEvent {
     /// `session_event`: one streamed event, with the frame's
-    /// `meta.sequence` (the worker's monotonic counter).
+    /// `meta.sequence` (the worker's monotonic counter) and its cursor
+    /// generation (the counter's epoch: sequences compare only within one).
     SessionEvent {
         active_session_id: String,
         event: Value,
         meta_sequence: u64,
+        meta_generation: Option<String>,
     },
     SessionClosed {
         active_session_id: String,
@@ -131,6 +133,12 @@ pub(crate) fn client_event_from_value(value: &Value) -> Option<DaemonClientEvent
                 })
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
+            meta_generation: value
+                .get("meta")
+                .and_then(|meta| meta.get("cursor"))
+                .and_then(|cursor| cursor.get("generation"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         "session_closed" => Some(DaemonClientEvent::SessionClosed {
             active_session_id: value
