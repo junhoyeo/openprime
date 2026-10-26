@@ -203,7 +203,18 @@ struct Client {
 
 impl Client {
     fn connect(socket: &Path) -> Self {
-        let stream = UnixStream::connect(socket).expect("connect supervisor");
+        // The socket file appears at bind; the listener may answer a moment
+        // later (a restarted supervisor): wait for an accepted connection.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match UnixStream::connect(socket) {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "connect supervisor: {error}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
         let writer = stream.try_clone().expect("clone socket");
         let mut client = Client {
             reader: BufReader::new(stream),
