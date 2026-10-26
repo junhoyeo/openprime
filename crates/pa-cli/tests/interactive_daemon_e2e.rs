@@ -3369,6 +3369,7 @@ async fn tui_side_question_pane_flow() {
         .filter(|row| row["type"] == "message" && row["message"]["role"] == "assistant")
         .map(|row| row["message"]["content"].to_string())
         .collect();
+    assert_eq!(side_answers.len(), 2, "{side_answers:?}");
     assert!(
         side_answers[0].contains("Paris, obviously") && side_answers[1].contains("Second answer"),
         "{side_answers:?}"
