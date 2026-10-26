@@ -114,6 +114,6 @@ After every blocker is closed, the integration lead will provide the tested Rust
 
 ## Current blockers
 
-The machine-readable ledger is intentionally all `BLOCKED` at the first checkpoint. It will be updated only from source mappings and passing verifiers. PR #32 and #33 remain blocked until their owners' exact-tip reports are integrated.
+The scout inventory is fully recorded: 3 entries are high-confidence `verified-upstream-equivalent`, 19 are `truly-obsolete` with concrete runtime/model/maintenance rationale, and 77 remain `BLOCKED`. Medium/low-confidence rewrite mappings stay blocked until their owning lane runs a focused verifier. PR #32 maps to the stronger upstream #3749 implementation; PR #33 remains blocked on the tested bundled-skill port.
 
 Known native blockers are the immediate spawn-to-collect positive-timeout race and the packaged-layout kernel receipt failure. State compatibility, package assembly, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.
