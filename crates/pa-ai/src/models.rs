@@ -25,7 +25,9 @@ pub fn is_opencode_public_model(model: &Model) -> bool {
 /// Prefer a configured key, otherwise use OpenCode's public credential for a free Zen model.
 #[must_use]
 pub fn opencode_public_api_key(model: &Model, configured: Option<String>) -> Option<String> {
-    configured.or_else(|| is_opencode_public_model(model).then(|| OPENCODE_PUBLIC_API_KEY.into()))
+    configured
+        .filter(|key| !key.is_empty())
+        .or_else(|| is_opencode_public_model(model).then(|| OPENCODE_PUBLIC_API_KEY.into()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,6 +115,10 @@ mod tests {
         assert_eq!(
             opencode_public_api_key(&free_zen, Some("configured".into())).as_deref(),
             Some("configured")
+        );
+        assert_eq!(
+            opencode_public_api_key(&free_zen, Some(String::new())).as_deref(),
+            Some(OPENCODE_PUBLIC_API_KEY)
         );
 
         let paid_zen = Model {

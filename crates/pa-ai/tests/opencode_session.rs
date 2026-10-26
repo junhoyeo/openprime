@@ -132,14 +132,43 @@ async fn opencode_session_preserves_case_insensitive_explicit_overrides() {
 }
 
 #[tokio::test]
-async fn zero_cost_zen_uses_the_public_key_without_configured_auth() {
-    let headers = capture("openai-completions", "opencode", "conversation", None, None).await;
-    assert!(headers.contains(&(
-        "authorization".into(),
-        format!("Bearer {}", pa_ai::models::OPENCODE_PUBLIC_API_KEY),
-    )));
-    assert!(headers.contains(&("user-agent".into(), "prime-agent".into())));
-    assert!(headers.contains(&("x-opencode-session".into(), "conversation".into())));
+async fn zero_cost_zen_uses_the_public_key_on_every_transport() {
+    for (api, key_header, key_value) in [
+        (
+            "openai-completions",
+            "authorization",
+            format!("Bearer {}", pa_ai::models::OPENCODE_PUBLIC_API_KEY),
+        ),
+        (
+            "openai-responses",
+            "authorization",
+            format!("Bearer {}", pa_ai::models::OPENCODE_PUBLIC_API_KEY),
+        ),
+        (
+            "anthropic-messages",
+            "x-api-key",
+            pa_ai::models::OPENCODE_PUBLIC_API_KEY.to_string(),
+        ),
+        (
+            "google-generative-ai",
+            "x-goog-api-key",
+            pa_ai::models::OPENCODE_PUBLIC_API_KEY.to_string(),
+        ),
+    ] {
+        let headers = capture(api, "opencode", "conversation", None, None).await;
+        assert!(
+            headers.contains(&(key_header.into(), key_value)),
+            "{api}: {headers:?}"
+        );
+        assert!(
+            headers.contains(&("user-agent".into(), "prime-agent".into())),
+            "{api}"
+        );
+        assert!(
+            headers.contains(&("x-opencode-session".into(), "conversation".into())),
+            "{api}"
+        );
+    }
 }
 
 #[tokio::test]
