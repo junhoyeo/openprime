@@ -29,18 +29,26 @@ fn run_quiet(command: &str, args: &[&str]) -> bool {
 /// require an explicit new host/runtime pairing; unknown newer ABIs fail closed.
 pub(crate) const SUPPORTED_RLM_RUNTIME_ABI: u64 = 2;
 
+/// Outcome of one pre-spawn probe interpreter.
+enum ProbeRun {
+    Passed,
+    Failed,
+    TimedOut,
+}
+
 /// One pre-spawn probe interpreter, awaited without blocking the async
 /// runtime and bounded by `bound`. An interpreter that outlives the bound, or
 /// a caller that drops this future (dispose, a start timeout), kills the
-/// probe child: a wedged probe must never wedge the kernel start. An
-/// interpreter that cannot launch at all is an error, not a failed probe.
+/// probe child: a wedged probe must never wedge the kernel start. Only the
+/// direct child is signalled, not its process group. An interpreter that
+/// cannot launch at all is an error, not a failed probe.
 async fn probe_quiet_with_env(
     command: &str,
     args: &[&str],
     env: &HashMap<String, String>,
     cwd: Option<&Path>,
     bound: std::time::Duration,
-) -> std::io::Result<bool> {
+) -> std::io::Result<ProbeRun> {
     let mut command = tokio::process::Command::new(command);
     command
         .args(args)
@@ -56,13 +64,29 @@ async fn probe_quiet_with_env(
     crate::platform::process::set_no_window(command.as_std_mut());
     let mut child = command.spawn()?;
     match tokio::time::timeout(bound, child.wait()).await {
-        Ok(status) => Ok(matches!(status, Ok(status) if status.success())),
+        Ok(Ok(status)) if status.success() => Ok(ProbeRun::Passed),
+        Ok(_) => Ok(ProbeRun::Failed),
         Err(_elapsed) => {
             // Fail closed, and reap the probe instead of leaking it.
             let _ = child.kill().await;
-            Ok(false)
+            Ok(ProbeRun::TimedOut)
         }
     }
+}
+
+/// Verdict of the pre-spawn check ([`spawn_environment_ready`]).
+#[derive(Debug)]
+pub(crate) enum SpawnProbe {
+    /// Every probe passed: the kernel may spawn.
+    Ready,
+    /// A probe ran and failed: not the supported runtime ABI or imports.
+    Rejected,
+    /// A probe interpreter did not exit within the bound.
+    TimedOut,
+    /// The caller stopped wanting the start between probes.
+    Abandoned,
+    /// The interpreter could not launch at all.
+    LaunchFailed(std::io::Error),
 }
 
 /// The runtime-ready assertion from the TS product: a current
@@ -91,13 +115,15 @@ pub(crate) fn has_required_default_imports(python: &str) -> bool {
 /// run with. Each probe interpreter gets `bound`; one that does not exit in
 /// time fails the check closed. Async so the probes never block a runtime
 /// thread (a blocked current-thread runtime cannot even fire its timers).
-/// `Err` carries the launch error of an interpreter that cannot start.
+/// `wanted` is asked before every probe launch: a superseded or torn-down
+/// start launches no further probe interpreters.
 pub(crate) async fn spawn_environment_ready(
     python: &str,
     env: &HashMap<String, String>,
     cwd: Option<&Path>,
     bound: std::time::Duration,
-) -> std::io::Result<bool> {
+    wanted: &(dyn Fn() -> bool + Send + Sync),
+) -> SpawnProbe {
     let imports = format!(
         "import {}",
         DEFAULT_RLM_EXTRA_PACKAGES
@@ -107,11 +133,17 @@ pub(crate) async fn spawn_environment_ready(
             .join(",")
     );
     for check in [RUNTIME_READY_CHECK, "import dill", imports.as_str()] {
-        if !probe_quiet_with_env(python, &["-c", check], env, cwd, bound).await? {
-            return Ok(false);
+        if !wanted() {
+            return SpawnProbe::Abandoned;
+        }
+        match probe_quiet_with_env(python, &["-c", check], env, cwd, bound).await {
+            Ok(ProbeRun::Passed) => {}
+            Ok(ProbeRun::Failed) => return SpawnProbe::Rejected,
+            Ok(ProbeRun::TimedOut) => return SpawnProbe::TimedOut,
+            Err(error) => return SpawnProbe::LaunchFailed(error),
         }
     }
-    Ok(true)
+    SpawnProbe::Ready
 }
 
 pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
@@ -294,7 +326,7 @@ pub(crate) fn clear_in_process_probe_memo_for_tests() {
 
 #[cfg(all(test, unix))]
 mod spawn_probe_tests {
-    use super::{spawn_environment_ready, HashMap};
+    use super::{spawn_environment_ready, HashMap, SpawnProbe};
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
@@ -316,19 +348,22 @@ mod spawn_probe_tests {
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake python");
         let started = Instant::now();
-        let ready = tokio::time::timeout(
+        let verdict = tokio::time::timeout(
             Duration::from_secs(10),
             spawn_environment_ready(
                 &python.to_string_lossy(),
                 &HashMap::new(),
                 None,
                 Duration::from_secs(2),
+                &|| true,
             ),
         )
         .await
-        .expect("the bound must settle the probe")
-        .expect("the probe interpreter launches");
-        assert!(!ready, "a probe that never exits must fail closed");
+        .expect("the bound must settle the probe");
+        assert!(
+            matches!(verdict, SpawnProbe::TimedOut),
+            "a probe that never exits must fail closed as a timeout: {verdict:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(8));
         let pid = std::fs::read_to_string(&pid_file).expect("the probe ran");
         let state = std::process::Command::new("ps")
@@ -338,6 +373,38 @@ mod spawn_probe_tests {
         assert!(
             String::from_utf8_lossy(&state.stdout).trim().is_empty(),
             "the timed-out probe interpreter must be killed and reaped"
+        );
+    }
+
+    /// A start that stops wanting the probe between launches gets no
+    /// further probe interpreter.
+    #[tokio::test]
+    async fn unwanted_spawn_probe_launches_no_further_interpreter() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = dir.path().join("counting-probe-python");
+        let count = dir.path().join("launches");
+        std::fs::write(
+            &python,
+            format!("#!/bin/sh\nprintf x >> '{}'\nexit 0\n", count.display()),
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let wanted = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let verdict = spawn_environment_ready(
+            &python.to_string_lossy(),
+            &HashMap::new(),
+            None,
+            Duration::from_secs(10),
+            &wanted,
+        )
+        .await;
+        assert!(matches!(verdict, SpawnProbe::Abandoned), "{verdict:?}");
+        assert_eq!(
+            std::fs::read_to_string(&count).expect("one probe ran"),
+            "x",
+            "only the probe launched while the start was wanted may run"
         );
     }
 }

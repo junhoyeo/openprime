@@ -9,6 +9,8 @@ use super::{
     READY_TIMEOUT_MS, REPL_PROTOCOL_VERSION,
 };
 
+use crate::kernel::bootstrap::venv::SpawnProbe;
+
 impl Inner {
     /// True when a teardown (or newer start) superseded the start that
     /// captured `generation`.
@@ -167,43 +169,57 @@ impl Inner {
         }
         let env = kernel_spawn_env(&self.options.env);
         let cwd = self.options.cwd.clone();
+        let wanted =
+            || !self.start_stale(generation) && lock(&self.guarded).state != KernelState::Shutdown;
         let probe = crate::kernel::bootstrap::venv::spawn_environment_ready(
             &python.to_string_lossy(),
             &env,
             cwd.as_deref(),
             Duration::from_millis(READY_TIMEOUT_MS),
+            &wanted,
         )
         .await;
-        if !matches!(probe, Ok(true)) {
-            live_kernels::remove(self);
-            {
-                let mut g = lock(&self.guarded);
-                if g.state != KernelState::Shutdown {
-                    g.state = KernelState::Idle;
-                }
-            }
-            return Err(match probe {
-                Err(error) => {
-                    // The interpreter itself cannot launch: surface that cause
-                    // (not an ABI verdict) and drop the stale runtime-ready memo,
-                    // as a failed kernel spawn does.
-                    crate::kernel::bootstrap::invalidate_runtime_probe_cache();
-                    self.append_diagnostic(&format!("spawn error: {error}"));
-                    anyhow!("failed to spawn kernel python {}: {error}", python.display())
-                }
-                Ok(_) => anyhow!(
-                    "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
-                    python.display()
-                ),
-            });
-        }
         // The probe awaited child processes: a teardown or newer start may
-        // have landed meanwhile and must not be followed by a spawn.
+        // have landed meanwhile. Whatever the verdict, never touch a newer
+        // start's state, and never spawn after a teardown.
         if self.start_stale(generation) {
             return Err(anyhow!("Kernel start superseded"));
         }
         if lock(&self.guarded).state == KernelState::Shutdown {
             return Err(anyhow!("Kernel was disposed during startup"));
+        }
+        let rejection = match probe {
+            SpawnProbe::Ready => None,
+            SpawnProbe::LaunchFailed(error) => {
+                // The interpreter itself cannot launch: surface that cause
+                // (not an ABI verdict) and drop the stale runtime-ready memo,
+                // as a failed kernel spawn does.
+                crate::kernel::bootstrap::invalidate_runtime_probe_cache();
+                self.append_diagnostic(&format!("spawn error: {error}"));
+                Some(anyhow!(
+                    "failed to spawn kernel python {}: {error}",
+                    python.display()
+                ))
+            }
+            // `wanted` turned false, which only a teardown or a newer start
+            // causes; both returned above.
+            SpawnProbe::Abandoned => Some(anyhow!("Kernel start superseded")),
+            SpawnProbe::TimedOut => Some(anyhow!(
+                "kernel python {} did not answer the runtime probe within {READY_TIMEOUT_MS}ms",
+                python.display()
+            )),
+            SpawnProbe::Rejected => Some(anyhow!(
+                "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
+                python.display()
+            )),
+        };
+        if let Some(error) = rejection {
+            live_kernels::remove(self);
+            let mut g = lock(&self.guarded);
+            if g.state != KernelState::Shutdown {
+                g.state = KernelState::Idle;
+            }
+            return Err(error);
         }
         // Bridge resolver ownership to the child-PID lease. If this host
         // crashes after exec but before child publication, the durable handoff
@@ -741,6 +757,128 @@ mod tests {
         // Dropping the runtime at test end drops the detached start, whose
         // kill-on-drop probe child dies with it.
         manager.kill();
+    }
+
+    /// A probe-gated fake interpreter: probe launch `n` (0-based) records
+    /// itself, waits for `gates/gate<n>`, and exits with the gate's content.
+    #[cfg(unix)]
+    fn gated_probe_python(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let python = dir.join("gated-probe-python");
+        let count = dir.join("probe-launches");
+        let gates = dir.join("gates");
+        std::fs::create_dir_all(&gates).expect("gates dir");
+        std::fs::write(&count, "").expect("count file");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"-c\" ]; then\n  n=$(wc -c < '{count}' | tr -d ' ')\n  printf x >> '{count}'\n  while [ ! -f '{gates}/gate'$n ] && [ -d '{gates}' ]; do sleep 0.02; done\n  exit $(cat '{gates}/gate'$n 2>/dev/null || echo 1)\nfi\nexit 1\n",
+                count = count.display(),
+                gates = gates.display(),
+            ),
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+        python
+    }
+
+    #[cfg(unix)]
+    fn probe_launches(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("probe-launches")).map_or(0, |text| text.len())
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_probe_launches(dir: &std::path::Path, launches: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while probe_launches(dir) < launches {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the probe launched");
+    }
+
+    /// A superseded start's failed probe must not touch the newer start:
+    /// A's probe is in flight, `restart()` puts B into Starting, then A's
+    /// probe fails. B stays Starting and tracked by the live-kernel registry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_probe_failure_leaves_the_newer_start_alone() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = gated_probe_python(dir.path());
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        let start_a = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start(KernelStartOptions::default()).await }
+        });
+        wait_for_probe_launches(dir.path(), 1).await;
+        let restart_b = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.restart().await }
+        });
+        wait_for_probe_launches(dir.path(), 2).await;
+        assert!(matches!(
+            lock(&manager.inner.guarded).state,
+            KernelState::Starting
+        ));
+        // A's probe now fails.
+        std::fs::write(dir.path().join("gates").join("gate0"), "1").expect("gate0");
+        let a = tokio::time::timeout(Duration::from_secs(10), start_a)
+            .await
+            .expect("the superseded start settles")
+            .expect("start task");
+        assert!(a.is_err(), "the superseded start fails");
+        let state = lock(&manager.inner.guarded).state;
+        assert!(
+            matches!(state, KernelState::Starting),
+            "the superseded start's probe failure must not reset the newer start: {state:?}"
+        );
+        assert!(
+            crate::kernel::live_kernels::is_tracked(&manager.inner),
+            "the newer start must stay tracked for cleanup"
+        );
+        manager.kill();
+        std::fs::write(dir.path().join("gates").join("gate1"), "1").expect("gate1");
+        let _ = tokio::time::timeout(Duration::from_secs(10), restart_b).await;
+    }
+
+    /// A start killed while its first probe runs launches no further probe
+    /// interpreters once that probe returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killed_start_launches_no_further_probes() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = gated_probe_python(dir.path());
+        let gates = dir.path().join("gates");
+        // Later probes would pass at once, so only the stale check stops them.
+        std::fs::write(gates.join("gate1"), "0").expect("gate1");
+        std::fs::write(gates.join("gate2"), "0").expect("gate2");
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start(KernelStartOptions::default()).await }
+        });
+        wait_for_probe_launches(dir.path(), 1).await;
+        manager.kill();
+        std::fs::write(gates.join("gate0"), "0").expect("gate0");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), start)
+            .await
+            .expect("the killed start settles")
+            .expect("start task");
+        assert!(outcome.is_err(), "a killed start fails");
+        assert_eq!(
+            probe_launches(dir.path()),
+            1,
+            "a killed start must not launch further probes"
+        );
     }
 
     #[test]
