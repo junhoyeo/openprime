@@ -113,7 +113,6 @@ impl SessionUi {
             list_rows: Vec::new(),
             turn_active: false,
             refine_active: false,
-            refine_cancel_in_flight: false,
             turn_ends_seen: 0,
             last_prompt_turn_end: 0,
             steering_mode: "all".to_string(),
