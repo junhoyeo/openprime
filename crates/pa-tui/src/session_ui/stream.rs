@@ -79,7 +79,41 @@ fn format_rate(tokens_per_second: f64) -> String {
     }
 }
 
+fn refine_working_state(cancel_key: &str, since: std::time::Instant) -> WorkingState {
+    WorkingState {
+        activity: "Refining",
+        message: Some(format!(
+            "{} to cancel",
+            crate::keybindings::format_key_text(cancel_key)
+        )),
+        download: false,
+        tokens: 0,
+        elapsed_secs: since.elapsed().as_secs(),
+    }
+}
+
 impl SessionUi {
+    pub(super) fn sync_refine_loader(&mut self, view: &mut AgentView) {
+        if self.refine_active {
+            if !self.turn_active {
+                let since = view.working_since.unwrap_or_else(std::time::Instant::now);
+                let key = self
+                    .keybindings
+                    .first_key("app.clear")
+                    .unwrap_or_else(|| "ctrl+c".to_string());
+                view.working = Some(refine_working_state(&key, since));
+                view.working_since = Some(since);
+            }
+        } else if view
+            .working
+            .as_ref()
+            .is_some_and(|working| working.activity == "Refining")
+        {
+            view.working = None;
+            view.working_since = None;
+        }
+    }
+
     pub(crate) fn start_loader(&mut self, view: &mut AgentView) {
         self.start_loader_at(view, std::time::Instant::now());
     }
@@ -325,5 +359,17 @@ mod loader_token_tests {
         stats.tokens += 100;
         stats.duration_ms += 500;
         assert!((stats.average_rate() - 200.0).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod refine_tests {
+    use super::*;
+    #[test]
+    fn refine_loader_is_visible_with_configured_cancel_key() {
+        let state = refine_working_state("escape", std::time::Instant::now());
+        assert_eq!(state.activity, "Refining");
+        assert_eq!(state.message.as_deref(), Some("Esc to cancel"));
+        assert!(!state.download);
     }
 }

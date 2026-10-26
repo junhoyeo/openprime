@@ -992,6 +992,7 @@ fn decodes_session_action_update_as_the_queue_projection() {
             starting: None,
             rlm_child_status: crate::queued::QueueLaneIndices::default(),
             injected_prompts: crate::queued::QueueLaneIndices::default(),
+            active_refine: false,
         }
     );
 }
@@ -1019,6 +1020,7 @@ fn decodes_the_child_status_provenance_from_the_live_queue_update() {
                 follow_up: Vec::new(),
             },
             injected_prompts: crate::queued::QueueLaneIndices::default(),
+            active_refine: false,
         }
     );
 }
@@ -1052,6 +1054,7 @@ fn decodes_the_injected_provenance_from_the_live_queue_update() {
                 steering: Vec::new(),
                 follow_up: vec![0],
             },
+            active_refine: false,
         }
     );
 }
@@ -1079,6 +1082,7 @@ fn decodes_the_preparing_turn_label_as_the_starting_row() {
             starting: Some("queued before compaction".to_string()),
             rlm_child_status: crate::queued::QueueLaneIndices::default(),
             injected_prompts: crate::queued::QueueLaneIndices::default(),
+            active_refine: false,
         })
     );
     let committed = json!({
@@ -1102,6 +1106,7 @@ fn decodes_the_preparing_turn_label_as_the_starting_row() {
             starting: None,
             rlm_child_status: crate::queued::QueueLaneIndices::default(),
             injected_prompts: crate::queued::QueueLaneIndices::default(),
+            active_refine: false,
         })
     );
     let other_kind = json!({
@@ -1125,6 +1130,7 @@ fn decodes_the_preparing_turn_label_as_the_starting_row() {
             starting: None,
             rlm_child_status: crate::queued::QueueLaneIndices::default(),
             injected_prompts: crate::queued::QueueLaneIndices::default(),
+            active_refine: false,
         })
     );
 }
@@ -2301,4 +2307,35 @@ fn windowed_prompt_time_prefers_the_readable_tail_over_an_older_scalar() {
             Some(2000)
         );
     }
+}
+
+#[test]
+fn session_action_refine_survives_live_update_and_attach_rebuild() {
+    let event = json!({"type":"session_action_update","actions":{"steering":[],"followUps":[],"active":{"kind":"session_command","phase":"running","label":"/refine"}}});
+    assert!(matches!(
+        event_to_update(&event),
+        Some(TurnUpdate::QueueUpdated {
+            active_refine: true,
+            ..
+        })
+    ));
+    let mut attach = slim_attach();
+    attach["snapshot"]["state"]["sessionActions"] = event["actions"].clone();
+    assert!(reconstruct(&attach_data_from_response(attach).unwrap()).active_refine);
+    let user_typed = json!({"type":"session_action_update","actions":{"active":{"kind":"turn","phase":"running","label":"/refine"}}});
+    assert!(matches!(
+        event_to_update(&user_typed),
+        Some(TurnUpdate::QueueUpdated {
+            active_refine: false,
+            ..
+        })
+    ));
+    let settled = json!({"type":"session_action_update","actions":{"active":null}});
+    assert!(matches!(
+        event_to_update(&settled),
+        Some(TurnUpdate::QueueUpdated {
+            active_refine: false,
+            ..
+        })
+    ));
 }

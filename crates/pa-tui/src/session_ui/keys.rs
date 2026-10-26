@@ -602,7 +602,11 @@ impl SessionUi {
                     }
                 });
             }
-            self.interrupt_running_work(view);
+            if self.refine_active {
+                self.abort_refine_and_restore_queue(view).await;
+            } else {
+                self.interrupt_running_work(view);
+            }
             self.show_ctrl_c_hint();
             self.dirty = true;
             return Ok(());
