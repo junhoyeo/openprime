@@ -28,7 +28,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
+GRACE_SECONDS = 60
 PASS_THROUGH = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "CARGO_HOME", "RUSTUP_HOME",
                 "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "CARGO_INCREMENTAL", "CARGO_NET_OFFLINE")
 KERNEL_VARS = ("PRIME_AGENT_KERNEL_PYTHON", "PA_CORE_KERNEL_PYTHON",
@@ -159,7 +161,14 @@ def main(argv=None):
         markers.append(env["CARGO_TARGET_DIR"])
     else:
         markers.append(str(Path.cwd() / "target"))
+    # Test workers that lose their supervisor exit on their own after a bounded
+    # window (WORKER_SUPERVISOR_LOST_EXIT_MS in e2e helpers); report only what is
+    # still alive once that observable condition has had time to settle.
+    deadline = time.monotonic() + GRACE_SECONDS
     survivors = leftovers(markers)
+    while survivors and time.monotonic() < deadline:
+        time.sleep(1)
+        survivors = leftovers(markers)
     if survivors:
         print("hermetic_test: processes survived the command (not killed):", file=sys.stderr)
         for row in survivors:

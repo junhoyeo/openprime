@@ -14,6 +14,7 @@ SPEC.loader.exec_module(ht)
 
 class HermeticTest(unittest.TestCase):
     def setUp(self):
+        ht.GRACE_SECONDS = 0
         self.tmp = Path(tempfile.mkdtemp(prefix="pa-ht", dir="/tmp"))
         self.python = self.tmp / "python"
         self.python.write_text("")
