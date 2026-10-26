@@ -28,3 +28,15 @@ Each fixed incompatibility was proven red before its fix, with
 | `a_topic_era_harness_entry_loads_under_path` | `04f9fe117` and `11a949bb0` | `fix(refinement): keep legacy harness entries through load and save` |
 | `saving_after_a_legacy_load_never_erases_an_entry` | `04f9fe117` and `11a949bb0` | `fix(refinement): keep legacy harness entries through load and save` |
 | `a_legacy_v1_compaction_keeps_its_summary_and_kept_turns` | `0c6a74564` (got only the post-compaction turns) | `fix(session): migrate v1 compaction rows with their kept-entry index` |
+
+## Known limits
+
+These limits are disclosed, not fixed:
+
+- Harness rows that are not JSON objects stay preserved on a Rust save. TS drops them.
+- `refinements[]` events that do not type are dropped on a Rust save. TS keeps them verbatim.
+- Unknown extra fields on a harness row that does type are dropped on a Rust save. TS keeps them.
+- Refine `update` and `delete` on a preserved row answer "entry not found". TS applies them.
+  A `create` on a preserved id is refused like TS.
+- The kernel's Python writer (`prime-agent-runtime/src/rlm/harness.py`, unchanged since legacy)
+  drops untyped rows and `topic` when the kernel writes first. Only the Rust writer is lossless.
