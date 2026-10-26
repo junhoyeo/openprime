@@ -1524,6 +1524,14 @@ impl SessionEngine for AgentSessionEngine {
         if let Some(agent) = agent {
             agent.abort();
         }
+        // TS `requestAbort` -> `_refineAbortController.abort()`: a refine run (the `/refine`
+        // command, `refine.run`) plans on the built session outside any agent turn. The slot
+        // lock is held only for the clone and the build, never across the refine itself.
+        if let Ok(session) = self.session.try_lock() {
+            if let Some(core) = session.as_ref() {
+                core.session.abort_refinement();
+            }
+        }
     }
 
     /// `set_steering_mode` / `set_follow_up_mode`: the queue delivery modes
