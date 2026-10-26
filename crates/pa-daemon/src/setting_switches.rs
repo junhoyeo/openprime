@@ -45,7 +45,7 @@ mod service_tier_compat_tests {
             "reasoning": true,
             "input": ["text"],
             "cost": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 128000,
+            "contextWindow": 128_000,
             "maxTokens": 8192,
             "compat": {"supportsFastMode": supports_fast_mode}
         })
