@@ -24,6 +24,7 @@ The complete 99-commit, non-merge legacy inventory is in:
 - [`legacy-commit-map.json`](legacy-commit-map.json), the authoritative machine-readable ledger.
 - [`legacy-commit-map.md`](legacy-commit-map.md), its review view.
 - [`evidence/skills.md`](evidence/skills.md), the integrated #33 source/package/review record with disclosed non-green attempts.
+- [`evidence/providers.md`](evidence/providers.md), the final provider review/provenance record plus combined safe-metadata seam evidence.
 
 Each commit and PR #32/#33 must end in exactly one state:
 
@@ -119,6 +120,6 @@ After every blocker is closed, the integration lead will provide the tested Rust
 
 ## Current blockers
 
-The scout inventory is fully recorded, and inventory disposition remains separate from verification outcome. All 99 rows currently remain `BLOCKED`. Provider code and focused gates are integrated, with candidate row outcomes recorded in JSON, but the independent Terra provider review is pending. Multiple legacy commits that name one invariant may share one reviewed regression proof. The two Fast-compat rows additionally require the session-owned full-model metadata producer and combined consumer verifier. PR #32 maps to the stronger upstream #3749 implementation but remains open and blocked through final Rust acceptance; PR #33 tracks both Aside indexing (`4af3c6d89`) and the Unicode smart-case fix (`5d4d1eb26`).
+The scout inventory is fully recorded, and inventory disposition remains separate from verification outcome. The independently reviewed provider lane plus combined safe metadata seam now closes 10 rows as `ported`, 4 as `verified-upstream-equivalent`, and 2 as `truly-obsolete`; 83 remain `BLOCKED`. Multiple legacy commits that name one invariant may share one reviewed regression proof. Skills are integrated/Terra-clear but remain blocked on the post-kernel staged package rerun. Lifecycle and kernel are not integrated and remain review-blocked. PR #32 remains open through final Rust acceptance; PR #33 tracks both Aside indexing (`4af3c6d89`) and Unicode smart-case (`5d4d1eb26`) and also stays open.
 
 The known pinned-base native blocker is the immediate spawn-to-collect positive-timeout race. State compatibility, final integrated package assembly and real-cell receipts, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.

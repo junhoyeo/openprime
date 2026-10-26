@@ -57,12 +57,16 @@
       "BLOCKED"
     ],
     "migration_status_counts": {
-      "BLOCKED": 99
+      "ported": 10,
+      "BLOCKED": 83,
+      "truly-obsolete": 2,
+      "verified-upstream-equivalent": 4
     },
     "classification_policy": "Inventory disposition and verification outcome are separate. Every row remains BLOCKED until its focused lane verifier and integrated-tip acceptance pass; confidence alone never proves parity. Proposed final statuses are review candidates, not acceptance claims.",
     "revision": "r2 (2026-10-26): behavioral-acceptance note, lane disproofs, PR row updates; dispositions unchanged from lead-integrated copy except notes",
     "behavioral_acceptance_note": "Source disposition != behavioral acceptance. covered-by-rewrite / already-covered are source-level readings of the frozen tip. Medium/low-confidence rows stay BLOCKED until lane verifiers pass. Disproved so far: kernel generation/bootstrap rewrite claims (venv/stderr cluster — real gaps per kernel lane tests+source review); bd15cf317 custom fast-mode compat (provider lane: missing); adde4cc6b queued/admission state (session lane: measured spawn->collect race; already re-dispositioned must-port in this ledger).",
-    "cutover_policy": "CONDITIONAL cutover only: never run unqualified `prime-agent update` on the fork install — the updater resolves latest.json under PRIME_AGENT_DOWNLOAD_BASE_URL or the DEFAULT upstream bucket and may install upstream artifacts. Use a fork-artifact channel (publish jobs pinned to fork origin, 93c2a3f6a) or isolated manual install, after URL/channel + checksum verification."
+    "cutover_policy": "CONDITIONAL cutover only: never run unqualified `prime-agent update` on the fork install — the updater resolves latest.json under PRIME_AGENT_DOWNLOAD_BASE_URL or the DEFAULT upstream bucket and may install upstream artifacts. Use a fork-artifact channel (publish jobs pinned to fork origin, 93c2a3f6a) or isolated manual install, after URL/channel + checksum verification.",
+    "provider_final_review": "docs/migration/evidence/providers.md"
   },
   "commits": [
     {
@@ -96,21 +100,29 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "15dad6468",
-        "1f067ceaa"
+        "1f067ceaa",
+        "2c9263698",
+        "85f34a093",
+        "861d71c63"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -167,22 +179,30 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "15dad6468",
         "46d96d506",
-        "1f067ceaa"
+        "1f067ceaa",
+        "2c9263698",
+        "85f34a093",
+        "861d71c63"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -219,22 +239,30 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "15dad6468",
         "46d96d506",
-        "1f067ceaa"
+        "1f067ceaa",
+        "2c9263698",
+        "85f34a093",
+        "861d71c63"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -313,18 +341,23 @@
       ],
       "port_target": null,
       "notes": "TS bundled-catalog build mechanism deleted; custom-model lane = models.json.",
-      "migration_status": "BLOCKED",
+      "migration_status": "truly-obsolete",
       "port_commits": [],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "truly-obsolete"
     },
     {
@@ -641,21 +674,29 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "15dad6468",
-        "1f067ceaa"
+        "1f067ceaa",
+        "2c9263698",
+        "85f34a093",
+        "861d71c63"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -690,20 +731,28 @@
       ],
       "port_target": "crates/pa-ai/src/providers/opencode_headers.rs + providers/anthropic + env_api_keys.rs",
       "notes": "Only needed if keyless zen use is still wanted; check current zen free model (big-pickle) accepts CLI identity/public key.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
-        "46d96d506"
+        "46d96d506",
+        "2c9263698",
+        "85f34a093",
+        "861d71c63"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -733,18 +782,23 @@
       ],
       "port_target": null,
       "notes": "union-alpha retired; generic zen capability covered; keyless semantics tracked in PR #30 cluster.",
-      "migration_status": "BLOCKED",
+      "migration_status": "truly-obsolete",
       "port_commits": [],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "truly-obsolete"
     },
     {
@@ -768,20 +822,25 @@
       ],
       "port_target": null,
       "notes": "Opus 5.5 served by live remote catalog (pa-models fetch, frozen URL contract).",
-      "migration_status": "BLOCKED",
+      "migration_status": "verified-upstream-equivalent",
       "port_commits": [
         "931483e24"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
@@ -812,21 +871,26 @@
       ],
       "port_target": "crates/pa-core/src/auth/manager.rs",
       "notes": "ai-gateway outages must not wipe stored credentials. Needs a targeted Rust-side test before deciding port vs covered.",
-      "migration_status": "BLOCKED",
+      "migration_status": "verified-upstream-equivalent",
       "port_commits": [
         "3ebdd4e3e",
         "7cbe23190"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
@@ -866,21 +930,26 @@
       ],
       "port_target": null,
       "notes": "Model + Fast mode both upstream (service tiers #2144).",
-      "migration_status": "BLOCKED",
+      "migration_status": "verified-upstream-equivalent",
       "port_commits": [
         "931483e24",
         "051d5974e"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
@@ -1086,21 +1155,26 @@
       ],
       "port_target": "crates/pa-core/src/settings/types.rs + session_engine/auto_retry.rs",
       "notes": "Port retry.maxBackoffMs semantics (cap exponential backoff) if absent.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "85eb18791",
         "695e39738"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -1417,20 +1491,25 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS docs page deleted upstream.",
-      "migration_status": "BLOCKED",
+      "migration_status": "verified-upstream-equivalent",
       "port_commits": [
         "051d5974e"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
@@ -1463,21 +1542,29 @@
       ],
       "port_target": "crates/pa-core/src/models/custom.rs",
       "notes": "ai-gateway custom models need a models.json knob mapping to service-tier support; verify before porting.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "3e2c5680b",
-        "6a197687a"
+        "6a197687a",
+        "ad95585b0",
+        "454e79ff2"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "consumer port integrated, but full-model metadata producer regression from session lane is still required before acceptance"
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "bd15cf317348b8e963463e3f774f0e7e12d8766f",
@@ -1505,21 +1592,29 @@
       ],
       "port_target": null,
       "notes": "Verify responses provider forwards service_tier.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "3e2c5680b",
-        "6a197687a"
+        "6a197687a",
+        "ad95585b0",
+        "454e79ff2"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "ported",
-      "verification_outcome": "consumer port integrated, but full-model metadata producer regression from session lane is still required before acceptance"
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "d13151be6a8368cdcd4e27a4d85436c02d3fdb71",
@@ -1981,21 +2076,29 @@
       "evidence": [],
       "port_target": "pa-ai tests",
       "notes": "Test companion of 4fa2ead97.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "7e84b0507",
-        "0ed7312f1"
+        "0ed7312f1",
+        "1dffba20e",
+        "15fd3ba60",
+        "ab4a9e8cc"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
@@ -2027,21 +2130,29 @@
       ],
       "port_target": "crates/pa-ai/src/providers/transform_messages.rs",
       "notes": "Owner already porting interrupted ordering.",
-      "migration_status": "BLOCKED",
+      "migration_status": "ported",
       "port_commits": [
         "7e84b0507",
-        "0ed7312f1"
+        "0ed7312f1",
+        "1dffba20e",
+        "15fd3ba60",
+        "ab4a9e8cc"
       ],
       "integration_evidence": [
         {
-          "kind": "integrated-provider-lane",
-          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
-          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+          "kind": "provider-final-review",
+          "ref": "origin/port/rust-providers@89d9310592c640f6cdb5ef666122c2f12eef7931",
+          "note": "Independent Terra CLEAR; exact-tip fmt/full affected tests/parity/clippy passed; four P1 corrections and four-transport boundary coverage verified."
+        },
+        {
+          "kind": "combined-safe-metadata",
+          "ref": "feat/rust-migration@454e79ff2",
+          "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "provider implementation and focused gates integrated; independent Terra provider review is pending",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
       "candidate_verification_status": "ported"
     },
     {
