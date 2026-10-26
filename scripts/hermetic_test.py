@@ -78,13 +78,16 @@ def build_env(root, kernel_python, environ):
 
 # macOS: deny outbound network except loopback and Unix sockets, so tests that would
 # reach a real endpoint (telemetry, catalogs) fail loudly instead of egressing.
-# DNS through mDNSResponder stays allowed for localhost resolution.
+# DNS through mDNSResponder stays allowed for localhost resolution. /bin/ps is setuid
+# and cannot exec inside a sandbox, so it runs unsandboxed (it opens no sockets);
+# process-identity code and tests read process start times through it.
 EGRESS_PROFILE = """(version 1)
 (allow default)
 (deny network-outbound)
 (allow network-outbound (remote ip "localhost:*"))
 (allow network-outbound (remote unix-socket))
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
+(allow process-exec (literal "/bin/ps") (with no-sandbox))
 """
 
 
