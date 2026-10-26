@@ -1924,14 +1924,17 @@ mod tests {
     async fn silent_bootstrap_fails_bounded_and_leaves_no_kernel() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Speaks protocol v3: answers the ready handshake, stays silent on
-        // every execute (the runtime bootstrap included), and answers the
-        // shutdown frame so a teardown does not wait out its kill deadline.
+        // Speaks protocol v3: passes the pre-spawn runtime probe (`-c`)
+        // without counting it as a start, answers the ready handshake, stays
+        // silent on every execute (the runtime bootstrap included), and answers
+        // the shutdown frame so a teardown does not wait out its kill deadline.
         const SILENT_BOOTSTRAP_RUNTIME: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import sys
 
+if sys.argv[1:2] == ["-c"]:
+    sys.exit(0)
 base = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(base, "starts"), "a") as f:
     f.write("x")
