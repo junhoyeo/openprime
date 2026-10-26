@@ -194,6 +194,16 @@ fn build_headers(
     headers
 }
 
+pub(super) fn build_resolved_headers(
+    model: &Model,
+    configured_api_key: Option<String>,
+    options: &OpenAIResponsesOptions,
+    cache_session_id: Option<&str>,
+) -> Option<Vec<(String, String)>> {
+    let api_key = crate::models::opencode_public_api_key(model, configured_api_key)?;
+    Some(build_headers(model, &api_key, options, cache_session_id))
+}
+
 fn build_params(model: &Model, context: &Context, options: &OpenAIResponsesOptions) -> Value {
     let messages = convert_responses_messages(
         model,
@@ -290,15 +300,11 @@ async fn run_stream(
     writer: &AssistantMessageEventWriter,
 ) -> Result<(), ProviderError> {
     let options = options.cloned().unwrap_or_default();
-    let api_key = crate::models::opencode_public_api_key(
-        model,
-        options
-            .base
-            .api_key
-            .clone()
-            .or_else(|| get_env_api_key(&model.provider)),
-    )
-    .unwrap_or_default();
+    let configured_api_key = options
+        .base
+        .api_key
+        .clone()
+        .or_else(|| get_env_api_key(&model.provider));
     let cache_retention = resolve_cache_retention(options.base.cache_retention);
     let cache_session_id = if cache_retention == CacheRetention::None {
         None
@@ -314,7 +320,15 @@ async fn run_stream(
     }
 
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
-    let headers = build_headers(model, &api_key, &options, cache_session_id.as_deref());
+    let headers = build_resolved_headers(
+        model,
+        configured_api_key,
+        &options,
+        cache_session_id.as_deref(),
+    )
+    .ok_or_else(|| {
+        ProviderError::Message(format!("No API key for provider: {}", model.provider))
+    })?;
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
         url,

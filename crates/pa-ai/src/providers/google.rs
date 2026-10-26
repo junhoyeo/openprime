@@ -203,6 +203,30 @@ fn build_params(model: &Model, context: &Context, options: &GoogleOptions) -> Va
 
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
+pub(super) fn build_resolved_headers(
+    model: &Model,
+    configured_api_key: Option<String>,
+    options_headers: Option<&std::collections::HashMap<String, String>>,
+    session_id: Option<&str>,
+) -> Option<Vec<(String, String)>> {
+    let api_key = crate::models::opencode_public_api_key(model, configured_api_key)?;
+    let mut headers: Vec<(String, String)> = model
+        .headers
+        .iter()
+        .flatten()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if let Some(options_headers) = options_headers {
+        for (name, value) in options_headers {
+            headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            headers.push((name.clone(), value.clone()));
+        }
+    }
+    crate::providers::opencode_headers::apply(&mut headers, &model.provider, session_id);
+    headers.push(("x-goog-api-key".into(), api_key));
+    Some(headers)
+}
+
 async fn run_stream(
     model: &Model,
     context: &Context,
@@ -211,15 +235,11 @@ async fn run_stream(
     writer: &AssistantMessageEventWriter,
 ) -> Result<(), ProviderError> {
     let options = options.cloned().unwrap_or_default();
-    let api_key = crate::models::opencode_public_api_key(
-        model,
-        options
-            .base
-            .api_key
-            .clone()
-            .or_else(|| get_env_api_key(&model.provider)),
-    )
-    .unwrap_or_default();
+    let configured_api_key = options
+        .base
+        .api_key
+        .clone()
+        .or_else(|| get_env_api_key(&model.provider));
 
     if options
         .base
@@ -262,22 +282,15 @@ async fn run_stream(
         )
     };
 
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for (name, value) in model.headers.iter().flatten() {
-        headers.push((name.clone(), value.clone()));
-    }
-    if let Some(options_headers) = &options.base.headers {
-        for (name, value) in options_headers {
-            headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-            headers.push((name.clone(), value.clone()));
-        }
-    }
-    crate::providers::opencode_headers::apply(
-        &mut headers,
-        &model.provider,
+    let headers = build_resolved_headers(
+        model,
+        configured_api_key,
+        options.base.headers.as_ref(),
         options.base.session_id.as_deref(),
-    );
-    headers.push(("x-goog-api-key".into(), api_key));
+    )
+    .ok_or_else(|| {
+        ProviderError::Message(format!("No API key for provider: {}", model.provider))
+    })?;
 
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,

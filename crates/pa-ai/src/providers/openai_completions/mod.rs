@@ -21,6 +21,8 @@ mod errors;
 mod params;
 mod stream;
 
+#[cfg(test)]
+pub(super) use params::build_resolved_headers;
 pub use stream::stream_openai_completions;
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";

@@ -355,6 +355,25 @@ pub(crate) fn build_headers(
     headers
 }
 
+pub(crate) fn build_resolved_headers(
+    model: &Model,
+    configured_api_key: Option<String>,
+    options_headers: Option<&HashMap<String, String>>,
+    cache_session_id: Option<&str>,
+    compat: &ResolvedCompat,
+    conversation_id: Option<&str>,
+) -> Option<Vec<(String, String)>> {
+    let api_key = crate::models::opencode_public_api_key(model, configured_api_key)?;
+    Some(build_headers(
+        model,
+        &api_key,
+        options_headers,
+        cache_session_id,
+        compat,
+        conversation_id,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
