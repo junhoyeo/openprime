@@ -174,6 +174,14 @@ fn emit_compact_end(
 }
 
 /// Parse a session command out of a prompt, if it is one.
+pub(crate) fn session_action_kind(text: &str) -> &'static str {
+    if parse_prompt_session_command(text).is_some() {
+        "session_command"
+    } else {
+        "turn"
+    }
+}
+
 pub(crate) fn parse_prompt_session_command(text: &str) -> Option<SessionSlashCommand> {
     let registry = SlashCommandRegistry::builtin();
     parse_session_command(&registry, text)
@@ -199,6 +207,8 @@ mod tests {
         assert!(parse_prompt_session_command("plain prompt").is_none());
         // Client commands are not session commands.
         assert!(parse_prompt_session_command("/model").is_none());
+        assert_eq!(session_action_kind("/refine"), "session_command");
+        assert_eq!(session_action_kind("plain prompt"), "turn");
     }
 
     #[test]

@@ -96,8 +96,9 @@ impl TurnRunner {
                 {
                     let mut core = self.core.lock().unwrap();
                     if let Some(anchor) = anchor {
+                        let kind = crate::session_commands::session_action_kind(&anchor.message);
                         core.active_action = Some(crate::types::SessionActionActive {
-                            kind: "turn".to_string(),
+                            kind: kind.to_string(),
                             phase: "preparing".to_string(),
                             label: Some(compact_action_label(
                                 anchor.preview.as_deref().unwrap_or(&anchor.message),

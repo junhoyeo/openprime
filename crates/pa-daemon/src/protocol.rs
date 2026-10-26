@@ -347,6 +347,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "prompt_admission_cancellation",
                 "owned_prompt_cancellation",
                 "queue_message_mutation",
+                "refine_queue_restore",
                 "authoritative_child_roster",
                 "owned_session_recovery_context",
                 "rlm_quiescence_barrier",

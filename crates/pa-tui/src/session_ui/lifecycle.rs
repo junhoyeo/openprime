@@ -112,6 +112,8 @@ impl SessionUi {
             context: None,
             list_rows: Vec::new(),
             turn_active: false,
+            refine_active: false,
+            refine_cancel_in_flight: false,
             turn_ends_seen: 0,
             last_prompt_turn_end: 0,
             steering_mode: "all".to_string(),
@@ -490,6 +492,7 @@ impl SessionUi {
         // chrome exactly like the other reconstructed session fields.
         self.context = reconstructed.context_usage;
         self.last_assistant_text = last_assistant_text_of(&reconstructed.chat);
+        self.refine_active = reconstructed.active_refine;
         self.pending_queue = Some(reconstructed.queued);
         self.pending_snapshot = Some(reconstructed.chat);
         self.loader_anchor_ms = reconstructed.last_user_prompt_ms;
@@ -636,6 +639,7 @@ impl SessionUi {
         // wins when the state reports neither.
         view.chrome.thinking_suffix = self.pending_thinking_suffix.take();
         view.queued = self.pending_queue.take().unwrap_or_default();
+        self.sync_refine_loader(view);
         // Any browse selection belonged to the previous queue and drops.
         let _ = self.queue_selection.reset();
         view.queue_selected = None;
