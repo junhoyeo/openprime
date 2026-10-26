@@ -22,6 +22,8 @@ Inside the parent Python tool turn:
 
 The standalone verifier exited 1 after all behavior above because it assumed the child JSONL would live in the user sessions root. The product correctly stored it under the child `session_dir` artifact. Per the one-run authorization, the case was not rerun. Post-run inspection used only the preserved owned root.
 
+The full session is **not green** for a second independent harness defect: after `parent boundary complete`, the no-reply child terminal notice intentionally triggered another model turn, but the parent faux script had no response reserved for that follow-up. The raw final assistant row therefore has `stopReason=error` and `errorMessage="No more faux responses queued"`. This does not invalidate the already-observed in-turn collect/one-kickoff behavior, which parent accepted narrowly, but it prevents any whole-session success claim. A corrected later harness must address the child terminal notice explicitly and assert every intended follow-up is error-free.
+
 Graceful protocol shutdown succeeded. Exact owned PIDs (daemon `8138`, parent worker `8639`, kernel `8974`, child worker `8982`) were all gone; root-scoped `lsof` and `ps` checks were empty. No global cleanup or live product state was touched.
 
 Full preserved summary: `/tmp/pa-0b5d31e1/case-summary-posthoc.json`, SHA-256 `2805917c40aa4e5a90baadb0b0addf9fddb47f156387f2aa03e10f57e5fafaf5`. The isolation incident records for earlier non-accepted worker attempts remain separate and are not superseded by this run.
