@@ -265,11 +265,26 @@
       "port_target": "skills/{agent-sessions,aside}/",
       "notes": "Grok Build transcripts — content of agent-sessions package; subsumed by the skill-dir copy.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "daa6b089fe5a9108d9ca43336991c95f4e8f9980",
@@ -461,11 +476,26 @@
       "port_target": ".github/workflows + prime-agent-runtime/test/test_bundled_skill_suites.py",
       "notes": "Re-add bundled-skill test job adapted to new skills/ locations.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "76a8053d7032db50f176433e3315c950ee6e909f",
@@ -513,11 +543,26 @@
       "port_target": "skills/{agent-sessions,aside}/",
       "notes": "aside reads models.json from selected account — content of aside package; subsumed by the skill-dir copy.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "8453b5e46d927dbf1837f8cb55416a287d9fda51",
@@ -542,11 +587,26 @@
       "port_target": "skills/{agent-sessions,aside}/",
       "notes": "probe/count/Kiro fixes — content of agent-sessions package; subsumed by the skill-dir copy.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "3555298ecc960f44f8f72afb3bade60b6989e31c",
@@ -847,11 +907,26 @@
       "port_target": "skills/{agent-sessions,aside}/",
       "notes": "Senpi harness indexing — content of agent-sessions package; subsumed by the skill-dir copy.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "d2b5c9569dac87ed79e9a0c0cf30df1e91e4f6e0",
@@ -895,11 +970,26 @@
       "port_target": "skills/aside/ (copy packages/coding-agent/skills/aside)",
       "notes": "Bundle aside skill in Rust layout; pure Python skill — no Rust code. Include 3a537a23f content (models.json per selected account).",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "6c4da7150f7cc484966bdf1be673df66920867b8",
@@ -944,11 +1034,26 @@
       "port_target": "skills/agent-sessions/ (copy latest fork source incl. PR #33)",
       "notes": "Bundle agent-sessions skill; copy LATEST fork source so ee7c91d05/3307acb13/8453b5e46/PR#33 ride along.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-skills-lane",
+          "ref": "origin/port/rust-skills@e2ad4ac1b214d60de69fb6abf33c59827d7811db",
+          "note": "Terra CLEAR; source suites 25+4, bundled runtime 29, prompt guards 10, ruff/fmt/clippy and staged package receipt passed. Combined integration reran source/prompt/ruff gates."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "reviewed skills source and combined focused gates pass; final staged package/native check after kernel integration is pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "eac7f200b6c85de7970bd747dda61f0a982a368e",
@@ -3836,10 +3941,24 @@
       "port_target": "skills/agent-sessions/ (top-level, Rust-era layout)",
       "notes": "Port both the Aside transcript/artifact indexing work and the later Unicode smart-case fix into the Rust-era top-level bundled skill, with package-layout execution evidence.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "d46fe9be5",
+        "dcec66085",
+        "b40858142",
+        "29282d390",
+        "c98ab0d36",
+        "90b3b8c5e",
+        "e02201fee"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "skills-evidence",
+          "ref": "docs/migration/evidence/skills.md",
+          "note": "Includes both Aside indexing and Unicode smart-case commit, final Terra CLEAR, package receipts, focused gates, and non-green history."
+        }
+      ],
       "proposed_final_status": "ported",
-      "verification_outcome": "pending integrated-tip acceptance; do not close the legacy PR",
+      "verification_outcome": "source port integrated and focused gates pass; final combined staged package after kernel changes pending",
       "related_legacy_commits": [
         "4af3c6d89",
         "5d4d1eb26f0e63ed8946bad39746412d00f6acd0"

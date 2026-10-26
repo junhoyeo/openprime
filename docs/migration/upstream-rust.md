@@ -23,6 +23,7 @@ The complete 99-commit, non-merge legacy inventory is in:
 
 - [`legacy-commit-map.json`](legacy-commit-map.json), the authoritative machine-readable ledger.
 - [`legacy-commit-map.md`](legacy-commit-map.md), its review view.
+- [`evidence/skills.md`](evidence/skills.md), the integrated #33 source/package/review record with disclosed non-green attempts.
 
 Each commit and PR #32/#33 must end in exactly one state:
 
