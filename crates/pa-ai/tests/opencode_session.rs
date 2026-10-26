@@ -165,13 +165,16 @@ async fn an_untrusted_opencode_endpoint_never_receives_the_public_literal() {
             messages: vec![],
             tools: None,
         };
-        let message = tokio::time::timeout(
+        let message = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             pa_ai::complete_simple(&model, &context, None),
         )
         .await
-        .unwrap_or_else(|_| panic!("{api} attempted the untrusted endpoint"))
-        .unwrap();
+        {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => panic!("{api} failed before request inspection: {error}"),
+            Err(_) => panic!("{api} attempted the untrusted endpoint"),
+        };
         assert_eq!(
             message.stop_reason,
             pa_ai::types::StopReason::Error,
