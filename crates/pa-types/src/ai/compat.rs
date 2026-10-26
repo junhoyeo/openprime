@@ -75,6 +75,10 @@ pub struct OpenAiResponsesCompat {
     pub send_session_id_header: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// Whether this Responses endpoint serves `service_tier: "priority"`. Custom gateways use
+    /// this to opt into Fast mode when they forward the tier to an upstream that honors it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_fast_mode: Option<bool>,
 }
 
 /// Compatibility settings for Anthropic Messages-compatible APIs.
@@ -108,7 +112,7 @@ const ANTHROPIC_COMPAT_KEYS: &[&str] = &[
     "supportsEagerToolInputStreaming",
     "requiresThinkingSignature",
 ];
-const RESPONSES_COMPAT_KEYS: &[&str] = &["sendSessionIdHeader"];
+const RESPONSES_COMPAT_KEYS: &[&str] = &["sendSessionIdHeader", "supportsFastMode"];
 /// Which compat object a `Model.compat` wire value carries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompatKind {

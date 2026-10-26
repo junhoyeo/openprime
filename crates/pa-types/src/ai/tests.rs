@@ -70,6 +70,33 @@ fn service_tier_eligibility_matches_ts() {
 }
 
 #[test]
+fn responses_compat_can_opt_a_custom_gateway_into_fast_mode() {
+    let compat = ModelCompat::from_kind(CompatKind::OpenAiResponses(OpenAiResponsesCompat {
+        supports_fast_mode: Some(true),
+        ..Default::default()
+    }));
+    let mut custom = tier_model("gateway", "openai-responses", "custom-model");
+    custom.compat = Some(compat.clone());
+    assert!(supports_fast_mode(&custom));
+    assert!(supports_service_tier(&custom, ServiceTier::Priority));
+
+    let mut explicitly_disabled = custom.clone();
+    explicitly_disabled.compat = Some(ModelCompat::from_kind(CompatKind::OpenAiResponses(
+        OpenAiResponsesCompat {
+            supports_fast_mode: Some(false),
+            ..Default::default()
+        },
+    )));
+    assert!(!supports_fast_mode(&explicitly_disabled));
+
+    for api in ["openai-completions", "anthropic-messages"] {
+        let mut unrelated = tier_model("gateway", api, "custom-model");
+        unrelated.compat = Some(compat.clone());
+        assert!(!supports_fast_mode(&unrelated), "{api}");
+    }
+}
+
+#[test]
 fn clamp_service_tier_degrades_unsupported_requests() {
     use ServiceTier::*;
     let openai = tier_model("openai", "openai-responses", "gpt-5.5");
@@ -143,6 +170,9 @@ fn model_with_compat_roundtrip() {
     );
     assert_roundtrip::<Model>(
         r#"{"id":"m2","name":"M2","api":"openai-completions","provider":"p","baseUrl":"https://y","reasoning":false,"input":["text"],"cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"compat":{"thinkingFormat":"openrouter","openRouterRouting":{"only":["a"],"sort":{"by":"price","partition":"model"},"max_price":{"prompt":"0.5","completion":2}}}}"#,
+    );
+    assert_roundtrip::<Model>(
+        r#"{"id":"gateway-model","name":"Gateway","api":"openai-responses","provider":"gateway","baseUrl":"http://127.0.0.1:8787/v1","reasoning":true,"input":["text"],"cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"compat":{"supportsFastMode":true}}"#,
     );
 }
 
