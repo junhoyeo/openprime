@@ -389,7 +389,7 @@ fn spawn_child(socket: &Path, slave: &OwnedFd) -> Child {
     // Runs between fork and exec: become a session leader and claim the pty slave.
     fn claim_controlling_tty(fd: i32) -> std::io::Result<()> {
         nix::unistd::setsid()?;
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
+        let rc = unsafe { libc::ioctl(fd, libc::c_ulong::from(libc::TIOCSCTTY), 0) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }

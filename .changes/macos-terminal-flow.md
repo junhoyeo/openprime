@@ -1,0 +1,1 @@
+- macOS terminal sessions now compile and restore software output flow across launch, resume, and exit without hanging the main-screen flush; PTY tests use portable process and termios helpers.

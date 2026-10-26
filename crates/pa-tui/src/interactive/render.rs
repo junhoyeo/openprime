@@ -175,9 +175,8 @@ impl Renderer {
             UiMode::Terminal => {
                 // Enable Windows VT processing before raw ANSI mode writes.
                 pa_types::platform::console_init();
-                // The raw-mode bracket's own `cfmakeraw` write clears IXON, which is the
-                // kernel's one trigger for lifting a pending Ctrl+S stop: a tty stopped at the
-                // shell prompt self-heals here (verified by the flow e2e's launch route).
+                // Lift any platform software-output stop before the first raw-mode write.
+                pa_types::platform::terminal::restart_output();
                 terminal::enable_raw_mode()?;
                 // The terminal state changed: every later setup step is fallible (the alt-screen
                 // enter, the mode enables, the terminal construction) and an error from any of them
@@ -326,6 +325,9 @@ impl Renderer {
                 // The raw-mode bracket takes the enhanced-key modes with it; `resume` re-enables
                 // both.
                 let _ = crate::enhanced_keys::disable(&mut std::io::stdout());
+                // A stopped tty holds the main-screen flush itself; lift it
+                // before the first exit write, not only in the release tail.
+                pa_types::platform::terminal::restart_output();
                 self.flush_to_main_screen(view)?;
                 crate::exit_restore::terminal_release_tail(&mut std::io::stdout());
                 Ok(())
@@ -338,9 +340,8 @@ impl Renderer {
     pub(super) fn resume(&mut self) -> Result<()> {
         match self {
             Renderer::Terminal { term, mouse, .. } => {
-                // The raw re-arm's `cfmakeraw` write clears IXON - the kernel's one trigger
-                // for lifting a pending Ctrl+S stop - so a stop armed at the shell never holds
-                // the resume's repaint.
+                // Lift a stop armed by the suspended shell before the resume repaint.
+                pa_types::platform::terminal::restart_output();
                 terminal::enable_raw_mode()?;
                 crate::altscreen::enter()?;
                 // The suspend's release tail showed the cursor for the plain terminal; taking
@@ -511,6 +512,9 @@ impl Renderer {
                     drop(term);
                     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                 } else {
+                    // A stopped tty holds the main-screen flush itself; lift it
+                    // before the first exit write, not only in the release tail.
+                    pa_types::platform::terminal::restart_output();
                     let _ = self.flush_to_main_screen(view);
                     // The shared exit tail ends the parity teardown: the synchronized-output
                     // release, the SGR reset, the cursor show, and the cooked-tty verification

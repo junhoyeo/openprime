@@ -89,29 +89,39 @@ fn tty() -> Option<File> {
     }
 }
 
-/// Lift a pending Ctrl+S output stop on the process tty: a stop armed from a VSTOP received while
-/// cooked is RUNTIME state - it survives every `tcsetattr`, and the kernel lifts it only on the
-/// IXON
-/// transition to off (`tcflow(TCOON)` clears only the separate `TCOFF` state). The two-step toggle
-/// clears IXON once (lifting the stop), then writes the captured attributes back.
+/// Lift a pending software output-flow stop on the process tty.
+///
+/// The stop is runtime line-discipline state and survives ordinary termios
+/// restoration. Linux lifts a VSTOP-armed stop on the IXON transition to off,
+/// so it keeps the established two-step toggle. Darwin's pty implements the
+/// POSIX `tcflow(TCOON)` restart instead; that path changes no termios fields.
 #[cfg(unix)]
 pub fn restart_output() {
     let Some(tty) = tty() else {
         return;
     };
     let fd = tty.as_raw_fd();
-    let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: `tcgetattr` only reads the line discipline into `attrs`.
-    if unsafe { libc::tcgetattr(fd, &raw mut attrs) } != 0 {
-        return;
-    }
-    let restored = attrs;
-    attrs.c_iflag &= !libc::IXON;
-    // SAFETY: the two `tcsetattr` writes run the kernel's one stop-lift
-    // (the IXON transition) and then restore the exact captured state.
+    #[cfg(target_vendor = "apple")]
     unsafe {
-        if libc::tcsetattr(fd, libc::TCSANOW, &raw const attrs) == 0 {
-            let _ = libc::tcsetattr(fd, libc::TCSANOW, &raw const restored);
+        // SAFETY: `fd` is the owned process tty; TCOON only resumes its
+        // output queue and does not mutate memory or terminal attributes.
+        let _ = libc::tcflow(fd, libc::TCOON);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `tcgetattr` only reads the line discipline into `attrs`.
+        if unsafe { libc::tcgetattr(fd, &raw mut attrs) } != 0 {
+            return;
+        }
+        let restored = attrs;
+        attrs.c_iflag &= !libc::IXON;
+        // SAFETY: the two `tcsetattr` writes run Linux's VSTOP lift (the
+        // IXON transition) and then restore the exact captured state.
+        unsafe {
+            if libc::tcsetattr(fd, libc::TCSANOW, &raw const attrs) == 0 {
+                let _ = libc::tcsetattr(fd, libc::TCSANOW, &raw const restored);
+            }
         }
     }
 }

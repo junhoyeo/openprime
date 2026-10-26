@@ -124,7 +124,10 @@ impl DifferentialHarness {
             if Instant::now() > deadline {
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            // The product flushes its inline transcript while exiting. Keep
+            // draining the owned pty so Darwin's smaller output queue cannot
+            // backpressure the child and masquerade as a flow-control stop.
+            self.master.drain_until_quiet(1);
         }
     }
 
@@ -184,10 +187,33 @@ impl DifferentialHarness {
 
 impl Drop for DifferentialHarness {
     fn drop(&mut self) {
-        // A panicking wait must never leak the pty child: it owns the
-        // controlling terminal of its own session.
+        // The pty child is a session/process-group leader. Kill the whole
+        // owned group first, then reap the direct child with a deadline: a
+        // stopped controlling-terminal child must never wedge the test harness
+        // in an unbounded `wait()` (observed on macOS).
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    eprintln!("pty child missed the 5s teardown deadline after SIGKILL");
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("could not reap pty child after SIGKILL: {error}");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -293,6 +319,9 @@ pub(crate) struct Termios {
     oflag: libc::tcflag_t,
     cflag: libc::tcflag_t,
     lflag: libc::tcflag_t,
+    // Linux exposes the selected line discipline as `c_line`; BSD termios
+    // (including macOS) has no equivalent field.
+    #[cfg(target_os = "linux")]
     line: libc::cc_t,
     cc: [libc::cc_t; libc::NCCS],
 }
@@ -308,6 +337,7 @@ impl Termios {
             oflag: raw.c_oflag,
             cflag: raw.c_cflag,
             lflag: raw.c_lflag,
+            #[cfg(target_os = "linux")]
             line: raw.c_line,
             cc: raw.c_cc,
         }
@@ -318,8 +348,18 @@ impl Termios {
             && self.oflag == other.oflag
             && self.cflag == other.cflag
             && self.lflag == other.lflag
-            && self.line == other.line
+            && Self::line_delta_is_empty(self, other)
             && self.cc == other.cc
+    }
+
+    #[cfg(target_os = "linux")]
+    fn line_delta_is_empty(left: &Termios, right: &Termios) -> bool {
+        left.line == right.line
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn line_delta_is_empty(_left: &Termios, _right: &Termios) -> bool {
+        true
     }
 
     pub(crate) fn describe(&self) -> String {
@@ -529,19 +569,36 @@ pub(crate) fn spawn_child(spec: &ChildSpec, socket: &Path, slave: &OwnedFd) -> C
     // and claim the pty slave as the controlling terminal.
     pub(crate) fn claim_controlling_tty(fd: i32) -> std::io::Result<()> {
         nix::unistd::setsid()?;
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
+        let rc = unsafe { libc::ioctl(fd, libc::c_ulong::from(libc::TIOCSCTTY), 0) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
     let slave_fd = slave.as_raw_fd();
+    let test_home = socket.parent().expect("mock socket has a temp parent");
+    let agent_dir = test_home.join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("isolated test agent dir");
     let mut command = Command::new(std::env::current_exe().expect("test binary"));
     command
         .arg("--exact")
         .arg(child_mode_test_name(spec.mode))
         .env(CHILD_MODE_ENV, spec.mode)
-        .env(CHILD_SOCKET_ENV, socket);
+        .env(CHILD_SOCKET_ENV, socket)
+        .env("HOME", test_home)
+        .env("PRIME_AGENT_CODING_AGENT_DIR", &agent_dir)
+        .env("PI_OFFLINE", "1")
+        .env_remove("PI_PACKAGE_DIR")
+        .env_remove("PRIME_AGENT_KERNEL_PYTHON")
+        .env_remove("PRIME_AGENT_KERNEL_VENV")
+        .env_remove("PRIME_TEAM_ID");
+    for provider in pa_ai::models_generated::get_providers() {
+        if let Some(vars) = pa_ai::env_api_keys::get_api_key_env_vars(provider) {
+            for var in vars {
+                command.env_remove(var);
+            }
+        }
+    }
     for (key, value) in &spec.env {
         command.env(key, value);
     }

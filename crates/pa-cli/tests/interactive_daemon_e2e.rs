@@ -16,6 +16,7 @@
 #![cfg(unix)]
 
 use std::fmt::Write as _;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -109,44 +110,28 @@ impl Drop for DetachedDaemon {
     }
 }
 
-fn child_pids_of(ppid: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let entries = std::fs::read_dir("/proc").expect("read /proc");
-    for entry in entries.flatten() {
-        let Ok(entry_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else {
-            continue;
-        };
-        // `comm` can contain spaces and parens, so parse after the last ')'.
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut fields = rest.split_whitespace();
-        fields.next(); // process state
-        let Ok(parent) = fields.next().unwrap_or_default().parse::<u32>() else {
-            continue;
-        };
-        if parent == ppid {
-            pids.push(entry_pid);
-        }
-    }
-    pids
+fn child_pids_of(parent_pid: u32) -> Vec<u32> {
+    // `ps` is the portable Unix process table used on macOS, where `/proc`
+    // does not exist. The same form works on Linux and keeps teardown behavior
+    // identical across the two hosts that compile and run this battery.
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let child_pid = fields.next()?.parse::<u32>().ok()?;
+            let observed_parent = fields.next()?.parse::<u32>().ok()?;
+            (observed_parent == parent_pid).then_some(child_pid)
+        })
+        .collect()
 }
 
-/// Liveness that ignores zombies: a detached child nobody reaps keeps its
-/// `/proc` entry, so path existence alone would call an exited process alive.
+/// Cross-platform Unix liveness with zombie demotion. This is the product's
+/// lease probe, so the test and daemon agree on when teardown is complete.
 fn process_alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // `comm` can contain spaces and parens, so parse after the last ')'.
-    let Some((_, rest)) = stat.rsplit_once(')') else {
-        return false;
-    };
-    let state = rest.split_whitespace().next().unwrap_or_default();
-    !state.starts_with('Z') && !state.starts_with('X')
+    pa_daemon::lease::is_process_alive(pid).unwrap_or(false)
 }
 
 /// Shut the supervisor down by protocol and assert it, its workers, and its
@@ -278,27 +263,29 @@ fn sweep_orphan_test_daemons() {
     if SWEEPED.set(()).is_err() {
         return; // a later test's spawn: the first spawn already swept
     }
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-axo", "pid=,ppid=,command="])
+        .output()
+    else {
+        return;
+    };
     let mut swept = 0;
-    for entry in std::fs::read_dir("/proc").expect("read /proc").flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(pid), Some(parent)) = (fields.first(), fields.get(1)) else {
             continue;
         };
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        let (Ok(pid), Ok(parent)) = (pid.parse::<u32>(), parent.parse::<u32>()) else {
             continue;
         };
-        // /proc cmdline is NUL-separated.
-        let args: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .collect();
-        let flag = |needle: &str| args.iter().any(|a| a == needle);
+        let args = &fields[2..];
         let arg_after = |needle: &str| {
             args.iter()
-                .position(|a| a == needle)
-                .and_then(|idx| args.get(idx + 1))
-                .cloned()
+                .position(|arg| *arg == needle)
+                .and_then(|index| args.get(index + 1))
+                .copied()
         };
-        if !flag("--mode") || arg_after("--mode").as_deref() != Some("daemon") {
+        if arg_after("--mode") != Some("daemon") {
             continue;
         }
         let Some(socket) = arg_after("--daemon-socket") else {
@@ -306,30 +293,13 @@ fn sweep_orphan_test_daemons() {
         };
         // A live run's daemon keeps its owning test binary as the parent, and
         // the user's product daemons fail the socket-dir test, so neither is swept.
-        let orphan_socket_dir = Path::new(&socket)
+        let orphan_socket_dir = Path::new(socket)
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(".tmp"));
-        if !orphan_socket_dir {
+        if !orphan_socket_dir || (parent != 1 && process_alive(parent)) {
             continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let Ok(parsed_ppid) = rest
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or_default()
-            .parse::<u32>()
-        else {
-            continue;
-        };
-        if parsed_ppid != 1 && process_alive(parsed_ppid) {
-            continue; // a live run's daemon: its test binary is still up
         }
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
@@ -391,8 +361,10 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
     // A full workspace run can starve a session worker's boot far past the
     // 30s default connect budget; this keeps session creates deterministic.
     command.env("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "90000");
-    // Die with this test binary: the kernel SIGKILLs a supervisor that gets
-    // reparented to init; the guard's protocol teardown stays the exit path.
+    // Linux backstop: die with this test binary if it is killed before the
+    // portable protocol/RAII teardown runs. macOS has no PDEATHSIG equivalent;
+    // its deterministic normal path is the same guard teardown used on Linux.
+    #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);

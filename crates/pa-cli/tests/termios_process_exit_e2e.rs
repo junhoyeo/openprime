@@ -122,6 +122,7 @@ fn diff_view_child_mode() {
 // The audit assertions.
 
 /// Resolve the pty slave's device path from the master fd.
+#[cfg(target_os = "linux")]
 fn pty_slave_path(master: &std::fs::File) -> PathBuf {
     let mut buffer = [0u8; 64];
     // SAFETY: `ptsname_r` writes the NUL-terminated slave path into
@@ -136,10 +137,27 @@ fn pty_slave_path(master: &std::fs::File) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&buffer[..end]).into_owned())
 }
 
-/// The fd-set audit: after the TUI exits, NO process may still hold the
-/// pty (a leaked grandchild keeps the pane busy).
-fn assert_no_process_holds_the_pty(master: &std::fs::File, context: &str) {
-    let slave = pty_slave_path(master);
+#[cfg(not(target_os = "linux"))]
+fn pty_slave_path(master: &std::fs::File) -> PathBuf {
+    // macOS exposes only the process-global `ptsname`; serialize access and
+    // copy its result before releasing the lock.
+    static PTSNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = PTSNAME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: the master fd is live for this call; a non-null result points to
+    // a NUL-terminated libc-owned string, copied immediately under the lock.
+    let name = unsafe { libc::ptsname(master.as_raw_fd()) };
+    assert!(
+        !name.is_null(),
+        "the harness could not resolve the pty slave path"
+    );
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    PathBuf::from(name.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn pty_holder_pids(slave: &Path) -> Vec<u32> {
     let self_pid = std::process::id();
     let mut holders = Vec::new();
     for entry in std::fs::read_dir("/proc").expect("the sandbox mounts /proc") {
@@ -156,14 +174,50 @@ fn assert_no_process_holds_the_pty(master: &std::fs::File, context: &str) {
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
-        for fd in fds.flatten() {
-            if let Ok(link) = std::fs::read_link(fd.path()) {
-                if link == slave {
-                    holders.push(pid);
-                }
-            }
+        if fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|link| link == slave))
+        {
+            holders.push(pid);
         }
     }
+    holders
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pty_holder_pids(slave: &Path) -> Vec<u32> {
+    // macOS has no `/proc`; its system `lsof` is the supported fd-owner
+    // query. `-t` prints one pid per line and `--` terminates options.
+    let lsof = Path::new("/usr/sbin/lsof");
+    let command = if lsof.exists() {
+        lsof
+    } else {
+        Path::new("lsof")
+    };
+    let output = Command::new(command)
+        .args(["-t", "--"])
+        .arg(slave)
+        .output()
+        .expect("run lsof for the pty holder audit");
+    // lsof returns 1 when no process holds the path.
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "lsof failed during the pty holder audit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let self_pid = std::process::id();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != self_pid)
+        .collect()
+}
+
+/// The fd-set audit: after the TUI exits, NO process may still hold the
+/// pty (a leaked grandchild keeps the pane busy).
+fn assert_no_process_holds_the_pty(master: &std::fs::File, context: &str) {
+    let slave = pty_slave_path(master);
+    let holders = pty_holder_pids(&slave);
     assert!(
         holders.is_empty(),
         "{context}: processes still hold the pty slave {} after the exit: \
@@ -175,6 +229,15 @@ fn assert_no_process_holds_the_pty(master: &std::fs::File, context: &str) {
 /// The Ctrl+S flow probe: the pty is cooked again after the exit, so a line
 /// echoes back — unless a stop state survived the TUI ("frozen shell until Ctrl+Q").
 fn assert_the_shell_flows(master: &mut PtyReader, context: &str) {
+    // Darwin returns EIO from the master once the last slave fd closes. Open
+    // the slave as the handed-back shell before probing its cooked echo; Linux
+    // keeps the existing route behavior unchanged.
+    #[cfg(not(target_os = "linux"))]
+    let _shell = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pty_slave_path(&master.file))
+        .expect("open the handed-back pty slave for the shell flow probe");
     let mark = master.mark();
     master.write(b"flow-probe\r");
     master.wait_from(
@@ -246,23 +309,55 @@ fn a_launch_on_a_ctrl_s_stopped_tty_flows_and_exits_whole() {
     // Arm the stop and PROVE it armed: the cooked discipline echoes input
     // as it arrives, and the stop holds that echo — the sentinel must NOT
     // come back (no newline, so the gate read stays blocked).
-    harness.write(&[CTRL_S]);
-    harness.write(b"arm");
-    let arm_mark = harness.mark();
-    let deadline = Instant::now() + Duration::from_millis(300);
-    let mut armed = true;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(30));
-        harness.drain_until_quiet(1);
-        if !harness.output()[arm_mark..].is_empty() {
-            armed = false;
-            break;
+    // Keep the Darwin slave descriptor open through the proof and mount: its
+    // pty drops a TCOOFF state when the flow-control descriptor closes.
+    #[cfg(target_vendor = "apple")]
+    let mut darwin_flow_control = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pty_slave_path(&harness.master.file))
+        .expect("open the Darwin pty slave for tcflow(TCOOFF)");
+    #[cfg(target_vendor = "apple")]
+    {
+        // Darwin ptys do not arm VSTOP from an injected Ctrl+S the same way
+        // Linux does. TCOOFF is the platform's explicit output-flow stop.
+        let rc = unsafe { libc::tcflow(darwin_flow_control.as_raw_fd(), libc::TCOOFF) };
+        assert_eq!(rc, 0, "Darwin tcflow(TCOOFF) must arm the output stop");
+        let flow_mark = harness.mark();
+        std::io::Write::write_all(&mut darwin_flow_control, b"darwin-flow-stop-proof")
+            .expect("write the Darwin stopped-output proof");
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(30));
+            harness.drain_until_quiet(1);
         }
+        assert!(
+            harness.output()[flow_mark..].is_empty(),
+            "Darwin TCOOFF did not hold slave output before the mount"
+        );
     }
-    assert!(
-        armed,
-        "the Ctrl+S write did not arm the output stop (the cooked-tty          echo came back); the route cannot prove the lift"
-    );
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        harness.write(&[CTRL_S]);
+        harness.write(b"arm");
+        let arm_mark = harness.mark();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut armed = true;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(30));
+            harness.drain_until_quiet(1);
+            if !harness.output()[arm_mark..].is_empty() {
+                armed = false;
+                break;
+            }
+        }
+        assert!(
+            armed,
+            "the Ctrl+S write did not arm the output stop (the cooked-tty echo came back); the route cannot prove the lift"
+        );
+    }
+    #[cfg(target_vendor = "apple")]
+    harness.write(b"arm");
     // The release completes the sentinel line; the mount runs under the armed stop.
     harness.write(b"\r\n");
     harness.answer_kitty_query();
