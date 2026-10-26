@@ -107,9 +107,18 @@ fn session_row(
         parent_session_id: value_str(&runtime, "parentSessionId").map(str::to_string),
         rlm_depth: runtime.get("rlmDepth").and_then(Value::as_u64).unwrap_or(0) as u32,
         cwd: value_str(data, "cwd").unwrap_or_default().to_string(),
-        runtime_config: json!({
-            "create": serde_json::to_value(&descriptor.create_command)?,
-        }),
+        runtime_config: {
+            let mut runtime_config = json!({
+                "create": serde_json::to_value(&descriptor.create_command)?,
+            });
+            // The telemetry opt-out (a descriptor field, not part of the durable
+            // create) rides along so the restore keeps it. Optional and absent
+            // unless opted out: an older daemon reading this roster ignores it.
+            if descriptor.telemetry_disabled == Some(true) {
+                runtime_config["telemetryDisabled"] = json!(true);
+            }
+            runtime_config
+        },
         // The Rust engine has no separate next-turn custom-message lane:
         // pending prompts ride the steering/follow-up lanes, so
         // `next_turn` is empty and `actions` carries the lane snapshot.
@@ -630,6 +639,21 @@ mod tests {
         // The projection has no archive flag, by type.
         let encoded = serde_json::to_value(beat).unwrap();
         assert!(!encoded.as_object().unwrap().contains_key("archived"));
+    }
+
+    /// A telemetry opt-out rides the row's runtime config — optional and
+    /// backward compatible (absent unless opted out; an older daemon ignores
+    /// it) — so an update restore never re-enables telemetry.
+    #[test]
+    fn an_opted_out_session_row_carries_its_telemetry_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let mut snapshot = worker_snapshot(&sessions_dir, "p1", "top-level", None, 0, None);
+        let default_row = session_row(&snapshot, &HashSet::new()).unwrap();
+        assert_eq!(default_row.runtime_config.get("telemetryDisabled"), None);
+        snapshot.descriptor.telemetry_disabled = Some(true);
+        let opted_out = session_row(&snapshot, &HashSet::new()).unwrap();
+        assert_eq!(opted_out.runtime_config["telemetryDisabled"], json!(true));
     }
 
     #[test]
