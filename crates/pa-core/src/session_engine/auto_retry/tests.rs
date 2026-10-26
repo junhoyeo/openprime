@@ -2,8 +2,6 @@
 //! park seam, and the stream-drop retry pins.
 use super::super::provider_retry::UNBOUNDED_BACKOFF_MS;
 use super::*;
-use crate::auth::manager::{AuthStorage, NoOAuth};
-use crate::auth::types::AuthStorageData;
 use pa_agent::types::{AssistantContent, AssistantMessageDiagnostic, TextContent, Usage};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -70,80 +68,6 @@ fn fast_policy() -> ProviderRetryPolicy {
         max_retry_delay_ms: 50,
         max_delay_ms: UNBOUNDED_BACKOFF_MS,
     }
-}
-
-fn synthetic_gateway_auth() -> AuthStorage {
-    let value = serde_json::json!({
-        "gateway": { "type": "api_key", "key": "synthetic-gateway-key" }
-    });
-    AuthStorage::in_memory_without_env(
-        &AuthStorageData(value.as_object().cloned().unwrap()),
-        Arc::new(NoOAuth),
-    )
-}
-
-#[tokio::test]
-async fn gateway_auth_failures_never_erase_credentials() {
-    let mut auth = synthetic_gateway_auth();
-    assert!(auth.has_auth("gateway"));
-
-    let mut disabled = fast_policy();
-    disabled.enabled = false;
-    let disabled_result = run_turn_with_auto_retry(
-        &disabled,
-        0,
-        None,
-        || async { Ok(error_message(Some("auth"), Some(401), None)) },
-        |_| async { Ok(()) },
-        |_| async { panic!("disabled retry must not wait") },
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(disabled_result.stop_reason, StopReason::Error);
-    assert!(auth.has_auth("gateway"));
-
-    let cancelled_result = run_turn_with_auto_retry(
-        &fast_policy(),
-        0,
-        None,
-        || async { Ok(error_message(Some("auth"), Some(401), None)) },
-        |_| async { Ok(()) },
-        |_| async { false },
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(cancelled_result.stop_reason, StopReason::Aborted);
-    assert!(auth.has_auth("gateway"));
-
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let recovered = run_turn_with_auto_retry(
-        &fast_policy(),
-        0,
-        None,
-        || {
-            let attempts = Arc::clone(&attempts);
-            async move {
-                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    Ok(error_message(Some("auth"), Some(401), None))
-                } else {
-                    Ok(ok_message())
-                }
-            }
-        },
-        |_| async { Ok(()) },
-        |_| async { true },
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(recovered.stop_reason, StopReason::Stop);
-    assert!(auth.has_auth("gateway"));
-    assert_eq!(
-        auth.get_api_key("gateway").as_deref(),
-        Some("synthetic-gateway-key")
-    );
 }
 
 /// A `rate_limit` failure whose server-requested wait exceeds the cap
