@@ -1460,3 +1460,85 @@ fn an_archived_fallback_cwd_session_revives_in_its_opened_cwd() {
         "the archived session must revive in the cwd it was opened with"
     );
 }
+
+/// A record written before the allowlist (the never-released a7a1820c2
+/// format kept the whole durable create) can never put a credential or a
+/// client env into a revival: the allowlist applies on read too.
+#[test]
+fn an_old_format_launch_record_never_replays_a_credential() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    let recorded = dir.path().join("recorded-by-the-record");
+    for path in [&project, &recorded] {
+        std::fs::create_dir_all(path).expect("dir");
+    }
+    let saved = sessions.join("old-record.jsonl");
+    std::fs::write(
+        &saved,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session", "version": 3, "id": "old-record-session",
+                "timestamp": "2026-10-12T00:00:00.000Z", "cwd": project,
+            })
+        ),
+    )
+    .expect("write transcript");
+    let socket = dir.path().join("daemon.sock");
+    let secret = "sk-old-record-SENTINEL";
+    let records =
+        pa_daemon::descriptor::descriptor_dir(&agent_dir, &socket).join("passivated-launches");
+    std::fs::create_dir_all(&records).expect("records dir");
+    let canonical_file = pa_daemon::lease::canonical_session_path(&saved);
+    std::fs::write(
+        records.join(format!(
+            "{}.json",
+            pa_daemon::paths::hash_key(&canonical_file.to_string_lossy(), 64)
+        )),
+        json!({
+            "createCommand": {
+                "sessionPath": saved,
+                "cwd": recorded,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+                "apiKey": secret,
+                "env": pane_env(&dir.path().join("herdr.sock"), "pane:old-record"),
+            },
+            "telemetryDisabled": null,
+        })
+        .to_string(),
+    )
+    .expect("plant the old-format record");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let attached = client.request(
+        "attach-durable",
+        &json!({ "type": "attach", "activeSessionId": "old-record-session" }),
+    );
+    assert_eq!(attached["success"], true, "{attached}");
+    let woken = client
+        .live_active_id("list", "old-record-session")
+        .expect("the session revived");
+    // The record's non-secret context still applies.
+    assert_eq!(pwd_output(&client.pwd("pwd", &woken)), canonical(&recorded));
+    let descriptors: Vec<String> =
+        std::fs::read_dir(pa_daemon::descriptor::descriptor_dir(&agent_dir, &socket))
+            .expect("descriptor dir")
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+            .collect();
+    assert!(
+        !descriptors.is_empty(),
+        "the revived worker has a descriptor"
+    );
+    for descriptor in &descriptors {
+        assert!(
+            !descriptor.contains(secret) && !descriptor.contains("pane:old-record"),
+            "an old record's credential or env reached the revival: {descriptor}"
+        );
+    }
+}

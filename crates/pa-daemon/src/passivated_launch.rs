@@ -82,7 +82,15 @@ impl PassivatedLaunch {
         rlm_depth: u64,
         runtime_metadata: Option<Value>,
     ) -> DaemonCommand {
-        let mut config: Map<String, Value> = self.create_command.rest.clone();
+        // The allowlist applies on read too: a record written before it (the
+        // never-released whole-create format) can never replay a credential.
+        let mut config: Map<String, Value> = self
+            .create_command
+            .rest
+            .iter()
+            .filter(|(key, _)| PERSISTED_LAUNCH_KEYS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         config.insert("rlmDepth".to_string(), Value::from(rlm_depth));
         DaemonCommand::Create {
             id: None,
