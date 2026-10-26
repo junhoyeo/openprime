@@ -344,14 +344,23 @@ console.log("B64:" + buf.toString('base64'));
 
 def _provider_origin(base_url: str) -> urllib.parse.SplitResult | None:
     """Parse one credential-free HTTP(S) origin, without paths or query data."""
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or base_url != base_url.strip()
+        or any(ord(char) <= 32 or ord(char) == 127 for char in base_url)
+    ):
+        return None
     try:
         parsed = urllib.parse.urlsplit(base_url)
-        _ = parsed.port
+        port = parsed.port
     except (TypeError, ValueError):
         return None
     if (
         parsed.scheme not in {"http", "https"}
         or parsed.hostname is None
+        or port == 0
+        or "%" in parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
@@ -475,9 +484,9 @@ async def _probe_health(base_url: str) -> dict[str, Any]:
         return {"ok": False, "status": "invalid local provider origin"}
     tls = parsed.scheme == "https"
     port = parsed.port or (443 if tls else 80)
-    ssl_context = ssl.create_default_context() if tls else None
     writer = None
     try:
+        ssl_context = ssl.create_default_context() if tls else None
         reader, writer = await asyncio.open_connection(
             parsed.hostname,
             port,
@@ -618,7 +627,13 @@ async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
             await asyncio.gather(*pending, return_exceptions=True)
         for provider_id, origin in selected:
             task = tasks[provider_id]
-            result = task.result() if task in done else {"ok": False, "status": "timed out"}
+            if task in done:
+                try:
+                    result = task.result()
+                except Exception:
+                    result = {"ok": False, "status": "unreachable"}
+            else:
+                result = {"ok": False, "status": "timed out"}
             report["local_providers"][provider_id] = {"baseUrl": origin, **result}
     for provider_id, origin in overflow:
         report["local_providers"][provider_id] = {
@@ -635,7 +650,7 @@ async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
     for provider_id, info in report["local_providers"].items():
         if not info["ok"]:
             problems.append(
-                f"local provider '{provider_id}' at {info['baseUrl']} looks down "
+                f"local provider {provider_id!r} at {info['baseUrl']} looks down "
                 f"({info['status']}); start it or pick a different model."
             )
     report["ok"] = not problems

@@ -181,6 +181,10 @@ class AccountConfigTest(unittest.TestCase):
                 "http://attacker@127.0.0.1:9002",
                 "http://localhost:9003?target=remote",
                 "http://localhost:9004/proxy",
+                "http://127.0.0.1:0",
+                " http://127.0.0.1:9007",
+                "http://127.0.0.1:9007\n",
+                "http://[::1%25lo0]:9008",
             ):
                 self.assertIsNone(aside._provider_origin(invalid_origin))
             self.assertTrue(report["local_providers"]["ipv4"]["ok"])
