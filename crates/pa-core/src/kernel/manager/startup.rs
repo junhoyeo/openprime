@@ -167,23 +167,35 @@ impl Inner {
         }
         let env = kernel_spawn_env(&self.options.env);
         let cwd = self.options.cwd.clone();
-        if !crate::kernel::bootstrap::venv::spawn_environment_ready(
+        let probe = crate::kernel::bootstrap::venv::spawn_environment_ready(
             &python.to_string_lossy(),
             &env,
             cwd.as_deref(),
             Duration::from_millis(READY_TIMEOUT_MS),
         )
-        .await
-        {
+        .await;
+        if !matches!(probe, Ok(true)) {
             live_kernels::remove(self);
-            let mut g = lock(&self.guarded);
-            if g.state != KernelState::Shutdown {
-                g.state = KernelState::Idle;
+            {
+                let mut g = lock(&self.guarded);
+                if g.state != KernelState::Shutdown {
+                    g.state = KernelState::Idle;
+                }
             }
-            return Err(anyhow!(
-                "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
-                python.display()
-            ));
+            return Err(match probe {
+                Err(error) => {
+                    // The interpreter itself cannot launch: surface that cause
+                    // (not an ABI verdict) and drop the stale runtime-ready memo,
+                    // as a failed kernel spawn does.
+                    crate::kernel::bootstrap::invalidate_runtime_probe_cache();
+                    self.append_diagnostic(&format!("spawn error: {error}"));
+                    anyhow!("failed to spawn kernel python {}: {error}", python.display())
+                }
+                Ok(_) => anyhow!(
+                    "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
+                    python.display()
+                ),
+            });
         }
         // The probe awaited child processes: a teardown or newer start may
         // have landed meanwhile and must not be followed by a spawn.

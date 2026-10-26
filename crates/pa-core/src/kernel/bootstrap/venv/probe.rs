@@ -32,14 +32,15 @@ pub(crate) const SUPPORTED_RLM_RUNTIME_ABI: u64 = 2;
 /// One pre-spawn probe interpreter, awaited without blocking the async
 /// runtime and bounded by `bound`. An interpreter that outlives the bound, or
 /// a caller that drops this future (dispose, a start timeout), kills the
-/// probe child: a wedged probe must never wedge the kernel start.
+/// probe child: a wedged probe must never wedge the kernel start. An
+/// interpreter that cannot launch at all is an error, not a failed probe.
 async fn probe_quiet_with_env(
     command: &str,
     args: &[&str],
     env: &HashMap<String, String>,
     cwd: Option<&Path>,
     bound: std::time::Duration,
-) -> bool {
+) -> std::io::Result<bool> {
     let mut command = tokio::process::Command::new(command);
     command
         .args(args)
@@ -53,15 +54,13 @@ async fn probe_quiet_with_env(
         command.current_dir(cwd);
     }
     crate::platform::process::set_no_window(command.as_std_mut());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
+    let mut child = command.spawn()?;
     match tokio::time::timeout(bound, child.wait()).await {
-        Ok(status) => matches!(status, Ok(status) if status.success()),
+        Ok(status) => Ok(matches!(status, Ok(status) if status.success())),
         Err(_elapsed) => {
             // Fail closed, and reap the probe instead of leaking it.
             let _ = child.kill().await;
-            false
+            Ok(false)
         }
     }
 }
@@ -92,27 +91,27 @@ pub(crate) fn has_required_default_imports(python: &str) -> bool {
 /// run with. Each probe interpreter gets `bound`; one that does not exit in
 /// time fails the check closed. Async so the probes never block a runtime
 /// thread (a blocked current-thread runtime cannot even fire its timers).
+/// `Err` carries the launch error of an interpreter that cannot start.
 pub(crate) async fn spawn_environment_ready(
     python: &str,
     env: &HashMap<String, String>,
     cwd: Option<&Path>,
     bound: std::time::Duration,
-) -> bool {
-    let imports = DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(_, import, _)| *import)
-        .collect::<Vec<_>>()
-        .join(",");
-    probe_quiet_with_env(python, &["-c", RUNTIME_READY_CHECK], env, cwd, bound).await
-        && probe_quiet_with_env(python, &["-c", "import dill"], env, cwd, bound).await
-        && probe_quiet_with_env(
-            python,
-            &["-c", &format!("import {imports}")],
-            env,
-            cwd,
-            bound,
-        )
-        .await
+) -> std::io::Result<bool> {
+    let imports = format!(
+        "import {}",
+        DEFAULT_RLM_EXTRA_PACKAGES
+            .iter()
+            .map(|(_, import, _)| *import)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for check in [RUNTIME_READY_CHECK, "import dill", imports.as_str()] {
+        if !probe_quiet_with_env(python, &["-c", check], env, cwd, bound).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
@@ -327,7 +326,8 @@ mod spawn_probe_tests {
             ),
         )
         .await
-        .expect("the bound must settle the probe");
+        .expect("the bound must settle the probe")
+        .expect("the probe interpreter launches");
         assert!(!ready, "a probe that never exits must fail closed");
         assert!(started.elapsed() < Duration::from_secs(8));
         let pid = std::fs::read_to_string(&pid_file).expect("the probe ran");
