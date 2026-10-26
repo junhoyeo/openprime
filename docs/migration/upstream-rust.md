@@ -77,6 +77,15 @@ State-compatibility acceptance is not satisfied by `--version`. Before cutover, 
 - daemon sessions, tool calls, spawn/message/observe/collect, cancellation, and resume work over isolated sockets;
 - the packaged install layout contains the Python runtime and Python-backed skill resources expected by the kernel contract.
 
+## Telemetry incident (possible pseudonymous usage events)
+
+The product sends pseudonymous usage and performance metrics unless `DO_NOT_TRACK=1`, telemetry is disabled, or it runs offline. Its notice states the limits: no prompts, responses, tool content, file paths, or repository data. During the migration, these runs started product workers or kernels **without** `DO_NOT_TRACK` and **without** an egress block. It is **unknown whether any event was delivered.**
+
+1. 2026-10-27 03:21-03:42 KST, before the hermetic rule: real-`HOME` cargo test runs by the verification and sessions lanes started real `pa-daemon` workers and kernels. Any events would carry the owner's real pseudonymous install identity from `~/.prime`.
+2. The mig-lead window between dropping `DO_NOT_TRACK` from the harness (to diagnose telemetry-test failures) and the sandboxed wrapper. All runs used synthetic `HOME`s and faux or mock providers: `pa-daemon` lib reruns (`/tmp/pa-v45c31ca` and siblings, `/tmp/pa-g1e64828`), class-C integration reruns (`/tmp/pa-v82d4083`), product-built kernel runtimes (`/tmp/pa-rtdfab866`, `/tmp/pa-bc0aa232e`, `/tmp/pa-gc6d8874e`), native harness validation runs 1-3 (`/tmp/pa-n99e3bdd`, `/tmp/pa-n2e73042`, `/tmp/pa-n3300788`), and one CI-runtime print-mode probe.
+
+Guards added afterwards: `scripts/hermetic_test.py` refuses to start unless the macOS egress sandbox is active or `--do-not-track` sets `DO_NOT_TRACK=1`. The native launcher refuses any product launch without both `DO_NOT_TRACK=1` and the sandbox. The CI test-runtime step sets `DO_NOT_TRACK=1`.
+
 ## Baseline evidence
 
 The pinned base was checked from a detached, clean worktree at `/private/tmp/pa-rust-study`.
