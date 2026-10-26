@@ -332,7 +332,10 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
         worker_token(&agent_dir, &child_active_session_id).expect("the child worker's token");
     let child_pid =
         worker_pid(&agent_dir, &child_active_session_id).expect("the child worker's pid");
-    assert!(process_alive(child_pid), "the child worker runs before passivation");
+    assert!(
+        process_alive(child_pid),
+        "the child worker runs before passivation"
+    );
     let child_alive = || process_alive(child_pid);
 
     // THE PASSIVATION ASK: the child worker's supervisor-link request (the worker-side
@@ -850,7 +853,10 @@ async fn an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcri
     let root_token =
         worker_token(&agent_dir, &root_active_session_id).expect("the root worker's token");
     let root_pid = worker_pid(&agent_dir, &root_active_session_id).expect("the root worker's pid");
-    assert!(process_alive(root_pid), "the root worker runs before passivation");
+    assert!(
+        process_alive(root_pid),
+        "the root worker runs before passivation"
+    );
 
     // THE PASSIVATION ASK for a ROOT: the supervisor's handler accepts an
     // unowned worker regardless of depth (without the fix this answers
