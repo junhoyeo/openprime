@@ -808,7 +808,12 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     });
                     let service_tier = match &self.hooks.resolve_service_tier {
                         Some(resolve) => resolve(response_tier, request_tier),
-                        None => response_tier.or(request_tier),
+                        None => {
+                            crate::providers::openai_responses_hooks::resolve_standard_service_tier(
+                                response_tier,
+                                request_tier,
+                            )
+                        }
                     };
                     apply(&mut self.output.usage, service_tier);
                 }

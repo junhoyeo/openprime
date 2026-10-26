@@ -35,6 +35,15 @@ pub struct ResponsesStreamHooks {
     pub apply_service_tier_pricing: Option<ApplyServiceTierPricingFn>,
 }
 
+/// Resolve the regular Responses API tier: an explicit response value is authoritative; only an
+/// omitted response tier falls back to what the request asked for.
+pub(crate) fn resolve_standard_service_tier(
+    response_tier: Option<String>,
+    request_tier: Option<String>,
+) -> Option<String> {
+    response_tier.or(request_tier)
+}
+
 /// Multipliers per <https://developers.openai.com/api/docs/pricing>.
 pub fn get_service_tier_cost_multiplier(model_id: &str, service_tier: Option<&str>) -> f64 {
     match service_tier {
@@ -67,4 +76,22 @@ pub fn apply_service_tier_pricing(usage: &mut Usage, service_tier: Option<&str>,
         + usage.cost.cache_read.as_f64()
         + usage.cost.cache_write.as_f64())
     .into();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_standard_service_tier;
+
+    #[test]
+    fn response_tier_wins_and_an_omission_falls_back_to_the_request() {
+        assert_eq!(
+            resolve_standard_service_tier(Some("default".into()), Some("priority".into())),
+            Some("default".into())
+        );
+        assert_eq!(
+            resolve_standard_service_tier(None, Some("priority".into())),
+            Some("priority".into())
+        );
+        assert_eq!(resolve_standard_service_tier(None, None), None);
+    }
 }
