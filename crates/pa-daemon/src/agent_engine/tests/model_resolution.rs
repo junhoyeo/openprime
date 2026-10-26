@@ -109,6 +109,60 @@ fn create_config_flags_reach_the_engine_model_resolution() {
 }
 
 #[test]
+fn model_metadata_preserves_full_resolved_model_capabilities() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir,
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(r#"{"engine":"faux","responses":[]}"#.to_string()),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let resolved: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
+        "id": "fast-custom",
+        "name": "Fast Custom",
+        "api": "openai-responses",
+        "provider": "gateway",
+        "baseUrl": "http://127.0.0.1:9",
+        "reasoning": true,
+        "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 128000,
+        "maxTokens": 4096,
+        "compat": { "sendSessionIdHeader": true }
+    }))
+    .unwrap();
+    engine
+        .faux_model
+        .set(resolved)
+        .expect("inject resolved model once");
+
+    let expected = engine.resolve_model().expect("injected resolved model");
+    let metadata = crate::engine::SessionEngine::model_metadata(&engine)
+        .expect("resolved full model metadata");
+    assert_eq!(metadata["provider"], "gateway");
+    assert_eq!(metadata["id"], "fast-custom");
+    assert_eq!(metadata["contextWindow"], 128_000);
+    assert_eq!(metadata["compat"]["sendSessionIdHeader"], true);
+    let round_trip: pa_types::ai::Model =
+        serde_json::from_value(metadata).expect("metadata is a complete Model");
+    assert_eq!(round_trip, expected);
+    assert_eq!(round_trip.provider, "gateway");
+    assert_eq!(round_trip.id, "fast-custom");
+}
+
+#[test]
 fn settings_default_drives_unflagged_resolution() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
