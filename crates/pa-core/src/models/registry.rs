@@ -297,6 +297,12 @@ impl ModelRegistry {
                 model_id: model_id.to_string(),
             });
         };
+        if is_private_prime_inference_model(model) && !self.is_authorized_private_model(model) {
+            return Err(SetModelSelectionError::NotFound {
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            });
+        }
         if self.get_provider_auth_status(provider).source
             == Some(crate::auth::types::AuthSource::Stale)
         {
