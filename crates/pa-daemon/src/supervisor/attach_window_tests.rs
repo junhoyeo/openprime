@@ -12,6 +12,9 @@ use super::subscribers::ClientSubscriptions;
 use super::*;
 
 const WORKER_ID: &str = "w-window";
+/// The bound on every wait: a step that cannot finish within it fails the test
+/// (load-tolerant, never a hang).
+const STEP_BOUND: Duration = Duration::from_secs(60);
 /// The attach snapshot's cursor; the racing event is the next sequence.
 const SNAPSHOT_CURSOR: u64 = 7;
 
@@ -26,7 +29,7 @@ struct FakeWorker {
 impl FakeWorker {
     async fn next_request(&mut self) -> (String, String) {
         let mut reader = PrivateFrameReader::new(&mut self.read_half, DEFAULT_PRIVATE_FRAME_LIMITS);
-        let frame = tokio::time::timeout(Duration::from_secs(10), reader.read_frame())
+        let frame = tokio::time::timeout(STEP_BOUND, reader.read_frame())
             .await
             .expect("the supervisor sends its next request")
             .expect("the supervisor's frame")
@@ -261,7 +264,7 @@ async fn an_event_cut_after_the_attach_snapshot_reaches_the_attaching_client() {
         .emit(SNAPSHOT_CURSOR + 1, "the update the snapshot lacks")
         .await;
     worker.answer(&request_id, &attach_success()).await;
-    tokio::time::timeout(Duration::from_secs(10), route)
+    tokio::time::timeout(STEP_BOUND, route)
         .await
         .expect("the attach route settles")
         .expect("the route task lives");
@@ -273,7 +276,7 @@ async fn an_event_cut_after_the_attach_snapshot_reaches_the_attaching_client() {
     assert_eq!(attached.session_ids(), vec![WORKER_ID.to_string()]);
     // Live events keep flowing to the attached connection afterwards.
     worker.emit(SNAPSHOT_CURSOR + 2, "a later update").await;
-    let later = tokio::time::timeout(Duration::from_secs(5), queue.recv())
+    let later = tokio::time::timeout(STEP_BOUND, queue.recv())
         .await
         .expect("the attached client hears live events")
         .expect("the queue stays open");
@@ -307,7 +310,7 @@ async fn a_refused_attach_retires_its_early_subscription() {
             },
         )
         .await;
-    tokio::time::timeout(Duration::from_secs(10), route)
+    tokio::time::timeout(STEP_BOUND, route)
         .await
         .expect("the attach route settles")
         .expect("the route task lives");
@@ -351,7 +354,7 @@ async fn a_refused_reattach_keeps_the_existing_subscription() {
             },
         )
         .await;
-    tokio::time::timeout(Duration::from_secs(10), route)
+    tokio::time::timeout(STEP_BOUND, route)
         .await
         .expect("the attach route settles")
         .expect("the route task lives");
@@ -359,7 +362,7 @@ async fn a_refused_reattach_keeps_the_existing_subscription() {
     worker
         .emit(SNAPSHOT_CURSOR + 1, "still for this client")
         .await;
-    let event = tokio::time::timeout(Duration::from_secs(5), queue.recv())
+    let event = tokio::time::timeout(STEP_BOUND, queue.recv())
         .await
         .expect("the held subscription still delivers")
         .expect("the queue stays open");
