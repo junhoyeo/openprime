@@ -69,6 +69,7 @@ impl SessionAlreadyActiveError {
     }
 }
 
+#[must_use]
 pub fn canonical_session_path(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
