@@ -4,6 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
+use pa_core::refinement::{
+    get_harness_state_path, load_harness_state, update_harness_state, HarnessScope, RefinementKind,
+};
 use pa_core::session::manager::SessionManager;
 use pa_types::session::AgentMessage;
 use serde_json::Value;
@@ -65,4 +68,113 @@ fn a_legacy_v2_hook_message_migrates_to_a_custom_message() {
             ("assistant", "v2 answer"),
         ])
     );
+}
+
+fn copied_harness_dir(temp: &Path, name: &str) -> PathBuf {
+    let dir = temp.join("harness");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(fixture(name), get_harness_state_path(&dir)).unwrap();
+    dir
+}
+
+fn entry_ids(path: &Path) -> Vec<(String, String)> {
+    let state: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut ids = Vec::new();
+    for (kind, records) in state["entries"].as_object().unwrap() {
+        for id in records.as_object().unwrap().keys() {
+            ids.push((kind.clone(), id.clone()));
+        }
+    }
+    ids.sort();
+    ids
+}
+
+#[test]
+fn a_legacy_kernel_written_harness_state_loads_every_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = copied_harness_dir(temp.path(), "harness_state.python-writer.json");
+    let state = load_harness_state(&dir, HarnessScope::Global);
+    let loaded: Vec<(RefinementKind, String, String)> = state
+        .entries
+        .iter()
+        .flat_map(|(kind, records)| {
+            records
+                .values()
+                .map(|entry| (*kind, entry.id.clone(), entry.path.clone()))
+        })
+        .collect();
+    assert_eq!(
+        loaded,
+        vec![
+            (
+                RefinementKind::Prompt,
+                "legacy_prompt_note".to_string(),
+                "policies/style".to_string()
+            ),
+            (
+                RefinementKind::Memory,
+                "legacy_memory".to_string(),
+                "facts/legacy".to_string()
+            ),
+            (
+                RefinementKind::Skill,
+                "legacy_skill".to_string(),
+                "skills/legacy".to_string()
+            ),
+            (
+                RefinementKind::Subagent,
+                "legacy_reviewer".to_string(),
+                "orchestration/review".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        state.entries[&RefinementKind::Skill]["legacy_skill"].reference["import"],
+        "legacy_skill"
+    );
+    assert_eq!(state.refinements.len(), 1);
+}
+
+#[test]
+fn a_topic_era_harness_entry_loads_under_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = copied_harness_dir(temp.path(), "harness_state.topic-era.json");
+    let state = load_harness_state(&dir, HarnessScope::Local);
+    let entry = state.entries[&RefinementKind::Memory]
+        .get("topic_entry")
+        .expect("TS loadHarnessState migrates a topic-era entry instead of dropping it");
+    assert_eq!(entry.path, "window/era");
+    assert_eq!(entry.content, "Window-era content.");
+}
+
+#[test]
+fn saving_after_a_legacy_load_never_erases_an_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = copied_harness_dir(temp.path(), "harness_state.topic-era.json");
+    let path = get_harness_state_path(&dir);
+    let before: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    update_harness_state(&dir, HarnessScope::Local, |state| {
+        state.refinements.clear();
+    })
+    .unwrap();
+    assert_eq!(
+        entry_ids(&path),
+        vec![
+            ("memory".to_string(), "hand_edited".to_string()),
+            ("memory".to_string(), "topic_entry".to_string()),
+        ]
+    );
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // A row this build cannot type survives byte-for-byte as JSON.
+    assert_eq!(
+        after["entries"]["memory"]["hand_edited"],
+        before["entries"]["memory"]["hand_edited"]
+    );
+    assert_eq!(
+        after["entries"]["memory"]["topic_entry"]["path"],
+        "window/era"
+    );
+    assert!(after["entries"]["memory"]["topic_entry"]
+        .get("topic")
+        .is_none());
 }

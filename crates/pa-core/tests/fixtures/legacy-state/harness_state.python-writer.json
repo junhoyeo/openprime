@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "entries": {
+    "prompt": {
+      "legacy_prompt_note": {
+        "id": "legacy_prompt_note",
+        "kind": "prompt",
+        "title": "Legacy prompt note",
+        "content": "Prefer short sentences.",
+        "path": "policies/style",
+        "scope": "global",
+        "reference": {},
+        "arguments": {},
+        "metadata": {},
+        "source": "agent",
+        "created_at": "2026-09-01T00:00:00+00:00",
+        "updated_at": "2026-09-01T00:00:00+00:00",
+        "version": 1
+      }
+    },
+    "memory": {
+      "legacy_memory": {
+        "id": "legacy_memory",
+        "kind": "memory",
+        "title": "Legacy memory — ünïcode",
+        "content": "A synthetic fact kept by the legacy kernel writer.",
+        "path": "facts/legacy",
+        "scope": "global",
+        "reference": {},
+        "arguments": {},
+        "metadata": {
+          "confidence": "high"
+        },
+        "source": "agent",
+        "created_at": "2026-09-01T00:00:00+00:00",
+        "updated_at": "2026-09-01T00:00:00+00:00",
+        "version": 2
+      }
+    },
+    "skill": {
+      "legacy_skill": {
+        "id": "legacy_skill",
+        "kind": "skill",
+        "title": "legacy-skill: python reference",
+        "content": "Call the legacy skill.",
+        "path": "skills/legacy",
+        "scope": "global",
+        "reference": {
+          "type": "python",
+          "import": "legacy_skill",
+          "callable": "run",
+          "call_pattern": "await legacy_skill.run(value)"
+        },
+        "arguments": {
+          "value": {
+            "type": "str",
+            "required": true
+          }
+        },
+        "metadata": {},
+        "source": "agent",
+        "created_at": "2026-09-01T00:00:00+00:00",
+        "updated_at": "2026-09-01T00:00:00+00:00",
+        "version": 1
+      }
+    },
+    "subagent": {
+      "legacy_reviewer": {
+        "id": "legacy_reviewer",
+        "kind": "subagent",
+        "title": "Legacy reviewer",
+        "content": "Review the change read-only.",
+        "path": "orchestration/review",
+        "scope": "local",
+        "reference": {},
+        "arguments": {},
+        "metadata": {},
+        "source": "agent",
+        "created_at": "2026-09-01T00:00:00+00:00",
+        "updated_at": "2026-09-01T00:00:00+00:00",
+        "version": 1
+      }
+    }
+  },
+  "refinements": [
+    {
+      "id": "refine_legacy_1",
+      "trigger": "Record a synthetic legacy refinement.",
+      "changes": [
+        "create memory:legacy_memory"
+      ],
+      "evidence": "synthetic",
+      "outcome": "kept",
+      "created_at": "2026-09-01T00:00:00+00:00"
+    }
+  ]
+}
