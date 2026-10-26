@@ -58,9 +58,9 @@
     ],
     "migration_status_counts": {
       "ported": 10,
-      "BLOCKED": 83,
+      "verified-upstream-equivalent": 4,
       "truly-obsolete": 2,
-      "verified-upstream-equivalent": 4
+      "BLOCKED": 83
     },
     "classification_policy": "Inventory disposition and verification outcome are separate. Every row remains BLOCKED until its focused lane verifier and integrated-tip acceptance pass; confidence alone never proves parity. Proposed final statuses are review candidates, not acceptance claims.",
     "revision": "r2 (2026-10-26): behavioral-acceptance note, lane disproofs, PR row updates; dispositions unchanged from lead-integrated copy except notes",
@@ -2405,10 +2405,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; sibling attach survives reviver cleanup; no stale attachment (revival_context_e2e); legacy-daemon negotiation is truly obsolete"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): sibling attach survives reviver cleanup; no stale attachment (revival_context_e2e); legacy-daemon negotiation is truly obsolete; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "b24bd42f6d44a0e985cfb9852ca18996a86c7fe0",
@@ -2668,11 +2675,20 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "1de572af0"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; fileless/foreign switched-in respawn uses its own cwd"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): fileless/foreign switched-in respawn uses its own cwd; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "c3adf81be0d994b613830a29b9ce8e3cea33da71",
@@ -2712,11 +2728,20 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "1de572af0"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; root-identity follow carries the live cwd into the durable create"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): root-identity follow carries the live cwd into the durable create; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "b2bb37bb273d14a41a52440ffa989a01960dadce",
@@ -2756,11 +2781,20 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "e31116ee4"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; passivated-wake replays the opened-with fallback cwd; revival_context_e2e red control fails at base (:283)"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): passivated-wake replays the opened-with fallback cwd; revival_context_e2e red control fails at base (:283); final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "aa3ae8fc06d4b790d3f8e527c14e6037cc35bdac",
@@ -3002,11 +3036,20 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "e31116ee4"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; proven at the daemon boundary only (create shape carries the opened-with config); agents-view client path not separately proven"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): proven at the daemon boundary only (create shape carries the opened-with config); agents-view client path not separately proven; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "48fae2a5a2fdb43e800a9bcd9943d1311b67f997",
@@ -3046,11 +3089,21 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "1de572af0",
+        "e31116ee4"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; switched-in transcript respawns in its own cwd; red control fails at base (:644)"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): switched-in transcript respawns in its own cwd; red control fails at base (:644); final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "ae2db8c32cf9619d0a40f6509a97beee79572f4c",
@@ -3181,11 +3234,20 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "e31116ee4"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; proven at the daemon boundary only (create shape); agents-view client path not separately proven"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): proven at the daemon boundary only (create shape); agents-view client path not separately proven; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "e32bce3840f0e234062f717f95bf518936a3e162",
@@ -3226,11 +3288,20 @@
       "port_target": null,
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "e31116ee4"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; telemetry opt-out survives passivated wake (red control :528); launch env intentionally not replayed; owned sessions never passivate"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): telemetry opt-out survives passivated wake (red control :528); launch env intentionally not replayed; owned sessions never passivate; final combined acceptance pending",
+      "candidate_verification_status": "ported"
     },
     {
       "hash": "37d7a7d7ea7ec24c09ab320a2cba809f379088a1",
@@ -3896,10 +3967,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; admission route has no wake arm; cancelled check precedes resolution; R4 (ACP admission prompts do not wake passivated sessions) stays open"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): admission route has no wake arm; cancelled check precedes resolution; R4 (ACP admission prompts do not wake passivated sessions) stays open; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "a59f857cd9767ec2bd1605ee1454c90c9af3b6e8",
@@ -4116,10 +4194,17 @@
       "notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; stale id -> exact refusal, durable attach wakes, replay runs; client pa-tui prompt_revival_rebind_headless (mutation-verified); also TS-archived reopen proof pending state-compat review"
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): stale id -> exact refusal, durable attach wakes, replay runs; client pa-tui prompt_revival_rebind_headless (mutation-verified); also TS-archived reopen proof pending state-compat review; final combined acceptance pending",
+      "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
       "hash": "0401ba71dc1ae6800801aabec199181a508e5a75",

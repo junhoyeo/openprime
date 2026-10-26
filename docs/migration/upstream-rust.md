@@ -27,6 +27,7 @@ The complete 99-commit, non-merge legacy inventory is in:
 - [`evidence/providers.md`](evidence/providers.md), the final provider review/provenance record plus combined safe-metadata seam evidence.
 - [`evidence/kernel.md`](evidence/kernel.md), the retain-only immutable-generation/diagnostics review and hermetic ABI evidence, including native holds.
 - [`evidence/lifecycle.md`](evidence/lifecycle.md), the final RLM/`/btw`/heartbeat review and combined hermetic evidence, with both isolation incidents and native hold.
+- [`evidence/revival.md`](evidence/revival.md), the integrated revival launch-context/switched-cwd lane with its scope-limited review and open residuals R1-R4.
 - [`evidence/native-collect.md`](evidence/native-collect.md), the one approved combined faux collect run, including its successful core behavior, post-collection harness failure, and exact cleanup.
 
 Each commit and PR #32/#33 must end in exactly one state:
