@@ -14,6 +14,13 @@ use crate::worker::Worker;
 
 const QUEUE_MODES: &[&str] = &["all", "one-at-a-time"];
 
+fn model_metadata_supports_service_tier(model: Option<&Value>, tier: ServiceTier) -> bool {
+    model
+        .and_then(|model| serde_json::from_value::<pa_types::ai::Model>(model.clone()).ok())
+        .is_some_and(|model| pa_types::ai::supports_service_tier(&model, tier))
+        || tier == ServiceTier::Default
+}
+
 /// Whether the engine's resolved model supports `tier`; a session without
 /// a resolved model supports only the `default` tier.
 pub(crate) fn engine_supports_service_tier(
@@ -21,17 +28,61 @@ pub(crate) fn engine_supports_service_tier(
     tier: ServiceTier,
 ) -> bool {
     let model = engine.model_metadata();
-    model
-        .as_ref()
-        .and_then(|model| {
-            Some(pa_types::ai::supports_service_tier_fields(
-                model.get("provider")?.as_str()?,
-                model.get("api")?.as_str()?,
-                model.get("id")?.as_str()?,
-                tier,
-            ))
+    model_metadata_supports_service_tier(model.as_ref(), tier)
+}
+
+#[cfg(test)]
+mod service_tier_compat_tests {
+    use super::*;
+
+    fn gateway_model(supports_fast_mode: bool) -> Value {
+        json!({
+            "id": "custom-astra",
+            "name": "Custom Astra",
+            "api": "openai-responses",
+            "provider": "gateway",
+            "baseUrl": "http://127.0.0.1:8787/v1",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 128000,
+            "maxTokens": 8192,
+            "compat": {"supportsFastMode": supports_fast_mode}
         })
-        .unwrap_or(tier == ServiceTier::Default)
+    }
+
+    #[test]
+    fn daemon_tier_clamp_honors_the_full_model_fast_compat() {
+        let enabled = gateway_model(true);
+        assert!(model_metadata_supports_service_tier(
+            Some(&enabled),
+            ServiceTier::Priority
+        ));
+
+        let disabled = gateway_model(false);
+        assert!(!model_metadata_supports_service_tier(
+            Some(&disabled),
+            ServiceTier::Priority
+        ));
+        assert!(model_metadata_supports_service_tier(
+            Some(&disabled),
+            ServiceTier::Default
+        ));
+    }
+
+    #[test]
+    fn malformed_or_missing_metadata_fails_safe_for_non_default_tiers() {
+        for metadata in [None, Some(&json!({"provider": "gateway"}))] {
+            assert!(!model_metadata_supports_service_tier(
+                metadata,
+                ServiceTier::Priority
+            ));
+            assert!(model_metadata_supports_service_tier(
+                metadata,
+                ServiceTier::Default
+            ));
+        }
+    }
 }
 
 /// The wire name of a service tier (the serde lowercase form).
