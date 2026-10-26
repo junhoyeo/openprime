@@ -44,8 +44,8 @@ impl PassivatedLaunch {
     }
 
     /// The wake create over `session_path`: the stopped worker's runtime
-    /// config, client env, and telemetry opt-out, with the wake path's own
-    /// `rlmDepth` (the passivation fence reads it) and runtime metadata.
+    /// config and telemetry opt-out, with the wake path's own `rlmDepth`
+    /// (the passivation fence reads it) and runtime metadata.
     pub(crate) fn wake_create(
         &self,
         session_path: &str,
@@ -60,11 +60,6 @@ impl PassivatedLaunch {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         config.insert("rlmDepth".to_string(), Value::from(rlm_depth));
-        let env = self
-            .create_command
-            .rest
-            .get("env")
-            .and_then(|env| serde_json::from_value(env.clone()).ok());
         DaemonCommand::Create {
             id: None,
             session_path: Some(session_path.to_string()),
@@ -75,7 +70,11 @@ impl PassivatedLaunch {
             telemetry_disabled: self.telemetry_disabled.filter(|disabled| *disabled),
             runtime_metadata,
             lifecycle: None,
-            env,
+            // Never the creator's pane identity: passivation requires zero
+            // attached clients, so that pane may be closed or reused. The
+            // waking client's attach adopts its own pane (adopt-if-absent),
+            // as the TS revival sent the reviving client's env.
+            env: None,
             // The client launch env never outlives a resident's create (see
             // `ResidentWorker::launch_env`): a wake runs on the daemon's env,
             // exactly like a crash relaunch.
@@ -134,8 +133,8 @@ mod tests {
     use serde_json::json;
 
     /// The wake create is the stopped worker's create with the wake path's
-    /// identity: config keys survive, the env moves to its own field, the
-    /// name and metadata never ride the config.
+    /// identity: config keys survive; the creator's pane env, the name, and
+    /// the metadata never ride along.
     #[test]
     fn the_wake_create_replays_the_opened_with_context() {
         let durable = crate::descriptor::durable_create_command(&json!({
@@ -168,10 +167,7 @@ mod tests {
             telemetry_disabled: Some(true),
             runtime_metadata: None,
             lifecycle: None,
-            env: Some(std::collections::BTreeMap::from([(
-                "HERDR_PANE_ID".to_string(),
-                "pane-1".to_string(),
-            )])),
+            env: None,
             launch_env: None,
             rest: Map::default(),
         };

@@ -10,7 +10,9 @@
 //!   also across a supervisor restart;
 //! - e32bce384 (+ 837be6824): the opened-with runtime config (system prompt
 //!   append, telemetry opt-out) survives the wake, so an opted-out client
-//!   can still attach and the revived worker never reports telemetry;
+//!   can still attach and the revived worker never reports telemetry; the
+//!   revived session reports for the waking client's pane, never the
+//!   creator's;
 //! - c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched in over a
 //!   fileless or foreign launch never inherits the launch cwd on respawn;
 //! - 6470a60e7: a cancellable prompt never starts a revival;
@@ -33,9 +35,10 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -330,13 +333,13 @@ fn passivate(client: &mut Client, agent_dir: &Path, active_session_id: &str, id:
     );
 }
 
-fn wait_until<T>(budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+fn wait_until<T>(what: &str, budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + budget;
     loop {
         if let Some(value) = probe() {
             return value;
         }
-        assert!(Instant::now() < deadline, "condition never became true");
+        assert!(Instant::now() < deadline, "never observed: {what}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -619,11 +622,15 @@ fn a_switched_transcript_respawns_in_its_own_cwd_not_the_launch_cwd() {
         );
         // The roster follow moves the durable record onto the switched-in
         // transcript before the crash.
-        wait_until(Duration::from_secs(15), || {
-            descriptor_field(&agent_dir, &active, "sessionFile")
-                .and_then(|file| file.as_str().map(str::to_string))
-                .filter(|file| Path::new(file) == transcript.as_path())
-        });
+        wait_until(
+            "the durable record follows the switched-in transcript",
+            Duration::from_secs(15),
+            || {
+                descriptor_field(&agent_dir, &active, "sessionFile")
+                    .and_then(|file| file.as_str().map(str::to_string))
+                    .filter(|file| Path::new(file) == transcript.as_path())
+            },
+        );
         let pid = descriptor_field(&agent_dir, &active, "pid")
             .and_then(|pid| pid.as_u64())
             .expect("the worker pid");
@@ -635,13 +642,17 @@ fn a_switched_transcript_respawns_in_its_own_cwd_not_the_launch_cwd() {
         assert!(killed.success(), "kill -9 {pid} failed");
         // The supervisor's crash respawn replays the durable create; the
         // respawned worker answers on the same active id.
-        let respawned = wait_until(Duration::from_secs(60), || {
-            let response = client.pwd(&format!("pwd-after-{index}"), &active);
-            (response["success"] == true
-                && descriptor_field(&agent_dir, &active, "pid").and_then(|p| p.as_u64())
-                    != Some(pid))
-            .then_some(response)
-        });
+        let respawned = wait_until(
+            "the respawned worker answers on the same id",
+            Duration::from_secs(60),
+            || {
+                let response = client.pwd(&format!("pwd-after-{index}"), &active);
+                (response["success"] == true
+                    && descriptor_field(&agent_dir, &active, "pid").and_then(|p| p.as_u64())
+                        != Some(pid))
+                .then_some(response)
+            },
+        );
         assert_eq!(
             pwd_output(&respawned),
             canonical(expected),
@@ -827,11 +838,15 @@ fn a_revival_keeps_a_sibling_attached_and_leaves_no_stale_attachment() {
         &json!({ "type": "prompt_and_wait", "activeSessionId": woken, "message": "second" }),
     );
     assert_eq!(turn["success"], true, "{turn}");
-    let event = wait_until(Duration::from_secs(30), || {
-        let line = sibling.read_line();
-        (line["type"] == "session_event" && line["activeSessionId"] == woken.as_str())
-            .then_some(line)
-    });
+    let event = wait_until(
+        "the sibling receives the revived session's events",
+        Duration::from_secs(30),
+        || {
+            let line = sibling.read_line();
+            (line["type"] == "session_event" && line["activeSessionId"] == woken.as_str())
+                .then_some(line)
+        },
+    );
     assert_eq!(event["activeSessionId"], woken.as_str());
 
     let detached = sibling.request(
@@ -914,5 +929,125 @@ fn a_passivated_launch_context_survives_a_supervisor_restart() {
         pwd_output(&client.pwd("pwd", &woken)),
         canonical(&fallback),
         "the restarted daemon must revive in the fallback the session was opened with"
+    );
+}
+
+/// The fake Herdr pane-state socket: one JSON request per connection, every
+/// request recorded in arrival order (the connector's wire contract).
+fn fake_herdr(socket: &Path) -> Arc<Mutex<Vec<Value>>> {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = UnixListener::bind(socket).expect("bind the fake herdr socket");
+    let seen = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let Ok(mut writer) = stream.try_clone() else {
+                continue;
+            };
+            let mut line = String::new();
+            if BufReader::new(stream).read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                seen.lock().unwrap().push(request.clone());
+                let response = json!({ "id": request.get("id").cloned().unwrap_or(Value::Null), "result": { "type": "ok" } });
+                let _ = writer.write_all(format!("{response}\n").as_bytes());
+                let _ = writer.flush();
+            }
+        }
+    });
+    requests
+}
+
+/// One pane identity as a client sends it (the connector's allowlist).
+fn pane_env(herdr_socket: &Path, pane_id: &str) -> Value {
+    json!({
+        "HERDR_ENV": "1",
+        "HERDR_SOCKET_PATH": herdr_socket.to_string_lossy(),
+        "HERDR_PANE_ID": pane_id,
+        "HERDR_TAB_ID": "t1",
+        "HERDR_WORKSPACE_ID": "ws1",
+    })
+}
+
+/// Row e32bce384's client-env half: the TS revival sent the REVIVING
+/// client's own pane identity (`collectDaemonClientEnv`), never the
+/// creator's. Passivation requires zero attached clients, so the creator's
+/// pane may be closed or reused by another program: the wake must not
+/// report into it. The rebind attach's pane identity is the one the revived
+/// session adopts and reports for.
+#[test]
+fn a_revival_reports_for_the_waking_pane_never_the_creators() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let herdr_socket = dir.path().join("herdr.sock");
+    let requests = fake_herdr(&herdr_socket);
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "env": pane_env(&herdr_socket, "pane:creator"),
+            "config": {
+                "cwd": project,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    // The probe sees the creator's pane while the creator's window owns it.
+    wait_until("the creator pane report", Duration::from_secs(20), || {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["params"]["pane_id"] == "pane:creator")
+            .then_some(())
+    });
+    passivate(&mut client, &agent_dir, &active, "passivate");
+    let before_wake = requests.lock().unwrap().len();
+
+    let attached = client.request(
+        "attach-durable",
+        &json!({
+            "type": "attach",
+            "activeSessionId": session_id,
+            "env": pane_env(&herdr_socket, "pane:waker"),
+        }),
+    );
+    assert_eq!(attached["success"], true, "{attached}");
+    let after_wake = wait_until(
+        "a report for the waking pane",
+        Duration::from_secs(20),
+        || {
+            let frames = requests.lock().unwrap()[before_wake..].to_vec();
+            frames
+                .iter()
+                .any(|request| request["params"]["pane_id"] == "pane:waker")
+                .then_some(frames)
+        },
+    );
+    let panes: Vec<&Value> = after_wake
+        .iter()
+        .map(|request| &request["params"]["pane_id"])
+        .collect();
+    assert!(
+        panes.iter().all(|pane| *pane == "pane:waker"),
+        "the revival reported into the creator's stale pane: {after_wake:?}"
     );
 }
