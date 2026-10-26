@@ -173,7 +173,8 @@ fn emit_compact_end(
     emit(EngineEvent::Compaction { entry, event })
 }
 
-/// Parse a session command out of a prompt, if it is one.
+/// The queue projection's active-action kind of a delivered prompt: a session command (`/refine`,
+/// `/compact`, ...) reports `session_command`, everything else `turn` (TS `SessionAction.kind`).
 pub(crate) fn session_action_kind(text: &str) -> &'static str {
     if parse_prompt_session_command(text).is_some() {
         "session_command"
@@ -182,6 +183,7 @@ pub(crate) fn session_action_kind(text: &str) -> &'static str {
     }
 }
 
+/// Parse a session command out of a prompt, if it is one.
 pub(crate) fn parse_prompt_session_command(text: &str) -> Option<SessionSlashCommand> {
     let registry = SlashCommandRegistry::builtin();
     parse_session_command(&registry, text)
