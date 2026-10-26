@@ -157,6 +157,20 @@ impl Supervisor {
         // flag with the path (the create refuses `noSession`+`sessionPath`).
         descriptor.create_command.session_path = Some(session_file.clone());
         descriptor.create_command.no_session = None;
+        // The relaunch cwd follows the moved-to session too: the replacement rebound
+        // the worker onto that transcript's own directory (or the fallback the switch
+        // selected for a missing one). Replaying the launch cwd would run the
+        // switched-in transcript in a directory that belongs to another session.
+        if let Some(cwd) = summary
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.is_empty())
+        {
+            descriptor
+                .create_command
+                .rest
+                .insert("cwd".to_string(), Value::from(cwd));
+        }
         // The durable record is the restart edge: a failed persist leaves the LIVE routing
         // correct while the record lags — keep the transition marked pending so the next
         // roster write repairs it.
