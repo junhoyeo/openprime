@@ -44,9 +44,10 @@ fn redaction_patterns() -> &'static [(fancy_regex::Regex, &'static str)] {
 /// replacement closes diagnostics where a child prints only the value, with
 /// no header/key syntax left for structural redaction.
 pub(super) fn ambient_secret_values() -> Vec<String> {
-    let mut values = std::env::vars()
+    let mut values = std::env::vars_os()
         .filter_map(|(name, value)| {
-            let name = name.to_ascii_uppercase();
+            let name = name.to_str()?.to_ascii_uppercase();
+            let value = value.into_string().ok()?;
             let credential_shaped = name.ends_with("_TOKEN")
                 || name.ends_with("_SECRET")
                 || name.ends_with("_PASSWORD")
