@@ -149,6 +149,7 @@ async fn an_untrusted_opencode_endpoint_never_receives_the_public_literal() {
         "openai-completions",
         "openai-responses",
         "anthropic-messages",
+        "google-generative-ai",
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -183,21 +184,6 @@ async fn an_untrusted_opencode_endpoint_never_receives_the_public_literal() {
             "{api} connected to the untrusted endpoint"
         );
     }
-
-    // The Google provider permits keyless-compatible endpoints and may still issue a request, but
-    // the automatic OpenCode literal must never be attached to an untrusted route.
-    let headers = capture(
-        "google-generative-ai",
-        "opencode",
-        "conversation",
-        None,
-        None,
-    )
-    .await;
-    assert!(!headers.contains(&(
-        "x-goog-api-key".into(),
-        pa_ai::models::OPENCODE_PUBLIC_API_KEY.into()
-    )));
 }
 
 #[tokio::test]
