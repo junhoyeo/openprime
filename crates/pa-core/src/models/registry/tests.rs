@@ -107,6 +107,42 @@ async fn keyless_free_zen_is_explicitly_selectable_but_not_discoverable() {
 }
 
 #[test]
+fn owner_defined_opencode_model_cannot_self_declare_public_eligibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.json");
+    std::fs::write(
+        &models_path,
+        serde_json::json!({
+            "providers": { "opencode": {
+                "baseUrl": "http://127.0.0.1:8787/v1",
+                "api": "openai-completions",
+                "models": [{"id": "owner-declared-free"}]
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut registry =
+        ModelRegistry::create(auth_without_env(&serde_json::json!({})), &models_path);
+    let model = registry
+        .get_all()
+        .iter()
+        .find(|model| model.provider == "opencode" && model.id == "owner-declared-free")
+        .unwrap()
+        .clone();
+    assert!(!registry.is_explicitly_selectable(&model));
+    assert!(matches!(
+        registry.resolve_set_model_selection(&model.provider, &model.id),
+        Err(SetModelSelectionError::ProviderUnauthenticated { .. })
+    ));
+    assert_eq!(registry.get_api_key_and_headers(&model, None).api_key, None);
+    assert!(!registry
+        .get_rlm_searchable_models()
+        .iter()
+        .any(|candidate| { candidate.provider == model.provider && candidate.id == model.id }));
+}
+
+#[test]
 fn stale_prime_auth_never_bypasses_private_model_entitlement() {
     let mut auth = auth_without_env(&serde_json::json!({
         "prime-inference": { "type": "api_key", "key": "synthetic-prime-key" }
