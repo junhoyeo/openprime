@@ -351,13 +351,19 @@ pub(crate) fn write_identity_pending(
     descriptor_path: &Path,
     session_id: &str,
     session_file: &str,
+    cwd: Option<&str>,
     moved_at: &str,
 ) -> Result<()> {
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "sessionId": session_id,
         "sessionFile": session_file,
         "movedAt": moved_at,
     });
+    // The moved-to session's directory rides along: the relaunch replays it
+    // instead of the superseded session's cwd.
+    if let Some(cwd) = cwd {
+        record["cwd"] = Value::from(cwd);
+    }
     write_file_atomic(
         &identity_pending_path(descriptor_path),
         &serde_json::to_string(&record)?,
@@ -378,6 +384,18 @@ pub(crate) fn read_identity_pending(descriptor_path: &Path) -> Option<(String, S
         session_file.to_string(),
         moved_at.to_string(),
     ))
+}
+
+/// The moved-to session's cwd a failed follow recorded with its identity
+/// (`None` when no follow is pending or the record predates the field).
+#[must_use]
+pub(crate) fn read_identity_pending_cwd(descriptor_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(identity_pending_path(descriptor_path)).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&content).ok()?;
+    record
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Remove the side record (the repair landed: the descriptor itself now
