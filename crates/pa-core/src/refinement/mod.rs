@@ -60,10 +60,12 @@ pub struct HarnessEntry {
     #[serde(rename = "arguments")]
     pub arguments: serde_json::Map<String, serde_json::Value>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// TS entries written before these fields existed omit them; TS keeps such entries.
+    #[serde(default)]
     pub source: String,
-    #[serde(rename = "created_at")]
+    #[serde(rename = "created_at", default)]
     pub created_at: String,
-    #[serde(rename = "updated_at")]
+    #[serde(rename = "updated_at", default)]
     pub updated_at: String,
     pub version: u64,
 }
@@ -89,6 +91,11 @@ pub struct HarnessState {
     /// would write random key order (and churn the file between runs).
     pub entries: BTreeMap<RefinementKind, BTreeMap<String, HarnessEntry>>,
     pub refinements: Vec<HarnessRefinementEvent>,
+    /// Stored rows this build cannot type (hand-edited or foreign shapes), by kind then id.
+    /// They are never rendered or refined; a save writes them back verbatim so a load-save
+    /// cycle never erases an entry the TS loader would have kept.
+    #[serde(skip)]
+    pub preserved_entries: BTreeMap<RefinementKind, serde_json::Map<String, serde_json::Value>>,
 }
 
 #[must_use]
@@ -105,6 +112,7 @@ pub fn empty_harness_state() -> HarnessState {
         .into_iter()
         .collect(),
         refinements: Vec::new(),
+        preserved_entries: BTreeMap::new(),
     }
 }
 
@@ -196,8 +204,14 @@ pub fn load_harness_state(harness_state_dir: &Path, scope: HarnessScope) -> Harn
             .and_then(|records| records.as_object())
         {
             for (id, raw_entry) in records {
-                let Ok(mut entry) = serde_json::from_value::<HarnessEntry>(raw_entry.clone())
+                let Ok(mut entry) =
+                    serde_json::from_value::<HarnessEntry>(normalize_stored_entry(raw_entry))
                 else {
+                    state
+                        .preserved_entries
+                        .entry(kind_key)
+                        .or_default()
+                        .insert(id.clone(), raw_entry.clone());
                     continue;
                 };
                 entry.scope = Some(entry.scope.unwrap_or(scope));
@@ -219,6 +233,34 @@ pub fn load_harness_state(harness_state_dir: &Path, scope: HarnessScope) -> Harn
             .collect();
     }
     state
+}
+
+/// TS `loadHarnessState` normalization of one stored entry: a topic-era grouping moves to
+/// `path` (`topic` is dropped), non-object records become `{}`, and an unknown scope falls
+/// back to the loading scope.
+fn normalize_stored_entry(raw_entry: &serde_json::Value) -> serde_json::Value {
+    let Some(raw) = raw_entry.as_object() else {
+        return raw_entry.clone();
+    };
+    let mut entry = raw.clone();
+    let topic = entry.remove("topic");
+    if !entry.get("path").is_some_and(serde_json::Value::is_string) {
+        if let Some(topic) = topic.filter(serde_json::Value::is_string) {
+            entry.insert("path".to_string(), topic);
+        }
+    }
+    for field in ["reference", "arguments", "metadata"] {
+        if !entry.get(field).is_some_and(serde_json::Value::is_object) {
+            entry.insert(field.to_string(), serde_json::json!({}));
+        }
+    }
+    if !matches!(
+        entry.get("scope").and_then(serde_json::Value::as_str),
+        Some("global" | "local")
+    ) {
+        entry.remove("scope");
+    }
+    serde_json::Value::Object(entry)
 }
 
 /// Merge global + local states: local ids conflict-prefixed with their scope.
@@ -282,7 +324,23 @@ pub fn save_harness_state(
 ) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(harness_state_dir)?;
     let state_path = get_harness_state_path(harness_state_dir);
-    let content = format!("{}\n", serde_json::to_string_pretty(state)?);
+    let mut document = serde_json::to_value(state)?;
+    for (kind, rows) in &state.preserved_entries {
+        let kind_name = serde_json::to_value(kind)?;
+        let Some(records) = kind_name
+            .as_str()
+            .and_then(|name| document["entries"].get_mut(name))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        for (id, row) in rows {
+            if !records.contains_key(id) {
+                records.insert(id.clone(), row.clone());
+            }
+        }
+    }
+    let content = format!("{}\n", serde_json::to_string_pretty(&document)?);
     crate::settings::storage::atomic_write_with(
         &state_path,
         &content,
