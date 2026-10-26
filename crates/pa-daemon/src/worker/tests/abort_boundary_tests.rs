@@ -794,7 +794,8 @@ async fn start_in_flight_held_turn(
         )
         .await;
     assert!(held.success, "prompt failed: {held:?}");
-    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified())
+    // Failure bound only: a load-expired bound left this turn running into the next faux test.
+    tokio::time::timeout(REFINE_TEST_BOUND, requested.notified())
         .await
         .expect("the held turn's provider request never started");
 }
@@ -1107,9 +1108,10 @@ async fn plain_abort_under_an_active_refine_parks_the_visible_queue() {
     assert_eq!(messages.data.as_ref().unwrap()["messages"], json!([]));
 }
 
-/// The failure bound of the refine abort tests' readiness waits: they wait on concrete events
-/// (the provider request, the settle frames, idle); the bound only stops a broken run, so it
-/// stays generous for a loaded machine.
+/// The failure bound of the refine abort tests' readiness waits (and the shared held-turn
+/// helper's): they wait on concrete events (the provider request, the settle frames, idle); the
+/// bound only stops a broken run, so it stays generous for a loaded machine. An expired bound
+/// leaves its faux turn running into the next faux test (the process-global provider registry).
 const REFINE_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// TS `requestAbort` cancels an in-flight `/refine` (`_refineAbortController.abort()`): a
