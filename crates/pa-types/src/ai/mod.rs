@@ -762,22 +762,44 @@ pub fn supports_service_tier_fields(
     tier == ServiceTier::Flex && eligible_id && openai_responses
 }
 
+/// Tier support from the model identity plus the allowlisted Fast-mode capability. This is the
+/// canonical predicate for consumers that carry a safe metadata projection rather than the full
+/// [`Model`] (for example the daemon connection-state boundary).
+#[must_use]
+pub fn supports_service_tier_with_fast_mode(
+    provider: &str,
+    api: &str,
+    model_id: &str,
+    supports_fast_mode: Option<bool>,
+    tier: ServiceTier,
+) -> bool {
+    if tier == ServiceTier::Priority && api == "openai-responses" {
+        if let Some(supports_fast_mode) = supports_fast_mode {
+            return supports_fast_mode;
+        }
+    }
+    supports_service_tier_fields(provider, api, model_id, tier)
+}
+
 /// TS `supportsServiceTier`: whether a provider accepts a requested service tier; the single
 /// predicate behind the `/tier` command, the settings row, and the `/fast` toggle.
 #[must_use]
 pub fn supports_service_tier(model: &Model, tier: ServiceTier) -> bool {
-    if tier == ServiceTier::Priority && model.api == "openai-responses" {
-        if let Some(compat) = model.compat.as_ref().and_then(|compat| compat.kind().ok()) {
-            return matches!(
-                compat,
-                CompatKind::OpenAiResponses(OpenAiResponsesCompat {
-                    supports_fast_mode: Some(true),
-                    ..
-                })
-            );
-        }
-    }
-    supports_service_tier_fields(&model.provider, &model.api, &model.id, tier)
+    let supports_fast_mode = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.kind().ok())
+        .and_then(|compat| match compat {
+            CompatKind::OpenAiResponses(compat) => compat.supports_fast_mode,
+            CompatKind::AnthropicMessages(_) | CompatKind::OpenAiCompletions(_) => None,
+        });
+    supports_service_tier_with_fast_mode(
+        &model.provider,
+        &model.api,
+        &model.id,
+        supports_fast_mode,
+        tier,
+    )
 }
 
 /// Clamp a requested tier to `default` when the model does not support it; an absent model clamps

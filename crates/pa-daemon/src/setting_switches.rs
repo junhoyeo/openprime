@@ -15,10 +15,29 @@ use crate::worker::Worker;
 const QUEUE_MODES: &[&str] = &["all", "one-at-a-time"];
 
 fn model_metadata_supports_service_tier(model: Option<&Value>, tier: ServiceTier) -> bool {
-    model
-        .and_then(|model| serde_json::from_value::<pa_types::ai::Model>(model.clone()).ok())
-        .is_some_and(|model| pa_types::ai::supports_service_tier(&model, tier))
-        || tier == ServiceTier::Default
+    let fallback = tier == ServiceTier::Default;
+    let Some(model) = model.and_then(Value::as_object) else {
+        return fallback;
+    };
+    let (Some(provider), Some(api), Some(model_id)) = (
+        model.get("provider").and_then(Value::as_str),
+        model.get("api").and_then(Value::as_str),
+        model.get("id").and_then(Value::as_str),
+    ) else {
+        return fallback;
+    };
+    let supports_fast_mode = match model.get("supportsFastMode") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return fallback,
+    };
+    pa_types::ai::supports_service_tier_with_fast_mode(
+        provider,
+        api,
+        model_id,
+        supports_fast_mode,
+        tier,
+    )
 }
 
 /// Whether the engine's resolved model supports `tier`; a session without
@@ -35,31 +54,29 @@ pub(crate) fn engine_supports_service_tier(
 mod service_tier_compat_tests {
     use super::*;
 
-    fn gateway_model(supports_fast_mode: bool) -> Value {
-        json!({
+    fn gateway_model(supports_fast_mode: Option<bool>) -> Value {
+        let mut model = json!({
             "id": "custom-astra",
             "name": "Custom Astra",
             "api": "openai-responses",
             "provider": "gateway",
-            "baseUrl": "http://127.0.0.1:8787/v1",
-            "reasoning": true,
-            "input": ["text"],
-            "cost": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 128_000,
-            "maxTokens": 8192,
-            "compat": {"supportsFastMode": supports_fast_mode}
-        })
+            "reasoning": true
+        });
+        if let Some(supports_fast_mode) = supports_fast_mode {
+            model["supportsFastMode"] = json!(supports_fast_mode);
+        }
+        model
     }
 
     #[test]
-    fn daemon_tier_clamp_honors_the_full_model_fast_compat() {
-        let enabled = gateway_model(true);
+    fn daemon_tier_clamp_honors_the_safe_fast_mode_capability() {
+        let enabled = gateway_model(Some(true));
         assert!(model_metadata_supports_service_tier(
             Some(&enabled),
             ServiceTier::Priority
         ));
 
-        let disabled = gateway_model(false);
+        let disabled = gateway_model(Some(false));
         assert!(!model_metadata_supports_service_tier(
             Some(&disabled),
             ServiceTier::Priority
@@ -68,11 +85,24 @@ mod service_tier_compat_tests {
             Some(&disabled),
             ServiceTier::Default
         ));
+
+        let absent = gateway_model(None);
+        assert!(!model_metadata_supports_service_tier(
+            Some(&absent),
+            ServiceTier::Priority
+        ));
     }
 
     #[test]
     fn malformed_or_missing_metadata_fails_safe_for_non_default_tiers() {
-        for metadata in [None, Some(&json!({"provider": "gateway"}))] {
+        for metadata in [
+            None,
+            Some(&json!({"provider": "gateway"})),
+            Some(&json!({
+                "provider": "openai", "api": "openai-responses", "id": "gpt-6-astra",
+                "supportsFastMode": "yes"
+            })),
+        ] {
             assert!(!model_metadata_supports_service_tier(
                 metadata,
                 ServiceTier::Priority
