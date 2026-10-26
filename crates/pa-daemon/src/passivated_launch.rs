@@ -1,6 +1,6 @@
-//! The launch contexts of idle-passivated sessions (legacy TS rows
-//! e32bce384 / 48fae2a5a / 843615757 / 837be6824): the passivation stop
-//! retires the worker's descriptor, so without this record a later wake
+//! The launch contexts of stopped sessions — idle-passivated or archived by
+//! a kill (legacy TS rows e32bce384 / 48fae2a5a / 843615757 / 837be6824):
+//! the stop retires the worker's descriptor, so without this record a later wake
 //! recreated the session from its file header alone — the header's
 //! recorded cwd (a missing directory for a transcript the user reopened
 //! with a fallback cwd), daemon-default telemetry (an opted-out client's
@@ -144,7 +144,8 @@ impl PassivatedLaunches {
     }
 
     /// Drop the record once a worker hosts the session again (any launch
-    /// over the file): the new resident's descriptor owns the context.
+    /// over the file: the new resident's descriptor owns the context), when
+    /// a passivation stop fails, or when the session is deleted.
     pub(crate) fn forget(&self, session_file: &str) {
         let _ = std::fs::remove_file(self.record_path(session_file));
     }
