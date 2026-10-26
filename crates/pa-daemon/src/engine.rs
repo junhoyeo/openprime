@@ -308,9 +308,10 @@ pub trait SessionEngine: Send + Sync {
         (None, None)
     }
 
-    /// The engine's complete resolved model as connection-state wire data.
-    /// Existing consumers project `id`/`provider`/`reasoning`; capability
-    /// consumers also need fields such as `compat` and service tiers.
+    /// The engine's safe model capability projection as connection-state
+    /// wire data: display identity/reasoning plus optional boolean
+    /// `supportsFastMode`. Never include arbitrary compat/provider config or
+    /// request secrets such as `baseUrl` credentials and model headers.
     fn model_metadata(&self) -> Option<Value> {
         None
     }

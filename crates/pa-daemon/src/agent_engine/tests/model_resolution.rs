@@ -108,58 +108,110 @@ fn create_config_flags_reach_the_engine_model_resolution() {
     );
 }
 
-#[test]
-fn model_metadata_preserves_full_resolved_model_capabilities() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let agent_dir = dir.path().join("agent");
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    let engine = AgentSessionEngine::new(AgentEngineConfig {
-        cwd: dir.path().to_path_buf(),
-        agent_dir,
-        provider: None,
-        model: None,
-        api_key: None,
-        thinking: None,
-        session_dir: None,
-        session_file: None,
-        faux_script: Some(r#"{"engine":"faux","responses":[]}"#.to_string()),
-        supervisor_link: None,
-        telemetry_disabled: None,
-        cron_store: None,
-        queued_steering_probe: None,
-    })
-    .unwrap();
-    let resolved: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
-        "id": "fast-custom",
-        "name": "Fast Custom",
-        "api": "openai-responses",
-        "provider": "gateway",
-        "baseUrl": "http://127.0.0.1:9",
-        "reasoning": true,
-        "input": ["text"],
-        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-        "contextWindow": 128000,
-        "maxTokens": 4096,
-        "compat": { "sendSessionIdHeader": true }
-    }))
-    .unwrap();
-    engine
-        .faux_model
-        .set(resolved)
-        .expect("inject resolved model once");
+#[tokio::test]
+async fn model_metadata_projects_fast_capability_without_request_secrets() {
+    let engine_for = |supports_fast_mode: Option<bool>| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let engine = AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir,
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(r#"{"engine":"faux","responses":[]}"#.to_string()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap();
+        let mut model = serde_json::json!({
+            "id": "fast-custom",
+            "name": "Fast Custom",
+            "api": "openai-responses",
+            "provider": "gateway",
+            "baseUrl": "https://user:base-url-secret@example.invalid/v1?token=query-secret",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 4096,
+            "headers": {
+                "Authorization": "Bearer authorization-secret",
+                "X-Api-Key": "x-api-key-secret",
+                "X-Custom-Secret": "custom-header-secret"
+            }
+        });
+        if let Some(supports_fast_mode) = supports_fast_mode {
+            model["compat"] = serde_json::json!({ "supportsFastMode": supports_fast_mode });
+        }
+        let resolved: pa_types::ai::Model = serde_json::from_value(model).unwrap();
+        engine
+            .faux_model
+            .set(resolved)
+            .expect("inject resolved model once");
+        let engine = std::sync::Arc::new(engine);
+        let metadata = crate::engine::SessionEngine::model_metadata(engine.as_ref())
+            .expect("resolved safe model metadata");
+        (dir, engine, metadata)
+    };
 
-    let expected = engine.resolve_model().expect("injected resolved model");
-    let metadata = crate::engine::SessionEngine::model_metadata(&engine)
-        .expect("resolved full model metadata");
-    assert_eq!(metadata["provider"], "gateway");
-    assert_eq!(metadata["id"], "fast-custom");
-    assert_eq!(metadata["contextWindow"], 128_000);
-    assert_eq!(metadata["compat"]["sendSessionIdHeader"], true);
-    let round_trip: pa_types::ai::Model =
-        serde_json::from_value(metadata).expect("metadata is a complete Model");
-    assert_eq!(round_trip, expected);
-    assert_eq!(round_trip.provider, "gateway");
-    assert_eq!(round_trip.id, "fast-custom");
+    let (dir, engine, enabled) = engine_for(Some(true));
+    assert_eq!(enabled["provider"], "gateway");
+    assert_eq!(enabled["id"], "fast-custom");
+    assert_eq!(enabled["reasoning"], true);
+    assert_eq!(enabled["supportsFastMode"], true);
+    for forbidden in ["baseUrl", "headers", "compat"] {
+        assert!(enabled.get(forbidden).is_none(), "{forbidden}: {enabled}");
+    }
+    let encoded = enabled.to_string();
+    for secret in [
+        "base-url-secret",
+        "query-secret",
+        "authorization-secret",
+        "x-api-key-secret",
+        "custom-header-secret",
+    ] {
+        assert!(
+            !encoded.contains(secret),
+            "metadata leaked {secret}: {encoded}"
+        );
+    }
+
+    // Exercise the real attach/get_connection_state projection: it must carry
+    // the exact same allowlisted object, not re-expand provider configuration.
+    let mut worker = crate::worker::Worker::new(
+        crate::worker::WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "safe-model-metadata".into(),
+            worker_instance_id: String::new(),
+            active_session_id: "safe-model-metadata".into(),
+            agent_dir: dir.path().join("worker-agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(serde_json::json!({ "responses": [] })),
+        },
+        None,
+    );
+    worker.engine = engine;
+    let state = {
+        let (core, inputs) = worker.connection_state_inputs();
+        crate::worker::Worker::connection_state_locked(&core, inputs)
+    };
+    let state = serde_json::to_value(state).unwrap();
+    assert_eq!(state["model"], enabled);
+    assert!(!state.to_string().contains("secret"));
+
+    let (_dir, _engine, disabled) = engine_for(Some(false));
+    assert_eq!(disabled["supportsFastMode"], false);
+    let (_dir, _engine, absent) = engine_for(None);
+    assert!(absent.get("supportsFastMode").is_none());
 }
 
 #[test]
