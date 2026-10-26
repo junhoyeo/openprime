@@ -437,6 +437,25 @@ pub(crate) fn build_request_headers(
     (pairs, is_oauth)
 }
 
+pub(crate) fn build_resolved_request_headers(
+    model: &Model,
+    configured_api_key: Option<String>,
+    interleaved_thinking: bool,
+    use_fine_grained_tool_streaming_beta: bool,
+    options_headers: Option<&std::collections::HashMap<String, String>>,
+    session_id: Option<&str>,
+) -> Option<(Vec<(String, String)>, bool)> {
+    let api_key = crate::models::opencode_public_api_key(model, configured_api_key)?;
+    Some(build_request_headers(
+        model,
+        &api_key,
+        interleaved_thinking,
+        use_fine_grained_tool_streaming_beta,
+        options_headers,
+        session_id,
+    ))
+}
+
 pub fn stream_simple_anthropic(
     model: &Model,
     context: &Context,

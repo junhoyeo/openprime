@@ -16,7 +16,7 @@ use crate::models::{calculate_cost, CostOverrides};
 use crate::providers::anthropic::convert::map_stop_reason;
 use crate::providers::anthropic::params::build_params;
 use crate::providers::anthropic::{
-    build_request_headers, from_claude_code_name, get_cache_control,
+    build_resolved_request_headers, from_claude_code_name, get_cache_control,
     should_use_fine_grained_tool_streaming_beta, AnthropicOptions,
 };
 use crate::types::{
@@ -194,27 +194,26 @@ async fn run_stream(
     let base_options = options
         .map(|options| options.base.clone())
         .unwrap_or_default();
-    let api_key = crate::models::opencode_public_api_key(
-        model,
-        base_options
-            .api_key
-            .clone()
-            .or_else(|| get_env_api_key(&model.provider)),
-    )
-    .unwrap_or_default();
+    let configured_api_key = base_options
+        .api_key
+        .clone()
+        .or_else(|| get_env_api_key(&model.provider));
 
     let interleaved_thinking = options
         .and_then(|options| options.interleaved_thinking)
         .unwrap_or(true);
     let use_fine_grained = should_use_fine_grained_tool_streaming_beta(model, context);
-    let (headers, is_oauth) = build_request_headers(
+    let (headers, is_oauth) = build_resolved_request_headers(
         model,
-        &api_key,
+        configured_api_key,
         interleaved_thinking,
         use_fine_grained,
         base_options.headers.as_ref(),
         base_options.session_id.as_deref(),
-    );
+    )
+    .ok_or_else(|| {
+        ProviderError::Message(format!("No API key for provider: {}", model.provider))
+    })?;
 
     let (_retention, cache_control) = get_cache_control(model, base_options.cache_retention);
     let uses_anthropic_cache_pricing = has_standard_anthropic_cache_pricing(model);

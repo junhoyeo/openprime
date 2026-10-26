@@ -14,7 +14,7 @@ use crate::event_stream::{
 use crate::providers::openai_completions::convert::{map_stop_reason, parse_chunk_usage};
 use crate::providers::openai_completions::errors::{openai_http_error, openrouter_raw_metadata};
 use crate::providers::openai_completions::get_compat_cache_control;
-use crate::providers::openai_completions::params::{build_headers, build_params};
+use crate::providers::openai_completions::params::{build_params, build_resolved_headers};
 use crate::providers::openai_completions::{
     encode_reasoning_details, get_compat, resolve_cache_retention, OpenAICompletionsOptions,
     REASONING_FIELDS,
@@ -544,14 +544,10 @@ async fn run_stream(
     let base_options = options
         .map(|options| options.base.clone())
         .unwrap_or_default();
-    let api_key = crate::models::opencode_public_api_key(
-        model,
-        base_options
-            .api_key
-            .clone()
-            .or_else(|| get_env_api_key(&model.provider)),
-    )
-    .unwrap_or_default();
+    let configured_api_key = base_options
+        .api_key
+        .clone()
+        .or_else(|| get_env_api_key(&model.provider));
     let compat = get_compat(model);
     let cache_retention = resolve_cache_retention(base_options.cache_retention);
     let cache_control = get_compat_cache_control(&compat, cache_retention);
@@ -590,14 +586,17 @@ async fn run_stream(
     }
 
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
-    let headers = build_headers(
+    let headers = build_resolved_headers(
         model,
-        &api_key,
+        configured_api_key,
         base_options.headers.as_ref(),
         cache_session_id.as_deref(),
         &compat,
         base_options.session_id.as_deref(),
-    );
+    )
+    .ok_or_else(|| {
+        ProviderError::Message(format!("No API key for provider: {}", model.provider))
+    })?;
 
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
