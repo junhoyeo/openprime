@@ -979,19 +979,28 @@ impl Supervisor {
             .map_or_else(|| "/".to_string(), |info| info.cwd);
         // The identity rides `config.rlmDepth` + `runtime_metadata.rlmChildId` —
         // the keys launch_worker copies into the DURABLE create command's rest.
-        let create = DaemonCommand::Create {
-            id: None,
-            session_path: Some(session_file.clone()),
-            continue_recent: Some(false),
-            no_session: None,
-            name: None,
-            config: Some(json!({ "cwd": cwd, "rlmDepth": depth })),
-            telemetry_disabled: None,
-            runtime_metadata: Some(json!({ "rlmChildId": child_id })),
-            lifecycle: None,
-            env: None,
-            launch_env: None,
-            rest: serde_json::Map::default(),
+        // A passivated session replays its opened-with launch context (see
+        // `passivated_launch`); the header cwd is the no-record fallback.
+        let create = match self.passivated_launches.get(&session_file) {
+            Some(launch) => launch.wake_create(
+                &session_file,
+                depth,
+                Some(json!({ "rlmChildId": child_id })),
+            ),
+            None => DaemonCommand::Create {
+                id: None,
+                session_path: Some(session_file.clone()),
+                continue_recent: Some(false),
+                no_session: None,
+                name: None,
+                config: Some(json!({ "cwd": cwd, "rlmDepth": depth })),
+                telemetry_disabled: None,
+                runtime_metadata: Some(json!({ "rlmChildId": child_id })),
+                lifecycle: None,
+                env: None,
+                launch_env: None,
+                rest: serde_json::Map::default(),
+            },
         };
         // Reuse before launching (TS `createOrReuseWorker`): a concurrent revival
         // may already host the file.

@@ -1,0 +1,528 @@
+//! Revival launch-context e2e: a session the daemon brings back after its
+//! worker went away — the idle-passivation wake on a client prompt or
+//! attach — runs with the launch context it was opened with, never with
+//! daemon defaults. Legacy TS parity rows, one invariant per test:
+//!
+//! - b2bb37bb2 / 48fae2a5a / 843615757 / 837be6824 (+ 502e7a496): a
+//!   transcript opened with an explicit fallback cwd (its recorded
+//!   directory is missing) revives in that fallback instead of dead-ending;
+//! - e32bce384 (+ 837be6824): the opened-with runtime config (system prompt
+//!   append, telemetry opt-out) survives the wake, so an opted-out client
+//!   can still attach and the revived worker never reports telemetry.
+// Stack-resident futures by design on the daemon's hot paths.
+#![allow(clippy::large_futures)]
+// Narrowing casts sit at OS boundaries (pid/fd/time/size) where the kernel
+// bounds the values.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+// Style gate only, not correctness: each scenario is one linear script.
+#![allow(clippy::too_many_lines)]
+#![cfg(unix)]
+
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+struct Daemon {
+    child: Child,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A loopback OpenAI-compatible provider answering every turn with `answer`.
+fn spawn_mock(answer: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let url = format!(
+        "http://127.0.0.1:{}/v1",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let _ = serve(stream, answer);
+            });
+        }
+    });
+    url
+}
+
+fn chunk(delta: &Value, finish_reason: Option<&str>) -> String {
+    json!({
+        "id": "chatcmpl-revival",
+        "object": "chat.completion.chunk",
+        "created": 1_750_000_000,
+        "model": "mock-1",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    })
+    .to_string()
+}
+
+fn serve(mut stream: TcpStream, answer: &str) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        if line == "\r\n" {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            content_length = value.trim().parse().unwrap_or_default();
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    let mut payload = String::new();
+    for data in [
+        chunk(&json!({"role": "assistant", "content": answer}), None),
+        chunk(&json!({}), Some("stop")),
+    ] {
+        write!(payload, "data: {data}\n\n").expect("write to String");
+    }
+    payload.push_str("data: [DONE]\n\n");
+    stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{payload}"
+        )
+        .as_bytes(),
+    )
+}
+
+/// The isolated agent dir: the loopback provider and the idle-eviction
+/// threshold the supervisor's passivation fence re-reads.
+fn agent_dir_with_mock(root: &Path) -> PathBuf {
+    let agent_dir = root.join("agent");
+    std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
+    let url = spawn_mock("revived reply");
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({
+            "providers": {
+                "prime-inference": {
+                    "api": "openai-completions",
+                    "baseUrl": url,
+                    "apiKey": "sk-revival",
+                    "models": [{
+                        "id": "mock-1",
+                        "name": "Mock 1",
+                        "api": "openai-completions",
+                        "contextWindow": 128_000,
+                        "maxTokens": 4096
+                    }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write models.json");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "idleEvictionMinutes": 1 }).to_string(),
+    )
+    .expect("write settings.json");
+    agent_dir
+}
+
+#[allow(clippy::zombie_processes)] // the timeout path exits the test process
+fn spawn_daemon(socket: &Path, agent_dir: &Path) -> Daemon {
+    let child = Command::new(env!("CARGO_BIN_EXE_pa-daemon"))
+        .arg("supervisor")
+        .arg("--socket")
+        .arg(socket)
+        .arg("--agent-dir")
+        .arg(agent_dir)
+        // The test owns its agent dir: an ambient session-dir override would
+        // point the saved-session catalog the wake resolves through elsewhere.
+        .env_remove("PRIME_AGENT_SESSION_DIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // A supervisor killed at teardown must not leak its session workers
+        // into later test binaries.
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
+        .spawn()
+        .expect("spawn pa-daemon supervisor");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if socket.exists() {
+            return Daemon { child };
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("supervisor socket never appeared");
+}
+
+struct Client {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Client {
+    fn connect(socket: &Path) -> Self {
+        let stream = UnixStream::connect(socket).expect("connect supervisor");
+        let writer = stream.try_clone().expect("clone socket");
+        let mut client = Client {
+            reader: BufReader::new(stream),
+            writer,
+        };
+        let hello = client.read_line();
+        assert_eq!(hello["type"], "daemon_hello", "{hello}");
+        client
+    }
+
+    fn send_command(&mut self, id: &str, command: &Value) {
+        let envelope = json!({
+            "type": "command",
+            "id": id,
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "command": command,
+        });
+        let mut line = serde_json::to_string(&envelope).expect("serialize command");
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).expect("send");
+        self.writer.flush().expect("flush");
+    }
+
+    fn read_line(&mut self) -> Value {
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        self.reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set timeout");
+        loop {
+            match self.reader.read_line(&mut line) {
+                Ok(0) => panic!("supervisor closed the connection"),
+                Ok(_) if line.trim().is_empty() => line.clear(),
+                Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for supervisor line: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn request(&mut self, id: &str, command: &Value) -> Value {
+        self.send_command(id, command);
+        loop {
+            let line = self.read_line();
+            if line.get("id").and_then(Value::as_str) == Some(id) && line["type"] == "response" {
+                return line;
+            }
+        }
+    }
+
+    /// The worker's real working directory, through the user-bash surface.
+    fn pwd(&mut self, id: &str, active_session_id: &str) -> Value {
+        self.request(
+            id,
+            &json!({
+                "type": "execute_bash_and_wait",
+                "activeSessionId": active_session_id,
+                "command": "pwd -P",
+            }),
+        )
+    }
+
+    /// The live row hosting `session_id`, once one is registered.
+    fn live_active_id(&mut self, id: &str, session_id: &str) -> Option<String> {
+        let list = self.request(id, &json!({ "type": "list" }));
+        list["data"]["sessions"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| row["sessionId"].as_str() == Some(session_id))
+                .and_then(|row| {
+                    row["activeSessionId"]
+                        .as_str()
+                        .or_else(|| row["id"].as_str())
+                })
+                .map(str::to_string)
+        })
+    }
+}
+
+fn canonical(path: &Path) -> String {
+    path.canonicalize()
+        .expect("canonical dir")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn pwd_output(response: &Value) -> String {
+    assert_eq!(response["success"], true, "pwd failed: {response}");
+    response["data"]["output"]
+        .as_str()
+        .expect("bash output")
+        .trim()
+        .to_string()
+}
+
+/// One persisted worker descriptor field (token or pid) by active id.
+fn descriptor_field(agent_dir: &Path, active_session_id: &str, field: &str) -> Option<Value> {
+    let instances = std::fs::read_dir(agent_dir.join("daemon-workers")).ok()?;
+    for instance in instances.flatten() {
+        let path = instance.path().join(format!("{active_session_id}.json"));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(descriptor) = serde_json::from_str::<Value>(&content) {
+            if let Some(value) = descriptor.get(field) {
+                return Some(value.clone());
+            }
+        }
+    }
+    None
+}
+
+/// The product's idle passivation ask (the worker-side clock and gates are
+/// unit-covered): the worker's own token drives the supervisor's graceful
+/// stop, leaving only the saved file and the passive roster row.
+fn passivate(client: &mut Client, agent_dir: &Path, active_session_id: &str, id: &str) {
+    let token = descriptor_field(agent_dir, active_session_id, "authenticationToken")
+        .and_then(|token| token.as_str().map(str::to_string))
+        .expect("the worker's token");
+    let response = client.request(
+        id,
+        &json!({
+            "type": "worker_idle_passivation",
+            "workerToken": token,
+            "idleMinutes": 1,
+        }),
+    );
+    assert_eq!(response["success"], true, "passivation failed: {response}");
+    let list = client.request(&format!("{id}-list"), &json!({ "type": "list" }));
+    assert_eq!(
+        list["data"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "the passivated worker left the live list: {list}"
+    );
+}
+
+/// A saved transcript whose recorded directory no longer exists.
+fn write_missing_cwd_transcript(sessions: &Path, gone: &Path) -> PathBuf {
+    let saved = sessions.join("missing-cwd.jsonl");
+    std::fs::write(
+        &saved,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session", "version": 3, "id": "missing-cwd-session",
+                "timestamp": "2026-10-12T00:00:00.000Z", "cwd": gone,
+            })
+        ),
+    )
+    .expect("write saved transcript");
+    saved
+}
+
+/// Rows b2bb37bb2 / 48fae2a5a / 843615757 / 837be6824 (+ 502e7a496): a
+/// transcript that only opened because the user chose a fallback cwd for its
+/// missing recorded directory keeps that fallback when the daemon revives
+/// it — through the stale-id prompt (the attached window's next keystroke)
+/// and through the attach-by-durable-id rebind — instead of dead-ending on
+/// the missing directory.
+#[test]
+fn a_fallback_cwd_session_revives_in_its_fallback_after_idle_passivation() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let fallback = dir.path().join("fallback");
+    std::fs::create_dir_all(&fallback).expect("fallback dir");
+    let saved = write_missing_cwd_transcript(&sessions, &dir.path().join("gone"));
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "sessionPath": saved,
+            "config": {
+                "cwd": fallback,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "fallback open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = client.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    assert_eq!(
+        pwd_output(&client.pwd("pwd-1", &active)),
+        canonical(&fallback)
+    );
+
+    // The window's next prompt targets the id it holds. The passivated
+    // worker's 12-hex id is not durable, so the daemon answers the exact
+    // unknown-session refusal the TUI's one-shot rebind keys on
+    // (`session_ui/prompt.rs`): the window re-attaches by the DURABLE
+    // session id and replays the prompt once.
+    passivate(&mut client, &agent_dir, &active, "passivate-1");
+    let stale = client.request(
+        "turn-stale",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "after idle" }),
+    );
+    assert_eq!(
+        stale["error"],
+        format!("Unknown active session: {active}"),
+        "the stale id answers the rebind trigger: {stale}"
+    );
+    for round in 0..2 {
+        let attached = client.request(
+            &format!("attach-durable-{round}"),
+            &json!({ "type": "attach", "activeSessionId": session_id }),
+        );
+        assert_eq!(
+            attached["success"], true,
+            "the durable-id attach must revive the session instead of dead-ending: {attached}"
+        );
+        let woken = client
+            .live_active_id(&format!("list-{round}"), &session_id)
+            .expect("the revived session is live");
+        let replayed = client.request(
+            &format!("turn-replay-{round}"),
+            &json!({ "type": "prompt_and_wait", "activeSessionId": woken, "message": "after idle" }),
+        );
+        assert_eq!(
+            replayed["success"], true,
+            "the replayed prompt runs: {replayed}"
+        );
+        assert_eq!(
+            pwd_output(&client.pwd(&format!("pwd-revived-{round}"), &woken)),
+            canonical(&fallback),
+            "the revival must reuse the fallback the session was opened with"
+        );
+        // A second idle cycle: the revived worker's own record keeps the fallback.
+        client.request(
+            &format!("detach-{round}"),
+            &json!({ "type": "detach", "activeSessionId": woken }),
+        );
+        passivate(
+            &mut client,
+            &agent_dir,
+            &woken,
+            &format!("passivate-again-{round}"),
+        );
+    }
+}
+
+/// Row e32bce384 (+ 837be6824): the revival recreates the session with the
+/// runtime config it was opened with, not daemon defaults — the opened-with
+/// system-prompt append still shapes the prompt, and the telemetry opt-out
+/// survives, so the opted-out client's re-attach is admitted.
+#[test]
+fn a_passivated_session_revives_with_its_opened_runtime_config() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let marker = "REVIVAL_LAUNCH_CONTEXT_MARKER";
+
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "telemetryDisabled": true,
+            "config": {
+                "cwd": project,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+                "appendSystemPrompt": [marker],
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = client.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    let prompt = client.request(
+        "system-1",
+        &json!({ "type": "get_system_prompt", "activeSessionId": active }),
+    );
+    assert!(
+        prompt["data"]["systemPrompt"]
+            .as_str()
+            .is_some_and(|text| text.contains(marker)),
+        "the probe sees the opened-with append: {prompt}"
+    );
+
+    passivate(&mut client, &agent_dir, &active, "passivate");
+    // The opted-out window's rebind attach by the durable id (the TUI sends
+    // its opt-out on every attach): the woken worker must carry the same
+    // opt-out, or the daemon refuses the attach after launching a worker
+    // that reports telemetry the user refused.
+    let attached = client.request(
+        "attach",
+        &json!({ "type": "attach", "activeSessionId": session_id, "telemetryDisabled": true }),
+    );
+    assert_eq!(
+        attached["success"], true,
+        "the telemetry opt-out must survive the revival: {attached}"
+    );
+    let woken = client
+        .live_active_id("list", &session_id)
+        .expect("the revived session is live");
+    let prompt = client.request(
+        "system-2",
+        &json!({ "type": "get_system_prompt", "activeSessionId": woken }),
+    );
+    assert!(
+        prompt["data"]["systemPrompt"]
+            .as_str()
+            .is_some_and(|text| text.contains(marker)),
+        "the revival must keep the opened-with system prompt append: {prompt}"
+    );
+}
