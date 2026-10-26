@@ -651,7 +651,6 @@ mod tests {
     fn malformed_immutable_pointer_is_never_replaced_or_duplicated() {
         let (_temp, core, registry) = fixture();
         let parent_path = core.lock().unwrap().store.as_ref().unwrap().path.clone();
-        use std::io::Write as _;
         let malformed = json!({
             "type":"custom", "id":"bad", "parentId":null,
             "timestamp":"2026-08-16T00:00:00.000Z",

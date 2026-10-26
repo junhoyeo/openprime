@@ -118,6 +118,8 @@ pub(super) fn bounded_stderr_tail(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::{bounded_stderr_tail, sanitize_bootstrap_diagnostic};
 
     #[test]
@@ -157,7 +159,7 @@ mod tests {
     fn bootstrap_diagnostic_bounds_after_sanitizing_the_retained_tail() {
         let mut input = String::from("Bearer discarded-secret\n");
         for index in 0..40 {
-            input.push_str(&format!("diagnostic-{index:02} {}\n", "x".repeat(120)));
+            let _ = writeln!(input, "diagnostic-{index:02} {}", "x".repeat(120));
         }
         input.push_str("client_secret=tail-secret\nsentinel-newest-line\n");
         let tail = bounded_stderr_tail(&input, false, &[]);
