@@ -7,6 +7,19 @@ check:
 	cargo build --release --workspace
 
 
+# Hermetic local gates (AGENTS.md, Tests): env -i, a synthetic HOME under /tmp, an
+# explicit test kernel interpreter (KERNEL_PYTHON or PA_E2E_KERNEL_PYTHON), and no
+# outbound network except loopback on macOS. Use these on a machine with Prime installed.
+HERMETIC = python3 scripts/hermetic_test.py $(if $(KERNEL_PYTHON),--kernel-python $(KERNEL_PYTHON))
+
+test-hermetic:
+	$(HERMETIC) -- cargo test --workspace
+
+check-hermetic:
+	$(HERMETIC) -- $(MAKE) check
+
+.PHONY: test-hermetic check-hermetic
+
 # Supply-chain gates — local mirrors of the
 # ci.yml workflow jobs. They fail loudly when the tool is missing instead of
 # silently skipping the gate.

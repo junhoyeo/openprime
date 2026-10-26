@@ -79,6 +79,15 @@ Every contributor (human or agent) must read this before working on this repo.
 - Tests must wait for observable readiness, not fixed sleeps or retry-to-green loops. If a
   test must be disabled, give a reason at the test. Use isolated ports and temporary paths, and
   restore shared state. Run focused tests when changing their behavior.
+- On a machine with a live Prime Agent install, run tests and gates through
+  `scripts/hermetic_test.py` (`make test-hermetic`, `make check-hermetic`). Never run a plain
+  `cargo test` there. `kernel_venv_dir` resolves from `HOME`, and many e2e helpers fall back to
+  `$HOME/.prime/agent/kernel-venv/bin/python` when `PA_E2E_KERNEL_PYTHON` is unset. With the real
+  `HOME`, a test run can start or rebuild the live kernel venv and write live agent state. The
+  wrapper uses `env -i`, a fresh `/tmp` root (synthetic `HOME`/`TMPDIR`/XDG and
+  `PRIME_AGENT_KERNEL_VENV`), an explicit test kernel interpreter (`--kernel-python` or
+  `PA_E2E_KERNEL_PYTHON`, never one under the live `~/.prime`), and, on macOS, a sandbox that
+  denies outbound network except loopback. It then reports any surviving test process.
 
 ## Lint discipline
 
