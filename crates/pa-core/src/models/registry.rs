@@ -250,8 +250,8 @@ impl ModelRegistry {
     }
 
     /// Whether an explicit user selection can serve this model. This is deliberately wider than
-    /// [`ModelRegistry::has_configured_auth`] only for zero-cost OpenCode Zen models, which use
-    /// OpenCode's public credential. Automatic discovery and cycling must keep using the narrower
+    /// [`ModelRegistry::has_configured_auth`] only for zero-cost `OpenCode` Zen models, which use
+    /// `OpenCode`'s public credential. Automatic discovery and cycling must keep using the narrower
     /// configured-auth predicate.
     #[must_use]
     pub fn is_explicitly_selectable(&self, model: &Model) -> bool {
