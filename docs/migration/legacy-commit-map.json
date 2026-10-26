@@ -57,7 +57,10 @@
       "BLOCKED"
     ],
     "migration_status_counts": {
-      "BLOCKED": 99
+      "ported": 8,
+      "BLOCKED": 85,
+      "truly-obsolete": 2,
+      "verified-upstream-equivalent": 4
     },
     "classification_policy": "Inventory disposition and verification outcome are separate. Every row remains BLOCKED until its focused lane verifier and integrated-tip acceptance pass; confidence alone never proves parity. Proposed final statuses are review candidates, not acceptance claims.",
     "revision": "r2 (2026-10-26): behavioral-acceptance note, lane disproofs, PR row updates; dispositions unchanged from lead-integrated copy except notes",
@@ -96,12 +99,21 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "15dad6468",
+        "1f067ceaa"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "c9e679576470170db4ce10d2777b9607476eaf8f",
@@ -157,12 +169,22 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "15dad6468",
+        "46d96d506",
+        "1f067ceaa"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "e29b02f94f466bf4b01c204bee281479a6ceb0dc",
@@ -198,12 +220,22 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "15dad6468",
+        "46d96d506",
+        "1f067ceaa"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "3307acb13ea32f64b8c65a5c37892793830c5337",
@@ -266,12 +298,18 @@
       ],
       "port_target": null,
       "notes": "TS bundled-catalog build mechanism deleted; custom-model lane = models.json.",
-      "migration_status": "BLOCKED",
+      "migration_status": "truly-obsolete",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "accepted obsolete after catalog/runtime mechanism inspection; no behavior reimplementation required"
     },
     {
       "hash": "eeddaf136e22ea5caf1baafa12d020f40fe90c31",
@@ -542,12 +580,21 @@
       ],
       "port_target": "crates/pa-core/src/models/{registry.rs,resolver.rs,allowlist.rs} + crates/pa-daemon/src/agent_engine (set_model)",
       "notes": "PR #30 cluster: explicitly selected zero-cost Zen model runs keyless; zero-cost models hidden from auto-available list; daemon set_model falls back to registered lookup.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "15dad6468",
+        "1f067ceaa"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "e61a6ff412d8e1b6151ff6e36509898c4c776a09",
@@ -581,12 +628,20 @@
       ],
       "port_target": "crates/pa-ai/src/providers/opencode_headers.rs + providers/anthropic + env_api_keys.rs",
       "notes": "Only needed if keyless zen use is still wanted; check current zen free model (big-pickle) accepts CLI identity/public key.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "46d96d506"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "a2c88fa285e0739c67aa0e8195177c071e355dd8",
@@ -615,12 +670,18 @@
       ],
       "port_target": null,
       "notes": "union-alpha retired; generic zen capability covered; keyless semantics tracked in PR #30 cluster.",
-      "migration_status": "BLOCKED",
+      "migration_status": "truly-obsolete",
       "port_commits": [],
-      "integration_evidence": [],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
       "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "accepted obsolete after catalog/runtime mechanism inspection; no behavior reimplementation required"
     },
     {
       "hash": "3dd5fe46af5f867267d990c2e7e313408d1364fe",
@@ -643,12 +704,20 @@
       ],
       "port_target": null,
       "notes": "Opus 5.5 served by live remote catalog (pa-models fetch, frozen URL contract).",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "verified-upstream-equivalent",
+      "port_commits": [
+        "931483e24"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "8b5ec62f8d33ca1609b4e704d40f5586ee76ebd0",
@@ -678,12 +747,21 @@
       ],
       "port_target": "crates/pa-core/src/auth/manager.rs",
       "notes": "ai-gateway outages must not wipe stored credentials. Needs a targeted Rust-side test before deciding port vs covered.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "verified-upstream-equivalent",
+      "port_commits": [
+        "3ebdd4e3e",
+        "7cbe23190"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "verified-upstream-equivalent",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "0e87bcc3e83378193b58ba0e7aa2ab2d62f1c784",
@@ -722,12 +800,21 @@
       ],
       "port_target": null,
       "notes": "Model + Fast mode both upstream (service tiers #2144).",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "verified-upstream-equivalent",
+      "port_commits": [
+        "931483e24",
+        "051d5974e"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "ee7c91d058b23d289212a70953028cbd7972cc1a",
@@ -887,12 +974,21 @@
       ],
       "port_target": "crates/pa-core/src/settings/types.rs + session_engine/auto_retry.rs",
       "notes": "Port retry.maxBackoffMs semantics (cap exponential backoff) if absent.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "85eb18791",
+        "695e39738"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "6567e228f01d14ab68307093151c2551ab541245",
@@ -1208,12 +1304,20 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS docs page deleted upstream.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "verified-upstream-equivalent",
+      "port_commits": [
+        "051d5974e"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
-      "proposed_final_status": "truly-obsolete",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "verified-upstream-equivalent",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "41f5a313d7bf248c6f4d10787cf54d19a924287c",
@@ -1246,11 +1350,20 @@
       "port_target": "crates/pa-core/src/models/custom.rs",
       "notes": "ai-gateway custom models need a models.json knob mapping to service-tier support; verify before porting.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3e2c5680b",
+        "6a197687a"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "consumer port integrated, but full-model metadata producer regression from session lane is still required before acceptance"
     },
     {
       "hash": "bd15cf317348b8e963463e3f774f0e7e12d8766f",
@@ -1279,11 +1392,20 @@
       "port_target": null,
       "notes": "Verify responses provider forwards service_tier.",
       "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "port_commits": [
+        "3e2c5680b",
+        "6a197687a"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "consumer port integrated, but full-model metadata producer regression from session lane is still required before acceptance"
     },
     {
       "hash": "d13151be6a8368cdcd4e27a4d85436c02d3fdb71",
@@ -1745,12 +1867,21 @@
       "evidence": [],
       "port_target": "pa-ai tests",
       "notes": "Test companion of 4fa2ead97.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "7e84b0507",
+        "0ed7312f1"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "4fa2ead9703978cdf8a77a7c94ac335404cbc5f0",
@@ -1781,12 +1912,21 @@
       ],
       "port_target": "crates/pa-ai/src/providers/transform_messages.rs",
       "notes": "Owner already porting interrupted ordering.",
-      "migration_status": "BLOCKED",
-      "port_commits": [],
-      "integration_evidence": [],
+      "migration_status": "ported",
+      "port_commits": [
+        "7e84b0507",
+        "0ed7312f1"
+      ],
+      "integration_evidence": [
+        {
+          "kind": "integrated-provider-lane",
+          "ref": "origin/port/rust-providers@befb4c26a4c9bfe0d7b3aa86dc1bb18224108b9c",
+          "note": "Adversarial findings fixed; exact-tip fmt, affected-crate clippy -D warnings, focused tests, and isolated daemon auth byte-preservation e2e passed. Integrated provider-owned paths byte-match the tested branch."
+        }
+      ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
+      "proposed_final_status": "ported",
+      "verification_outcome": "accepted from tested provider lane and byte-identical integration of owned paths"
     },
     {
       "hash": "d5bc1eedca9a324c46684e61565f9bb4fa15c6a5",
