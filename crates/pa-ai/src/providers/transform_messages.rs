@@ -162,7 +162,12 @@ pub fn transform_messages_with_normalizer(
     model: &Model,
     normalize_tool_call_id: &Normalizer<'_>,
 ) -> Vec<Message> {
-    let mut tool_call_id_map: HashMap<String, String> = HashMap::new();
+    // Raw-id ownership is resolved before normalization. A positional tool result can only inherit
+    // the normalized id of its owning assistant epoch; it never takes the most recent global map.
+    let mut pending_raw_calls: Vec<(String, String, String)> = Vec::new();
+    let mut unresolved_raw_calls: Vec<(String, String, String)> = Vec::new();
+    let mut normalized_id_owners: HashMap<String, String> = HashMap::new();
+    let mut colliding_normalized_ids: HashSet<String> = HashSet::new();
     let image_aware = downgrade_unsupported_images(messages, model);
 
     // `None` marks a dropped unnamed-only assistant turn: it still ends the previous turn's pending
@@ -172,10 +177,39 @@ pub fn transform_messages_with_normalizer(
         .map(|msg| match msg {
             Message::User(_) => Some(msg.clone()),
             Message::ToolResult(tool_result) => {
-                if let Some(normalized) = tool_call_id_map.get(&tool_result.tool_call_id) {
-                    if normalized != &tool_result.tool_call_id {
+                let owns_result = |call: &(String, String, String)| {
+                    call.0 == tool_result.tool_call_id
+                        && (tool_result.tool_name.is_empty()
+                            || call.1.is_empty()
+                            || call.1 == tool_result.tool_name)
+                };
+                if let Some(index) = pending_raw_calls.iter().position(owns_result) {
+                    if unresolved_raw_calls.iter().any(owns_result) {
+                        // The same raw id/name is unresolved in an earlier assistant epoch. The
+                        // wire has no provenance to distinguish the late result from the current
+                        // one, so preserve it unmatched and synthesize the current result later.
+                        return Some(msg.clone());
+                    }
+                    let (_, _, normalized) = pending_raw_calls.remove(index);
+                    if normalized != tool_result.tool_call_id {
                         return Some(Message::ToolResult(ToolResultMessage {
-                            tool_call_id: normalized.clone(),
+                            tool_call_id: normalized,
+                            ..tool_result.clone()
+                        }));
+                    }
+                    return Some(msg.clone());
+                }
+
+                let candidates: HashSet<&str> = unresolved_raw_calls
+                    .iter()
+                    .filter(|call| owns_result(call))
+                    .map(|call| call.2.as_str())
+                    .collect();
+                if candidates.len() == 1 {
+                    let normalized = candidates.iter().next().expect("one candidate");
+                    if *normalized != tool_result.tool_call_id {
+                        return Some(Message::ToolResult(ToolResultMessage {
+                            tool_call_id: (*normalized).to_string(),
                             ..tool_result.clone()
                         }));
                     }
@@ -183,6 +217,11 @@ pub fn transform_messages_with_normalizer(
                 Some(msg.clone())
             }
             Message::Assistant(assistant) => {
+                unresolved_raw_calls.extend(pending_raw_calls.drain(..));
+                let tracks_tool_calls = !matches!(
+                    assistant.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                );
                 let is_same_model = assistant.provider == model.provider
                     && assistant.api == model.api
                     && assistant.model == model.id;
@@ -230,12 +269,25 @@ pub fn transform_messages_with_normalizer(
                                 if let Some(normalizer) =
                                     normalize_tool_call_id(&tool_call.id, model, assistant)
                                 {
-                                    if normalizer != tool_call.id {
-                                        tool_call_id_map
-                                            .insert(tool_call.id.clone(), normalizer.clone());
-                                        normalized.id = normalizer;
-                                    }
+                                    normalized.id = normalizer;
                                 }
+                            }
+                            if tracks_tool_calls {
+                                match normalized_id_owners.get(&normalized.id) {
+                                    Some(owner) if owner != &tool_call.id => {
+                                        colliding_normalized_ids.insert(normalized.id.clone());
+                                    }
+                                    None => {
+                                        normalized_id_owners
+                                            .insert(normalized.id.clone(), tool_call.id.clone());
+                                    }
+                                    Some(_) => {}
+                                }
+                                pending_raw_calls.push((
+                                    tool_call.id.clone(),
+                                    tool_call.name.clone(),
+                                    normalized.id.clone(),
+                                ));
                             }
                             vec![AssistantContent::ToolCall(normalized)]
                         }
@@ -348,8 +400,9 @@ pub fn transform_messages_with_normalizer(
                     ambiguous_tool_calls = tool_calls
                         .iter()
                         .filter(|tool_call| {
-                            unresolved_tool_calls
-                                .contains(&(tool_call.id.clone(), tool_call.name.clone()))
+                            colliding_normalized_ids.contains(&tool_call.id)
+                                || unresolved_tool_calls
+                                    .contains(&(tool_call.id.clone(), tool_call.name.clone()))
                         })
                         .map(|tool_call| (tool_call.id.clone(), tool_call.name.clone()))
                         .collect();
@@ -746,6 +799,210 @@ mod tests {
     }
 
     #[test]
+    fn cross_model_normalization_keeps_reused_raw_ids_epoch_ambiguous() {
+        let mut first = assistant(
+            vec![tool_call("raw-reused", "same-tool")],
+            StopReason::ToolUse,
+        );
+        first.model = "source-a".into();
+        let mut second = assistant(
+            vec![tool_call("raw-reused", "same-tool")],
+            StopReason::ToolUse,
+        );
+        second.model = "source-b".into();
+        let messages = vec![
+            Message::Assistant(first),
+            user("interrupt"),
+            Message::Assistant(second),
+            tool_result("raw-reused", "same-tool", "late-first-result"),
+            tool_result("raw-reused", "same-tool", "claimed-second-result"),
+        ];
+        let normalize = |id: &str, _model: &Model, assistant: &AssistantMessage| {
+            Some(match (id, assistant.model.as_str()) {
+                ("raw-reused", "source-a") => "normalized-a".to_string(),
+                ("raw-reused", "source-b") => "normalized-b".to_string(),
+                _ => id.to_string(),
+            })
+        };
+
+        let repaired = transform_messages_with_normalizer(&messages, &test_model(), &normalize);
+        let results = repaired
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_call_id, "normalized-a");
+        assert_eq!(results[1].tool_call_id, "normalized-b");
+        assert!(results.iter().all(|result| matches!(
+            &result.content[0],
+            UserOrToolContent::Text(text) if text.text == "No result provided"
+        )));
+        assert_eq!(
+            transform_messages_with_normalizer(&repaired, &test_model(), &normalize),
+            repaired
+        );
+    }
+
+    #[test]
+    fn cross_model_normalization_assigns_distinct_names_to_their_raw_epochs() {
+        let mut first = assistant(
+            vec![tool_call("raw-reused", "first-tool")],
+            StopReason::ToolUse,
+        );
+        first.model = "source-a".into();
+        let mut second = assistant(
+            vec![tool_call("raw-reused", "second-tool")],
+            StopReason::ToolUse,
+        );
+        second.model = "source-b".into();
+        let messages = vec![
+            Message::Assistant(first),
+            user("interrupt"),
+            Message::Assistant(second),
+            tool_result("raw-reused", "first-tool", "late-first"),
+            tool_result("raw-reused", "second-tool", "real-second"),
+        ];
+        let normalize = |id: &str, _model: &Model, assistant: &AssistantMessage| {
+            Some(match (id, assistant.model.as_str()) {
+                ("raw-reused", "source-a") => "normalized-a".to_string(),
+                ("raw-reused", "source-b") => "normalized-b".to_string(),
+                _ => id.to_string(),
+            })
+        };
+        let repaired = transform_messages_with_normalizer(&messages, &test_model(), &normalize);
+        assert!(repaired.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if result.tool_call_id == "normalized-a"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
+        )));
+        assert!(repaired.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if result.tool_call_id == "normalized-b"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "real-second")
+        )));
+        assert!(!repaired.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "late-first")
+        )));
+    }
+
+    #[test]
+    fn cross_model_normalization_with_missing_current_result_fails_closed() {
+        let mut first = assistant(
+            vec![tool_call("raw-reused", "same-tool")],
+            StopReason::ToolUse,
+        );
+        first.model = "source-a".into();
+        let mut second = assistant(
+            vec![tool_call("raw-reused", "same-tool")],
+            StopReason::ToolUse,
+        );
+        second.model = "source-b".into();
+        let messages = vec![
+            Message::Assistant(first),
+            user("interrupt"),
+            Message::Assistant(second),
+            tool_result("raw-reused", "same-tool", "late-first"),
+        ];
+        let normalize = |id: &str, _model: &Model, assistant: &AssistantMessage| {
+            Some(match (id, assistant.model.as_str()) {
+                ("raw-reused", "source-a") => "normalized-a".to_string(),
+                ("raw-reused", "source-b") => "normalized-b".to_string(),
+                _ => id.to_string(),
+            })
+        };
+        let repaired = transform_messages_with_normalizer(&messages, &test_model(), &normalize);
+        let results = repaired
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_call_id, "normalized-a");
+        assert_eq!(results[1].tool_call_id, "normalized-b");
+        assert!(results.iter().all(|result| matches!(
+            &result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided"
+        )));
+    }
+
+    #[test]
+    fn noninterrupted_cross_model_reuse_maps_each_result_to_its_epoch() {
+        let mut first = assistant(
+            vec![tool_call("raw-reused", "same-tool")],
+            StopReason::ToolUse,
+        );
+        first.model = "source-a".into();
+        let mut second = assistant(
+            vec![tool_call("raw-reused", "same-tool")],
+            StopReason::ToolUse,
+        );
+        second.model = "source-b".into();
+        let messages = vec![
+            Message::Assistant(first),
+            tool_result("raw-reused", "same-tool", "first"),
+            user("next"),
+            Message::Assistant(second),
+            tool_result("raw-reused", "same-tool", "second"),
+        ];
+        let normalize = |id: &str, _model: &Model, assistant: &AssistantMessage| {
+            Some(match (id, assistant.model.as_str()) {
+                ("raw-reused", "source-a") => "normalized-a".to_string(),
+                ("raw-reused", "source-b") => "normalized-b".to_string(),
+                _ => id.to_string(),
+            })
+        };
+        let repaired = transform_messages_with_normalizer(&messages, &test_model(), &normalize);
+        assert!(
+            matches!(&repaired[1], Message::ToolResult(result) if result.tool_call_id == "normalized-a")
+        );
+        assert!(
+            matches!(&repaired[4], Message::ToolResult(result) if result.tool_call_id == "normalized-b")
+        );
+    }
+
+    #[test]
+    fn distinct_raw_ids_colliding_after_normalization_fail_closed() {
+        let mut first = assistant(vec![tool_call("raw-a", "tool")], StopReason::ToolUse);
+        first.model = "source-a".into();
+        let mut second = assistant(vec![tool_call("raw-b", "tool")], StopReason::ToolUse);
+        second.model = "source-b".into();
+        let messages = vec![
+            Message::Assistant(first),
+            user("interrupt"),
+            Message::Assistant(second),
+            tool_result("raw-a", "tool", "late-first"),
+            tool_result("raw-b", "tool", "claimed-second"),
+        ];
+        let normalize = |id: &str, _model: &Model, _assistant: &AssistantMessage| {
+            Some(if matches!(id, "raw-a" | "raw-b") {
+                "normalized-collision".to_string()
+            } else {
+                id.to_string()
+            })
+        };
+        let repaired = transform_messages_with_normalizer(&messages, &test_model(), &normalize);
+        let results = repaired
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| matches!(
+            &result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided"
+        )));
+    }
+
+    #[test]
     fn exact_retransmission_dedupes_but_conflicting_duplicates_fail_closed() {
         let assistant = Message::Assistant(assistant(
             vec![tool_call("call-1", "bash")],
@@ -759,7 +1016,7 @@ mod tests {
         );
 
         let conflicting = vec![
-            assistant.clone(),
+            assistant,
             tool_result("call-1", "bash", "first"),
             tool_result("call-1", "bash", "second"),
         ];
@@ -782,13 +1039,13 @@ mod tests {
                 vec![tool_call("call-reused", "same-tool")],
                 StopReason::ToolUse,
             )),
-            first.clone(),
+            first,
             user("next"),
             Message::Assistant(assistant(
                 vec![tool_call("call-reused", "same-tool")],
                 StopReason::ToolUse,
             )),
-            second.clone(),
+            second,
         ];
         assert_eq!(
             transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None),
