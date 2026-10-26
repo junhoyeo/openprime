@@ -442,9 +442,10 @@ impl Supervisor {
     }
 
     /// Selector-less `heartbeats_list`: merge every live worker's heartbeats with the
-    /// passive heartbeat jobs. Each worker serves its last-good snapshot when busy; a
-    /// worker with no usable snapshot fails the whole response, so the client keeps its
-    /// last catalog instead of reading a partial merge as an emptied one.
+    /// passive heartbeat jobs. Each worker serves its last-good snapshot when busy.
+    /// A failed worker is isolated: healthy rows still return, and `workerErrors`
+    /// names omitted or stale slices so clients never mistake a partial merge for a
+    /// complete empty catalog (fork #1045 parity).
     pub(crate) async fn handle_heartbeats_list_catalog(
         self: &Arc<Self>,
         command: &DaemonCommand,
@@ -454,7 +455,7 @@ impl Supervisor {
     ) -> (Vec<Value>, bool) {
         let mut heartbeats: Vec<Value> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut failed: Option<DaemonResponse> = None;
+        let mut worker_errors: Vec<Value> = Vec::new();
         for resident in self.live_workers_in_creation_order().await {
             // The generation this read captures: a stored snapshot is only fresh
             // while its generation is current.
@@ -503,6 +504,10 @@ impl Supervisor {
                 if let Some(list) = list {
                     list
                 } else {
+                    let error = response
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "worker heartbeat catalog unavailable".to_string());
                     let snapshot = resident.heartbeat_snapshot.lock().await;
                     if let Some(snapshot) = snapshot.as_ref().filter(|snapshot| {
                         snapshot.generation
@@ -510,9 +515,20 @@ impl Supervisor {
                                 .heartbeat_snapshot_generation
                                 .load(Ordering::Relaxed)
                     }) {
+                        worker_errors.push(json!({
+                            "workerId": resident.worker_id,
+                            "error": error,
+                            "stale": true,
+                            "omitted": false,
+                        }));
                         snapshot.rows.clone()
                     } else {
-                        failed.get_or_insert(response);
+                        worker_errors.push(json!({
+                            "workerId": resident.worker_id,
+                            "error": error,
+                            "stale": true,
+                            "omitted": true,
+                        }));
                         continue;
                     }
                 }
@@ -537,10 +553,6 @@ impl Supervisor {
                 }
             }
         }
-        if let Some(mut response) = failed {
-            response.id = Some(command_id.to_string());
-            return (vec![response_line(&response)], false);
-        }
         // Passivated sessions keep their armed heartbeats; no worker can list them (the
         // snapshot-served passive rows).
         for passive in self.passive_catalog_rows(false).await {
@@ -562,7 +574,11 @@ impl Supervisor {
             vec![response_line(&response_success(
                 Some(command_id),
                 type_name,
-                Some(json!({ "heartbeats": heartbeats })),
+                Some(if worker_errors.is_empty() {
+                    json!({ "heartbeats": heartbeats })
+                } else {
+                    json!({ "heartbeats": heartbeats, "workerErrors": worker_errors })
+                }),
             ))],
             false,
         )
