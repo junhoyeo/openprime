@@ -42,7 +42,7 @@ async fn capture(
         "id":"test-model", "name":"Test", "provider":provider, "api":api,
         "baseUrl":format!("http://{address}"), "reasoning":false, "input":["text"],
         "contextWindow":10000, "maxTokens":100,
-        "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+        "cost":{"input":1,"output":2,"cacheRead":0.1,"cacheWrite":0.5}
     }))
     .unwrap();
     let options = SimpleStreamOptions::from_base(StreamOptions {
@@ -96,6 +96,18 @@ async fn opencode_session_identity_reaches_every_transport_without_cache_retenti
             headers.contains(&("user-agent".into(), "prime-agent".into())),
             "{api}: {headers:?}"
         );
+        let configured_auth = match api {
+            "anthropic-messages" => ("x-api-key", "synthetic-only".to_string()),
+            "google-generative-ai" => ("x-goog-api-key", "synthetic-only".to_string()),
+            "openai-completions" | "openai-responses" => {
+                ("authorization", "Bearer synthetic-only".to_string())
+            }
+            other => panic!("unexpected transport {other}"),
+        };
+        assert!(
+            headers.contains(&(configured_auth.0.into(), configured_auth.1)),
+            "configured key missing on {api}: {headers:?}"
+        );
     }
 }
 
@@ -132,43 +144,60 @@ async fn opencode_session_preserves_case_insensitive_explicit_overrides() {
 }
 
 #[tokio::test]
-async fn zero_cost_zen_uses_the_public_key_on_every_transport() {
-    for (api, key_header, key_value) in [
-        (
-            "openai-completions",
-            "authorization",
-            format!("Bearer {}", pa_ai::models::OPENCODE_PUBLIC_API_KEY),
-        ),
-        (
-            "openai-responses",
-            "authorization",
-            format!("Bearer {}", pa_ai::models::OPENCODE_PUBLIC_API_KEY),
-        ),
-        (
-            "anthropic-messages",
-            "x-api-key",
-            pa_ai::models::OPENCODE_PUBLIC_API_KEY.to_string(),
-        ),
-        (
-            "google-generative-ai",
-            "x-goog-api-key",
-            pa_ai::models::OPENCODE_PUBLIC_API_KEY.to_string(),
-        ),
+async fn an_untrusted_opencode_endpoint_never_receives_the_public_literal() {
+    for api in [
+        "openai-completions",
+        "openai-responses",
+        "anthropic-messages",
     ] {
-        let headers = capture(api, "opencode", "conversation", None, None).await;
-        assert!(
-            headers.contains(&(key_header.into(), key_value)),
-            "{api}: {headers:?}"
-        );
-        assert!(
-            headers.contains(&("user-agent".into(), "prime-agent".into())),
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let model: Model = serde_json::from_value(json!({
+            "id":"untrusted-free", "name":"Untrusted", "provider":"opencode", "api":api,
+            "baseUrl":format!("http://{address}"), "reasoning":false, "input":["text"],
+            "contextWindow":10000, "maxTokens":100,
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+        }))
+        .unwrap();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: None,
+        };
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pa_ai::complete_simple(&model, &context, None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{api} attempted the untrusted endpoint"))
+        .unwrap();
+        assert_eq!(
+            message.stop_reason,
+            pa_ai::types::StopReason::Error,
             "{api}"
         );
+        let listener = listener.into_std().unwrap();
+        listener.set_nonblocking(true).unwrap();
         assert!(
-            headers.contains(&("x-opencode-session".into(), "conversation".into())),
-            "{api}"
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{api} connected to the untrusted endpoint"
         );
     }
+
+    // The Google provider permits keyless-compatible endpoints and may still issue a request, but
+    // the automatic OpenCode literal must never be attached to an untrusted route.
+    let headers = capture(
+        "google-generative-ai",
+        "opencode",
+        "conversation",
+        None,
+        None,
+    )
+    .await;
+    assert!(!headers.contains(&(
+        "x-goog-api-key".into(),
+        pa_ai::models::OPENCODE_PUBLIC_API_KEY.into()
+    )));
 }
 
 #[tokio::test]

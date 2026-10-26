@@ -73,3 +73,31 @@ fn skip_invalid_keeps_the_real_payload_whole() {
     let parsed = parse_model_catalog(&fixture(), InvalidEntries::SkipInvalid).expect("skip mode");
     assert_eq!(parsed.models.len(), 1197, "no real entry is skipped");
 }
+
+#[test]
+fn reviewed_public_zen_allowlist_matches_the_catalog_fixture() {
+    let parsed = parse_model_catalog(&fixture(), InvalidEntries::Reject).unwrap();
+    let zero_cost_zen = parsed
+        .models
+        .iter()
+        .filter(|model| {
+            model.provider == "opencode"
+                && model.base_url == "https://opencode.ai/zen/v1"
+                && [
+                    model.cost.input.as_f64(),
+                    model.cost.output.as_f64(),
+                    model.cost.cache_read.as_f64(),
+                    model.cost.cache_write.as_f64(),
+                ]
+                .into_iter()
+                .all(|cost| cost == 0.0)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(zero_cost_zen.len(), 7, "reviewed 2026-10-26 fixture set");
+    assert!(zero_cost_zen
+        .iter()
+        .all(|model| pa_ai::models::is_opencode_public_model(model)));
+    assert!(parsed.models.iter().all(|model| {
+        !pa_ai::models::is_opencode_public_model(model) || zero_cost_zen.contains(&model)
+    }));
+}

@@ -335,6 +335,30 @@ mod tests {
     }
 
     #[test]
+    fn fully_qualified_owner_defined_opencode_model_stays_unavailable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("models.json"),
+            json!({
+                "providers": { "opencode": {
+                    "baseUrl": "http://127.0.0.1:8787/v1",
+                    "api": "openai-completions",
+                    "models": [{"id": "owner-declared-free"}]
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(resolve_child_model_unchecked(
+            dir.path(),
+            Some("opencode/owner-declared-free"),
+            None,
+            "subagent"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn the_allowlist_refuses_resolved_models_loudly() {
         let dir = tempfile::TempDir::new().unwrap();
         write_catalog(dir.path());
