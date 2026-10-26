@@ -242,15 +242,34 @@ fn entry_base_mut(entry: &mut FileEntry) -> Option<&mut EntryBase> {
     }
 }
 
-/// v3 renamed the `hookMessage` role to `custom`.
+/// v3 renamed the `hookMessage` role to `custom` (TS `migrateV2ToV3`). The
+/// v2 row fails the typed parse and loads as [`FileEntry::Unknown`], so the
+/// rename runs on its raw JSON and the row is parsed again.
 fn migrate_v2_to_v3(entries: &mut [FileEntry]) {
     for entry in entries.iter_mut() {
         if let FileEntry::Header { header } = entry {
             header.version = Some(3);
         }
-        // hookMessage -> custom happens through raw JSON (AgentMessage
-        // deserializes unknown roles into Unknown); the payload-level
-        // rewrite happens in migrate hooks upstream (v2->v3 in the TS port).
+        let FileEntry::Unknown { rest } = entry else {
+            continue;
+        };
+        if rest.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        let mut raw = rest.clone();
+        let Some(message) = raw
+            .get_mut("message")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("hookMessage") {
+            continue;
+        }
+        message.insert("role".to_string(), serde_json::json!("custom"));
+        if let Ok(migrated) = serde_json::from_value::<FileEntry>(serde_json::Value::Object(raw)) {
+            *entry = migrated;
+        }
     }
 }
 
