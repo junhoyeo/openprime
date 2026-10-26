@@ -503,6 +503,24 @@ enum Composer {
     Reply(Box<reply::ReplyComposer>),
 }
 
+fn apply_heartbeat_catalog_update(
+    mode: &mut AgentsViewMode,
+    current_generation: u64,
+    generation: u64,
+    heartbeats: Option<Vec<crate::heartbeats_picker::HeartbeatEntry>>,
+    error: Option<String>,
+) {
+    if generation != current_generation {
+        return;
+    }
+    if let Some(heartbeats) = heartbeats {
+        mode.heartbeats = heartbeats;
+    }
+    if let Some(error) = error {
+        mode.set_status_tone(&error, StatusTone::Warning);
+    }
+}
+
 impl AgentsViewMode {
     fn new(mut options: AgentsViewOptions) -> Self {
         let theme = crate::app::load_theme(&options.theme);
@@ -1066,14 +1084,13 @@ async fn run_agents_view_surface(
                     heartbeats,
                     error,
                 } => {
-                    if generation == heartbeat_generation {
-                        if let Some(heartbeats) = heartbeats {
-                            mode.heartbeats = heartbeats;
-                        }
-                        if let Some(error) = error {
-                            mode.set_status_tone(&error, StatusTone::Warning);
-                        }
-                    }
+                    apply_heartbeat_catalog_update(
+                        &mut mode,
+                        heartbeat_generation,
+                        generation,
+                        heartbeats,
+                        error,
+                    );
                 }
                 UiInput::PersistentShellsLoaded(data) => {
                     if let Some(data) = data {
