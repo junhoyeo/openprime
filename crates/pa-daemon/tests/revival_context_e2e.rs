@@ -11,7 +11,10 @@
 //!   append, telemetry opt-out) survives the wake, so an opted-out client
 //!   can still attach and the revived worker never reports telemetry;
 //! - c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched in over a
-//!   fileless or foreign launch never inherits the launch cwd on respawn.
+//!   fileless or foreign launch never inherits the launch cwd on respawn;
+//! - 6470a60e7: a cancellable prompt never starts a revival;
+//! - d5bc1eedc: a revival never detaches a sibling window and leaves no
+//!   stale attachment pinning the session.
 // Stack-resident futures by design on the daemon's hot paths.
 #![allow(clippy::large_futures)]
 // Narrowing casts sit at OS boundaries (pid/fd/time/size) where the kernel
@@ -649,4 +652,195 @@ fn a_switched_transcript_respawns_in_its_own_cwd_not_the_launch_cwd() {
         );
         assert_eq!(killed["success"], true, "{killed}");
     }
+}
+
+/// Row 6470a60e7: a cancelled prompt never revives a passivated session. A
+/// cancellable prompt carries an admission id; the daemon's admission route
+/// resolves only live residents and stale-id bindings, so it refuses with the
+/// unknown-session error instead of launching a worker, and the cancellation
+/// that follows finds nothing to race. The plain durable-id attach (the TUI
+/// rebind) is the control: the same session is revivable.
+#[test]
+fn a_cancellable_prompt_never_revives_a_passivated_session() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    let created = client.request(
+        "open",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": project,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let active = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = client.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": active, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    passivate(&mut client, &agent_dir, &active, "passivate");
+
+    for selector in [active.as_str(), session_id.as_str()] {
+        let admitted = client.request(
+            &format!("admitted-{selector}"),
+            &json!({
+                "type": "prompt",
+                "activeSessionId": selector,
+                "message": "cancel me",
+                "admissionId": format!("admission-{selector}"),
+            }),
+        );
+        assert_eq!(
+            admitted["error"],
+            format!("Unknown active session: {selector}"),
+            "the cancellable prompt is refused, not revived: {admitted}"
+        );
+        let cancelled = client.request(
+            &format!("cancel-{selector}"),
+            &json!({
+                "type": "cancel_prompt_admission",
+                "activeSessionId": selector,
+                "admissionId": format!("admission-{selector}"),
+            }),
+        );
+        assert_eq!(cancelled["success"], true, "{cancelled}");
+        assert_eq!(
+            client.live_active_id(&format!("list-{selector}"), &session_id),
+            None,
+            "no worker was launched for the cancellable prompt"
+        );
+    }
+    // The control: the plain durable-id attach revives the same session.
+    let attached = client.request(
+        "attach-durable",
+        &json!({ "type": "attach", "activeSessionId": session_id }),
+    );
+    assert_eq!(attached["success"], true, "{attached}");
+    assert!(client.live_active_id("list-after", &session_id).is_some());
+}
+
+/// Row d5bc1eedc's invariants on the Rust attach model (the legacy-daemon
+/// ownership negotiation itself has no Rust peer: a Rust client only talks
+/// to a Rust daemon, whose attachments are per connection): a revival never
+/// detaches a SIBLING window attached to the same session — not the
+/// reviving window's detach of its superseded id, not its own detach — and
+/// once the last window leaves, no attachment lingers, so the session stays
+/// eligible for the next idle passivation.
+#[test]
+fn a_revival_keeps_a_sibling_attached_and_leaves_no_stale_attachment() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut driver = Client::connect(&socket);
+    let created = driver.request(
+        "open",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": project,
+                "sessionDir": sessions,
+                "provider": "prime-inference",
+                "model": "mock-1",
+            },
+        }),
+    );
+    assert_eq!(created["success"], true, "open failed: {created}");
+    let stale = created["data"]["id"]
+        .as_str()
+        .expect("active id")
+        .to_string();
+    let session_id = created["data"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first = driver.request(
+        "turn-1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": stale, "message": "first" }),
+    );
+    assert_eq!(first["success"], true, "first turn failed: {first}");
+    passivate(&mut driver, &agent_dir, &stale, "passivate");
+
+    let attached_clients = |driver: &mut Client, id: &str| -> u64 {
+        let list = driver.request(id, &json!({ "type": "list" }));
+        list["data"]["sessions"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["sessionId"].as_str() == Some(session_id.as_str()))
+                    .and_then(|row| row["attachedClients"].as_u64())
+            })
+            .expect("the revived session's live row")
+    };
+    // The reviving window and a sibling window both rebind by the durable id.
+    let mut reviver = Client::connect(&socket);
+    let mut sibling = Client::connect(&socket);
+    for (client, id) in [
+        (&mut reviver, "attach-reviver"),
+        (&mut sibling, "attach-sibling"),
+    ] {
+        let attached = client.request(
+            id,
+            &json!({ "type": "attach", "activeSessionId": session_id }),
+        );
+        assert_eq!(attached["success"], true, "{attached}");
+    }
+    let woken = driver
+        .live_active_id("list-woken", &session_id)
+        .expect("the revived session is live");
+    assert_eq!(attached_clients(&mut driver, "count-2"), 2);
+
+    // The reviving window retires its superseded id, then leaves.
+    for (id, target) in [("detach-stale", &stale), ("detach-woken", &woken)] {
+        let detached = reviver.request(id, &json!({ "type": "detach", "activeSessionId": target }));
+        assert_eq!(detached["success"], true, "{detached}");
+    }
+    assert_eq!(
+        attached_clients(&mut driver, "count-1"),
+        1,
+        "the sibling's attachment survives the reviver's cleanup"
+    );
+    let turn = driver.request(
+        "turn-2",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": woken, "message": "second" }),
+    );
+    assert_eq!(turn["success"], true, "{turn}");
+    let event = wait_until(Duration::from_secs(30), || {
+        let line = sibling.read_line();
+        (line["type"] == "session_event" && line["activeSessionId"] == woken.as_str())
+            .then_some(line)
+    });
+    assert_eq!(event["activeSessionId"], woken.as_str());
+
+    let detached = sibling.request(
+        "detach-sibling",
+        &json!({ "type": "detach", "activeSessionId": woken }),
+    );
+    assert_eq!(detached["success"], true, "{detached}");
+    assert_eq!(
+        attached_clients(&mut driver, "count-0"),
+        0,
+        "no stale attachment pins the session against idle passivation"
+    );
 }
