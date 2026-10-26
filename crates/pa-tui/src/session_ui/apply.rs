@@ -207,8 +207,19 @@ impl SessionUi {
                 active_session_id,
                 event,
                 meta_sequence,
+                meta_generation,
             } => {
                 if active_session_id != self.active_session_id {
+                    return;
+                }
+                // The attach window (legacy `da68b1903`): the daemon streams from before the
+                // attach cuts its snapshot, so a live event can replay one the snapshot already
+                // holds — at or below the attach cursor, in the cursor's generation. The
+                // snapshot is the source of truth for those; only newer events apply.
+                if self.attach_cursor_present
+                    && meta_generation.as_deref() == Some(self.attach_event_generation.as_str())
+                    && meta_sequence <= self.attach_event_sequence
+                {
                     return;
                 }
                 // The run's stash keys the LATEST sequence the worker has reported: a turn during
