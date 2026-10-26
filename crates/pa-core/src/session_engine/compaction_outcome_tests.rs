@@ -806,3 +806,33 @@ async fn an_abort_after_a_committed_refine_reaches_nothing() {
         ]
     );
 }
+
+/// The daemon's delivery arm: an abort that beat the refine's registration (the model resolve,
+/// the first-use build) refuses the run before its planning request ever starts.
+#[tokio::test]
+async fn an_armed_abort_refuses_the_refine_before_planning() {
+    let (session, tmp) = refine_test_session().await;
+    let global_dir = tmp.path().join("harness");
+    let slot = Arc::new(crate::session_engine::refine_abort::RefineAbortSlot::default());
+    session.share_refine_abort_slot(Arc::clone(&slot));
+    slot.arm();
+    slot.abort();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = session
+        .refine_with_refiner(
+            &global_refine(),
+            refine::RefinementSource::User,
+            &session_ai_model(),
+            stalled_refine_call(Arc::clone(&started), Arc::clone(&dropped)),
+            global_dir.clone(),
+        )
+        .await
+        .expect_err("the armed abort refuses the run");
+    assert!(pa_agent::abort::is_abort_error(&error), "{error:#}");
+    assert!(
+        futures::FutureExt::now_or_never(started.notified()).is_none(),
+        "no planning request started"
+    );
+    assert!(!crate::refinement::get_harness_state_path(&global_dir).exists());
+}

@@ -385,8 +385,29 @@ impl AgentSession {
     /// Abort the in-flight refine run (TS `requestAbort` -> `_refineAbortController.abort()`): a
     /// run still planning stops its model request and applies nothing; a run whose harness write
     /// already committed completes and reports its result. No run in flight: nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the slot handle's lock is poisoned.
     pub fn abort_refinement(&self) {
-        self.refine_abort.abort();
+        self.refine_abort_slot().abort();
+    }
+
+    /// Share `slot` as this session's refine abort slot: the host aborts (and arms deliveries)
+    /// through its own handle without touching the session.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the slot handle's lock is poisoned.
+    pub fn share_refine_abort_slot(
+        &self,
+        slot: std::sync::Arc<super::refine_abort::RefineAbortSlot>,
+    ) {
+        *self.refine_abort.write().expect("refine abort slot handle") = slot;
+    }
+
+    fn refine_abort_slot(&self) -> std::sync::Arc<super::refine_abort::RefineAbortSlot> {
+        std::sync::Arc::clone(&self.refine_abort.read().expect("refine abort slot handle"))
     }
 
     /// Execute `/refine`: plan, re-read, apply, and persist the continual
@@ -426,7 +447,7 @@ impl AgentSession {
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
         // The run's abort registration spans the whole plan -> apply flow; it unregisters on
         // every exit, so a late abort never reaches a finished run.
-        let registration = self.refine_abort.register();
+        let registration = self.refine_abort_slot().register();
         let abort = registration.signal().clone();
         // The flight serializes every live-context replacer against a
         // compaction's rebuild: this round's outcome rows persist and then

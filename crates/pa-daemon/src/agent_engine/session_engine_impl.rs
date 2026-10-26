@@ -1395,12 +1395,26 @@ impl SessionEngine for AgentSessionEngine {
         if let Some(command) =
             crate::session_commands::parse_prompt_session_command(&request.message)
         {
-            let Some(execution) = crate::session_commands::run_session_command(
+            // A `/refine` delivery arms its abort before the refine registers (model resolve,
+            // first-use build): an abort in that window cancels it before planning starts. One
+            // that landed between the pickup and the arm reads from the delivery's own flag.
+            let refine_delivery = command.name == "refine";
+            if refine_delivery {
+                self.refine_abort.arm();
+                if aborted() {
+                    self.refine_abort.abort();
+                }
+            }
+            let execution = crate::session_commands::run_session_command(
                 self,
                 &command,
                 &request.images,
                 &mut emit,
-            ) else {
+            );
+            if refine_delivery {
+                self.refine_abort.disarm();
+            }
+            let Some(execution) = execution else {
                 return;
             };
             if let Some(error) = &execution.error {
@@ -1525,13 +1539,9 @@ impl SessionEngine for AgentSessionEngine {
             agent.abort();
         }
         // TS `requestAbort` -> `_refineAbortController.abort()`: a refine run (the `/refine`
-        // command, `refine.run`) plans on the built session outside any agent turn. The slot
-        // lock is held only for the clone and the build, never across the refine itself.
-        if let Ok(session) = self.session.try_lock() {
-            if let Some(core) = session.as_ref() {
-                core.session.abort_refinement();
-            }
-        }
+        // command, `refine.run`) plans on the built session outside any agent turn. The shared
+        // slot reaches it (or the delivery's armed controller) without the session lock.
+        self.refine_abort.abort();
     }
 
     /// `set_steering_mode` / `set_follow_up_mode`: the queue delivery modes

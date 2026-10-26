@@ -201,6 +201,10 @@ pub struct AgentSessionEngine {
     /// arms clone the Arc and release this mutex before their awaits, so
     /// every read seam answers while a turn streams.
     pub(crate) session: Arc<tokio::sync::Mutex<Option<Arc<CoreSessionEngine>>>>,
+    /// The refine abort slot every built session shares: the abort path and the delivery arm
+    /// reach the running refine without the `session` lock (another holder can keep that lock
+    /// across an await).
+    pub(crate) refine_abort: Arc<pa_core::session_engine::refine_abort::RefineAbortSlot>,
     threshold_yielded: Arc<std::sync::atomic::AtomicBool>,
     threshold_checks_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// The build gate: at most one `build_session` in flight; the eager build
