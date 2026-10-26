@@ -88,8 +88,8 @@ fn responses_compat_can_opt_a_custom_gateway_into_fast_mode() {
     custom.compat = Some(disabled_compat.clone());
     assert!(!supports_fast_mode(&custom));
 
-    // An explicit Responses compat object is authoritative even for a provider/id that the modern
-    // built-in table otherwise marks eligible. This lets a gateway override opt back out.
+    // An explicit capability is authoritative even for a provider/id that the modern built-in
+    // table otherwise marks eligible. An absent capability preserves the table's current default.
     let mut eligible_builtin = tier_model("openai", "openai-responses", "gpt-6-astra");
     assert!(supports_fast_mode(&eligible_builtin));
     eligible_builtin.compat = Some(disabled_compat);
@@ -100,7 +100,7 @@ fn responses_compat_can_opt_a_custom_gateway_into_fast_mode() {
             ..Default::default()
         },
     )));
-    assert!(!supports_fast_mode(&eligible_builtin));
+    assert!(supports_fast_mode(&eligible_builtin));
 
     for api in ["openai-completions", "anthropic-messages"] {
         let mut unrelated = tier_model("gateway", api, "custom-model");
