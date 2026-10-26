@@ -351,8 +351,20 @@ jobs:
           test -n "${kernel_python}"
           test -x "${kernel_python}"
 
+          # The bootstrap never syncs skills (TS parity) and generations are
+          # immutable, so one faux print-mode turn makes the product publish
+          # the skill-bearing generation a first session would use. Tests pin
+          # that interpreter; pinning the skill-less bootstrap one disables
+          # every bundled Python skill under the override.
+          runtime_script='{"responses":[{"content":[{"type":"toolCall","name":"python_repl","arguments":{"code":"import goal, agent_message\nprint(\"TEST_RUNTIME_\" + \"READY\")"}}]},{"text":"ready"}]}'
+          DO_NOT_TRACK=1 PRIME_AGENT_FAUX_SCRIPT="${runtime_script}" \
+            ./target/debug/prime-agent --mode json -p "prepare the test runtime" > "${RUNNER_TEMP}/test-runtime.jsonl"
+          grep -qF TEST_RUNTIME_READY "${RUNNER_TEMP}/test-runtime.jsonl"
+          kernel_python="$(python3 scripts/ci_test_runtime.py)"
+          test -x "${kernel_python}"
+
           # ABI 2 is a closed host-payload contract. Run the ignored positive
-          # verifier explicitly against the exact runtime this shard booted,
+          # verifier explicitly against the exact runtime the tests pin,
           # and audit that one test really executed (filter-0 is not green).
           abi_test='kernel::bootstrap::venv::probe::runtime_abi_tests::configured_packaged_runtime_satisfies_the_full_probe'
           abi_log="${RUNNER_TEMP}/runtime-abi-${{ matrix.shard }}.log"
