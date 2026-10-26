@@ -888,11 +888,16 @@
           "kind": "combined-safe-metadata",
           "ref": "feat/rust-migration@454e79ff2",
           "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
+        },
+        {
+          "kind": "state-compat-evidence",
+          "ref": "docs/migration/evidence/state-compat.md",
+          "note": "port/rust-state-compat-v3 d7eaa6a42, independent review CLEAR (round 2); integrated 5bfaf19b4..172ce1942; legacy auth.json load/write value identity only; no 401 regression test (no production mark_auth_stale caller)"
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "verified-upstream-equivalent",
-      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass",
+      "verification_outcome": "accepted: final provider tip independently CLEAR, provider-owned paths byte-match integration, safe metadata producer combined tests pass; state-compat: legacy auth.json load/write value identity only; no 401 regression test (no production mark_auth_stale caller)",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
@@ -1220,11 +1225,16 @@
           "kind": "lifecycle-evidence",
           "ref": "docs/migration/evidence/lifecycle.md",
           "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        },
+        {
+          "kind": "state-compat-evidence",
+          "ref": "docs/migration/evidence/state-compat.md",
+          "note": "port/rust-state-compat-v3 d7eaa6a42, independent review CLEAR (round 2); integrated 5bfaf19b4..172ce1942; full spend of a TS side transcript folds 1050/85/40/1175 tokens, $0.004425"
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance; state-compat: full spend of a TS side transcript folds 1050/85/40/1175 tokens, $0.004425",
       "candidate_verification_status": "ported"
     },
     {
@@ -1321,11 +1331,16 @@
           "kind": "lifecycle-evidence",
           "ref": "docs/migration/evidence/lifecycle.md",
           "note": "Final 2e review CLEAR; P0/P1 closures and combined 54+1+1+30 focused tests. Native isolation incidents and hold disclosed."
+        },
+        {
+          "kind": "state-compat-evidence",
+          "ref": "docs/migration/evidence/state-compat.md",
+          "note": "port/rust-state-compat-v3 d7eaa6a42, independent review CLEAR (round 2); integrated 5bfaf19b4..172ce1942; TS-written linked /btw side transcript opens with parent linkage and visible history and resumes with one pointer"
         }
       ],
       "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
       "proposed_final_status": "ported",
-      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance",
+      "verification_outcome": "lifecycle source independently CLEAR and combined hermetic focused gates pass; actual status remains blocked pending preflight-approved native collect and legacy copied-state acceptance; state-compat: TS-written linked /btw side transcript opens with parent linkage and visible history and resumes with one pointer",
       "candidate_verification_status": "ported"
     },
     {
@@ -2683,11 +2698,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; fileless/foreign switched-in respawn uses its own cwd"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; identity-pending boot repair carries the moved-to cwd"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): fileless/foreign switched-in respawn uses its own cwd; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): fileless/foreign switched-in respawn uses its own cwd; identity-pending boot repair carries the moved-to cwd; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -2736,11 +2756,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; root-identity follow carries the live cwd into the durable create"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; identity-pending boot repair carries the moved-to cwd"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): root-identity follow carries the live cwd into the durable create; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): root-identity follow carries the live cwd into the durable create; identity-pending boot repair carries the moved-to cwd; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -2789,11 +2814,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; passivated-wake replays the opened-with fallback cwd; revival_context_e2e red control fails at base (:283)"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; restart and update-restore paths included"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): passivated-wake replays the opened-with fallback cwd; revival_context_e2e red control fails at base (:283); final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): passivated-wake replays the opened-with fallback cwd; revival_context_e2e red control fails at base (:283); restart and update-restore paths included; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -3044,11 +3074,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; proven at the daemon boundary only (create shape carries the opened-with config); agents-view client path not separately proven"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; restart/update-restore included; daemon boundary only"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): proven at the daemon boundary only (create shape carries the opened-with config); agents-view client path not separately proven; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): proven at the daemon boundary only (create shape carries the opened-with config); agents-view client path not separately proven; restart/update-restore included; daemon boundary only; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -3098,11 +3133,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; switched-in transcript respawns in its own cwd; red control fails at base (:644)"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; identity-pending path included"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): switched-in transcript respawns in its own cwd; red control fails at base (:644); final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): switched-in transcript respawns in its own cwd; red control fails at base (:644); identity-pending path included; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -3242,11 +3282,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; proven at the daemon boundary only (create shape); agents-view client path not separately proven"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; restart/update-restore included; daemon boundary only"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): proven at the daemon boundary only (create shape); agents-view client path not separately proven; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): proven at the daemon boundary only (create shape); agents-view client path not separately proven; restart/update-restore included; daemon boundary only; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -3296,11 +3341,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; telemetry opt-out survives passivated wake (red control :528); launch env intentionally not replayed; owned sessions never passivate"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; telemetry opt-out through update restore (R3b) and waking-client env; non-secret allowlisted record"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): telemetry opt-out survives passivated wake (red control :528); launch env intentionally not replayed; owned sessions never passivate; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): telemetry opt-out survives passivated wake (red control :528); launch env intentionally not replayed; owned sessions never passivate; telemetry opt-out through update restore (R3b) and waking-client env; non-secret allowlisted record; final combined acceptance pending",
       "candidate_verification_status": "ported"
     },
     {
@@ -3972,11 +4022,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; admission route has no wake arm; cancelled check precedes resolution; R4 (ACP admission prompts do not wake passivated sessions) stays open"
+        },
+        {
+          "kind": "revival-evidence",
+          "ref": "docs/migration/evidence/revival.md",
+          "note": "revival rounds 2-5 (a7a1820c2..8541f81a7) CLEAR, integrated c6e7ce813..ea903681c + 14ef3e499; R4 classified parity-equivalent (ACP binding is client-owned; passivation refuses it)"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): admission route has no wake arm; cancelled check precedes resolution; R4 (ACP admission prompts do not wake passivated sessions) stays open; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): admission route has no wake arm; cancelled check precedes resolution; R4 (ACP admission prompts do not wake passivated sessions) stays open; R4 classified parity-equivalent (ACP binding is client-owned; passivation refuses it); final combined acceptance pending",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {
@@ -4199,11 +4254,16 @@
           "kind": "revival-evidence",
           "ref": "docs/migration/evidence/revival.md",
           "note": "verify/revival-context 532f11c9a, lifecycle-review-opus CLEAR-FOR-INTEGRATION (scope-limited); integrated as e31116ee4, 1de572af0, 68ca60950; stale id -> exact refusal, durable attach wakes, replay runs; client pa-tui prompt_revival_rebind_headless (mutation-verified); also TS-archived reopen proof pending state-compat review"
+        },
+        {
+          "kind": "state-compat-evidence",
+          "ref": "docs/migration/evidence/state-compat.md",
+          "note": "port/rust-state-compat-v3 d7eaa6a42, independent review CLEAR (round 2); integrated 5bfaf19b4..172ce1942; TS-archived session reopens by name with its history (saved_session_wake_e2e)"
         }
       ],
       "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): stale id -> exact refusal, durable attach wakes, replay runs; client pa-tui prompt_revival_rebind_headless (mutation-verified); also TS-archived reopen proof pending state-compat review; final combined acceptance pending",
+      "verification_outcome": "revival lane integrated and CLEAR (scope-limited): stale id -> exact refusal, durable attach wakes, replay runs; client pa-tui prompt_revival_rebind_headless (mutation-verified); also TS-archived reopen proof pending state-compat review; final combined acceptance pending; state-compat: TS-archived session reopens by name with its history (saved_session_wake_e2e)",
       "candidate_verification_status": "verified-upstream-equivalent"
     },
     {

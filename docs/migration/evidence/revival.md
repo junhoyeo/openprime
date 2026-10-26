@@ -4,7 +4,8 @@ Status: **integrated; independently CLEAR-FOR-INTEGRATION (scope-limited); final
 
 - Lane branch: `origin/verify/revival-context` at `532f11c9ae80f80175880b40095b8e116521dca0` (base `11a949bb0`), owner `verify-revival-opus`.
 - Review: `lifecycle-review-opus`, verdict CLEAR-FOR-INTEGRATION (scope-limited) for that exact SHA. Full section in `/tmp/openprime-rust-lifecycle-review.md`.
-- Integrated on `feat/rust-migration` as `e31116ee4` (passivated launch context), `1de572af0` (switched-in transcript cwd on respawn), `68ca60950` (parity tests).
+- Round 1 integrated on `feat/rust-migration` as `e31116ee4` (passivated launch context), `1de572af0` (switched-in transcript cwd on respawn), `68ca60950` (parity tests).
+- Rounds 2-5 (`a7a1820c2`..`8541f81a7`, each CLEAR-FOR-INTEGRATION from `lifecycle-review-opus` with its own red control) are integrated as one batch: `c6e7ce813`..`ea903681c` plus `14ef3e499`. Round 2 (`ae935ab8e`) was CLEAR but **held back**: its durable passivated-launch record persisted the CLI apiKey and the creator's client env (a new secret-at-rest location), and nothing removed it on delete or archive. The parent raised that to must-fix. Round 3 (`fd38f632b`) keeps only an allowlist of non-secret launch keys and forgets the record on delete, a failed stop, and any launch. Round 4 applies the allowlist on read too, and keeps an archived session's record for its user-driven revival (TS parity). Round 5 is a test-only fix for a helper flake (see below).
 
 ## Product gaps closed
 
@@ -22,9 +23,19 @@ Status: **integrated; independently CLEAR-FOR-INTEGRATION (scope-limited); final
   - `cargo test -p pa-daemon --lib -- passivat root_identity`: 27 passed
   - `cargo test -p pa-daemon --test idle_passivation_e2e -- --test-threads=1`: 3 passed (portable liveness probe `747571c49`)
 
+## Rounds 2-5 summary
+
+- R1 closed: the passivated launch record is durable beside the descriptors, so it survives a supervisor restart (`a_passivated_launch_context_survives_a_supervisor_restart`).
+- R2 closed: the identity-pending boot repair carries the moved-to cwd.
+- R3 closed: update restore nests flat durable keys under `config`, as TS `createCommand` does. R3b closed: the roster `runtime_config` gains an optional `telemetryDisabled`, so the opt-out survives an update restore.
+- R4 classified parity-equivalent: TS eviction requires zero attached clients, and an ACP binding is client-owned, so passivation refuses it.
+- Reviewer P2 (env replay) closed: a wake sends no creator client env; the waking attach adopts its own pane.
+- Secret at rest closed: `a_passivated_launch_record_holds_no_secrets_and_dies_with_its_session` asserts on the file bytes with a sentinel key. `an_old_format_launch_record_never_replays_a_credential` covers records from the unreleased round-2 format.
+- Round 5 (test-only): under load, `passivate()` flaked at `revival_context_e2e:351`. Cause: the supervisor eviction fence defers `worker_idle_passivation` while any route holds an in-flight permit, and the deferral answers success, the same as an executed stop. The helper now re-asks until that exact session leaves the live list, with a fail-closed 30 s bound. `an_idle_passivation_ask_defers_while_a_route_is_in_flight` reproduces the deferral deterministically. Possible follow-up, not adopted (wire-shape change outside parity scope): a `{"deferred": true}` reply field.
+- Accepted P3: a plain kill of a depth>0 RLM child marked for ledger deletion also leaves a non-secret record on disk. The ledger and the revival gate still decide revival.
+
 ## Scope limits and open items
 
 - `843615757` and `837be6824` are proven at the daemon boundary only (create shape). The agents-view client path is not separately proven.
 - `6470a60e7` holds because admission prompts never revive. R4 stays open.
-- Open residuals: R1, the passivation record is lost on supervisor restart (falls back to the header); R2, `apply_identity_pending` carries no cwd; R3, `update_restore::restore_session` builds Create from flat durable keys (needs a test before any claim); R4, ACP admission prompts do not wake passivated sessions.
-- Reviewer P2 (follow-up owed): the wake replays the original creator's client env (`HERDR_PANE_ID`). TS revive used the waking client's env (`daemon-agent-connection.ts:1893`). A successor delta fixes this after its own review.
+- Round 1 left R1-R4 and an env-replay P2 open. Rounds 2-5 closed or classified them (above).
