@@ -49,6 +49,16 @@ impl Supervisor {
             descriptor.session_file = Some(session_file.clone());
             descriptor.create_command.session_path = Some(session_file.clone());
             descriptor.create_command.no_session = None;
+            // The moved-to session's cwd (the live follow's cwd rule): the relaunch
+            // must not replay the superseded session's directory.
+            if let Some(cwd) =
+                crate::descriptor::read_identity_pending_cwd(&resident.descriptor_path)
+            {
+                descriptor
+                    .create_command
+                    .rest
+                    .insert("cwd".to_string(), Value::from(cwd));
+            }
         }
         match crate::descriptor::persist_worker(&resident.descriptor_path, &descriptor) {
             Ok(()) => {
@@ -161,15 +171,16 @@ impl Supervisor {
         // the worker onto that transcript's own directory (or the fallback the switch
         // selected for a missing one). Replaying the launch cwd would run the
         // switched-in transcript in a directory that belongs to another session.
-        if let Some(cwd) = summary
+        let moved_cwd = summary
             .get("cwd")
             .and_then(Value::as_str)
             .filter(|cwd| !cwd.is_empty())
-        {
+            .map(str::to_string);
+        if let Some(cwd) = &moved_cwd {
             descriptor
                 .create_command
                 .rest
-                .insert("cwd".to_string(), Value::from(cwd));
+                .insert("cwd".to_string(), Value::from(cwd.as_str()));
         }
         // The durable record is the restart edge: a failed persist leaves the LIVE routing
         // correct while the record lags — keep the transition marked pending so the next
@@ -206,6 +217,7 @@ impl Supervisor {
                     &resident.descriptor_path,
                     &session_id,
                     &session_file,
+                    moved_cwd.as_deref(),
                     &crate::util::now_iso(),
                 ) {
                     // The last resort: the side record could not land either. The boot's live
@@ -586,6 +598,7 @@ mod tests {
             &resident.descriptor_path,
             "sOld",
             &dir.join("old.jsonl").to_string_lossy(),
+            /*cwd*/ None,
             "2020-01-01T00:00:00.000Z",
         )
         .unwrap();
@@ -623,6 +636,7 @@ mod tests {
             &resident.descriptor_path,
             "sOld",
             &dir.join("old.jsonl").to_string_lossy(),
+            /*cwd*/ None,
             &equal_stamped,
         )
         .unwrap();
@@ -636,6 +650,74 @@ mod tests {
         assert!(
             crate::descriptor::read_identity_pending(&resident.descriptor_path).is_none(),
             "the equal-timestamp pending is cleared, not applied"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot repair carries the moved-to session's cwd (legacy TS rows
+    /// c3adf81be / 48fae2a5a through the double-failed persist): a restart
+    /// that applies the pending identity relaunches the switched-in
+    /// transcript in its own directory, never the stale record's launch cwd.
+    #[tokio::test]
+    async fn a_durable_pending_carries_the_moved_to_cwd_into_the_boot_relaunch() {
+        let dir = std::env::temp_dir().join(format!("pa-root-id-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let supervisor = supervisor_with_movable_worker(&dir).await;
+        let resident = supervisor.registry.get("w-a").await.expect("resident");
+        // Both persists of the move fail: only the side record lands.
+        std::fs::remove_file(&resident.descriptor_path).ok();
+        std::fs::create_dir_all(&resident.descriptor_path).unwrap();
+        let mut moved = swap_summary(&dir, "sA", "a.jsonl");
+        moved["cwd"] = json!("/moved/session/cwd");
+        drive_delta(&supervisor, moved, 1).await;
+        assert!(crate::descriptor::read_identity_pending(&resident.descriptor_path).is_some());
+
+        // THE RESTART: a fresh supervisor loads the stale record (the launch cwd) and
+        // applies the side record before any relaunch.
+        std::fs::remove_dir_all(&resident.descriptor_path).unwrap();
+        let stale = json!({
+            "version": 2,
+            "workerId": "w-a",
+            "pid": 0,
+            "socketPath": "/tmp/none.sock",
+            "recoveryJournalPath": "/tmp/none.jsonl",
+            "supervisorSocketPath": "/tmp/none.sock",
+            "authenticationToken": "token-a",
+            "rootActiveSessionId": "w-a",
+            "rootSessionId": "s0",
+            "sessionFile": dir.join("s0.jsonl").to_string_lossy(),
+            "createdAt": "2026-09-30T00:00:00Z",
+            "updatedAt": "2026-09-30T00:00:00Z",
+            "lifecycle": "ready",
+            "createCommand": {
+                "sessionPath": dir.join("s0.jsonl").to_string_lossy(),
+                "cwd": "/launch/cwd",
+            },
+            "consecutiveFailures": 0,
+        });
+        std::fs::write(&resident.descriptor_path, stale.to_string()).unwrap();
+        let restarted = Supervisor::new(crate::supervisor::SupervisorOptions {
+            socket_path: dir.join("daemon.sock"),
+            agent_dir: dir.join("agent"),
+        })
+        .expect("restarted supervisor");
+        let fresh = ResidentWorker::new(
+            "w-a".to_string(),
+            serde_json::from_value(stale).expect("stale descriptor"),
+            resident.descriptor_path.clone(),
+        );
+        restarted.apply_identity_pending(&fresh).await;
+        let create_command = fresh.descriptor.lock().await.create_command.clone();
+        assert_eq!(
+            (
+                create_command.session_path,
+                create_command.rest.get("cwd").cloned()
+            ),
+            (
+                Some(dir.join("a.jsonl").to_string_lossy().to_string()),
+                Some(json!("/moved/session/cwd"))
+            ),
+            "the relaunch replays the moved-to session and its own directory"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
