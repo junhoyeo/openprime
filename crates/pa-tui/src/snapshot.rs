@@ -70,6 +70,7 @@ pub struct Reconstructed {
     /// TS re-reads after subscribe because a `session_action_update`
     /// in the gap is lost.
     pub queued: crate::queued::QueuedMessages,
+    pub active_refine: bool,
     /// The LAST HUMAN PROMPT's wall-clock time (unix ms): the newest
     /// user message's `timestamp`; the rebuilt loader anchors its
     /// elapsed clock here (the operator's 2026-09-28 rule: the timer
@@ -369,6 +370,7 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         .and_then(|state| state.get("goal"))
         .and_then(|goal| serde_json::from_value::<pa_types::goal::GoalState>(goal.clone()).ok());
     let actions = state.and_then(|state| state.get("sessionActions")).cloned();
+    let active_refine = actions.as_ref().is_some_and(active_refine_from_actions);
     let queued = crate::queued::QueuedMessages {
         steering: actions
             .as_ref()
@@ -430,6 +432,7 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         last_event_sequence,
         cursor_present,
         queued,
+        active_refine,
         service_tier,
         model_fallback_message,
         last_user_prompt_ms,
@@ -470,6 +473,17 @@ fn starting_from_actions(actions: &Value) -> Option<String> {
             .unwrap_or_default()
             .to_string()
     })
+}
+
+fn active_refine_from_actions(actions: &Value) -> bool {
+    let Some(active) = actions.get("active") else {
+        return false;
+    };
+    active.get("kind").and_then(Value::as_str) == Some("session_command")
+        && active
+            .get("label")
+            .and_then(Value::as_str)
+            .is_some_and(|label| label == "/refine" || label.starts_with("/refine "))
 }
 
 /// One typed-provenance rider of a `sessionActions` wire value

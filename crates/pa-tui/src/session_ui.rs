@@ -245,6 +245,9 @@ pub(crate) struct SessionUi {
     context: Option<crate::chrome::ContextUsage>,
     list_rows: Vec<Value>,
     pub(crate) turn_active: bool,
+    /// A `/refine` session action is running without a provider stream.
+    refine_active: bool,
+    refine_cancel_in_flight: bool,
     /// Completed turns observed on this connection. A prompt ACK may arrive
     /// after its entire streamed turn; it must not restart the loader then.
     turn_ends_seen: u64,
