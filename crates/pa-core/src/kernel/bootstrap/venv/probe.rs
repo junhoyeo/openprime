@@ -317,6 +317,22 @@ pub fn invalidate_runtime_probe_cache() {
     }
 }
 
+/// Seed the in-process memo with `key` pointing at a disk memo `path`.
+#[cfg(test)]
+pub(crate) fn seed_probe_memo_for_tests(key: &str, path: PathBuf) {
+    lock_probe_memo()
+        .get_or_insert_with(HashMap::new)
+        .insert(key.to_string(), path);
+}
+
+/// Whether the in-process memo still holds `key`.
+#[cfg(test)]
+pub(crate) fn probe_memo_has_for_tests(key: &str) -> bool {
+    lock_probe_memo()
+        .as_ref()
+        .is_some_and(|memo| memo.contains_key(key))
+}
+
 /// Drop only the in-process memo layer, leaving the on-disk layer intact:
 /// the fresh-process simulation the disk-memo oracles use. Unix only.
 #[cfg(all(test, unix))]

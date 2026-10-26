@@ -54,6 +54,8 @@ pub(crate) use probe::{
     SpawnProbe, SUPPORTED_RLM_RUNTIME_ABI,
 };
 use probe::{has_prime_agent_runtime_memoized, installed_runtime_identity};
+#[cfg(test)]
+pub(crate) use probe::{probe_memo_has_for_tests, seed_probe_memo_for_tests};
 use runtime_source::collect_python_files;
 pub(super) use runtime_source::{hash_runtime_source, require_runtime_source_dir};
 pub(super) use runtime_source::{package_dir, packaged_runtime_dir};
