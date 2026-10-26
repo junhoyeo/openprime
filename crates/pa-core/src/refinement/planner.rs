@@ -402,7 +402,12 @@ pub fn apply_refinement_proposal(
             applied_edits.push(row);
             continue;
         }
-        if action == RefinementAction::Create && before.is_some() {
+        // A preserved row is an entry this build cannot type; TS still holds it as one.
+        let preserved = state
+            .preserved_entries
+            .get(&kind)
+            .is_some_and(|rows| rows.contains_key(&id));
+        if action == RefinementAction::Create && (before.is_some() || preserved) {
             let mut row = AppliedRefinementEdit::planned(edit, action, kind, id.clone());
             row.before = before;
             row.error = Some("entry already exists".to_string());
@@ -874,6 +879,45 @@ mod tests {
         assert!(rolled.applied_edits[0].applied);
         // r1 created m1 with no before snapshot, so the rollback deletes it.
         assert!(!state.entries[&RefinementKind::Memory].contains_key("m1"));
+    }
+
+    #[test]
+    fn create_refuses_an_id_held_by_a_preserved_row() {
+        // TS keeps a hand-edited row as an entry, so a create on its id is a duplicate
+        // (refinement.ts:1111) and must never replace the row on the next save.
+        let mut state = empty_harness_state();
+        let preserved = serde_json::json!({ "id": "hand_edited", "title": 42 });
+        state
+            .preserved_entries
+            .entry(RefinementKind::Memory)
+            .or_default()
+            .insert("hand_edited".to_string(), preserved.clone());
+        let result = apply_refinement_proposal(
+            &mut state,
+            &RefinementProposal {
+                summary: "add a memory".to_string(),
+                rationale: String::new(),
+                expected_outcome: String::new(),
+                edits: vec![create_memory_edit("hand_edited", "Fact", "replacement")],
+            },
+            ApplyOptions {
+                id: "r1".to_string(),
+                rollback_of: None,
+                scope: None,
+                baseline_state: None,
+                factory_enabled: false,
+            },
+        );
+        assert!(!result.applied_edits[0].applied);
+        assert_eq!(
+            result.applied_edits[0].error.as_deref(),
+            Some("entry already exists")
+        );
+        assert!(!state.entries[&RefinementKind::Memory].contains_key("hand_edited"));
+        assert_eq!(
+            state.preserved_entries[&RefinementKind::Memory]["hand_edited"],
+            preserved
+        );
     }
 
     #[test]
