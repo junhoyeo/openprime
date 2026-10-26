@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json as _json
 import os
 import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -61,7 +64,14 @@ def config_dir(account: str | None = None) -> Path:
     return CONFIG_DIR.parent / slot
 
 # Hosts treated as "a gateway running on this machine" when probing provider health.
-_LOOPBACK = ("127.0.0.1", "localhost", "0.0.0.0", "::1")
+_LOCALHOST = "localhost"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep a configured loopback health check on its validated origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 DEFAULT_REPL_TIMEOUT = 120.0
 DEFAULT_AGENT_TIMEOUT = 900.0
@@ -326,7 +336,7 @@ if (url && !{str(bool(keep_open)).lower()}) await p.close();
 console.log("B64:" + buf.toString('base64'));
 """
     body = await repl(js, timeout=timeout)
-    line = next((l for l in body.splitlines() if l.startswith("B64:")), None)
+    line = next((output_line for output_line in body.splitlines() if output_line.startswith("B64:")), None)
     if not line:
         raise AsideError(f"no screenshot data returned:\n{body[:500]}")
     dest = Path(path).expanduser()
@@ -335,41 +345,99 @@ console.log("B64:" + buf.toString('base64'));
     return str(dest)
 
 
-def _read_providers(account: str | None = None) -> dict:
+def _provider_config(account: str | None = None) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Validated non-secret fields from one account's optional models.json."""
     cfg = config_dir(account) / "models.json"
-    if not cfg.exists():
-        return {}
     try:
-        return _json.loads(cfg.read_text()).get("providers") or {}
-    except ValueError:
-        return {}
+        document = _json.loads(cfg.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, None
+    except OSError:
+        return {}, "models.json could not be read"
+    except (UnicodeError, ValueError):
+        return {}, "models.json is not valid UTF-8 JSON"
+    if not isinstance(document, dict):
+        return {}, "models.json root must be an object"
+    raw_providers = document.get("providers", {})
+    if not isinstance(raw_providers, dict):
+        return {}, "models.json providers must be an object"
+
+    invalid = False
+    normalized: dict[str, dict[str, Any]] = {}
+    for provider_id, raw_provider in raw_providers.items():
+        if not isinstance(provider_id, str) or not isinstance(raw_provider, dict):
+            invalid = True
+            continue
+        base_url = raw_provider.get("baseUrl", "")
+        if not isinstance(base_url, str):
+            invalid = True
+            base_url = ""
+        raw_models = raw_provider.get("models", [])
+        if not isinstance(raw_models, list):
+            invalid = True
+            raw_models = []
+        valid_models = []
+        for raw_model in raw_models:
+            if not isinstance(raw_model, dict) or not isinstance(raw_model.get("id"), str) or not raw_model["id"]:
+                invalid = True
+                continue
+            valid_models.append({"id": raw_model["id"]})
+        normalized[provider_id] = {"baseUrl": base_url, "models": valid_models}
+    error = "models.json contains invalid provider or model entries" if invalid else None
+    return normalized, error
+
+
+def _read_providers(account: str | None = None) -> dict[str, dict[str, Any]]:
+    return _provider_config(account)[0]
 
 
 def providers(*, account: str | None = None) -> dict[str, str]:
     """Custom providers declared in the account's `models.json`, as {provider_id: baseUrl}."""
-    return {pid: (prov.get("baseUrl") or "") for pid, prov in _read_providers(account).items()}
+    return {pid: provider["baseUrl"] for pid, provider in _read_providers(account).items()}
 
 
 def models(*, account: str | None = None) -> list[str]:
     """List custom `provider/model` ids configured in the account's `models.json`.
 
-    Returns [] when no custom providers are configured - the built-in providers
-    picked in Aside's settings still work, they just are not listed here.
+    Returns [] when no valid custom providers are configured - the built-in
+    providers picked in Aside's settings still work, they just are not listed here.
     """
     return [
-        f"{pid}/{m.get('id')}"
-        for pid, prov in _read_providers(account).items()
-        for m in (prov.get("models") or [])
+        f"{provider_id}/{model['id']}"
+        for provider_id, provider in _read_providers(account).items()
+        for model in provider["models"]
     ]
+
+
+def _loopback_origin(base_url: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        _ = parsed.port  # reject malformed ports before any request
+    except (TypeError, ValueError):
+        return None
+    try:
+        is_loopback = parsed.hostname == _LOCALHOST or ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        is_loopback = False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not is_loopback
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return base_url.rstrip("/")
 
 
 async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
     """Diagnose the whole chain before blaming a task: CLI, app, custom providers.
 
     Run this first whenever an aside call fails. Returns a dict with an `ok` flag
-    and a human-readable `summary`. Local providers (a gateway on loopback declared
-    in `models.json`) are probed only when they are actually configured, so a plain
-    install with no custom providers still reports healthy.
+    and a human-readable `summary`. Only exact loopback origins from a valid
+    `models.json` are probed. Redirects are refused and response bodies are bounded.
     """
     report: dict[str, Any] = {}
     try:
@@ -379,33 +447,66 @@ async def health(*, account: str | None = None, timeout: float = 15.0) -> dict:
 
     report["app_running"] = await asyncio.to_thread(_app_running)
     report["account"] = account or "u0"
-    report["models"] = models(account=account)
+    configured, config_error = _provider_config(account)
+    report["models"] = [
+        f"{provider_id}/{model['id']}"
+        for provider_id, provider in configured.items()
+        for model in provider["models"]
+    ]
+    if config_error:
+        report["config_error"] = config_error
 
-    def _probe(base: str) -> str:
+    def _probe(base_url: str) -> dict[str, Any]:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         try:
-            with urllib.request.urlopen(f"{base.rstrip('/')}/health", timeout=timeout) as r:
-                return r.read().decode()[:200]
-        except Exception as exc:  # noqa: BLE001
-            return f"unreachable: {exc}"
+            with opener.open(f"{base_url}/health", timeout=timeout) as response:
+                status = getattr(response, "status", 200)
+                body = response.read(201)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            status = "redirect refused" if 300 <= exc.code < 400 else f"HTTP {exc.code}"
+            return {"ok": False, "status": status}
+        except Exception:  # network and TLS errors are diagnostics, never fatal
+            return {"ok": False, "status": "unreachable"}
+        if status != 200:
+            return {"ok": False, "status": f"HTTP {status}"}
+        if len(body) > 200:
+            return {"ok": False, "status": "response too large"}
+        try:
+            payload = _json.loads(body.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            return {"ok": False, "status": "invalid health response"}
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            return {"ok": False, "status": "health response did not report ok"}
+        return {"ok": True, "status": "ok"}
 
-    local = {pid: url for pid, url in providers(account=account).items()
-             if any(h in url for h in _LOOPBACK)}
+    local = {}
+    if config_error is None:
+        for provider_id, provider in configured.items():
+            origin = _loopback_origin(provider["baseUrl"])
+            if origin is not None:
+                local[provider_id] = origin
     report["local_providers"] = {}
-    for pid, url in local.items():
-        body = await asyncio.to_thread(_probe, url)
-        report["local_providers"][pid] = {"baseUrl": url, "response": body, "ok": '"ok"' in body}
-
-    report["ok"] = bool(report["app_running"])
+    budget = max(float(timeout), 0.001)
+    for provider_id, origin in local.items():
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(_probe, origin), timeout=budget)
+        except asyncio.TimeoutError:
+            result = {"ok": False, "status": "timed out"}
+        report["local_providers"][provider_id] = {"baseUrl": origin, **result}
 
     problems = []
     if not report["app_running"]:
         problems.append("Aside Browser is not running - open the Aside app")
-    for pid, info in report["local_providers"].items():
+    if config_error:
+        problems.append(config_error)
+    for provider_id, info in report["local_providers"].items():
         if not info["ok"]:
             problems.append(
-                f"local provider '{pid}' at {info['baseUrl']} looks down ({info['response']}); "
-                "start it or pick a different model. Other providers still work."
+                f"local provider '{provider_id}' at {info['baseUrl']} looks down "
+                f"({info['status']}); start it or pick a different model."
             )
+    report["ok"] = not problems
     report["summary"] = "; ".join(problems) if problems else (
         f"ok - app running, {len(report['models'])} custom model(s), "
         f"{len(report['local_providers'])} local provider(s)"

@@ -1598,31 +1598,35 @@ def _split_alternation(pattern: str) -> list[str]:
     return branches
 
 
-def _probe_terms(literal: str, ignore_case: bool = False) -> list[str]:
+def _probe_terms(literal: str) -> list[str]:
     literal = literal.strip()
-    if len(literal) < 3 or (ignore_case and not literal.isascii()):
-        # bytes.lower() cannot reproduce Unicode case folding, so a Unicode
-        # smart-case probe could reject a file that the parsed regex matches.
+    if len(literal) < 3 or not literal.isascii():
+        # bytes.lower() cannot preserve exact non-ASCII bytes or reproduce
+        # Unicode case folding, so a Unicode probe could reject a real match.
         return []
     # JSONL stores text escaped (\n, \uXXXX for non-ASCII), so probe the raw
     # literal and its JSON-escaped form.
     return [literal.lower(), json.dumps(literal, ensure_ascii=True)[1:-1].lower()]
 
 
-def _prefilter_terms(pattern: str, fixed: bool, ignore_case: bool = False) -> list[str]:
+def _prefilter_terms(pattern: str, fixed: bool) -> list[str]:
     """Cheap literal probes used to skip whole transcripts before parsing.
 
     Returns an empty list when the pattern cannot be probed safely, which means
     "do not skip any file".
     """
     if fixed:
-        return _probe_terms(pattern, ignore_case)
+        return _probe_terms(pattern)
+    if re.search(r"\\(?:[uUxN]|[0-7])", pattern):
+        # Python's regex engine decodes Unicode/hex/named/octal escapes after
+        # this raw-file probe, so their textual spelling is not mandatory.
+        return []
     terms: list[str] = []
     for branch in _split_alternation(pattern):
         runs = _mandatory_literals(branch)
         if not runs:
             return []  # one un-probeable branch makes the whole filter unsafe
-        probes = _probe_terms(max(runs, key=len), ignore_case)
+        probes = _probe_terms(max(runs, key=len))
         if not probes:
             return []
         terms.extend(probes)
@@ -1699,7 +1703,7 @@ def grep_sessions(
     """Grep parsed events across transcripts. Returns one dict per session with
     a ``hits`` list of {index, kind, name, text, context}."""
     regex = compile_pattern(pattern, fixed=fixed, ignore_case=ignore_case)
-    terms = _prefilter_terms(pattern, fixed, bool(regex.flags & re.IGNORECASE))
+    terms = _prefilter_terms(pattern, fixed)
 
     if session is not None:
         candidates = _grep_paths(session, harness)

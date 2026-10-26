@@ -7,8 +7,6 @@ Structured helpers: ``find_sessions``, ``load_session``, ``grep_sessions``,
 
 from __future__ import annotations
 
-from typing import Any
-
 from .sessions import (  # noqa: F401
     HARNESSES,
     Event,
