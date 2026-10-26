@@ -45,11 +45,9 @@
       "BLOCKED"
     ],
     "migration_status_counts": {
-      "BLOCKED": 77,
-      "truly-obsolete": 19,
-      "verified-upstream-equivalent": 3
+      "BLOCKED": 99
     },
-    "classification_policy": "Only high-confidence already-covered source mappings close as verified. Medium/low rewrites and test-only diffs naming product invariants remain BLOCKED until a focused lane verifier passes; unproven equivalence is never obsolete."
+    "classification_policy": "Inventory disposition and verification outcome are separate. Every row remains BLOCKED until its focused lane verifier and integrated-tip acceptance pass; confidence alone never proves parity. Proposed final statuses are review candidates, not acceptance claims."
   },
   "commits": [
     {
@@ -86,7 +84,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "c9e679576470170db4ce10d2777b9607476eaf8f",
@@ -103,10 +103,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "changelog fragment for retired union-alpha.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "bf9f9899d04763c4a9d5a66eb9c3f9d49b7fd22f",
@@ -143,7 +145,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "e29b02f94f466bf4b01c204bee281479a6ceb0dc",
@@ -182,7 +186,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "3307acb13ea32f64b8c65a5c37892793830c5337",
@@ -214,7 +220,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "daa6b089fe5a9108d9ca43336991c95f4e8f9980",
@@ -243,10 +251,12 @@
       ],
       "port_target": null,
       "notes": "TS bundled-catalog build mechanism deleted; custom-model lane = models.json.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "eeddaf136e22ea5caf1baafa12d020f40fe90c31",
@@ -265,10 +275,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "fork-side reconciliation with upstream v0.9.6 merge; meaningless on a Rust base.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "92e926c4597a90af867a8beb6a2dcc9b58282bec",
@@ -291,10 +303,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "fork-side reconciliation with upstream v0.9.6 merge; meaningless on a Rust base.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "da68b19032079233205afdc831f31122a4d501d1",
@@ -314,10 +328,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "fork-side reconciliation with upstream v0.9.6 merge; meaningless on a Rust base.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "69bea2c159eea0107bfecc01b2fb9ebf80c11517",
@@ -334,10 +350,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "dropped a TS test asserting statically-compiled entries now served remotely.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "9320cf4642896386dfabe134239d5fa695ed0677",
@@ -360,10 +378,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "fork-side reconciliation with upstream v0.9.6 merge; meaningless on a Rust base.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "2151c02717ea54bbdd085e7abf85d7b45ef2220b",
@@ -389,7 +409,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "76a8053d7032db50f176433e3315c950ee6e909f",
@@ -406,10 +428,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "changelog fragment",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "3a537a23f2750ad221c21b136eab8455db4b3705",
@@ -437,7 +461,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "8453b5e46d927dbf1837f8cb55416a287d9fda51",
@@ -464,7 +490,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "3555298ecc960f44f8f72afb3bade60b6989e31c",
@@ -502,7 +530,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "e61a6ff412d8e1b6151ff6e36509898c4c776a09",
@@ -539,7 +569,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "a2c88fa285e0739c67aa0e8195177c071e355dd8",
@@ -568,10 +600,12 @@
       ],
       "port_target": null,
       "notes": "union-alpha retired; generic zen capability covered; keyless semantics tracked in PR #30 cluster.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "3dd5fe46af5f867267d990c2e7e313408d1364fe",
@@ -594,10 +628,12 @@
       ],
       "port_target": null,
       "notes": "Opus 5.5 served by live remote catalog (pa-models fetch, frozen URL contract).",
-      "migration_status": "verified-upstream-equivalent",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port."
+      "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
+      "proposed_final_status": "verified-upstream-equivalent",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "8b5ec62f8d33ca1609b4e704d40f5586ee76ebd0",
@@ -630,7 +666,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "0e87bcc3e83378193b58ba0e7aa2ab2d62f1c784",
@@ -669,10 +707,12 @@
       ],
       "port_target": null,
       "notes": "Model + Fast mode both upstream (service tiers #2144).",
-      "migration_status": "verified-upstream-equivalent",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port."
+      "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
+      "proposed_final_status": "verified-upstream-equivalent",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "ee7c91d058b23d289212a70953028cbd7972cc1a",
@@ -700,7 +740,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "d2b5c9569dac87ed79e9a0c0cf30df1e91e4f6e0",
@@ -746,7 +788,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6c4da7150f7cc484966bdf1be673df66920867b8",
@@ -793,7 +837,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "eac7f200b6c85de7970bd747dda61f0a982a368e",
@@ -829,7 +875,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6567e228f01d14ab68307093151c2551ab541245",
@@ -853,11 +901,13 @@
         }
       ],
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
-      "notes": "Fork btw feature: persist side-question pointer + full spend. Port only if the persisted-/btw workflow is still wanted; upstream base gives ephemeral /btw.",
+      "notes": "Fork btw feature: persist side-question pointer + full spend. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "1bfc4904b1fa778296fe1135f26557d6a528b9e7",
@@ -882,11 +932,13 @@
         }
       ],
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
-      "notes": "Fork btw feature: capability-gate side-question pane ids on the wire. Port only if the persisted-/btw workflow is still wanted; upstream base gives ephemeral /btw.",
+      "notes": "Fork btw feature: capability-gate side-question pane ids on the wire. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "a4ca8cbd8ccd5b44718e9ea8eee184cdcb13e9be",
@@ -914,11 +966,13 @@
         }
       ],
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
-      "notes": "Fork btw feature: persist side conversations as linked sub-sessions — upstream /btw is ephemeral by design. Port only if the persisted-/btw workflow is still wanted; upstream base gives ephemeral /btw.",
+      "notes": "Fork btw feature: persist side conversations as linked sub-sessions — upstream /btw is ephemeral by design. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "660476b2485e01ebce78fe3a4ba574d017ed0723",
@@ -938,7 +992,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust."
+      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "d3f48ca26340baf26309621b0966d7178723fec3",
@@ -958,7 +1014,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust."
+      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6865437be45315a882a8298abc34d9cbfce411f9",
@@ -978,7 +1036,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust."
+      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "cec974ddbddfafda20b8c7f0de452dab87a82de6",
@@ -996,10 +1056,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS feature-hint mock fixture",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "d3572635dfa7a710a56f556bbc064e7bd7f26bf7",
@@ -1030,7 +1092,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "91a6463434aabb20c5d89a342f2e09c49b3a87b1",
@@ -1047,10 +1111,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "fork CI trigger on develop; upstream CI differs — migration branch sets its own triggers",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "934108148442f27dc764f4b3b219fe65ff6bd802",
@@ -1074,10 +1140,12 @@
       ],
       "port_target": null,
       "notes": "MCP SDK 2.x schema read covered.",
-      "migration_status": "verified-upstream-equivalent",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port."
+      "migration_rationale": "High-confidence source mapping identifies the upstream implementation and verifier; no duplicate port.",
+      "proposed_final_status": "verified-upstream-equivalent",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "a4599defb520a68c5445f8d6f63ef935b7858432",
@@ -1102,11 +1170,13 @@
         }
       ],
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
-      "notes": "Fork btw feature: settle btw panes reliably (TUI/daemon). Port only if the persisted-/btw workflow is still wanted; upstream base gives ephemeral /btw.",
+      "notes": "Fork btw feature: settle btw panes reliably (TUI/daemon). MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "4f60d6426661c077c63b409a9efb1e867b8ad8e7",
@@ -1123,10 +1193,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS docs page deleted upstream.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "41f5a313d7bf248c6f4d10787cf54d19a924287c",
@@ -1161,7 +1233,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "bd15cf317348b8e963463e3f774f0e7e12d8766f",
@@ -1192,7 +1266,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "d13151be6a8368cdcd4e27a4d85436c02d3fdb71",
@@ -1216,11 +1292,13 @@
         }
       ],
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
-      "notes": "Fork btw feature: honor hooks during btw compaction. Port only if the persisted-/btw workflow is still wanted; upstream base gives ephemeral /btw.",
+      "notes": "Fork btw feature: honor hooks during btw compaction. MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "ecb6288b88494e38f2e291da0f7a6a74c0c37472",
@@ -1247,11 +1325,13 @@
         }
       ],
       "port_target": "crates/pa-core/src/session_engine/side_question.rs + pa-daemon wire + pa-tui + session storage",
-      "notes": "Fork btw feature: auto-compact btw context (upstream has only a 3-turn cap). Port only if the persisted-/btw workflow is still wanted; upstream base gives ephemeral /btw.",
+      "notes": "Fork btw feature: auto-compact btw context (upstream has only a 3-turn cap). MUST preserve the fork workflow: legacy linked side-session JSONL, parent linkage, visible historical pane/conversation, and full spend must load and resume; byte preservation alone is insufficient.",
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "0b5676b6498cf0ecb89dbffc530b2f67545b8f18",
@@ -1290,7 +1370,7 @@
           "id": "failed-worker-heartbeat-isolation",
           "migration_status": "BLOCKED",
           "owner": "rust-port-sessions",
-          "rationale": "Verify the Rust fail-whole/last-good-snapshot design preserves global listing availability when one worker fails; semantics require an explicit decision."
+          "rationale": "Intentional fork invariant: one failed worker must not fail the global heartbeats list. Preserve per-worker failure isolation with explicit error/staleness where possible; any concrete semantic incompatibility remains a parent-decision blocker."
         },
         {
           "id": "queue-selection-test-fixture",
@@ -1298,7 +1378,9 @@
           "owner": "rust-port-sessions",
           "rationale": "TypeScript-only test-double repair; no production behavior to port."
         }
-      ]
+      ],
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "23b34f058c392f7dc00b04d56d32114b870c5a39",
@@ -1315,10 +1397,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS catalog snapshot/build/test plumbing; mechanism deleted upstream.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6ba3841c3cb8db2880ac2918681128495f5d814b",
@@ -1336,10 +1420,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS catalog snapshot/build/test plumbing; mechanism deleted upstream.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "8cfa9331619ef01a43c6bd1cf552141cceb9dfa5",
@@ -1356,10 +1442,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS catalog snapshot/build/test plumbing; mechanism deleted upstream.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "d16a6d94bb638292c3e83d94ffe3df3a3e8fcd3b",
@@ -1376,10 +1464,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "esbuild bundle-chunk eviction; no JS bundler in Rust",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "8a681bfd112b12b6ef5e3a00709a3e9c09d6cc76",
@@ -1410,7 +1500,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "cc4f35b8d1a426be5a2956538dfaaa66f65288ba",
@@ -1443,7 +1535,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "b3e91c3d65518d69fc8f44f831204a47ed274707",
@@ -1476,7 +1570,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "9e06acc6993ef1ffc82ebc946d322cc0a6dc5cf2",
@@ -1507,7 +1603,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "2f2cdfb1e1b0b4ff171ff68d46dc6897d53abedf",
@@ -1542,7 +1640,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "632dd62f6cd8356b57bb40a77396f430830d9b73",
@@ -1576,7 +1676,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6da4f31a6c34baf44f6e604840ad0ccdb661fdc2",
@@ -1609,7 +1711,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "4dcace9c88d98f24460211ed506da715c51502b8",
@@ -1629,7 +1733,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "4fa2ead9703978cdf8a77a7c94ac335404cbc5f0",
@@ -1663,7 +1769,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "d5bc1eedca9a324c46684e61565f9bb4fa15c6a5",
@@ -1707,7 +1815,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "b24bd42f6d44a0e985cfb9852ca18996a86c7fe0",
@@ -1759,7 +1869,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "07af2c24b6abe327d1822b0664e1e76c6e2fbfd9",
@@ -1811,7 +1923,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "adde4cc6b080316fa21463311af133759ef3a1da",
@@ -1853,7 +1967,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "43556ee4f9ddbcf7956164443877eb8c71fd8a0b",
@@ -1901,7 +2017,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "1ca7353702fb954aaa401c96424bedc9bae52740",
@@ -1943,7 +2061,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "c3adf81be0d994b613830a29b9ce8e3cea33da71",
@@ -1985,7 +2105,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "b2bb37bb273d14a41a52440ffa989a01960dadce",
@@ -2027,7 +2149,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "aa3ae8fc06d4b790d3f8e527c14e6037cc35bdac",
@@ -2068,7 +2192,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "7dc2817dc1a4e28566533f3900af3b887e1b3789",
@@ -2109,7 +2235,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6f0b233ddc1a38d336f092b224c3dada6f67ed32",
@@ -2129,7 +2257,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust."
+      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "9aca6ba2a1b5a27cab3a66bb43fa5d4f9ba70734",
@@ -2155,7 +2285,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "50ffa44c24414458516153aba6f60dafe183bb39",
@@ -2172,10 +2304,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "removed TS heartbeats regression test",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "0807e4a69721b1f768132e5bd4474822b72b5308",
@@ -2192,10 +2326,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "removed TS stop-identity tests",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "33db789918541865157bf1ad31f92123e1165dbb",
@@ -2215,7 +2351,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust."
+      "migration_rationale": "The TypeScript diff is test-only, but it names a product invariant; keep blocked until the owning lane maps and verifies that invariant in Rust.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "8436157579b3458ac19b0dae475fd9209c98b252",
@@ -2257,7 +2395,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "48fae2a5a2fdb43e800a9bcd9943d1311b67f997",
@@ -2299,7 +2439,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "ae2db8c32cf9619d0a40f6509a97beee79572f4c",
@@ -2343,7 +2485,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "c5e9a2a5f74713244e93132192e61e35f748bdea",
@@ -2386,7 +2530,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "837be68249a6e6d631c7bc50ca0814b0cbbb13d1",
@@ -2428,7 +2574,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "e32bce3840f0e234062f717f95bf518936a3e162",
@@ -2471,7 +2619,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "37d7a7d7ea7ec24c09ab320a2cba809f379088a1",
@@ -2514,7 +2664,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "60afe1a781cf9e37466bf65c78eeb6138d41da8f",
@@ -2558,7 +2710,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "38b69af3a15f2ff66b3b0f55e2bfc66d210df858",
@@ -2600,7 +2754,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "ec5e6766e57ee41ace0c9b31d0457b9f93b1d519",
@@ -2642,7 +2798,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "5a19fe961441376cbb87a5800e19e0ea400b191a",
@@ -2684,7 +2842,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "b66ce86d3f3c57d532c36f025e3bfd6cb53548f0",
@@ -2726,7 +2886,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "324f9b63749ccfc71a1ab6d890b21d4d12226992",
@@ -2768,7 +2930,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "0d2e4ed73222f1cb940558f77cdeed5413b5d670",
@@ -2810,7 +2974,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "ba1ad540dd9e8f73f4aa632a9e1bf4ee86dd31cc",
@@ -2852,7 +3018,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "8109307ac3bbbb898f6e21a2ace2ed69d9ea46f6",
@@ -2894,7 +3062,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "fed4fd4c7624a33459a0cd62d8d4919977f87e35",
@@ -2936,7 +3106,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "50b835d4985c79597bddb0959e9205377311bef0",
@@ -2978,7 +3150,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "b06797e3218a8c45963cdb81ff8996830b6ee3d7",
@@ -3026,7 +3200,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "df0cf07528372237c70129205eb75695df18a0e8",
@@ -3068,7 +3244,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "6470a60e7f3ec2ed7e1bf26b56ed230ae51297ca",
@@ -3110,7 +3288,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "a59f857cd9767ec2bd1605ee1454c90c9af3b6e8",
@@ -3152,7 +3332,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "3201db6436272687236b1d52658444da115a1fb6",
@@ -3194,7 +3376,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "4d987e7008fff296f5c547f23cba948b1634a3dd",
@@ -3236,7 +3420,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "966c11aa77a73ffd8634f063d8de1d49477b72f7",
@@ -3278,7 +3464,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "502e7a496c9c6923063a30067fd5215443c62659",
@@ -3320,7 +3508,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "0401ba71dc1ae6800801aabec199181a508e5a75",
@@ -3347,7 +3537,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier."
+      "migration_rationale": "Scout found a Rust rewrite, but medium/low-confidence source mapping is not cutover proof; the owning lane must run a focused verifier.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "3f747ebbe16d94fe4341f4e204d1befc178fd72c",
@@ -3364,10 +3556,12 @@
       "evidence": [],
       "port_target": null,
       "notes": "TS docs note.",
-      "migration_status": "truly-obsolete",
+      "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port."
+      "migration_rationale": "The concrete notes identify language/runtime-specific, removed-fixture, or merge-maintenance work with no Rust production behavior to port.",
+      "proposed_final_status": "truly-obsolete",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     },
     {
       "hash": "2ac5eed4249acca319009e37870749c4e8b473e2",
@@ -3395,7 +3589,9 @@
       "migration_status": "BLOCKED",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port."
+      "migration_rationale": "Behavior is absent or incomplete at the pinned Rust tip; keep blocked until the named owner supplies a tested integrated port.",
+      "proposed_final_status": "BLOCKED",
+      "verification_outcome": "pending focused lane verifier and integrated-tip acceptance"
     }
   ],
   "pull_requests": [
@@ -3426,15 +3622,17 @@
       ],
       "port_target": null,
       "notes": "DO NOT re-port — fork PR would regress the reviewed upstream implementation. Close PR #32 with a pointer to #3749.",
-      "migration_status": "verified-upstream-equivalent",
+      "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": []
+      "integration_evidence": [],
+      "proposed_final_status": "verified-upstream-equivalent",
+      "verification_outcome": "pending integrated-tip acceptance; do not close the legacy PR"
     },
     {
       "hash": "4af3c6d89",
       "short": "PR#33",
       "date": "2026-09-26",
-      "subject": "feat(agent-sessions): search Aside chats and text artifacts (branch feat/agent-sessions-aside)",
+      "subject": "agent-sessions Aside indexing and Unicode smart-case fixes (PR #33)",
       "files": [
         "packages/coding-agent/skills/agent-sessions/*(7 files, +436/-23)"
       ],
@@ -3462,13 +3660,24 @@
           "kind": "upstream-path",
           "ref": "crates/pa-cli/tests/packaged_layout_e2e.rs:259,600",
           "note": "packaged install ships a skills/ dir beside the binary"
+        },
+        {
+          "kind": "fork-commit",
+          "ref": "5d4d1eb26f0e63ed8946bad39746412d00f6acd0",
+          "note": "preserve Unicode smart-case matches in the Rust-bundled Python skill port"
         }
       ],
       "port_target": "skills/agent-sessions/ (top-level, Rust-era layout)",
-      "notes": "Pure Python skill content + tests; carries over verbatim when agent-sessions is bundled from latest fork source. No TS dependency.",
+      "notes": "Port both the Aside transcript/artifact indexing work and the later Unicode smart-case fix into the Rust-era top-level bundled skill, with package-layout execution evidence.",
       "migration_status": "BLOCKED",
       "port_commits": [],
-      "integration_evidence": []
+      "integration_evidence": [],
+      "proposed_final_status": "ported",
+      "verification_outcome": "pending integrated-tip acceptance; do not close the legacy PR",
+      "related_legacy_commits": [
+        "4af3c6d89",
+        "5d4d1eb26f0e63ed8946bad39746412d00f6acd0"
+      ]
     }
   ]
 }

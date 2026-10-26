@@ -36,7 +36,7 @@ Each commit and PR #32/#33 must end in exactly one state:
 Legacy commit `0b5676b6498cf0ecb89dbffc530b2f67545b8f18` restored three behaviors after an old upstream merge. They must be audited independently rather than classifying the commit by its broad subject:
 
 1. Normalize process start IDs before deciding a descriptor belongs to a replaced process; unverifiable identity remains unknown and is not reaped as stale.
-2. Exclude failed workers from the global heartbeat list so one poisoned worker cannot fail the entire listing.
+2. Preserve the intentional per-worker heartbeat failure isolation so one poisoned worker cannot fail the entire global listing. An explicit error/stale row is acceptable; upstream's fail-whole/last-good snapshot alone is not accepted without a parent decision.
 3. Preserve refinement-status test fixture compatibility after queue-selection changes. This third item may be TypeScript-test-only, but it stays blocked until the Rust test surface is checked.
 
 ## Work ownership
@@ -59,6 +59,7 @@ All runtime and state checks use a temporary `HOME`, explicit temporary daemon s
 State-compatibility acceptance is not satisfied by `--version`. Before cutover, the integrated binary must prove all of the following while original evidence remains byte-identical:
 
 - sanitized TypeScript session JSONL, settings, models, harness entries, and skill metadata load from copied fixtures;
+- legacy persisted `/btw` linked sessions load and resume with parent linkage, full spend, and visible historical conversation; byte preservation alone is insufficient;
 - archived sessions reopen;
 - restored kernel snapshots never truncate or recreate referenced files;
 - auth schema compatibility is tested with synthetic values only;
@@ -114,6 +115,6 @@ After every blocker is closed, the integration lead will provide the tested Rust
 
 ## Current blockers
 
-The scout inventory is fully recorded: 3 entries are high-confidence `verified-upstream-equivalent`, 19 are `truly-obsolete` with concrete runtime/model/maintenance rationale, and 77 remain `BLOCKED`. Medium/low-confidence rewrite mappings stay blocked until their owning lane runs a focused verifier. PR #32 maps to the stronger upstream #3749 implementation; PR #33 remains blocked on the tested bundled-skill port.
+The scout inventory is fully recorded, but inventory disposition and verification outcome are separate. All 99 entries remain `BLOCKED` until a focused lane verifier and integrated-tip acceptance pass. Proposed final statuses currently contain 3 upstream-equivalent candidates, 19 obsolete candidates with concrete runtime/model/maintenance rationale, and 77 rows requiring a port or equivalence/invariant proof. PR #32 maps to the stronger upstream #3749 implementation but remains open and blocked through final Rust acceptance; PR #33 tracks both Aside indexing (`4af3c6d89`) and the Unicode smart-case fix (`5d4d1eb26`).
 
 Known native blockers are the immediate spawn-to-collect positive-timeout race and the packaged-layout kernel receipt failure. State compatibility, package assembly, changed-surface parity, combined gates, substantive (non-skipped) Rust CI, and adversarial review are also pending.
