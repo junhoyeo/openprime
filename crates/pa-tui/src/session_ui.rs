@@ -21,6 +21,9 @@ mod settings;
 mod share;
 mod stream;
 mod window;
+
+#[cfg(test)]
+mod refine_cancel_tests;
 pub(crate) use window::TranscriptPageNote;
 
 pub(crate) use apply::CompactionAbortNote;
@@ -247,7 +250,6 @@ pub(crate) struct SessionUi {
     pub(crate) turn_active: bool,
     /// A `/refine` session action is running without a provider stream.
     refine_active: bool,
-    refine_cancel_in_flight: bool,
     /// Completed turns observed on this connection. A prompt ACK may arrive
     /// after its entire streamed turn; it must not restart the loader then.
     turn_ends_seen: u64,
