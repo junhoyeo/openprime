@@ -706,7 +706,8 @@ impl Supervisor {
             return response_success(Some(command_id), type_name, None);
         };
         // The opened-with launch context outlives the retired descriptor: a
-        // later wake recreates the session the way it was opened.
+        // later wake recreates the session the way it was opened. It lands
+        // before the stop, so no wake racing the retire can miss it.
         let launch = {
             let descriptor = resident.descriptor.lock().await;
             descriptor.session_file.clone().map(|file| {
@@ -719,11 +720,16 @@ impl Supervisor {
                 )
             })
         };
+        if let Some((session_file, launch)) = &launch {
+            if let Err(error) = self.passivated_launches.remember(session_file, launch) {
+                self.log_line(&format!(
+                    "session worker {} passivation kept no launch record (its wake falls back to the session header): {error:#}",
+                    resident.worker_id
+                ));
+            }
+        }
         match self.stop_worker_releasing(&resident, Some(fence)).await {
             Ok(()) => {
-                if let Some((session_file, launch)) = launch {
-                    self.passivated_launches.remember(&session_file, launch);
-                }
                 self.log_line(&format!(
                     "session worker {} passivated idle (idleEvictionMinutes={threshold})",
                     resident.worker_id

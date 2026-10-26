@@ -139,8 +139,8 @@ pub struct Supervisor {
     /// reuses the first one's worker instead of losing the runtime session lease.
     pub(crate) opening_files:
         std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// The idle-passivated sessions' opened-with launch contexts: the wake
-    /// replays them instead of the bare file header.
+    /// The idle-passivated sessions' durable opened-with launch contexts: the
+    /// wake replays them instead of the bare file header.
     pub(crate) passivated_launches: crate::passivated_launch::PassivatedLaunches,
     /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
     /// run start (None = opted out); never blocks supervision paths.
@@ -255,6 +255,9 @@ impl Supervisor {
             &options.socket_path,
             &options.agent_dir,
         ));
+        let passivated_launches = crate::passivated_launch::PassivatedLaunches::new(
+            descriptor_dir.join("passivated-launches"),
+        );
         Ok(Supervisor {
             options,
             descriptor_dir,
@@ -262,7 +265,7 @@ impl Supervisor {
             worker_connect_budget: std::sync::Mutex::new(None),
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
             opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
-            passivated_launches: crate::passivated_launch::PassivatedLaunches::default(),
+            passivated_launches,
             telemetry: std::sync::Mutex::new(None),
             daemon_event_counts: std::sync::Mutex::default(),
             registry: SessionRegistry::new(),
