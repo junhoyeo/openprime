@@ -767,21 +767,14 @@ pub fn supports_service_tier_fields(
 #[must_use]
 pub fn supports_service_tier(model: &Model, tier: ServiceTier) -> bool {
     if tier == ServiceTier::Priority && model.api == "openai-responses" {
-        let explicitly_supported = model
-            .compat
-            .as_ref()
-            .and_then(|compat| compat.kind().ok())
-            .is_some_and(|compat| {
-                matches!(
-                    compat,
-                    CompatKind::OpenAiResponses(OpenAiResponsesCompat {
-                        supports_fast_mode: Some(true),
-                        ..
-                    })
-                )
-            });
-        if explicitly_supported {
-            return true;
+        if let Some(compat) = model.compat.as_ref().and_then(|compat| compat.kind().ok()) {
+            return matches!(
+                compat,
+                CompatKind::OpenAiResponses(OpenAiResponsesCompat {
+                    supports_fast_mode: Some(true),
+                    ..
+                })
+            );
         }
     }
     supports_service_tier_fields(&model.provider, &model.api, &model.id, tier)
