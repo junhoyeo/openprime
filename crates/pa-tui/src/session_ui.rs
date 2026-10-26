@@ -22,7 +22,8 @@ mod share;
 mod stream;
 mod window;
 
-#[cfg(test)]
+// The mock daemon listens on a unix socket.
+#[cfg(all(test, unix))]
 mod refine_cancel_tests;
 pub(crate) use window::TranscriptPageNote;
 
