@@ -6,9 +6,9 @@ use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
     ChildCloseReason, ChildObservationSource, ChildRecord, Context, DaemonCommand, Duration,
-    Instant, Mutex, Path, PathBuf, Result, RlmChildResult, RlmCreateSessionHandle,
-    RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle,
-    RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
+    Instant, KickoffAttemptPhase, Mutex, Path, PathBuf, Result, RlmChildResult,
+    RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture,
+    RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
     SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
     RENAME_TIMEOUT_MS,
 };
@@ -86,6 +86,102 @@ pub(crate) static KICKOFF_RETRY_GATE_REACHED: tokio::sync::Notify =
 #[cfg(test)]
 pub(crate) static KICKOFF_RETRY_GATE_RELEASE: tokio::sync::Notify =
     tokio::sync::Notify::const_new();
+
+impl SupervisorChildSessionsInner {
+    async fn prompt_kickoff_attempt(
+        &self,
+        record: &Arc<Mutex<ChildRecord>>,
+        active_session_id: &str,
+        content: &str,
+        row: &Value,
+    ) -> Option<Result<()>> {
+        let mut lifecycle = self.lifecycle_epoch.subscribe();
+        loop {
+            let claim = {
+                let mut child = record.lock().await;
+                if child.settled_status.is_none() && !child.closed_by_parent && !child.retiring {
+                    child.kickoff_epoch = child.kickoff_epoch.wrapping_add(1);
+                    let epoch = child.kickoff_epoch;
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    child.kickoff_phase = KickoffAttemptPhase::Reserved(epoch);
+                    child.kickoff_cancel = Some(cancel.clone());
+                    Some((epoch, cancel))
+                } else {
+                    None
+                }
+            };
+            let Some((epoch, cancel)) = claim else {
+                let child = record.lock().await;
+                if (child.closed_by_parent || child.retiring) && !child.retirement_finished {
+                    drop(child);
+                    if lifecycle.changed().await.is_err() {
+                        return None;
+                    }
+                    continue;
+                }
+                return None;
+            };
+            let dispatch = {
+                let mut child = record.lock().await;
+                if child.kickoff_epoch == epoch
+                    && child.kickoff_phase == KickoffAttemptPhase::Reserved(epoch)
+                    && child.settled_status.is_none()
+                    && !child.closed_by_parent
+                    && !child.retiring
+                {
+                    child.kickoff_phase = KickoffAttemptPhase::Dispatched(epoch);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !dispatch || cancel.is_cancelled() {
+                continue;
+            }
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    let abort = DaemonCommand::Abort { id: None, active_session_id: active_session_id.to_string(), rest: serde_json::Map::default() };
+                    let _ = self.command(&abort, KILL_TIMEOUT_MS).await;
+                    continue;
+                }
+                result = self.prompt_child(active_session_id, content, Some(row)) => result,
+            };
+            let accepted = {
+                let mut child = record.lock().await;
+                let accepted = child.kickoff_epoch == epoch
+                    && child.kickoff_phase == KickoffAttemptPhase::Dispatched(epoch)
+                    && child.settled_status.is_none()
+                    && !child.closed_by_parent
+                    && !child.retiring;
+                if accepted {
+                    child.kickoff_cancel = None;
+                    child.kickoff_phase = if result.is_ok() {
+                        KickoffAttemptPhase::Admitted(epoch)
+                    } else {
+                        KickoffAttemptPhase::Queued
+                    };
+                    if result.is_ok() {
+                        child.prompt_admitted = true;
+                    }
+                }
+                accepted
+            };
+            if accepted {
+                return Some(result);
+            }
+            if result.is_ok() {
+                let abort = DaemonCommand::Abort {
+                    id: None,
+                    active_session_id: active_session_id.to_string(),
+                    rest: serde_json::Map::default(),
+                };
+                let _ = self.command(&abort, KILL_TIMEOUT_MS).await;
+            }
+            return None;
+        }
+    }
+}
 
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
@@ -185,6 +281,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     prompt_release: Arc::clone(&prompt_release),
                     kickoff_started: false,
                     kickoff_epoch: 0,
+                    kickoff_phase: KickoffAttemptPhase::Queued,
                     kickoff_cancel: None,
                     error: None,
                     closed_by_parent: false,
@@ -296,30 +393,18 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         }
                     }
                 }
-                let first_cancel = {
-                    let mut record = watcher_record.lock().await;
-                    if record.settled_status.is_some() || record.closed_by_parent || record.retiring
-                    {
-                        return;
-                    }
-                    record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    record.kickoff_cancel = Some(cancel.clone());
-                    cancel
-                };
-                let first_result = tokio::select! {
-                    biased;
-                    () = first_cancel.cancelled() => return,
-                    result = watcher_this.prompt_child(&child_active_session_id, &kickoff_content, Some(&kickoff_row)) => result,
-                };
-                if first_cancel.is_cancelled() {
+                let Some(first_result) = watcher_this
+                    .prompt_kickoff_attempt(
+                        &watcher_record,
+                        &child_active_session_id,
+                        &kickoff_content,
+                        &kickoff_row,
+                    )
+                    .await
+                else {
                     return;
-                }
+                };
                 if let Err(error) = first_result {
-                    // The route can fail ambiguously around a worker
-                    // replacement. The durable session file arbitrates: a
-                    // kickoff row in the file landed (re-sending would
-                    // duplicate the first turn); one retry is safe.
                     let landed = session_file_carries_spawn_kickoff(
                         child_session_file.as_deref(),
                         &kickoff_row_id,
@@ -329,31 +414,22 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         KICKOFF_RETRY_GATE_REACHED.notify_one();
                         KICKOFF_RETRY_GATE_RELEASE.notified().await;
                     }
-                    let retry_cancel = {
-                        let mut record = watcher_record.lock().await;
-                        if record.closed_by_parent
-                            || record.retiring
-                            || record.settled_status.is_some()
-                        {
-                            return;
-                        }
-                        record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
-                        let cancel = tokio_util::sync::CancellationToken::new();
-                        record.kickoff_cancel = Some(cancel.clone());
-                        cancel
-                    };
                     let retried = if landed {
                         Ok(())
                     } else {
-                        tokio::select! {
-                            biased;
-                            () = retry_cancel.cancelled() => return,
-                            result = watcher_this.prompt_child(&child_active_session_id, &kickoff_content, Some(&kickoff_row)) => result,
-                        }
+                        let Some(result) = watcher_this
+                            .prompt_kickoff_attempt(
+                                &watcher_record,
+                                &child_active_session_id,
+                                &kickoff_content,
+                                &kickoff_row,
+                            )
+                            .await
+                        else {
+                            return;
+                        };
+                        result
                     };
-                    if retry_cancel.is_cancelled() {
-                        return;
-                    }
                     if let Err(retry_error) = retried {
                         eprintln!(
                             "pa-daemon: RLM child task prompt failed for {child_log_id}: {error:#}; retry failed: {retry_error:#}"
@@ -636,6 +712,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 if was_running {
                     row.retiring = true;
                     row.kickoff_epoch = row.kickoff_epoch.wrapping_add(1);
+                    row.kickoff_phase = KickoffAttemptPhase::Terminal;
                     if let Some(cancel) = row.kickoff_cancel.take() {
                         cancel.cancel();
                     }
