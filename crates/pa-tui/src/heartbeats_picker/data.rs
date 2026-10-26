@@ -121,6 +121,43 @@ pub fn parse_heartbeats(data: &Value) -> Vec<HeartbeatEntry> {
         .collect()
 }
 
+/// A bounded warning for an explicitly negotiated partial heartbeat catalog.
+/// Older clients never opt in, so they receive a failed response and keep their
+/// last complete catalog instead of silently rendering partial rows.
+pub fn heartbeat_worker_error(data: &Value) -> Option<String> {
+    let errors = data.get("workerErrors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let mut details = Vec::new();
+    for error in errors.iter().take(3) {
+        let worker = error.get("workerId").and_then(Value::as_str).map_or_else(
+            || "unknown worker".to_string(),
+            crate::menu_panel::scrub_controls,
+        );
+        let message = error.get("error").and_then(Value::as_str).map_or_else(
+            || "catalog unavailable".to_string(),
+            crate::menu_panel::scrub_controls,
+        );
+        let message: String = message.chars().take(160).collect();
+        let disposition = if error.get("omitted") == Some(&Value::Bool(true)) {
+            "omitted"
+        } else {
+            "stale"
+        };
+        details.push(format!("{worker} ({disposition}): {message}"));
+    }
+    let suffix = if errors.len() > details.len() {
+        format!(" +{} more", errors.len() - details.len())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Heartbeat catalog is partial: {}{suffix}",
+        details.join("; ")
+    ))
+}
+
 /// TS `scopeHeartbeatsToSession`: a heartbeat is in scope when its durable
 /// session matches `session_id`, or its live session is the current one or
 /// one of the session's RLM children. No session identity shows nothing.

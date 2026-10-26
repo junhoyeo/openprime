@@ -173,7 +173,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     notice_delivered: false,
                     prompt_admitted: false,
                     prompt_release: Arc::clone(&prompt_release),
-                    kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    kickoff_started: false,
                     error: None,
                     closed_by_parent: false,
                     retiring: false,
@@ -246,28 +246,43 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // admission happens mid-turn, so the parent's continuation
             // request reaches the provider first (see `wait_turn_done`).
             let turn_generation = *this.turn_done.subscribe().borrow();
-            let (prompt_release, kickoff_lock) = {
-                let record = record.lock().await;
-                (
-                    Arc::clone(&record.prompt_release),
-                    Arc::clone(&record.kickoff_lock),
-                )
-            };
+            let prompt_release = Arc::clone(&record.lock().await.prompt_release);
             tokio::spawn(async move {
                 tokio::select! {
                     () = watcher_this.wait_turn_done(turn_generation) => {}
                     () = prompt_release.notified() => {}
                 }
-                let kickoff_guard = kickoff_lock.lock().await;
-                // Cancel/delete/parent-close owns the same per-child gate. A
-                // terminal or retiring child can never be resurrected by a late
-                // collect release or parent boundary.
-                let prompt_allowed = {
-                    let record = watcher_record.lock().await;
-                    !record.closed_by_parent && !record.retiring && record.settled_status.is_none()
-                };
-                if !prompt_allowed {
-                    return;
+                // Claim once under the record mutex, then release it before the
+                // supervisor RPC. A delete/close reservation can fail, so wait for
+                // its lifecycle verdict instead of consuming the only kickoff task.
+                let mut lifecycle = watcher_this.lifecycle_epoch.subscribe();
+                loop {
+                    let decision = {
+                        let mut record = watcher_record.lock().await;
+                        if !record.kickoff_started
+                            && !record.closed_by_parent
+                            && !record.retiring
+                            && record.settled_status.is_none()
+                        {
+                            record.kickoff_started = true;
+                            1u8
+                        } else if (record.closed_by_parent || record.retiring)
+                            && !record.retirement_finished
+                        {
+                            0u8
+                        } else {
+                            2u8
+                        }
+                    };
+                    match decision {
+                        1 => break,
+                        2 => return,
+                        _ => {
+                            if lifecycle.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
                 if let Err(error) = watcher_this
                     .prompt_child(
@@ -311,11 +326,45 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 }
                 // The worker accepted the task: from here an idle read is a
                 // finished run, never the pre-prompt idle worker.
-                watcher_record.lock().await.prompt_admitted = true;
+                let mut lifecycle = watcher_this.lifecycle_epoch.subscribe();
+                loop {
+                    let decision = {
+                        let mut record = watcher_record.lock().await;
+                        if !record.closed_by_parent
+                            && !record.retiring
+                            && record.settled_status.is_none()
+                        {
+                            record.prompt_admitted = true;
+                            1u8
+                        } else if (record.closed_by_parent || record.retiring)
+                            && !record.retirement_finished
+                        {
+                            0u8
+                        } else {
+                            2u8
+                        }
+                    };
+                    match decision {
+                        1 => break,
+                        2 => {
+                            let abort = DaemonCommand::Abort {
+                                id: None,
+                                active_session_id: child_active_session_id,
+                                rest: serde_json::Map::default(),
+                            };
+                            let _ = watcher_this.command(&abort, KILL_TIMEOUT_MS).await;
+                            return;
+                        }
+                        _ => {
+                            if lifecycle.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
                 watcher_this
                     .lifecycle_epoch
                     .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-                drop(kickoff_guard);
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -506,15 +555,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     }
                 }
             };
-            let (rename_lock, kickoff_lock) = {
-                let record = record.lock().await;
-                (
-                    Arc::clone(&record.rename_lock),
-                    Arc::clone(&record.kickoff_lock),
-                )
-            };
+            let rename_lock = Arc::clone(&record.lock().await.rename_lock);
             let _rename_guard = rename_lock.lock().await;
-            let _kickoff_guard = kickoff_lock.lock().await;
             let already_terminated = this.has_retired_usage(&record);
             let no_longer_matches = {
                 let record = record.lock().await;
@@ -566,6 +608,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     // still-live child stays watchable and a later cancel
                     // can still record the parent -> child edge.
                     record.lock().await.retiring = false;
+                    this.lifecycle_epoch
+                        .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
                     return Err(error);
                 }
                 this.retain_retired_usage(&record, super::RetirementIntent::Delete { was_running });

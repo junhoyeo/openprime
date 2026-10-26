@@ -717,7 +717,13 @@ fn wave_b10_heartbeat_snapshot_fallback() {
     assert_eq!(response["success"], true, "{response}");
     stop(pid);
     client.send_command("s5", &json!({ "type": "heartbeats_list" }));
-    let response = client.read_response("s5");
+    let legacy = client.read_response("s5");
+    assert_eq!(legacy["success"], false, "{legacy}");
+    client.send_command(
+        "s6",
+        &json!({ "type": "heartbeats_list", "acceptPartialErrors": true }),
+    );
+    let response = client.read_response("s6");
     assert_eq!(response["success"], true, "{response}");
     assert_eq!(response["data"]["heartbeats"], json!([]), "{response}");
     let errors = response["data"]["workerErrors"]

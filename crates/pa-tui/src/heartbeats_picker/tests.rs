@@ -472,6 +472,30 @@ fn a_managed_job_replaces_or_removes_its_row() {
 }
 
 #[test]
+fn partial_worker_errors_are_bounded_and_render_as_fetch_error() {
+    let data = serde_json::json!({
+        "heartbeats": [{"job": {"id":"healthy","status":"active"}}],
+        "workerErrors": [{
+            "workerId": "worker-a\u{001b}[31m",
+            "error": format!("{}\u{001b}]8;;bad", "failure ".repeat(40)),
+            "stale": true,
+            "omitted": true
+        }]
+    });
+    let rows = parse_heartbeats(&data);
+    assert_eq!(rows.len(), 1);
+    let error = heartbeat_worker_error(&data).expect("partial warning");
+    assert!(error.contains("partial"));
+    assert!(error.contains("omitted"));
+    assert!(!error.contains('\u{1b}'));
+    assert!(error.chars().count() < 300);
+    let mut picker = HeartbeatsPicker::new(rows, Some(error.clone()), None, 10);
+    assert_eq!(picker.fetch_error.as_deref(), Some(error.as_str()));
+    picker.apply_catalog(picker.heartbeats.clone(), Some(error.clone()));
+    assert_eq!(picker.fetch_error.as_deref(), Some(error.as_str()));
+}
+
+#[test]
 fn a_fetch_error_keeps_the_rows() {
     let mut picker = HeartbeatsPicker::new(entries(), None, None, 24);
     picker.set_fetch_error(Some("daemon busy".to_string()));

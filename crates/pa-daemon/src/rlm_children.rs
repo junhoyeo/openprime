@@ -196,9 +196,8 @@ struct ChildRecord {
     /// otherwise the kickoff waits for the parent turn boundary, which the
     /// in-turn collect itself cannot reach until it returns.
     prompt_release: Arc<tokio::sync::Notify>,
-    /// Serializes kickoff admission with cancel/delete/parent-close. This is
-    /// per child (never the registry/session mutex) and may span the one prompt RPC.
-    kickoff_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Claimed under the record mutex before the detached kickoff RPC starts.
+    kickoff_started: bool,
     /// Terminal error text: the cancel reason for a cancelled run, the
     /// failure text for a failed one.
     error: Option<String>,
@@ -779,7 +778,7 @@ impl SupervisorChildSessions {
                 notice_delivered: false,
                 prompt_admitted: true,
                 prompt_release: Arc::new(tokio::sync::Notify::new()),
-                kickoff_lock: Arc::new(tokio::sync::Mutex::new(())),
+                kickoff_started: true,
                 error: None,
                 closed_by_parent: false,
                 retiring: false,

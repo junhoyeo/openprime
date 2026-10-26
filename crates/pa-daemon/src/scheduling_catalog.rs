@@ -456,6 +456,12 @@ impl Supervisor {
         let mut heartbeats: Vec<Value> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut worker_errors: Vec<Value> = Vec::new();
+        let accept_partial_errors = matches!(
+            command,
+            DaemonCommand::HeartbeatsList { rest, .. }
+                if rest.get("acceptPartialErrors").and_then(Value::as_bool) == Some(true)
+        );
+        let mut legacy_error = None;
         for resident in self.live_workers_in_creation_order().await {
             // The generation this read captures: a stored snapshot is only fresh
             // while its generation is current.
@@ -508,6 +514,7 @@ impl Supervisor {
                         .error
                         .clone()
                         .unwrap_or_else(|| "worker heartbeat catalog unavailable".to_string());
+                    legacy_error.get_or_insert_with(|| error.clone());
                     let snapshot = resident.heartbeat_snapshot.lock().await;
                     if let Some(snapshot) = snapshot.as_ref().filter(|snapshot| {
                         snapshot.generation
@@ -552,6 +559,19 @@ impl Supervisor {
                     heartbeats.push(heartbeat);
                 }
             }
+        }
+        if !worker_errors.is_empty() && !accept_partial_errors {
+            let error =
+                legacy_error.unwrap_or_else(|| "worker heartbeat catalog unavailable".to_string());
+            return (
+                vec![response_line(&response_failure(
+                    Some(command_id),
+                    type_name,
+                    &error,
+                    None,
+                ))],
+                false,
+            );
         }
         // Passivated sessions keep their armed heartbeats; no worker can list them (the
         // snapshot-served passive rows).

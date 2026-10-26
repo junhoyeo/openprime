@@ -1,9 +1,10 @@
 //! The background catalog fetch and its update fold, the `/heartbeats`
 //! manager view's keys and management requests.
 use super::{
-    key_event_to_id, parse_heartbeats, picker_viewport_rows, scope_heartbeats, sort_heartbeats,
-    AgentView, DaemonCommand, Duration, HeartbeatAction, HeartbeatEntry, HeartbeatsPicker,
-    HeartbeatsPickerAction, KeyEvent, Map, Result, SessionUi, Value, UI_REQUEST_TIMEOUT_MS,
+    heartbeat_worker_error, key_event_to_id, parse_heartbeats, picker_viewport_rows,
+    scope_heartbeats, sort_heartbeats, AgentView, DaemonCommand, Duration, HeartbeatAction,
+    HeartbeatEntry, HeartbeatsPicker, HeartbeatsPickerAction, KeyEvent, Map, Result, SessionUi,
+    Value, UI_REQUEST_TIMEOUT_MS,
 };
 
 /// A landed heartbeat-catalog refresh: the scoped, sorted rows, or the
@@ -143,13 +144,20 @@ impl SessionUi {
         // Advance the epoch so a refresh still in flight from before the attach
         // never overwrites this fold: the epoch check drops it at fold time.
         self.heartbeat_refresh_epoch += 1;
+        let mut rest = Map::default();
+        if self
+            .client
+            .supports_server_capability("heartbeat_partial_errors")
+        {
+            rest.insert("acceptPartialErrors".to_string(), Value::Bool(true));
+        }
         let Ok(data) = self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
                 DaemonCommand::HeartbeatsList {
                     id: None,
                     active_session_id: None,
-                    rest: Map::default(),
+                    rest,
                 },
             )
             .await
@@ -159,6 +167,7 @@ impl SessionUi {
         let mut heartbeats = self.scope_heartbeats(parse_heartbeats(&data));
         sort_heartbeats(&mut heartbeats);
         self.heartbeat_catalog = heartbeats;
+        self.heartbeat_catalog_error = heartbeat_worker_error(&data);
     }
 
     /// Fire a background heartbeat-catalog refresh: at most one in flight with one queued trailing
@@ -173,11 +182,16 @@ impl SessionUi {
         let updates = self.heartbeat_updates.clone();
         let client = self.client.clone();
         let epoch = self.heartbeat_refresh_epoch;
+        let accepts_partial = client.supports_server_capability("heartbeat_partial_errors");
         tokio::spawn(async move {
+            let mut rest = Map::default();
+            if accepts_partial {
+                rest.insert("acceptPartialErrors".to_string(), Value::Bool(true));
+            }
             let request = DaemonCommand::HeartbeatsList {
                 id: None,
                 active_session_id: None,
-                rest: Map::default(),
+                rest,
             };
             let fetched = tokio::time::timeout(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -189,7 +203,7 @@ impl SessionUi {
                     let _ = updates.send(HeartbeatsUpdate {
                         epoch,
                         heartbeats: parse_heartbeats(&data),
-                        fetch_error: None,
+                        fetch_error: heartbeat_worker_error(&data),
                     });
                 }
                 Ok(Err(error)) => {
@@ -232,11 +246,13 @@ impl SessionUi {
         // Stale-while-revalidate: a failed refresh keeps the last catalog, and
         // the failure surfaces only inside an open manager view.
         if let Some(error) = update.fetch_error {
+            self.heartbeat_catalog_error = Some(error.clone());
             if let Some(picker) = view.heartbeats_picker.as_mut() {
                 picker.set_fetch_error(Some(error));
             }
             self.dirty = true;
         } else {
+            self.heartbeat_catalog_error = None;
             let mut heartbeats = self.scope_heartbeats(update.heartbeats);
             sort_heartbeats(&mut heartbeats);
             self.heartbeat_catalog.clone_from(&heartbeats);
@@ -261,7 +277,7 @@ impl SessionUi {
         self.activity_group = crate::chrome::ActivityGroup::Heartbeats;
         view.heartbeats_picker = Some(HeartbeatsPicker::new(
             self.heartbeat_catalog.clone(),
-            None,
+            self.heartbeat_catalog_error.clone(),
             None,
             picker_viewport_rows(view.terminal_rows()),
         ));
