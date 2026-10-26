@@ -689,3 +689,78 @@ fn a_second_refresh_joins_the_first_flight_instead_of_fetching_again() {
         "one flight per provider: the second caller served the first's fresh credential"
     );
 }
+
+/// The auth.json the TS writer leaves (`JSON.stringify(data, null, 2)`), synthetic values only:
+/// every credential shape resolves, and a Rust write to one provider keeps every other row
+/// value-identical (unknown OAuth fields and the MCP paste fields included).
+#[test]
+fn a_legacy_auth_document_resolves_and_survives_a_rust_write() {
+    let fixture = include_str!("../../../tests/fixtures/legacy-state/auth.json");
+    let legacy: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let auth_path = temp.path().join("auth.json");
+    std::fs::write(&auth_path, fixture).unwrap();
+    let backend: Arc<dyn AuthStorageBackend> = Arc::new(
+        crate::auth::storage::FileAuthStorageBackend::new(auth_path.clone()),
+    );
+    let mut auth = AuthStorage::from_storage(backend, Arc::new(NoOAuth));
+    auth.env_credentials = Arc::new(ScriptedEnv(HashMap::new()));
+
+    assert_eq!(auth.load_error(), None);
+    assert_eq!(
+        serde_json::Value::Object(auth.get_all().0),
+        legacy,
+        "the load keeps every legacy row"
+    );
+    let resolved: Vec<(&str, Option<String>)> = [
+        "anthropic",
+        "prime-inference",
+        "openai-codex",
+        "github-copilot",
+        "google-gemini-cli",
+        "serper",
+    ]
+    .into_iter()
+    .map(|provider| (provider, auth.get_api_key(provider)))
+    .collect();
+    assert_eq!(
+        resolved,
+        vec![
+            ("anthropic", Some("sk-ant-synthetic-0000".to_string())),
+            ("prime-inference", Some("pit-synthetic-0000".to_string())),
+            ("openai-codex", Some("synthetic-codex-access".to_string())),
+            (
+                "github-copilot",
+                Some("synthetic-copilot-access".to_string())
+            ),
+            (
+                "google-gemini-cli",
+                Some("synthetic-gemini-access".to_string())
+            ),
+            ("serper", Some("synthetic-serper-key".to_string())),
+        ]
+    );
+    assert_eq!(
+        auth.get_prime_inference_team_selection(),
+        StoredPrimeTeam::PersonalAccount
+    );
+    assert!(matches!(
+        auth.get_all().credential("mcp:synthetic-connection"),
+        Some(AuthCredential::McpStaticToken { bearer, endpoint: Some(endpoint) })
+            if bearer == "synthetic-bearer" && endpoint == "https://mcp.example.invalid/mcp"
+    ));
+
+    auth.set(
+        "openrouter",
+        AuthCredential::ApiKey {
+            key: "synthetic-openrouter-key".to_string(),
+            prime_team: None,
+        },
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let mut expected = legacy;
+    expected["openrouter"] =
+        serde_json::json!({ "type": "api_key", "key": "synthetic-openrouter-key" });
+    assert_eq!(written, expected);
+}

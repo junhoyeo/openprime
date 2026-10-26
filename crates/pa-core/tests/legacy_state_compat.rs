@@ -8,6 +8,7 @@ use pa_core::refinement::{
     get_harness_state_path, load_harness_state, update_harness_state, HarnessScope, RefinementKind,
 };
 use pa_core::session::manager::SessionManager;
+use pa_core::skills::{load_skills_from_dir, SkillKind};
 use pa_types::session::AgentMessage;
 use serde_json::Value;
 
@@ -55,6 +56,54 @@ fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 #[test]
+fn a_legacy_v3_session_rebuilds_the_typescript_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = open_copied_session(temp.path(), "v3-compacted-branch.jsonl");
+    let context = manager.active_context();
+    // TS buildSessionContext: summary first, the kept tail from firstKeptEntryId, then the
+    // post-compaction turns; the abandoned sibling branch and the /btw pointer stay out.
+    assert_eq!(
+        transcript(&context.messages),
+        pairs(&[
+            ("compactionSummary", "legacy compaction summary"),
+            ("assistant", "legacy first answer"),
+            ("user", "legacy second question"),
+            ("assistant", "legacy second answer"),
+        ])
+    );
+    assert_eq!(context.thinking_level, "high");
+    assert_eq!(
+        context.model,
+        Some(("anthropic".to_string(), "claude-opus-4-1".to_string()))
+    );
+}
+
+#[test]
+fn a_legacy_v1_session_migrates_to_a_linear_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = open_copied_session(temp.path(), "v1-linear.jsonl");
+    let context = manager.active_context();
+    assert_eq!(
+        transcript(&context.messages),
+        pairs(&[
+            ("user", "v1 first question"),
+            ("assistant", "v1 first answer"),
+            ("user", "v1 second question"),
+            ("assistant", "v1 second answer"),
+        ])
+    );
+    assert_eq!(context.thinking_level, "medium");
+    assert_eq!(
+        context.model,
+        Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string()))
+    );
+    assert_eq!(
+        manager.get_header().and_then(|header| header.version),
+        Some(3)
+    );
+}
+
+#[test]
 fn a_legacy_v2_hook_message_migrates_to_a_custom_message() {
     let temp = tempfile::tempdir().unwrap();
     let manager = open_copied_session(temp.path(), "v2-hook-message.jsonl");
@@ -68,6 +117,45 @@ fn a_legacy_v2_hook_message_migrates_to_a_custom_message() {
             ("assistant", "v2 answer"),
         ])
     );
+}
+
+#[test]
+fn a_legacy_python_skill_loads_with_its_import_metadata() {
+    let skill_dir = fixture("skills/python-skill");
+    let loaded = load_skills_from_dir(&skill_dir, "test");
+    assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    assert_eq!(loaded.skills.len(), 1);
+    let skill = &loaded.skills[0];
+    assert_eq!(skill.name, "python-skill");
+    assert_eq!(skill.kind, SkillKind::Python);
+    let python = skill.python.as_ref().expect("python metadata");
+    assert_eq!(
+        (
+            python.import_name.as_str(),
+            python.package_path.clone(),
+            python.pyproject_path.clone()
+        ),
+        (
+            "python_skill",
+            skill_dir.clone(),
+            skill_dir.join("pyproject.toml")
+        )
+    );
+}
+
+#[test]
+fn a_legacy_python_skill_without_its_package_degrades_to_markdown() {
+    let loaded = load_skills_from_dir(&fixture("skills/python-package-missing"), "test");
+    assert_eq!(loaded.skills.len(), 1);
+    assert_eq!(loaded.skills[0].kind, SkillKind::Markdown);
+    assert!(!loaded.diagnostics.is_empty());
+}
+
+#[test]
+fn a_legacy_manual_only_skill_keeps_disable_model_invocation() {
+    let loaded = load_skills_from_dir(&fixture("skills/disable-model-invocation"), "test");
+    assert_eq!(loaded.skills.len(), 1);
+    assert!(loaded.skills[0].disable_model_invocation);
 }
 
 fn copied_harness_dir(temp: &Path, name: &str) -> PathBuf {
