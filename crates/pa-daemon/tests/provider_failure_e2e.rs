@@ -60,6 +60,9 @@ enum MockRejection {
     /// THE 402 REGRESSION (the diagnosis's variant B): a wallet-drain 402 carrying
     /// the prime-inference `invalid_request_error` type text (the shape that settled silently).
     PaymentRequired,
+    /// External gateway authentication rejection. Credentials belong to the local auth store and
+    /// must survive retries, cancellation, and a later recovered turn.
+    AuthRejected,
 }
 
 impl FailingMock {
@@ -169,6 +172,18 @@ fn serve(
                         "message": "429 Too many concurrent requests for this model (limit: 32). Try again shortly.",
                         "type": "rate_limit_error",
                         "code": 429
+                    }
+                })
+                .to_string(),
+            ),
+            MockRejection::AuthRejected => (
+                "HTTP/1.1 401 Unauthorized",
+                String::new(),
+                json!({
+                    "error": {
+                        "message": "synthetic gateway rejected authentication",
+                        "type": "authentication_error",
+                        "code": 401
                     }
                 })
                 .to_string(),
@@ -469,12 +484,195 @@ fn setup_with_rejection(
     (dir, mock, supervisor, client, session_id)
 }
 
+#[allow(clippy::type_complexity)]
+fn setup_stored_openai_auth(
+    name: &str,
+    failures: usize,
+    retry_enabled: bool,
+    base_delay_ms: u64,
+) -> (tempfile::TempDir, FailingMock, Supervisor, Client, String) {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let mock = FailingMock::start_with_rejection(
+        failures,
+        "gateway recovered",
+        MockRejection::AuthRejected,
+    );
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({
+            "providers": { "openai": {
+                "api": "openai-completions",
+                "baseUrl": mock.url(),
+                "models": [{
+                    "id": "mock-auth", "name": "Mock Auth",
+                    "api": "openai-completions",
+                    "contextWindow": 128_000, "maxTokens": 4096
+                }]
+            }}
+        })
+        .to_string(),
+    )
+    .expect("write models.json");
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        json!({
+            "openai": { "type": "api_key", "key": "synthetic-stored-key" }
+        })
+        .to_string(),
+    )
+    .expect("write auth.json");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({
+            "retry": {
+                "enabled": retry_enabled,
+                "maxRetries": 2,
+                "baseDelayMs": base_delay_ms
+            }
+        })
+        .to_string(),
+    )
+    .expect("write settings.json");
+
+    let socket = dir.path().join(format!("{name}.sock"));
+    let mut supervisor = spawn_supervisor(&socket, &agent_dir);
+    let mut client = Client::connect(&mut supervisor);
+    client.send_command(
+        "c1",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": session_dir.to_string_lossy(),
+                "provider": "openai",
+                "model": "mock-auth"
+            }
+        }),
+    );
+    let created = client.request("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("session id")
+        .to_string();
+    client.send_command(
+        "a1",
+        &json!({ "type": "attach", "activeSessionId": session_id }),
+    );
+    let attached = client.request("a1");
+    assert_eq!(attached["success"], true, "attach failed: {attached}");
+    (dir, mock, supervisor, client, session_id)
+}
+
 fn event_types(events: &[Value]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| event.get("type").and_then(Value::as_str))
         .map(str::to_string)
         .collect()
+}
+
+#[test]
+fn stored_gateway_credentials_survive_disabled_retry_and_the_next_turn() {
+    let (dir, mock, _supervisor, mut client, session_id) =
+        setup_stored_openai_auth("auth-disabled", 1, false, 50);
+    let auth_path = dir.path().join("agent/auth.json");
+    let before = std::fs::read(&auth_path).unwrap();
+
+    client.send_command(
+        "p1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": session_id, "message": "fail" }),
+    );
+    let failed = client.request("p1");
+    assert_eq!(failed["success"], false, "first turn must fail: {failed}");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+    assert_eq!(mock.count(), 1);
+
+    client.send_command(
+        "p2",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": session_id, "message": "recover" }),
+    );
+    let recovered = client.request("p2");
+    assert_eq!(
+        recovered["success"], true,
+        "next turn recovers: {recovered}"
+    );
+    assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+    assert_eq!(mock.count(), 2);
+}
+
+#[test]
+fn stored_gateway_credentials_survive_retry_recovery() {
+    let (dir, mock, _supervisor, mut client, session_id) =
+        setup_stored_openai_auth("auth-recovery", 1, true, 10);
+    let auth_path = dir.path().join("agent/auth.json");
+    let before = std::fs::read(&auth_path).unwrap();
+
+    client.send_command(
+        "p1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": session_id, "message": "recover" }),
+    );
+    let recovered = client.request("p1");
+    assert_eq!(recovered["success"], true, "retry recovers: {recovered}");
+    assert_eq!(mock.count(), 2, "one rejected request and one retry");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+}
+
+#[test]
+fn stored_gateway_credentials_survive_cancelled_retry() {
+    let (dir, mock, _supervisor, mut client, session_id) =
+        setup_stored_openai_auth("auth-cancelled", 10, true, 5_000);
+    let auth_path = dir.path().join("agent/auth.json");
+    let before = std::fs::read(&auth_path).unwrap();
+
+    client.send_command(
+        "p1",
+        &json!({ "type": "prompt_and_wait", "activeSessionId": session_id, "message": "cancel" }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "auto-retry did not start");
+        let line = client.read_line();
+        let started = line.get("type").and_then(Value::as_str) == Some("session_event")
+            && line["event"]["type"] == "auto_retry_start";
+        client.collect_event(&line);
+        if started {
+            break;
+        }
+        assert_ne!(
+            line.get("id").and_then(Value::as_str),
+            Some("p1"),
+            "prompt settled before retry cancellation: {line}"
+        );
+    }
+
+    client.send_command(
+        "cancel-retry",
+        &json!({ "type": "abort_retry", "activeSessionId": session_id }),
+    );
+    let mut prompt = None;
+    let mut cancelled = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while prompt.is_none() || cancelled.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "retry cancellation did not settle"
+        );
+        let line = client.read_line();
+        match line.get("id").and_then(Value::as_str) {
+            Some("p1") => prompt = Some(line),
+            Some("cancel-retry") => cancelled = Some(line),
+            _ => client.collect_event(&line),
+        }
+    }
+    assert_eq!(cancelled.unwrap()["success"], true);
+    assert_eq!(prompt.unwrap()["success"], false);
+    assert_eq!(mock.count(), 1, "the cancelled delay never issues a retry");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), before);
 }
 
 #[test]
