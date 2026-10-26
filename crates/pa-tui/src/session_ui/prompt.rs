@@ -908,20 +908,25 @@ impl SessionUi {
                 }
                 let rendered = format!("{error:#}");
                 // One rebind attempt per submit: a prompt refused with the unknown-session error
-                // re-attaches by the DURABLE session id and replays ONCE; the failed attempt never
-                // reached a worker, so the replay is exactly-once by construction.
+                // re-attaches by the DURABLE id of the transcript it was written for and replays
+                // ONCE; the failed attempt never reached a worker, so the replay is exactly-once
+                // by construction. The replay needs the re-attach to land on that same
+                // transcript (legacy `5a19fe961`): a worker now showing another transcript (an
+                // in-worker switch moved it) never receives the prompt — the refusal surfaces.
                 if note.rebind_available
                     && rendered.contains("Unknown active session")
-                    && !self.session_id.is_empty()
+                    && !note.session_id.is_empty()
                 {
-                    let durable = self.session_id.clone();
-                    if self
+                    let durable = note.session_id.clone();
+                    let reattached = self
                         .attach_session(&durable, DockFold::FirstFrame)
                         .await
-                        .is_ok()
-                    {
-                        // The replay keeps the submit's generation and spends the rebind budget.
+                        .is_ok();
+                    if reattached {
                         self.rebuild_view(view, &RebuildKind::Rebind);
+                    }
+                    if reattached && self.session_id == durable {
+                        // The replay keeps the submit's generation and spends the rebind budget.
                         self.order_prompt_request(
                             note.text.clone(),
                             note.behavior,
