@@ -217,7 +217,7 @@ pub fn transform_messages_with_normalizer(
                 Some(msg.clone())
             }
             Message::Assistant(assistant) => {
-                unresolved_raw_calls.extend(pending_raw_calls.drain(..));
+                unresolved_raw_calls.append(&mut pending_raw_calls);
                 let tracks_tool_calls = !matches!(
                     assistant.stop_reason,
                     StopReason::Error | StopReason::Aborted
