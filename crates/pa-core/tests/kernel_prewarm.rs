@@ -137,8 +137,13 @@ async fn prewarmed_kernel_lands_compaction_notice_without_tool_use() {
     std::fs::create_dir_all(&cwd).expect("cwd");
     std::fs::write(
         agent_dir.join("settings.json"),
+        // No built-in skills: a kernel interpreter without the bundled Python
+        // skills would add a `python_skills_unavailable` notice to the history,
+        // and the split-turn compaction would then need a second summary. This
+        // test is about the prewarm, not the skill set of the interpreter.
         serde_json::json!({
-            "compaction": { "enabled": true, "reserveTokens": 1000, "keepRecentTokens": 10 }
+            "compaction": { "enabled": true, "reserveTokens": 1000, "keepRecentTokens": 10 },
+            "enableBuiltinSkills": false
         })
         .to_string(),
     )
