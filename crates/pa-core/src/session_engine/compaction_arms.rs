@@ -382,6 +382,13 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Abort the in-flight refine run (TS `requestAbort` -> `_refineAbortController.abort()`): a
+    /// run still planning stops its model request and applies nothing; a run whose harness write
+    /// already committed completes and reports its result. No run in flight: nothing.
+    pub fn abort_refinement(&self) {
+        self.refine_abort.abort();
+    }
+
     /// Execute `/refine`: plan, re-read, apply, and persist the continual
     /// harness state for this session.
     ///
@@ -417,12 +424,17 @@ impl AgentSession {
         refine_call: crate::refinement::executor::RefinerFn,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
+        // The run's abort registration spans the whole plan -> apply flow; it unregisters on
+        // every exit, so a late abort never reaches a finished run.
+        let registration = self.refine_abort.register();
+        let abort = registration.signal().clone();
         // The flight serializes every live-context replacer against a
         // compaction's rebuild: this round's outcome rows persist and then
         // push onto the context the compaction replaces, so the push must
         // not interleave with a replace (duplicating in the rebuilt view
         // or vanishing under it).
-        let _flight = self.compaction_flight.lock().await;
+        let _flight =
+            pa_agent::abort::race_with_abort(self.compaction_flight.lock(), &abort).await?;
         // The transcript's consumed artifacts are extracted under this first
         // lock straight from the retained rows: no second clone of the rows.
         let parts = self.session.lock().await.refine_transcript_parts();
@@ -454,6 +466,7 @@ impl AgentSession {
                 source,
                 refine_call,
                 self.agent_dir.as_deref(),
+                &abort,
             )
             .await?
         };
