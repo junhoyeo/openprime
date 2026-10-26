@@ -583,6 +583,45 @@ mod tests {
     }
 
     #[test]
+    fn several_notices_keep_results_anchored_and_repair_is_idempotent() {
+        let messages = vec![
+            Message::Assistant(assistant(
+                vec![tool_call("call-1", "bash"), tool_call("call-2", "bash")],
+                StopReason::ToolUse,
+            )),
+            user("[from child:worker] agent message"),
+            user("<ipython_state_restored>"),
+            tool_result("call-2", "bash", "two"),
+            tool_result("call-2", "bash", "duplicate"),
+        ];
+
+        let repaired =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        assert_eq!(repaired.len(), 5);
+        assert!(matches!(
+            &repaired[1],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-2"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "two")
+        ));
+        assert!(matches!(
+            &repaired[2],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call-1"
+                    && matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "No result provided")
+        ));
+        assert!(!repaired.iter().any(|message| matches!(
+            message,
+            Message::ToolResult(result)
+                if matches!(&result.content[0], UserOrToolContent::Text(text) if text.text == "duplicate")
+        )));
+        assert_eq!(
+            transform_messages_with_normalizer(&repaired, &test_model(), &|_, _, _| None),
+            repaired
+        );
+    }
+
+    #[test]
     fn an_assistant_boundary_prevents_hoisting_a_result_from_a_later_turn() {
         let messages = vec![
             Message::Assistant(assistant(
