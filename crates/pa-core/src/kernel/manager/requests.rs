@@ -455,9 +455,11 @@ mod tests {
 
         let dir = tempfile::TempDir::new().expect("temp dir");
         let python = dir.path().join("ready-but-not-reading");
+        // `-c` is the pre-spawn runtime probe: pass it like a supported
+        // runtime so the start reaches the non-reading kernel itself.
         std::fs::write(
             &python,
-            "#!/usr/bin/env python3\nimport json, time\nprint(json.dumps({'event': 'ready', 'protocol': 3, 'python': '3.13.0'}), flush=True)\ntime.sleep(30)\n",
+            "#!/usr/bin/env python3\nimport json, sys, time\nif sys.argv[1:2] == ['-c']:\n    sys.exit(0)\nprint(json.dumps({'event': 'ready', 'protocol': 3, 'python': '3.13.0'}), flush=True)\ntime.sleep(30)\n",
         )
         .expect("write fake kernel");
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
@@ -504,7 +506,8 @@ mod tests {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
 
-        // Protocol v3: ready, then idles without reading stdin until the
+        // Protocol v3: passes the pre-spawn runtime probe (`-c`) like a
+        // supported runtime, then ready, then idles without reading stdin until the
         // sibling "go" file appears, then answers execute frames, ignores
         // glued garbage (a torn prefix makes any next line invalid), and
         // never answers interrupts (that would settle the aborted execution).
@@ -514,6 +517,8 @@ import os
 import sys
 import time
 
+if sys.argv[1:2] == ["-c"]:
+    sys.exit(0)
 print(json.dumps({"event": "ready", "protocol": 3, "python": "3.13.0"}), flush=True)
 go = os.path.join(os.path.dirname(os.path.abspath(__file__)), "go")
 while not os.path.exists(go):
