@@ -3,6 +3,14 @@
 These rules mirror the repo standards in AGENTS.md - update both whenever
 either changes.
 
+## Repository target
+
+- Review and land changes only in `junhoyeo/openprime:main`. Treat
+  `PrimeIntellect-ai/prime-agent` as a read-only upstream reference; reject workflow, release,
+  or contribution changes that push, publish, or direct pull requests there.
+- An ordinary fork merge must not create a tag or release. Repository guards are not release
+  approval; fork releases require the explicit manual controls documented in `AGENTS.md`.
+
 ## No legacy or migration scaffolding
 
 - When a migration or refactor completes within a PR, its staging scaffolding must be deleted, not kept: no type aliases where two names point at one type, no re-exports "for compatibility" without a live external consumer, no migration-era vocabulary ("staged", "legacy", "new-style") surviving in names, comments, or test titles.

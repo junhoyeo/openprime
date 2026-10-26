@@ -113,6 +113,13 @@ During migration, the branch and draft PR may build verification artifacts only.
 
 Never use an unqualified `prime-agent update` for cutover. The updater resolves channel metadata from `PRIME_AGENT_DOWNLOAD_BASE_URL` or its default upstream bucket and can install an upstream artifact. Cutover must use an isolated manual install or a reviewed fork artifact channel only after the served URL, artifact identity, checksum, and rollback input are verified.
 
+Fork target audit:
+
+- `AGENTS.md`, the pull-request template, CI badge, and contribution links target only `junhoyeo/openprime:main`; `PrimeIntellect-ai/prime-agent` is read-only.
+- `nightly.yml` is manual-dispatch-only and all write-capable release jobs are hard-gated to `github.repository == 'junhoyeo/openprime'`.
+- The built-in updater still defaults to the upstream R2 channel and the official installer constant still names `app.primeintellect.ai`; neither is an authorized fork cutover source. README installation commands no longer point fork users at that upstream installer.
+- A final cutover manifest must name the fork-served metadata URL, artifact commit/build identity and SHA-256, verify those served bytes, and provide an isolated manual fallback. Repository targeting and release approval remain separate controls.
+
 ## Rollback and cutover plan
 
 Rollback evidence is the untouched `origin/develop` tip `703367badf5c84e48e8c8cd986fbcda882b6378c` and the currently installed TypeScript runtime. The migration does not rewrite or delete either.

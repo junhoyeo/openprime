@@ -19,8 +19,8 @@ Prime Agent: A Self-Improving RLM Harness
 </p>
 
 <p align="center">
-  <a href="https://github.com/PrimeIntellect-ai/prime-agent/actions/workflows/ci.yml">
-    <img src="https://github.com/PrimeIntellect-ai/prime-agent/actions/workflows/ci.yml/badge.svg" alt="CI" />
+  <a href="https://github.com/junhoyeo/openprime/actions/workflows/ci.yml">
+    <img src="https://github.com/junhoyeo/openprime/actions/workflows/ci.yml/badge.svg" alt="CI" />
   </a>
   <a href="https://arxiv.org/abs/2608.23552">
     <img src="https://img.shields.io/badge/arXiv-2608.23552-b31b1b.svg" alt="arXiv" />
@@ -38,21 +38,19 @@ Prime Agent is an open-source coding and research agent for general and long-run
 - The **[Recursive Language Model (RLM)](https://www.primeintellect.ai/blog/rlm)** treats context as variables (*prompt-as-a-variable*) and tools like recursive subagents as function calls (*programmatic tool /sub-agent calling*) inside a persistent REPL.
 - The **[Continual Harness](https://arxiv.org/abs/2605.09998)** stores supplemental prompts, memories, skill descriptions, and reusable subagent specifications as durable state that Prime Agent can refine through small, evidence-backed updates, local to the session by default.
 
-## Install
+## Build this fork
 
-Install the latest stable version with the one-command installer:
+Build and verify the fork with the pinned Rust toolchain:
 
 ```bash
-curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+make check
+make package
 ```
 
-On Windows, install from PowerShell:
-
-```powershell
-irm https://app.primeintellect.ai/prime-agent/install.ps1 | iex
-```
-
-The Windows installer downloads the latest stable Windows x64 build and verifies its checksum before installation.
+`make package` creates a checksummed native package under `target/release-package` with the
+Python runtime and bundled skills beside the binary. Release and live-install commands are kept in
+the reviewed fork cutover runbook; the upstream `app.primeintellect.ai` installer is not a
+`junhoyeo/openprime` artifact.
 
 ## Why Prime Agent
 
@@ -126,7 +124,7 @@ Prime Agent is built for long-running work, especially for evaluations in resear
 
 ## Contributing
 
-Start with a GitHub Discussion for [general questions](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/general), [bug reports](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/bug-reports), and [feature requests](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/feature-requests). Maintainers promote accepted work into Issues, and pull requests are reviewed from maintainers and vouched contributors.
+Use [junhoyeo/openprime issues](https://github.com/junhoyeo/openprime/issues) for this fork. Pull requests target `junhoyeo/openprime:main`; the `PrimeIntellect-ai/prime-agent` remote is an upstream reference only.
 
 ## License
 

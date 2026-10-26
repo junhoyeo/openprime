@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Development rules for Prime Agent (Rust) on PrimeIntellect-ai/prime-agent, branch `main`.
+Development rules for Prime Agent (Rust) in the `junhoyeo/openprime` fork, branch `main`.
 Every contributor (human or agent) must read this before working on this repo.
 
 ## Repository
@@ -16,15 +16,17 @@ Every contributor (human or agent) must read this before working on this repo.
   suggestions, not as attribution for work merged from branches. A PR's commits carry
   one identity: the ambient git config's. Fabricated or hand-written trailers (including
   noreply forms) misattribute commits to unrelated GitHub accounts.
-- The repo is PrimeIntellect-ai/prime-agent; the Rust implementation lives on the `main` branch.
-- PRs go to the org repo with base `main`:
-  `gh pr create --repo PrimeIntellect-ai/prime-agent --base main`.
-- CI runs on the org's billing: `.github/workflows/continuous.yml` on `main` pushes and
-  `release.yml` on version tags.
-- Parity ground truth is unchanged: a read-only checkout of the TS implementation (this
-  repo at tag `v0.9.8`, the last TS release before the Rust port merged to `main`). Clone
-  it to `~/prime-agent`, the conventional location the parity scripts and code fall back
-  to; tooling that honors an override reads `PA_TS_REFERENCE`.
+- The writable repository is `junhoyeo/openprime`; the Rust implementation lives on `main`.
+  `PrimeIntellect-ai/prime-agent` is a read-only upstream reference: never push, tag, publish,
+  or open a pull request there from this fork.
+- PRs go only to this fork with base `main`:
+  `gh pr create --repo junhoyeo/openprime --base main`.
+- CI runs on the fork: `.github/workflows/ci.yml` on PRs/`main`, and
+  `.github/workflows/continuous.yml` on `main` pushes. Release/tag workflows require explicit
+  fork-owned manual action; an ordinary merge must not publish.
+- Parity ground truth includes the read-only TS release `v0.9.8` and the fork legacy evidence
+  preserved on `origin/develop`. Tooling that honors an override reads `PA_TS_REFERENCE`.
+  Never mutate the reference checkout or rewrite the legacy branch to simplify a Rust port.
 
 ## Style and structure
 
