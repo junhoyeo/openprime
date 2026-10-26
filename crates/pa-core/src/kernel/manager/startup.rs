@@ -884,6 +884,46 @@ mod tests {
         );
     }
 
+    /// P2-f: an interpreter the pre-spawn probe cannot launch fails the
+    /// start like c4c's spawn error: the manager turns defunct, leaves the
+    /// live-kernel registry, and drops the runtime-ready memo (both layers).
+    #[tokio::test]
+    async fn unlaunchable_probe_interpreter_makes_the_manager_defunct() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let disk_memo = dir.path().join("runtime-ready-memo.json");
+        std::fs::write(&disk_memo, "{}").expect("disk memo");
+        let key = format!("p2f-{}", std::process::id());
+        crate::kernel::bootstrap::venv::seed_probe_memo_for_tests(&key, disk_memo.clone());
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(dir.path().join("nonexistent-python")),
+            ..Default::default()
+        });
+        let error = manager
+            .start(KernelStartOptions::default())
+            .await
+            .expect_err("an unlaunchable interpreter fails the start");
+        assert!(
+            format!("{error:#}").contains("failed to spawn kernel python"),
+            "{error:#}"
+        );
+        assert!(
+            manager.is_defunct(),
+            "an unlaunchable interpreter leaves the manager defunct, as at c4c"
+        );
+        assert!(
+            !crate::kernel::live_kernels::is_tracked(&manager.inner),
+            "a defunct manager leaves the live-kernel registry"
+        );
+        assert!(
+            !crate::kernel::bootstrap::venv::probe_memo_has_for_tests(&key),
+            "the in-process runtime-ready memo is dropped"
+        );
+        assert!(
+            !disk_memo.exists(),
+            "the on-disk runtime-ready memo is dropped"
+        );
+    }
+
     #[test]
     fn kernel_stderr_log_is_owner_only() {
         let root = temp_root("create");
