@@ -174,6 +174,15 @@ fn worker_token(agent_dir: &Path, active_session_id: &str) -> Option<String> {
 
 /// The worker's pid from its persisted descriptor (the process the
 /// passivation must retire).
+/// Portable liveness (Linux `/proc` state, else `kill(0)` plus the Darwin zombie
+/// check): the product's own probe, so the assertions keep their meaning on
+/// macOS instead of reading a `/proc` that does not exist there. A probe error
+/// fails the test rather than guessing.
+fn process_alive(pid: u64) -> bool {
+    let pid = u32::try_from(pid).expect("worker pid fits u32");
+    pa_daemon::lease::is_process_alive(pid).expect("process liveness probe")
+}
+
 fn worker_pid(agent_dir: &Path, active_session_id: &str) -> Option<u64> {
     let instances = std::fs::read_dir(agent_dir.join("daemon-workers")).ok()?;
     for instance in instances.flatten() {
@@ -323,8 +332,8 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
         worker_token(&agent_dir, &child_active_session_id).expect("the child worker's token");
     let child_pid =
         worker_pid(&agent_dir, &child_active_session_id).expect("the child worker's pid");
-    assert!(std::path::Path::new(&format!("/proc/{child_pid}")).exists());
-    let child_alive = || std::path::Path::new(&format!("/proc/{child_pid}")).exists();
+    assert!(process_alive(child_pid), "the child worker runs before passivation");
+    let child_alive = || process_alive(child_pid);
 
     // THE PASSIVATION ASK: the child worker's supervisor-link request (the worker-side
     // clock and gates are unit-covered; this drives the supervisor's handler, the
@@ -721,7 +730,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
         "the second idle passivation must succeed: {passivated}"
     );
     let deadline = Instant::now() + Duration::from_secs(60);
-    while std::path::Path::new(&format!("/proc/{revived_pid}")).exists() {
+    while process_alive(revived_pid) {
         assert!(
             Instant::now() < deadline,
             "the revived worker survived the second passivation"
@@ -841,7 +850,7 @@ async fn an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcri
     let root_token =
         worker_token(&agent_dir, &root_active_session_id).expect("the root worker's token");
     let root_pid = worker_pid(&agent_dir, &root_active_session_id).expect("the root worker's pid");
-    assert!(std::path::Path::new(&format!("/proc/{root_pid}")).exists());
+    assert!(process_alive(root_pid), "the root worker runs before passivation");
 
     // THE PASSIVATION ASK for a ROOT: the supervisor's handler accepts an
     // unowned worker regardless of depth (without the fix this answers
@@ -862,7 +871,7 @@ async fn an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcri
 
     // The root worker's process is gone (the whole-worker stop).
     let deadline = Instant::now() + Duration::from_secs(60);
-    while std::path::Path::new(&format!("/proc/{root_pid}")).exists() {
+    while process_alive(root_pid) {
         assert!(
             Instant::now() < deadline,
             "the root worker process survived the passivation"
