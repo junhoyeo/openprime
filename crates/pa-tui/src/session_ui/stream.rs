@@ -94,16 +94,16 @@ fn refine_working_state(cancel_key: &str, since: std::time::Instant) -> WorkingS
 
 impl SessionUi {
     pub(super) fn sync_refine_loader(&mut self, view: &mut AgentView) {
+        // TS `getWorkingLoaderMessage`: an active refine owns the loader even while the daemon
+        // reports the session command as streaming.
         if self.refine_active {
-            if !self.turn_active {
-                let since = view.working_since.unwrap_or_else(std::time::Instant::now);
-                let key = self
-                    .keybindings
-                    .first_key("app.clear")
-                    .unwrap_or_else(|| "ctrl+c".to_string());
-                view.working = Some(refine_working_state(&key, since));
-                view.working_since = Some(since);
-            }
+            let since = view.working_since.unwrap_or_else(std::time::Instant::now);
+            let key = self
+                .keybindings
+                .first_key("app.clear")
+                .unwrap_or_else(|| "ctrl+c".to_string());
+            view.working = Some(refine_working_state(&key, since));
+            view.working_since = Some(since);
         } else if view
             .working
             .as_ref()
@@ -131,6 +131,8 @@ impl SessionUi {
         });
         view.working_since = Some(since);
         self.working_tokens.reset();
+        // A turn start under an active refine keeps the Refining loader.
+        self.sync_refine_loader(view);
     }
 
     /// Update the loader's activity label from one provider stream event (thinking/text/toolcall

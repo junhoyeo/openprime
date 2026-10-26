@@ -665,14 +665,12 @@ impl SessionUi {
             // The interrupt cancels the compaction run only — the agent is not
             // streaming, so no turn abort goes out.
             self.abort_compaction(view.compaction_generation);
-        } else if self.turn_active {
-            // No transient abort hint: the aborted turn's own assistant row carries
-            // the interrupt, so nothing is noted here.
-            self.abort_turn();
         } else if self.refine_active {
             // TS `interruptOrClearInput`: a running `/refine` gets the plain, non-destructive
-            // abort — no clear, no editor restore; the daemon parks the visible queue behind its
-            // abort suspension. Off the UI loop like every abort.
+            // abort — no clear, no editor restore; the daemon cancels the refinement and parks the
+            // visible queue behind its abort suspension. Checked before the turn: the daemon
+            // reports the session command as streaming (`isStreaming` is its busy flag), while TS
+            // never streams a refine. Off the UI loop like every abort.
             let client = self.client.clone();
             let active_session_id = self.active_session_id.clone();
             let notes = self.notes.clone();
@@ -688,6 +686,10 @@ impl SessionUi {
                     let _ = notes.send(format!("the abort failed: {error:#}"));
                 }
             });
+        } else if self.turn_active {
+            // No transient abort hint: the aborted turn's own assistant row carries
+            // the interrupt, so nothing is noted here.
+            self.abort_turn();
         }
         // A running user-bash command aborts the same way; the settled run
         // reports cancelled through its bash_end.
