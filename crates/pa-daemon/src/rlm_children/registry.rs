@@ -87,6 +87,10 @@ impl SupervisorChildSessionsInner {
                 record.notice_delivered = true;
                 record.settled_status = Some("cancelled");
                 record.error = Some("Cancelled by user".to_string());
+                record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
+                if let Some(cancel) = record.kickoff_cancel.take() {
+                    cancel.cancel();
+                }
                 notice_was_delivered
             };
             self.emit_child_update(record).await;
@@ -259,6 +263,10 @@ impl SupervisorChildSessionsInner {
                     let mut record = record.lock().await;
                     record.closed_by_parent = true;
                     record.notice_delivered = true;
+                    record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
+                    if let Some(cancel) = record.kickoff_cancel.take() {
+                        cancel.cancel();
+                    }
                 }
                 self.emit_child_usage(record).await;
                 let (active_session_id, was_running) = {
@@ -633,6 +641,8 @@ fn ledger_child_records(
             prompt_admitted: true,
             prompt_release: Arc::new(tokio::sync::Notify::new()),
             kickoff_started: true,
+            kickoff_epoch: 0,
+            kickoff_cancel: None,
             error: None,
             closed_by_parent: false,
             retiring: false,

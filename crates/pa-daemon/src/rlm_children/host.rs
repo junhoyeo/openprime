@@ -184,6 +184,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     prompt_admitted: false,
                     prompt_release: Arc::clone(&prompt_release),
                     kickoff_started: false,
+                    kickoff_epoch: 0,
+                    kickoff_cancel: None,
                     error: None,
                     closed_by_parent: false,
                     retiring: false,
@@ -294,14 +296,26 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         }
                     }
                 }
-                if let Err(error) = watcher_this
-                    .prompt_child(
-                        &child_active_session_id,
-                        &kickoff_content,
-                        Some(&kickoff_row),
-                    )
-                    .await
-                {
+                let first_cancel = {
+                    let mut record = watcher_record.lock().await;
+                    if record.settled_status.is_some() || record.closed_by_parent || record.retiring
+                    {
+                        return;
+                    }
+                    record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    record.kickoff_cancel = Some(cancel.clone());
+                    cancel
+                };
+                let first_result = tokio::select! {
+                    biased;
+                    () = first_cancel.cancelled() => return,
+                    result = watcher_this.prompt_child(&child_active_session_id, &kickoff_content, Some(&kickoff_row)) => result,
+                };
+                if first_cancel.is_cancelled() {
+                    return;
+                }
+                if let Err(error) = first_result {
                     // The route can fail ambiguously around a worker
                     // replacement. The durable session file arbitrates: a
                     // kickoff row in the file landed (re-sending would
@@ -315,26 +329,31 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         KICKOFF_RETRY_GATE_REACHED.notify_one();
                         KICKOFF_RETRY_GATE_RELEASE.notified().await;
                     }
-                    let retry_allowed = {
-                        let record = watcher_record.lock().await;
-                        !record.closed_by_parent
-                            && !record.retiring
-                            && record.settled_status.is_none()
+                    let retry_cancel = {
+                        let mut record = watcher_record.lock().await;
+                        if record.closed_by_parent
+                            || record.retiring
+                            || record.settled_status.is_some()
+                        {
+                            return;
+                        }
+                        record.kickoff_epoch = record.kickoff_epoch.wrapping_add(1);
+                        let cancel = tokio_util::sync::CancellationToken::new();
+                        record.kickoff_cancel = Some(cancel.clone());
+                        cancel
                     };
-                    if !landed && !retry_allowed {
-                        return;
-                    }
                     let retried = if landed {
                         Ok(())
                     } else {
-                        watcher_this
-                            .prompt_child(
-                                &child_active_session_id,
-                                &kickoff_content,
-                                Some(&kickoff_row),
-                            )
-                            .await
+                        tokio::select! {
+                            biased;
+                            () = retry_cancel.cancelled() => return,
+                            result = watcher_this.prompt_child(&child_active_session_id, &kickoff_content, Some(&kickoff_row)) => result,
+                        }
                     };
+                    if retry_cancel.is_cancelled() {
+                        return;
+                    }
                     if let Err(retry_error) = retried {
                         eprintln!(
                             "pa-daemon: RLM child task prompt failed for {child_log_id}: {error:#}; retry failed: {retry_error:#}"
@@ -616,6 +635,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let was_running = row.settled_status.is_none();
                 if was_running {
                     row.retiring = true;
+                    row.kickoff_epoch = row.kickoff_epoch.wrapping_add(1);
+                    if let Some(cancel) = row.kickoff_cancel.take() {
+                        cancel.cancel();
+                    }
                 }
                 was_running
             };
