@@ -426,9 +426,9 @@ def _provider_config(account: str | None = None) -> tuple[dict[str, dict[str, An
             invalid = True
             continue
         base_url = raw_provider.get("baseUrl", "")
-        if not isinstance(base_url, str) or (base_url and _provider_origin(base_url) is None):
+        if not isinstance(base_url, str) or _provider_origin(base_url) is None:
             invalid = True
-            base_url = ""
+            continue
         raw_models = raw_provider.get("models", [])
         if not isinstance(raw_models, list):
             invalid = True

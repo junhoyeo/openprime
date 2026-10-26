@@ -48,6 +48,10 @@ class AccountConfigTest(unittest.TestCase):
                     ([], "models.json root must be an object"),
                     ({"providers": None}, "models.json providers must be an object"),
                     ({"providers": []}, "models.json providers must be an object"),
+                    ({"providers": {"missing": {"models": [{"id": "m"}]}}},
+                     "models.json contains invalid provider or model entries"),
+                    ({"providers": {"empty": {"baseUrl": "", "models": [{"id": "m"}]}}},
+                     "models.json contains invalid provider or model entries"),
                     ({"providers": {"broken": []}},
                      "models.json contains invalid provider or model entries"),
                 )
@@ -61,8 +65,12 @@ class AccountConfigTest(unittest.TestCase):
                 models.write_text(json.dumps({"providers": {
                     "gw": {"baseUrl": 123, "models": [None, {"id": None}, {"id": "valid"}]},
                 }}))
-                self.assertEqual(aside.models(), ["gw/valid"])
-                self.assertEqual(aside.providers(), {"gw": ""})
+                self.assertEqual(aside.models(), [])
+                self.assertEqual(aside.providers(), {})
+                self.assertEqual(
+                    aside._provider_config()[1],
+                    "models.json contains invalid provider or model entries",
+                )
                 with mock.patch.object(aside.os, "open", side_effect=FileNotFoundError):
                     self.assertEqual(aside._provider_config(), ({}, None))
                 with mock.patch.object(aside.os, "open", side_effect=PermissionError):
