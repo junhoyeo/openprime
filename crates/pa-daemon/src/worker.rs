@@ -454,6 +454,12 @@ impl Worker {
                 concrete.register_arc();
                 concrete
                     .set_rlm_usage_store(std::sync::Arc::new(CoreUsageStore(Arc::clone(&core))));
+                concrete.set_side_question_recorders(std::sync::Arc::new(
+                    crate::side_question_store::SideQuestionPaneRegistry::new(
+                        Arc::clone(&core),
+                        config.agent_dir.clone(),
+                    ),
+                ));
                 let sink_core = Arc::clone(&core);
                 let sink_notify = Arc::clone(&work_notify);
                 let autonomous_sink: crate::agent_engine::AutonomousAdmission = {

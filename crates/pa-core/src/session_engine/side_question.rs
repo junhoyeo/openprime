@@ -30,6 +30,8 @@ const SIDE_QUESTION_INSTRUCTION: &str = "The user asked this via `/btw` — a te
 const SIDE_QUESTION_TOOL_BLOCKED: &str =
     "Tools are deactivated in this side thread. Answer from the conversation context.";
 
+const SIDE_QUESTION_SUMMARY_INSTRUCTION: &str = "Summarize the supplied conversation context for a side question. Preserve facts, decisions, constraints, prior side questions and answers, exact identifiers, and unresolved work. The continuing agent must answer only from this summary and the retained recent context, without tools.";
+
 /// Backstop for a model that keeps calling deactivated tools instead of answering.
 const SIDE_QUESTION_MAX_TURNS: u32 = 3;
 
@@ -64,6 +66,11 @@ pub struct SideQuestionResult {
     pub status: SideQuestionStatus,
     pub answer: String,
     pub error_message: Option<String>,
+    /// The paid completion for this turn. Hosts persist it outside the parent
+    /// transcript so `/btw` usage is accounted without entering main context.
+    pub assistant: Option<AssistantMessage>,
+    /// Paid completions replaced during side-context compaction or overflow recovery.
+    pub auxiliary_completions: Vec<AssistantMessage>,
 }
 
 impl SideQuestionResult {
@@ -72,6 +79,8 @@ impl SideQuestionResult {
             status: SideQuestionStatus::Cancelled,
             answer,
             error_message: None,
+            assistant: None,
+            auxiliary_completions: Vec::new(),
         }
     }
 
@@ -80,6 +89,8 @@ impl SideQuestionResult {
             status: SideQuestionStatus::Error,
             answer,
             error_message: Some(error_message),
+            assistant: None,
+            auxiliary_completions: Vec::new(),
         }
     }
 }
@@ -96,6 +107,199 @@ fn assistant_text(message: &AssistantMessage) -> String {
         .collect()
 }
 
+fn serialized_tokens(message: &pa_agent::types::AgentMessage) -> u64 {
+    serde_json::to_string(message)
+        .map_or(0, |json| json.chars().count() as u64)
+        .div_ceil(3)
+}
+
+fn side_context_tokens(messages: &[pa_agent::types::AgentMessage]) -> u64 {
+    let anchor = messages.iter().rposition(|message| {
+        matches!(
+            message,
+            pa_agent::types::AgentMessage::Standard(Message::Assistant(assistant))
+                if assistant.stop_reason != StopReason::Error
+                    && assistant.stop_reason != StopReason::Aborted
+                    && assistant.usage.total_tokens > 0
+        )
+    });
+    match anchor {
+        Some(index) => {
+            let pa_agent::types::AgentMessage::Standard(Message::Assistant(assistant)) =
+                &messages[index]
+            else {
+                unreachable!("the anchor predicate admits assistant messages only")
+            };
+            assistant.usage.total_tokens
+                + messages[index + 1..]
+                    .iter()
+                    .map(serialized_tokens)
+                    .sum::<u64>()
+        }
+        None => messages.iter().map(serialized_tokens).sum(),
+    }
+}
+
+fn side_turn_start(message: &pa_agent::types::AgentMessage) -> bool {
+    matches!(
+        message,
+        pa_agent::types::AgentMessage::Standard(Message::User(_))
+            | pa_agent::types::AgentMessage::Custom(_)
+    )
+}
+
+async fn summarize_side_chunk(
+    parent: &Arc<Agent>,
+    stream_fn: pa_agent::stream::StreamFn,
+    parent_state: &pa_agent::agent::AgentStateSnapshot,
+    chunk: String,
+    signal: &AbortSignal,
+) -> anyhow::Result<AssistantMessage> {
+    let summary_agent = Arc::new(Agent::new(AgentOptions {
+        initial_state: AgentInitialState {
+            system_prompt: Some(SIDE_QUESTION_SUMMARY_INSTRUCTION.to_string()),
+            model: Some(parent_state.model.clone()),
+            thinking_level: Some(parent_state.thinking_level),
+            tools: Some(Vec::new()),
+            messages: Some(Vec::new()),
+        },
+        convert_to_llm: Some(parent.convert_to_llm_fn()),
+        transform_context: parent.transform_context_fn(),
+        stream_fn: Some(stream_fn),
+        get_api_key: parent.get_api_key_fn(),
+        session_id: parent.session_id().map(str::to_string),
+        transport: Some(pa_agent::types::Transport::Sse),
+        ..Default::default()
+    }));
+    let run = {
+        let summary_agent = Arc::clone(&summary_agent);
+        async move {
+            summary_agent
+                .prompt(pa_agent::agent::AgentPromptInput::text(format!(
+                    "<conversation_segment>\n{chunk}\n</conversation_segment>"
+                )))
+                .await?;
+            summary_agent.wait_for_idle().await;
+            anyhow::Ok(())
+        }
+    };
+    if let Err(error) = race_with_abort(run, signal).await {
+        summary_agent.abort();
+        return Err(error);
+    }
+    let state = summary_agent.state().await;
+    let assistant = state
+        .messages
+        .into_iter()
+        .rev()
+        .find_map(|message| match message {
+            pa_agent::types::AgentMessage::Standard(Message::Assistant(assistant)) => {
+                Some(assistant)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("Side-question summary produced no assistant message"))?;
+    if assistant.stop_reason == StopReason::Error {
+        anyhow::bail!(
+            "Side-question summary failed: {}",
+            assistant
+                .error_message
+                .as_deref()
+                .unwrap_or("Unknown error")
+        );
+    }
+    if assistant_text(&assistant).trim().is_empty() {
+        anyhow::bail!("Side-question summary was empty");
+    }
+    Ok(assistant)
+}
+
+async fn compact_side_messages(
+    parent: &Arc<Agent>,
+    stream_fn: pa_agent::stream::StreamFn,
+    parent_state: &pa_agent::agent::AgentStateSnapshot,
+    messages: &[pa_agent::types::AgentMessage],
+    settings: &super::compaction::CompactionSettings,
+    force: bool,
+    signal: &AbortSignal,
+) -> anyhow::Result<Option<(Vec<pa_agent::types::AgentMessage>, Vec<AssistantMessage>)>> {
+    let system_tokens = (parent_state.system_prompt.chars().count() as u64).div_ceil(3);
+    let context_tokens = system_tokens.saturating_add(side_context_tokens(messages));
+    if !force
+        && !super::compaction::should_compact(
+            context_tokens,
+            parent_state.model.context_window,
+            parent_state.model.max_tokens,
+            settings,
+        )
+    {
+        return Ok(None);
+    }
+
+    let mut retained_tokens = 0u64;
+    let mut cut = messages.len();
+    for (index, message) in messages.iter().enumerate().rev() {
+        let tokens = serialized_tokens(message);
+        let keep_recent_tokens = if force {
+            0
+        } else {
+            settings.keep_recent_tokens
+        };
+        if retained_tokens.saturating_add(tokens) > keep_recent_tokens {
+            break;
+        }
+        retained_tokens = retained_tokens.saturating_add(tokens);
+        cut = index;
+    }
+    while cut > 0 && (cut == messages.len() || !side_turn_start(&messages[cut])) {
+        cut -= 1;
+    }
+    if cut == 0 {
+        return Ok(None);
+    }
+
+    let serialized = messages[..cut]
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input_token_budget = parent_state
+        .model
+        .context_window
+        .saturating_sub(parent_state.model.max_tokens)
+        .saturating_sub(settings.reserve_tokens)
+        .max(1);
+    let max_chars = usize::try_from(input_token_budget.saturating_mul(3))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    for character in serialized.chars() {
+        if chunk.chars().count() >= max_chars {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(character);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+
+    let mut completions = Vec::new();
+    let mut summaries = Vec::new();
+    for chunk in chunks {
+        let assistant =
+            summarize_side_chunk(parent, stream_fn.clone(), parent_state, chunk, signal).await?;
+        summaries.push(assistant_text(&assistant));
+        completions.push(assistant);
+    }
+    let summary = summaries.join("\n\n---\n\n");
+    let mut compacted = vec![pa_agent::types::AgentMessage::user(format!(
+        "<side_context_summary>\n{summary}\n</side_context_summary>"
+    ))];
+    compacted.extend_from_slice(&messages[cut..]);
+    Ok(Some((compacted, completions)))
+}
+
 /// Run one side question against a clone of the parent conversation.
 ///
 /// The side calls run on `stream_fn` (TS `unwrapSemanticEdgeStreamFn`: the
@@ -104,12 +308,14 @@ fn assistant_text(message: &AssistantMessage) -> String {
 /// (returning `false` aborts the run), honors `signal` for external
 /// aborts, and retries provider failures per `retry_policy`. It never
 /// mutates the parent agent or its history.
+#[allow(clippy::too_many_arguments)] // Parent hooks, policy, cancellation, and stream sink are independent seams.
 pub async fn run_side_question(
     parent: &Arc<Agent>,
     stream_fn: pa_agent::stream::StreamFn,
     question: &str,
     previous_turns: &[SideQuestionTurn],
     retry_policy: &ProviderRetryPolicy,
+    compaction_settings: Option<&super::compaction::CompactionSettings>,
     signal: &AbortSignal,
     sink: &SideQuestionSink,
 ) -> SideQuestionResult {
@@ -158,6 +364,37 @@ pub async fn run_side_question(
     // assistant turns it appended rather than in its last message.
     let cloned_message_count = messages.len();
 
+    let mut auxiliary_completions = Vec::new();
+    if let Some(settings) = compaction_settings.filter(|settings| settings.enabled) {
+        match compact_side_messages(
+            parent,
+            stream_fn.clone(),
+            &parent_state,
+            &messages,
+            settings,
+            false,
+            signal,
+        )
+        .await
+        {
+            Ok(Some((compacted, completions))) => {
+                messages = compacted;
+                auxiliary_completions = completions;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return SideQuestionResult {
+                    status: SideQuestionStatus::Error,
+                    answer: String::new(),
+                    error_message: Some(error.to_string()),
+                    assistant: None,
+                    auxiliary_completions,
+                };
+            }
+        }
+    }
+
+    let overflow_context = messages.clone();
     let turn_count = Arc::new(AtomicU32::new(0));
     let should_stop_after_turn: ShouldStopAfterTurnFn = {
         let turn_count = Arc::clone(&turn_count);
@@ -190,7 +427,10 @@ pub async fn run_side_question(
             tools: Some(parent_state.tools.clone()),
             messages: Some(messages),
         },
-        stream_fn: Some(stream_fn),
+        convert_to_llm: Some(parent.convert_to_llm_fn()),
+        transform_context: parent.transform_context_fn(),
+        stream_fn: Some(stream_fn.clone()),
+        get_api_key: parent.get_api_key_fn(),
         before_tool_call: Some(before_tool_call),
         should_stop_after_turn: Some(should_stop_after_turn),
         // TS `side-question.ts`: the side call keeps the parent's identity so it reads the main
@@ -203,7 +443,7 @@ pub async fn run_side_question(
 
     // Streaming events carry one partial turn at a time, so they only fill in
     // text as it arrives; the answer of the whole run is derived at the end.
-    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
+    let (update_tx, update_rx) = std::sync::mpsc::channel::<AssistantMessage>();
     let update_tx = Arc::new(update_tx);
     let subscription = side_agent
         .subscribe(move |event, _signal| {
@@ -218,17 +458,14 @@ pub async fn run_side_question(
                     assistant,
                 ))) = message
                 {
-                    let text = assistant_text(assistant);
-                    if !text.is_empty() {
-                        let _ = update_tx.send(text);
-                    }
+                    let _ = update_tx.send(assistant.clone());
                 }
                 Ok(())
             })
         })
         .await;
 
-    let result = run_attempts(
+    let mut result = run_attempts(
         &side_agent,
         question,
         previous_turns,
@@ -239,7 +476,56 @@ pub async fn run_side_question(
         &update_rx,
     )
     .await;
+    let overflow = result.assistant.as_ref().is_some_and(|assistant| {
+        result.status == SideQuestionStatus::Error
+            && super::provider_retry::is_context_overflow_failure(
+                assistant,
+                parent_state.model.context_window,
+            )
+    });
+    if overflow {
+        if let (Some(settings), Some(overflow_completion)) = (
+            compaction_settings.filter(|settings| settings.enabled),
+            result.assistant.take(),
+        ) {
+            auxiliary_completions.push(overflow_completion);
+            match compact_side_messages(
+                parent,
+                stream_fn,
+                &parent_state,
+                &overflow_context,
+                settings,
+                true,
+                signal,
+            )
+            .await
+            {
+                Ok(Some((compacted, mut completions))) => {
+                    auxiliary_completions.append(&mut completions);
+                    side_agent.set_messages(compacted).await;
+                    turn_count.store(0, Ordering::SeqCst);
+                    result = run_attempts(
+                        &side_agent,
+                        question,
+                        previous_turns,
+                        side_agent.state().await.messages.len(),
+                        retry_policy,
+                        signal,
+                        sink,
+                        &update_rx,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    result = SideQuestionResult::failed(String::new(), error.to_string());
+                }
+            }
+        }
+    }
     let () = subscription.unsubscribe().await;
+    auxiliary_completions.append(&mut result.auxiliary_completions);
+    result.auxiliary_completions = auxiliary_completions;
     result
 }
 
@@ -255,9 +541,10 @@ async fn run_attempts(
     retry_policy: &ProviderRetryPolicy,
     signal: &AbortSignal,
     sink: &SideQuestionSink,
-    update_rx: &std::sync::mpsc::Receiver<String>,
+    update_rx: &std::sync::mpsc::Receiver<AssistantMessage>,
 ) -> SideQuestionResult {
     let mut answer = String::new();
+    let mut latest_streamed_message = None;
     if signal.is_aborted() {
         return SideQuestionResult::cancelled(answer);
     }
@@ -278,6 +565,7 @@ async fn run_attempts(
             signal,
             sink,
             update_rx,
+            &mut latest_streamed_message,
             &mut answer,
         )
         .await;
@@ -286,15 +574,25 @@ async fn run_attempts(
             AttemptOutcome::Aborted => break Ok(None),
             AttemptOutcome::Finished(turn) => match *turn {
                 None => {
-                    let error = side_agent.state().await.error_message.unwrap_or_else(|| {
-                        "Side question produced no assistant message".to_string()
-                    });
-                    break Err(anyhow::anyhow!(error));
+                    if let Some(message) = latest_streamed_message.clone() {
+                        message
+                    } else {
+                        let error = side_agent.state().await.error_message.unwrap_or_else(|| {
+                            "Side question produced no assistant message".to_string()
+                        });
+                        break Err(anyhow::anyhow!(error));
+                    }
                 }
                 Some(message) => message,
             },
         };
         if message.stop_reason != StopReason::Error {
+            break Ok(Some(message));
+        }
+        if super::provider_retry::is_context_overflow_failure(
+            &message,
+            side_agent.state().await.model.context_window,
+        ) {
             break Ok(Some(message));
         }
         if retries_performed >= max_retries
@@ -339,7 +637,13 @@ async fn run_attempts(
             .error_message
             .clone()
             .unwrap_or_else(|| "Side question produced no assistant message".to_string());
-        return SideQuestionResult::failed(answer, error);
+        return SideQuestionResult {
+            status: SideQuestionStatus::Error,
+            answer,
+            error_message: Some(error),
+            assistant: Some(message),
+            auxiliary_completions: Vec::new(),
+        };
     }
     // A run that ends on a tool turn was answered in an earlier turn; a
     // textless final turn without tool calls is a genuinely empty answer.
@@ -362,6 +666,8 @@ async fn run_attempts(
         status: SideQuestionStatus::Complete,
         answer: final_answer,
         error_message: None,
+        assistant: Some(message),
+        auxiliary_completions: Vec::new(),
     }
 }
 
@@ -381,7 +687,8 @@ async fn run_attempt(
     cloned_message_count: usize,
     signal: &AbortSignal,
     sink: &SideQuestionSink,
-    update_rx: &std::sync::mpsc::Receiver<String>,
+    update_rx: &std::sync::mpsc::Receiver<AssistantMessage>,
+    latest_streamed_message: &mut Option<AssistantMessage>,
     answer: &mut String,
 ) -> AttemptOutcome {
     let attempt: tokio::task::JoinHandle<anyhow::Result<Option<AssistantMessage>>> = {
@@ -408,7 +715,9 @@ async fn run_attempt(
     };
     let mut aborted = false;
     loop {
-        while let Ok(text) = update_rx.try_recv() {
+        while let Ok(message) = update_rx.try_recv() {
+            let text = assistant_text(&message);
+            *latest_streamed_message = Some(message);
             if !text.is_empty() && text != *answer {
                 answer.clone_from(&text);
                 if !sink(answer) {
@@ -570,6 +879,7 @@ mod tests {
             question,
             previous_turns,
             &fast_retry_policy(),
+            None,
             signal,
             sink,
         )
@@ -640,6 +950,7 @@ mod tests {
             "what is the answer?",
             &[],
             &fast_retry_policy(),
+            None,
             &AbortSignal::never(),
             &sink,
         )
@@ -685,6 +996,140 @@ mod tests {
             context.matches("deactivated in this side thread").count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_side_context_compacts_with_parent_hooks_and_reports_paid_summary() {
+        let mut model = test_model();
+        model.context_window = 10_000;
+        let provider = Arc::new(ScriptedProvider::new(model.clone()));
+        provider.push_text_turn("side context summary");
+        provider.push_text_turn("answer after compaction");
+        let transform_calls = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&transform_calls);
+        let transform: pa_agent::agent_loop::TransformContextFn =
+            Arc::new(move |messages, _signal| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(messages) })
+            });
+        let parent = Arc::new(Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("parent system".to_string()),
+                model: Some(model),
+                messages: Some(
+                    (0..4)
+                        .map(|index| {
+                            pa_agent::types::AgentMessage::user(format!(
+                                "old context {index}: {}",
+                                "x".repeat(500)
+                            ))
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            transform_context: Some(transform),
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        }));
+        let sink: SideQuestionSink = Arc::new(|_| true);
+        let settings = super::super::compaction::CompactionSettings {
+            enabled: true,
+            threshold_percent: 5.0,
+            reserve_tokens: 10,
+            keep_recent_tokens: 10,
+        };
+        let result = run_side_question(
+            &parent,
+            provider.stream_fn(),
+            "answer this",
+            &[],
+            &fast_retry_policy(),
+            Some(&settings),
+            &AbortSignal::never(),
+            &sink,
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            SideQuestionStatus::Complete,
+            "side result: {result:?}"
+        );
+        assert_eq!(result.answer, "answer after compaction");
+        assert_eq!(result.auxiliary_completions.len(), 1);
+        assert_eq!(
+            assistant_text(&result.auxiliary_completions[0]),
+            "side context summary"
+        );
+        assert!(transform_calls.load(Ordering::SeqCst) >= 2);
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "one summary call and one answer call");
+        let answer_context = serde_json::to_string(&calls[1]).unwrap();
+        assert!(answer_context.contains("side_context_summary"));
+        assert!(answer_context.contains("side context summary"));
+        assert_eq!(parent.state().await.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_once_and_records_replaced_completion() {
+        let mut model = test_model();
+        model.context_window = 10_000;
+        let provider = Arc::new(ScriptedProvider::new(model.clone()));
+        provider.push_stream_failure_turn(
+            "overflow partial",
+            "This model's maximum context length is 100 tokens. However, your messages resulted in 200 tokens.",
+        );
+        provider.push_text_turn("overflow recovery summary");
+        provider.push_text_turn("answer after overflow recovery");
+        let parent = Arc::new(Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(model),
+                messages: Some(vec![
+                    pa_agent::types::AgentMessage::user("old first turn"),
+                    pa_agent::types::AgentMessage::user("old second turn"),
+                    pa_agent::types::AgentMessage::user("recent turn"),
+                ]),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        }));
+        let sink: SideQuestionSink = Arc::new(|_| true);
+        let settings = super::super::compaction::CompactionSettings {
+            enabled: true,
+            threshold_percent: 95.0,
+            reserve_tokens: 10,
+            keep_recent_tokens: 10,
+        };
+        let result = run_side_question(
+            &parent,
+            provider.stream_fn(),
+            "recover this",
+            &[],
+            &fast_retry_policy(),
+            Some(&settings),
+            &AbortSignal::never(),
+            &sink,
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            SideQuestionStatus::Complete,
+            "side result: {result:?}"
+        );
+        assert_eq!(result.answer, "answer after overflow recovery");
+        assert_eq!(result.auxiliary_completions.len(), 2);
+        assert_eq!(
+            result.auxiliary_completions[0].stop_reason,
+            StopReason::Error
+        );
+        assert_eq!(
+            assistant_text(&result.auxiliary_completions[1]),
+            "overflow recovery summary"
+        );
+        assert_eq!(provider.calls().len(), 3);
     }
 
     #[tokio::test]

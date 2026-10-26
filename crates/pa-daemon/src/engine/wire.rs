@@ -387,6 +387,14 @@ pub struct SideQuestionRequest {
     pub question: String,
     /// Earlier `{question, answer}` exchanges replayed before the question.
     pub previous_turns: Vec<SideQuestionTurn>,
+    /// Recorder registry key. A negotiated pane id is stable across reconnects;
+    /// legacy clients fall back to their client/session scope.
+    pub recorder_key: String,
+    /// Identifier written into the parent pointer (pane id, or the first run id
+    /// for a legacy client that cannot send one).
+    pub btw_id: String,
+    /// Whether an existing recorder under `recorder_key` still describes this pane.
+    pub reuse_recorder: bool,
 }
 
 /// How one side-question run ended.

@@ -213,6 +213,9 @@ pub(crate) struct SessionUi {
     /// The side-question run currently streaming (TS `activeSideQuestionId`):
     /// at most one run per client, exactly like the daemon enforces.
     active_side_question_id: Option<String>,
+    /// Stable across follow-ups in one visible pane. It is sent only when the
+    /// daemon negotiated `side_question_pane_id`.
+    side_question_pane_id: Option<String>,
     side_question_counter: u64,
     /// A `/share` gist upload in flight: aborting kills `gh` (kill-on-drop).
     share: Option<ShareRun>,

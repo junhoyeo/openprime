@@ -15,7 +15,7 @@ Slack's endpoint selects its documented public desktop client; `login.rs`: login
 endpoint-bound credential into the shared auth store and the
 `wire_begin_login`/`McpOAuth` refresh integration hosts wire). The MCP
 protocol itself runs kernel-side (Python
-stdio/HTTP); the engine never spawns MCP servers. Tools (bash, edit, python_repl + internal rename/stdout), file mutation queue, truncation and rendering rules, RLM kernel lifecycle (IPython spawn/execute/revive), skills loading, system prompt assembly, compaction, harness refinement, settings/config, package manager (npm/git/local source install/remove/list/update against settings), session manager (persist/resume). Autonomous mode
+stdio/HTTP); the engine never spawns MCP servers. Tools (bash, edit, python_repl + internal rename/stdout), file mutation queue, truncation and rendering rules, RLM kernel lifecycle (IPython spawn/execute/revive), skills loading, system prompt assembly, compaction, harness refinement, settings/config, package manager (npm/git/local source install/remove/list/update against settings), session manager (persist/resume), and side-question execution (parent-hook-compatible context cloning, threshold/overflow compaction, full paid-completion reporting; hosts own linked transcript persistence). Autonomous mode
 (`autonomous`): runtime state with limit normalization, continuation and
 gate-failure texts, shell quality gates with retry windows and git
 worktree snapshotting, and the `AutonomousDriver` policy trait a turn

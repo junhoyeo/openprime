@@ -1097,6 +1097,24 @@ impl Agent {
         self.inner.stream_fn.as_ref()
     }
 
+    /// Clone the host's message conversion hook for a cache-compatible side loop.
+    #[must_use]
+    pub fn convert_to_llm_fn(&self) -> crate::agent_loop::ConvertToLlmFn {
+        Arc::clone(&self.inner.convert_to_llm)
+    }
+
+    /// Clone the host's pre-conversion context hook for a cache-compatible side loop.
+    #[must_use]
+    pub fn transform_context_fn(&self) -> Option<crate::agent_loop::TransformContextFn> {
+        self.inner.transform_context.clone()
+    }
+
+    /// Clone the host's dynamic credential hook for a cache-compatible side loop.
+    #[must_use]
+    pub fn get_api_key_fn(&self) -> Option<crate::agent_loop::GetApiKeyFn> {
+        self.inner.get_api_key.clone()
+    }
+
     #[must_use]
     pub fn signal(&self) -> Option<AbortSignal> {
         self.inner.current_signal()

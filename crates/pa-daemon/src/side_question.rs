@@ -91,6 +91,16 @@ impl SideQuestionManager {
                     .collect()
             })
             .unwrap_or_default();
+        let pane_id = payload
+            .get("paneId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let recorder_key = pane_id
+            .as_ref()
+            .map_or_else(|| format!("legacy:{client_id}"), |id| format!("pane:{id}"));
+        let btw_id = pane_id.unwrap_or_else(|| side_question_id.clone());
+        let reuse_recorder = recorder_key.starts_with("pane:") || !previous_turns.is_empty();
 
         let controller = pa_agent::abort::AbortController::new();
         {
@@ -130,7 +140,15 @@ impl SideQuestionManager {
                 },
             );
         }
-        self.spawn_run(side_question_id, question, previous_turns, controller);
+        self.spawn_run(
+            side_question_id,
+            question,
+            previous_turns,
+            recorder_key,
+            btw_id,
+            reuse_recorder,
+            controller,
+        );
         response_success(None, "start_side_question", None)
     }
 
@@ -199,11 +217,15 @@ impl SideQuestionManager {
 
     /// Spawn the run task: the engine call runs on a blocking thread while
     /// the task emits the event frames and owns the registry lifetime.
+    #[allow(clippy::too_many_arguments)] // Wire ids, pane grouping, and cancellation are independent inputs.
     fn spawn_run(
         &self,
         side_question_id: String,
         question: String,
         previous_turns: Vec<SideQuestionTurn>,
+        recorder_key: String,
+        btw_id: String,
+        reuse_recorder: bool,
         controller: pa_agent::abort::AbortController,
     ) {
         let engine = Arc::clone(&self.engine);
@@ -216,11 +238,17 @@ impl SideQuestionManager {
             side_question_id: side_question_id.clone(),
             question: question.clone(),
             previous_turns: Vec::new(),
+            recorder_key: recorder_key.clone(),
+            btw_id: btw_id.clone(),
+            reuse_recorder,
         };
         let engine_request = SideQuestionRequest {
             side_question_id: side_question_id.clone(),
             question: question.clone(),
             previous_turns,
+            recorder_key: recorder_key.clone(),
+            btw_id: btw_id.clone(),
+            reuse_recorder,
         };
         // The streaming sink emits one running event per partial answer.
         let sink: SideQuestionSink = Arc::new(move |answer| {
@@ -240,6 +268,9 @@ impl SideQuestionManager {
                 side_question_id: side_question_id.clone(),
                 question: question.clone(),
                 previous_turns: Vec::new(),
+                recorder_key: recorder_key.clone(),
+                btw_id: btw_id.clone(),
+                reuse_recorder,
             };
             emit_side_question_frame(
                 &events,
@@ -263,6 +294,9 @@ impl SideQuestionManager {
                 side_question_id: side_question_id.clone(),
                 question,
                 previous_turns: Vec::new(),
+                recorder_key,
+                btw_id,
+                reuse_recorder,
             };
             let event = side_question_event_value(
                 &event_request,

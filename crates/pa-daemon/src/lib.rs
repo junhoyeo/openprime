@@ -101,6 +101,7 @@ pub mod session_tree;
 pub mod session_usage;
 pub(crate) mod setting_switches;
 pub mod side_question;
+pub(crate) mod side_question_store;
 mod signal_drain;
 pub mod snapshot_stream;
 pub mod socket;
