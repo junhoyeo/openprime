@@ -1059,15 +1059,15 @@ describe("resolveMcpServiceCatalog", () => {
 });
 
 describe("/mcp and /plugins picker row counts", () => {
-	it("ships exactly 68 catalog services after the ENG-6108 single-credential cut", () => {
+	it("ships exactly 69 catalog services after adding the official Vercel integration", () => {
 		// The live /mcp picker counter read /77 against the earlier shipped 75: the extra rows are installed connections
 		// pinned from records (below), never catalog growth or duplicated rows. The 2026-09-16 token-only cut dropped 5
 		// more non-pasteable survivors (CockroachDB Cloud, Dynatrace, Sourcegraph, PayPal Sandbox, Render), and the
-		// single-credential cut dropped the two named-header pairs (Datadog, Cloudinary MediaFlows). Pin the shipped length
-		// so silent re-growth changes the counter loudly.
+		// single-credential cut dropped the two named-header pairs (Datadog, Cloudinary MediaFlows). Vercel then added one
+		// reviewed OAuth service; pin the shipped length so silent re-growth changes the counter loudly.
 		const entries = bundledMcpServiceEntries();
 		const services = defaultServiceCatalogProvider()();
-		expect(entries).toHaveLength(68);
+		expect(entries).toHaveLength(69);
 		expect(services.map((service) => service.serviceId).sort()).toEqual(entries.map((entry) => entry.server).sort());
 	});
 
