@@ -112,6 +112,7 @@ pub(crate) fn write_artifact_dir(
                 outcome: String::new(),
                 created_at: at,
             }],
+            preserved_entries: std::collections::BTreeMap::new(),
         };
         std::fs::write(
             harness_dir.join("harness_state.json"),
