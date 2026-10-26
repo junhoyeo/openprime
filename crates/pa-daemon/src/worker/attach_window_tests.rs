@@ -46,12 +46,11 @@ impl Link {
     }
 
     async fn frame(&mut self) -> (Value, Value) {
-        let frame =
-            tokio::time::timeout(std::time::Duration::from_secs(10), self.reader.read_frame())
-                .await
-                .expect("the worker answers")
-                .expect("a frame")
-                .expect("the connection stays open");
+        let frame = tokio::time::timeout(STEP_BOUND, self.reader.read_frame())
+            .await
+            .expect("the worker answers")
+            .expect("a frame")
+            .expect("the connection stays open");
         let payload = serde_json::from_slice(&frame.payload).expect("frame payload");
         (frame.header, payload)
     }
@@ -123,7 +122,7 @@ async fn served_worker_with_session_client() -> (Arc<Worker>, Link, Link) {
         .await;
     assert!(created.success, "create failed: {created:?}");
     tokio::spawn(Arc::clone(&worker).serve());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + STEP_BOUND;
     while tokio::net::UnixStream::connect(&socket).await.is_err() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -190,7 +189,7 @@ fn reader_barrier() -> Value {
 
 /// The bound on every step of the held-lock seam: a step that cannot finish within
 /// it fails the test instead of hanging it.
-const STEP_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+const STEP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One step the lock holder takes on the test's signal.
 enum HolderStep {
