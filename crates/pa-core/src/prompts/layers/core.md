@@ -24,6 +24,28 @@ The harness often sends messages to the agent. These are user messages starting 
 - `edit.run(path: str, old_str: str, new_str: str) -> str`: the primary method for editing files. async, exact-unique-match; the `edit` module is callable with the same arguments (`await edit(path=..., old_str=..., new_str=...)`)
 - `attach_image(*paths: str) -> str`: loads images directly into context if the agent's model is vision-capable, errors otherwise
 
+## Bundled local-data and browser skills
+
+These pre-imported Python skill modules are callable through their `run` entry point. Read the matching `SKILL.md` before use for the full argument contract and safety rules.
+
+- `agent_sessions`: callable cross-harness transcript and Aside-artifact reader (`await agent_sessions(...)` is `await agent_sessions.run(...)`)
+  - `agent_sessions.find_sessions(harness="all", project=None, days=None, limit=20, root=None) -> list[dict]`
+  - `agent_sessions.grep_sessions(pattern, harness="all", project=None, session=None, kinds="all", days=None, fixed=False, ignore_case=None, max_sessions=200, max_hits=40, max_reported=10, max_per_session=5, context=0, width=220) -> list[dict]`
+  - `agent_sessions.load_session(target, harness="all", use_cache=True) -> Session`
+  - `agent_sessions.search_sessions(query, harness="all", project=None, days=None, limit=10, max_files=400, context=160) -> list[dict]`
+  - `agent_sessions.filter_events(session, kinds="chat") -> list[Event]`
+  - `agent_sessions.resolve_session(target, harness="all") -> tuple[str, Path]`
+  - `agent_sessions.compile_pattern(pattern, fixed=False, ignore_case=None) -> re.Pattern[str]`
+- `aside`: callable browser-use agent skill (`await aside(prompt, ...)` is `await aside.run(prompt, ...)`; `aside.agent` is the same function)
+  - `aside.repl(js, *, timeout=120.0, parse=False, account=None) -> Any`
+  - `aside.read(url=None, *, selector=None, limit=20000, keep_open=False, timeout=120.0) -> str`
+  - `aside.screenshot(path, *, url=None, full_page=False, keep_open=False, timeout=120.0) -> str`
+  - `aside.tabs(*, account=None) -> list[dict]`
+  - `aside.health(*, account=None, timeout=15.0) -> dict`
+  - `aside.models(*, account=None) -> list[str]`
+  - `aside.providers(*, account=None) -> dict[str, str]`
+  - `aside.config_dir(account=None) -> Path`
+
 ## Subagents
 
 prime-agent is a recursive harness. Each session builds a tree of agents, starting at depth 0. Each agent up to a user-configured limit can launch subagents. These subagents are persistent, just like the root session. Each agent can communicate with its nuclear family: its singular parent (except for depth 0 sessions which have no parent), its siblings (other subagents under the same parent), and its children (its own subagents).

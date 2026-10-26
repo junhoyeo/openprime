@@ -512,14 +512,15 @@ fn core_layer_documents_the_real_tool_surface() {
     }
 }
 
-// Packaged-set parity (TS packages/coding-agent/skills)
+// Packaged-set parity (fork TS packages/coding-agent/skills)
 
-/// The packaged skill set at TS tip `f62dae4d0` (`packages/coding-agent/skills/`): 12 skills — the
-/// generic `mcp` doc skill in, the per-service linear/notion pair out (TS removed theirs when the
-/// generic MCP surface landed).
-const TS_PACKAGED_SKILL_SET: &[&str] = &[
+/// The packaged skill set at openprime TS tip `e4f7718ae` (`packages/coding-agent/skills/`):
+/// the upstream 12 skills plus the fork's `agent-sessions` reader and Aside browser wrapper.
+const OPENPRIME_TS_PACKAGED_SKILL_SET: &[&str] = &[
     "agent-message",
     "agent-observe",
+    "agent-sessions",
+    "aside",
     "attach-image",
     "compact",
     "edit",
@@ -535,15 +536,32 @@ const TS_PACKAGED_SKILL_SET: &[&str] = &[
 /// The bundled skills directory matches the TS packaged set name-for-name: the generic `mcp` skill
 /// is present and markdown-only, and the retired per-service pair (linear/notion) is gone.
 #[test]
-fn bundled_skills_match_the_ts_packaged_set() {
+fn bundled_skills_match_the_openprime_ts_packaged_set() {
     let skills = sorted_bundled_skills();
     let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
-    let mut expected = TS_PACKAGED_SKILL_SET.to_vec();
+    let mut expected = OPENPRIME_TS_PACKAGED_SKILL_SET.to_vec();
     expected.sort_unstable();
     assert_eq!(
         names, expected,
-        "the packaged skill set must match the TS packaged set"
+        "the packaged skill set must match the openprime TS packaged set"
     );
+    for (name, import_name) in [("agent-sessions", "agent_sessions"), ("aside", "aside")] {
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == name)
+            .unwrap_or_else(|| panic!("{name} is packaged exactly once"));
+        let python = skill
+            .python
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} keeps its Python package metadata"));
+        assert_eq!(python.import_name, import_name);
+        assert_eq!(skill.base_dir, bundled_skills_dir().join(name));
+        assert_eq!(python.package_path, bundled_skills_dir().join(name));
+        assert_eq!(
+            python.pyproject_path,
+            bundled_skills_dir().join(name).join("pyproject.toml")
+        );
+    }
     assert!(
         !names.contains(&"linear") && !names.contains(&"notion"),
         "the per-service MCP skills retired with the generic mcp skill"
@@ -560,6 +578,41 @@ fn bundled_skills_match_the_ts_packaged_set() {
         mcp_skill.description,
         "Use external MCP services generically from Python - search the supported-service catalog, inspect the user's connections, discover live tool schemas, and call tools on any connection (Notion, Linear, Slack, and the rest of the catalog) without per-service packages."
     );
+}
+
+/// The fork's Python skills render once from the canonical bundled root with their actual kernel
+/// import names. A duplicate built-in path or a markdown-only degradation fails this inventory.
+#[test]
+fn openprime_python_skills_render_once_in_the_prompt_inventory() {
+    let options = BuildSystemPromptOptions {
+        cwd: "/w".to_string(),
+        messages_path: Some("/log.jsonl".to_string()),
+        skills: sorted_bundled_skills(),
+        selected_tools: Some(vec!["python_repl"]),
+        ..Default::default()
+    };
+    let breakdown = system_prompt_breakdown(&options);
+    let inventory = breakdown
+        .segments
+        .iter()
+        .find(|segment| {
+            matches!(segment.kind, SegmentKind::Dynamic)
+                && segment.text.contains("<available_skills>")
+        })
+        .map(|segment| segment.text.as_str())
+        .expect("the skills inventory segment renders");
+
+    for (name, import_name) in [("agent-sessions", "agent_sessions"), ("aside", "aside")] {
+        assert_eq!(
+            inventory.matches(&format!("<name>{name}</name>")).count(),
+            1,
+            "{name} must render exactly once from the canonical built-in path"
+        );
+        assert!(
+            inventory.contains(&format!("<python_import>{import_name}</python_import>")),
+            "{name} must expose its real Python import {import_name}"
+        );
+    }
 }
 
 /// The bounded-await contract renders wherever the Python REPL does: every session kind, daemon

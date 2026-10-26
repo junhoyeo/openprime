@@ -1,0 +1,1 @@
+- Added the built-in `aside` skill for deterministic browser automation, page extraction, screenshots, and browser-use agent sessions through the Aside CLI.
