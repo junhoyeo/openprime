@@ -1,8 +1,8 @@
 //! The live-event decoder: the `TurnUpdate` vocabulary (session-event
 //! wire shapes) and the `event_to_update` fold.
 use super::{
-    assistant_value_to_entries, queue_lane, queue_lane_indices, starting_from_actions, ChatEntry,
-    Value,
+    active_refine_from_actions, assistant_value_to_entries, queue_lane, queue_lane_indices,
+    starting_from_actions, ChatEntry, Value,
 };
 
 /// One live session event decoded for the transcript (the `event` field of
@@ -107,6 +107,7 @@ pub enum TurnUpdate {
         starting: Option<String>,
         rlm_child_status: crate::queued::QueueLaneIndices,
         injected_prompts: crate::queued::QueueLaneIndices,
+        active_refine: bool,
     },
     /// `bash_start` (the user-bash slot): a command run outside the model
     /// loop; `transient` marks a side-conversation run rendering only
@@ -338,6 +339,7 @@ pub fn event_to_update(event: &Value) -> Option<TurnUpdate> {
                 starting: starting_from_actions(&actions),
                 rlm_child_status: queue_lane_indices(&actions, "rlmChildStatus"),
                 injected_prompts: queue_lane_indices(&actions, "injectedPrompts"),
+                active_refine: active_refine_from_actions(&actions),
             })
         }
         // The identity fields ride the same frame.

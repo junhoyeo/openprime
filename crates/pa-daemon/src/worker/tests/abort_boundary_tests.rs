@@ -1030,3 +1030,44 @@ async fn abort_and_send_queued_under_a_held_pause_delivers_on_the_release() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn refine_queue_restore_clears_humans_and_preserves_internal_provenance() {
+    let worker = created_dispatch_worker().await;
+    let item = |message: &str, visible: bool| QueuedItem {
+        message: message.to_string(),
+        priority: QueuePriority::Human,
+        preview: Some(message.to_string()),
+        custom_message: None,
+        agent_message: None,
+        queue_key: None,
+        admission_id: None,
+        images: Vec::new(),
+        done: None,
+        queue_visible: visible,
+        policy: TurnPolicy::Queued,
+        forced_batch: false,
+    };
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.steering.push_back(item("human steer", true));
+        core.steering.push_back(item("internal heartbeat", false));
+        core.follow_up.push_back(item("human follow", true));
+    }
+    let result = worker
+        .dispatch("abort_and_clear_queue", &json!({"preserveInternal":true}))
+        .await;
+    assert!(result.success, "{result:?}");
+    assert_eq!(
+        result.data.as_ref().unwrap()["steering"],
+        json!(["human steer"])
+    );
+    assert_eq!(
+        result.data.as_ref().unwrap()["followUp"],
+        json!(["human follow"])
+    );
+    let core = worker.core.lock().unwrap();
+    assert_eq!(core.steering.len(), 1);
+    assert_eq!(core.steering[0].message, "internal heartbeat");
+    assert!(core.follow_up.is_empty());
+}

@@ -16,6 +16,49 @@ pub(crate) struct CompactionAbortNote {
     pub(crate) outcome: Result<(), String>,
 }
 
+fn refine_restore_reply_is_current(
+    expected_session: &str,
+    current_session: &str,
+    expected_generation: u64,
+    current_generation: u64,
+    expected_draft: &str,
+    current_draft: &str,
+) -> bool {
+    expected_session == current_session
+        && expected_generation == current_generation
+        && expected_draft == current_draft
+}
+
+fn restored_refine_editor_text(data: &Value, draft: &str) -> String {
+    let lane = |name: &str| {
+        data.get(name)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let mut queued = lane("steering");
+    queued.extend(lane("followUp"));
+    [
+        queued.join(
+            "
+
+",
+        ),
+        draft.to_string(),
+    ]
+    .into_iter()
+    .filter(|text| !text.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(
+        "
+
+",
+    )
+}
+
 impl SessionUi {
     /// Abort the active turn off the UI loop: with the schema-29 capability the daemon aborts the
     /// run and the queue keeps flowing behind the settled turn; otherwise the plain abort.
@@ -56,6 +99,58 @@ impl SessionUi {
                 let _ = notes.send(format!("the abort failed: {error:#}"));
             }
         });
+    }
+
+    pub(super) async fn abort_refine_and_restore_queue(&mut self, view: &mut AgentView) {
+        if self.refine_cancel_in_flight {
+            return;
+        }
+        self.refine_cancel_in_flight = true;
+        let active_session_id = self.active_session_id.clone();
+        let draft = view.editor.get_text();
+        let submission_generation = self.input_submission_generation;
+        let mut rest = Map::default();
+        if self
+            .client
+            .supports_server_capability("refine_queue_restore")
+        {
+            rest.insert("preserveInternal".to_string(), Value::Bool(true));
+        }
+        let response = self
+            .bounded_request(
+                std::time::Duration::from_millis(super::UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::AbortAndClearQueue {
+                    id: None,
+                    active_session_id: active_session_id.clone(),
+                    rest,
+                },
+            )
+            .await;
+        self.refine_cancel_in_flight = false;
+        if !refine_restore_reply_is_current(
+            &active_session_id,
+            &self.active_session_id,
+            submission_generation,
+            self.input_submission_generation,
+            &draft,
+            &view.editor.get_text(),
+        ) {
+            return;
+        }
+        match response {
+            Ok(data) => {
+                let restored = restored_refine_editor_text(&data, &draft);
+                view.editor.set_text(&restored);
+                view.queued = crate::queued::QueuedMessages::default();
+                self.refine_active = false;
+                self.sync_refine_loader(view);
+            }
+            Err(error) => self.note_as(
+                &format!("Could not cancel refinement: {error:#}"),
+                StatusKind::Error,
+                view,
+            ),
+        }
     }
 
     /// Cancel the in-flight compaction off the UI loop; the request never
@@ -621,7 +716,9 @@ impl SessionUi {
                 starting,
                 rlm_child_status,
                 injected_prompts,
+                active_refine,
             } => {
+                self.refine_active = active_refine;
                 view.queued = crate::queued::QueuedMessages {
                     steering,
                     follow_ups,
@@ -629,6 +726,7 @@ impl SessionUi {
                     rlm_child_status,
                     injected_prompts,
                 };
+                self.sync_refine_loader(view);
                 // A queue change under an active browse reconciles the selection: the cursor
                 // survives only when the addressed item is unchanged; a stale selection drops.
                 if let Some(selected) = self.queue_selection.selected() {
@@ -918,5 +1016,38 @@ impl SessionUi {
             working.activity = activity;
             working.download = download;
         }
+    }
+}
+
+#[cfg(test)]
+mod refine_restore_tests {
+    use super::*;
+    #[test]
+    fn restored_refine_queue_orders_lanes_before_draft_once() {
+        let data = serde_json::json!({"steering":["steer one","steer two"],"followUp":["follow" ]});
+        assert_eq!(
+            restored_refine_editor_text(&data, "draft"),
+            "steer one\n\nsteer two\n\nfollow\n\ndraft"
+        );
+    }
+    #[test]
+    fn late_refine_reply_cannot_overwrite_new_session_or_draft() {
+        assert!(refine_restore_reply_is_current(
+            "s1", "s1", 4, 4, "draft", "draft"
+        ));
+        assert!(!refine_restore_reply_is_current(
+            "s1", "s2", 4, 4, "draft", "draft"
+        ));
+        assert!(!refine_restore_reply_is_current(
+            "s1", "s1", 4, 5, "draft", "draft"
+        ));
+        assert!(!refine_restore_reply_is_current(
+            "s1",
+            "s1",
+            4,
+            4,
+            "draft",
+            "new draft"
+        ));
     }
 }

@@ -103,8 +103,8 @@ impl Worker {
             "get_session_stats" => self.handle_get_session_stats(),
             "get_model_catalog" => self.handle_get_model_catalog(),
             "get_queue" => self.handle_get_queue(),
-            "clear_queue" => self.handle_clear_queue(),
-            "abort_and_clear_queue" => self.handle_abort_and_clear_queue(),
+            "clear_queue" => self.handle_clear_queue(false),
+            "abort_and_clear_queue" => self.handle_abort_and_clear_queue(payload),
             "get_last_assistant_text" => self.handle_get_last_assistant_text(),
             "get_connection_state" => self.handle_get_connection_state(),
             "get_mcp_connections" => self.handle_get_mcp_connections().await,
@@ -542,7 +542,7 @@ impl Worker {
         )
     }
 
-    fn handle_clear_queue(&self) -> DaemonResponse {
+    fn handle_clear_queue(&self, preserve_internal: bool) -> DaemonResponse {
         if let Err(response) = self.require_created("clear_queue") {
             return response;
         }
@@ -552,17 +552,23 @@ impl Worker {
         let mut dropped_agent_rows = Vec::new();
         let drain_lane =
             |lane: &mut VecDeque<QueuedItem>, dropped_agent_rows: &mut Vec<Value>| -> Vec<String> {
-                lane.drain(..)
-                    .map(|item| {
-                        if let Some(id) = item.admission_id.as_deref() {
-                            self.prompt_admissions.clear(id);
-                        }
-                        if item.agent_message.is_some() {
-                            dropped_agent_rows.extend(item.custom_message);
-                        }
-                        item.message
-                    })
-                    .collect()
+                let mut drained = Vec::new();
+                let mut kept = VecDeque::new();
+                while let Some(item) = lane.pop_front() {
+                    if preserve_internal && !item.queue_visible {
+                        kept.push_back(item);
+                        continue;
+                    }
+                    if let Some(id) = item.admission_id.as_deref() {
+                        self.prompt_admissions.clear(id);
+                    }
+                    if item.agent_message.is_some() {
+                        dropped_agent_rows.extend(item.custom_message.clone());
+                    }
+                    drained.push(item.message);
+                }
+                *lane = kept;
+                drained
             };
         let steering: Vec<String> = drain_lane(&mut core.steering, &mut dropped_agent_rows);
         let follow_up: Vec<String> = drain_lane(&mut core.follow_up, &mut dropped_agent_rows);
@@ -633,8 +639,12 @@ impl Worker {
         });
     }
 
-    fn handle_abort_and_clear_queue(&self) -> DaemonResponse {
-        let cleared = self.handle_clear_queue();
+    fn handle_abort_and_clear_queue(&self, payload: &Value) -> DaemonResponse {
+        let preserve_internal = payload
+            .get("preserveInternal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let cleared = self.handle_clear_queue(preserve_internal);
         if !cleared.success {
             return cleared;
         }
