@@ -13,6 +13,8 @@
 //!   can still attach and the revived worker never reports telemetry; the
 //!   revived session reports for the waking client's pane, never the
 //!   creator's;
+//! - e32bce384 / 48fae2a5a through the update restore: a roster row is
+//!   recreated from its captured launch context, not the transcript header;
 //! - c3adf81be / 1ca735370 / 48fae2a5a: a transcript switched in over a
 //!   fileless or foreign launch never inherits the launch cwd on respawn;
 //! - 6470a60e7: a cancellable prompt never starts a revival;
@@ -156,6 +158,11 @@ fn agent_dir_with_mock(root: &Path) -> PathBuf {
 
 #[allow(clippy::zombie_processes)] // the timeout path exits the test process
 fn spawn_daemon(socket: &Path, agent_dir: &Path) -> Daemon {
+    spawn_daemon_with_env(socket, agent_dir, &[])
+}
+
+#[allow(clippy::zombie_processes)] // the timeout path exits the test process
+fn spawn_daemon_with_env(socket: &Path, agent_dir: &Path, env: &[(&str, &Path)]) -> Daemon {
     let child = Command::new(env!("CARGO_BIN_EXE_pa-daemon"))
         .arg("supervisor")
         .arg("--socket")
@@ -173,6 +180,7 @@ fn spawn_daemon(socket: &Path, agent_dir: &Path) -> Daemon {
             pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
             "15000",
         )
+        .envs(env.iter().copied())
         .spawn()
         .expect("spawn pa-daemon supervisor");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1049,5 +1057,79 @@ fn a_revival_reports_for_the_waking_pane_never_the_creators() {
     assert!(
         panes.iter().all(|pane| *pane == "pane:waker"),
         "the revival reported into the creator's stale pane: {after_wake:?}"
+    );
+}
+
+/// Rows e32bce384 / 48fae2a5a through the update restore: a roster row whose
+/// session no worker came back for is recreated from the durable create
+/// command the roster captured — its explicit cwd and runtime config — not
+/// from the transcript header (TS restores with its durable `createCommand`
+/// config).
+#[test]
+fn an_update_restore_recreates_a_session_with_its_captured_launch_context() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = agent_dir_with_mock(dir.path());
+    let sessions = agent_dir.join("sessions");
+    let fallback = dir.path().join("fallback");
+    std::fs::create_dir_all(&fallback).expect("fallback dir");
+    let saved = write_missing_cwd_transcript(&sessions, &dir.path().join("gone"));
+    let socket = dir.path().join("daemon.sock");
+    // The captured row: the Rust roster stores the worker's durable create
+    // command (flat runtime keys) under `runtime_config.create`.
+    let roster = dir.path().join("update-roster.json");
+    std::fs::write(
+        &roster,
+        json!({
+            "format_version": 1,
+            "update_id": "u-revival-1",
+            "socket_path": socket.to_string_lossy(),
+            "created_at": "2026-10-12T00:00:00Z",
+            "supervisor": { "pid": 1, "process_start_id": "p", "generation": "g" },
+            "binary": { "from_version": "0.1", "to_version": "0.2" },
+            "sessions": [{
+                "session_id": "missing-cwd-session",
+                "active_session_id": "gone-worker",
+                "session_file": saved.to_string_lossy(),
+                "kind": "top-level",
+                "rlm_depth": 0,
+                "cwd": fallback.to_string_lossy(),
+                "runtime_config": {
+                    "create": {
+                        "sessionPath": saved.to_string_lossy(),
+                        "cwd": fallback.to_string_lossy(),
+                        "sessionDir": sessions.to_string_lossy(),
+                        "provider": "prime-inference",
+                        "model": "mock-1",
+                    },
+                },
+                "queue": { "next_turn": [], "actions": {} },
+                "in_flight": {
+                    "streaming": false, "compacting": false, "bash_running": false,
+                    "rlm_children": false, "retrying": false, "prompt_in_flight": false
+                },
+                "should_resume": false
+            }],
+        })
+        .to_string(),
+    )
+    .expect("write roster");
+    let _daemon = spawn_daemon_with_env(
+        &socket,
+        &agent_dir,
+        &[(
+            pa_types::daemon::update_flow::UPDATE_ROSTER_ENV,
+            roster.as_path(),
+        )],
+    );
+    let mut client = Client::connect(&socket);
+    let restored = wait_until(
+        "the restored session is live",
+        Duration::from_secs(30),
+        || client.live_active_id("list", "missing-cwd-session"),
+    );
+    assert_eq!(
+        pwd_output(&client.pwd("pwd", &restored)),
+        canonical(&fallback),
+        "the restore must run in the captured explicit cwd"
     );
 }

@@ -696,8 +696,18 @@ async fn restore_session(
     if let Some(restored_ids) = restored_ids {
         remap_legacy_parent(&mut payload, restored_ids);
     }
-    let command: DaemonCommand =
+    let mut command: DaemonCommand =
         serde_json::from_value(payload).context("rebuild the create command")?;
+    // A Rust roster row stores the launch's FLAT durable keys (cwd, sessionDir,
+    // model, ...), which the typed create leaves in `rest` where the launch
+    // never reads them: they move back under `config`, so the restore runs
+    // with the captured launch context instead of the transcript header. A TS
+    // legacy row nests `config` already and parses as-is.
+    if let DaemonCommand::Create { config, rest, .. } = &mut command {
+        if config.is_none() && !rest.is_empty() {
+            *config = Some(serde_json::Value::Object(std::mem::take(rest)));
+        }
+    }
     let summary = supervisor
         .handle_create(&command, UPDATE_RESTORE_CLIENT_ID.to_string())
         .await?;
