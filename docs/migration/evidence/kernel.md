@@ -111,3 +111,20 @@ as a final-tip gate. The stable Win32 directory-identity replacement passed a
 private `x86_64-pc-windows-gnu` cargo check before final retain-only edits.
 Exact commands, exit codes, and final SHA are recorded in the handoff after the
 final combined-tip gates. `Cargo.toml` and `Cargo.lock` are unchanged.
+
+
+## Pre-spawn probe regression (found by the first Linux CI)
+
+Fork commit `8556b9c32` added `spawn_environment_ready()` before every kernel spawn, injected interpreters included. It ran three synchronous, unbounded `std::process::Command::status()` probes inside the async start. That blocked the runtime thread, so the start's own timeouts could not fire. On Linux CI, shard 2 hung until the 45-minute job timeout (`cancelled_request_write_retires_the_kernel`). `nonreading_kernel_fails_bootstrap_without_parking_shutdown`, `prewarm_swallows_failure_and_keeps_lazy_fallback`, `startup_failure_surfaces_cause_and_duration`, and `silent_bootstrap_fails_bounded_and_leaves_no_kernel` failed. All of them pass at `c4c238ca0`.
+
+Fix (`fix/kernel-request-regression` @ `60d5f6d51`, owner `kernel-fix-opus`, independent reviewer `kernel-review-opus`: CLEAR in two rounds with mutation controls; integrated as 7 picks ending at `1e527e5f8`):
+
+- The probe uses `tokio::process` with `kill_on_drop`, and each launch is bounded by the existing 30 s ready budget (`READY_TIMEOUT_MS`, no new constant). A cold purged-pyc import probe measured 12.96 s. A hung interpreter fails at the first probe (about 60 s with the provisioner retry, the same as c4c's 2 x 30 s ready timeout), so no shared deadline is needed.
+- Supersession and Shutdown are checked after the probe await and before every probe launch. A superseded or killed start launches no further probes and never touches the newer start's state (red-first tests).
+- A probe timeout reports `did not answer the runtime probe within 30000ms`, not the ABI verdict.
+- An unlaunchable interpreter fails with c4c's exact `failed to spawn kernel python <path>: <error>`, and the manager is left defunct (Shutdown, removed from live kernels, cleaned up, memo invalidated), as at c4c. A probe that runs and is rejected, or times out, leaves the manager Idle and reusable. Those are fork-only outcomes, and the provisioner retries them.
+- Limits: a timed-out or cancelled probe signals only its direct child, not the process group (a non-exec wrapper's helpers may outlive it). An already-running probe is not signalled on supersession; it ends within its bound and is reaped. P2-f: no test pins the defunct outcome for an unlaunchable interpreter (a reviewer mutation showed nothing fails); possible follow-up.
+
+Test-fixture adaptations (parent sign-off; not behavior changes): three upstream fake kernels (`requests.rs` x2, `provisioner.rs` x1) and `SILENT_BOOTSTRAP_RUNTIME` now answer `-c` with exit 0, so they pass the fork's deliberate ABI2 probe of injected interpreters. No assertion changed. The ABI2 negative tests still fail closed (absent / ABI 1 / ABI 3 / string / float / bool / malformed, and the exact env and cwd probes). `kernel_prewarm` sets `enableBuiltinSkills: false` in its own fixture. Its compaction cut otherwise depends on whether the interpreter carries every bundled skill (a `python_skills_unavailable` notice adds a history summary call). The reviewer reproduced that at `c4c238ca0` with a skill-less interpreter, so it is not a fork product regression.
+
+Gates at the integrated tip (hermetic wrapper): fmt 0; clippy `pa-core` `-D warnings` 0; `pa-core --lib kernel::` 125 passed; `lock_timeout_prevents_venv_rebuild` 1/1 (run without the wrapper's `PRIME_AGENT_KERNEL_VENV`); `kernel_prewarm` 3/3; `kernel_bootstrap_generations` 16/16; `kernel_startup_join` 5/5; `kernel_lifecycle` 9/9.
