@@ -51,6 +51,16 @@ fn contains(entries: &[Weak<Inner>], inner: &std::sync::Arc<Inner>) -> bool {
         .any(|weak| std::ptr::eq(Weak::as_ptr(weak), std::sync::Arc::as_ptr(inner)))
 }
 
+/// Whether the registry tracks this exact kernel (the global count is shared
+/// by every concurrently running test).
+#[cfg(test)]
+pub(crate) fn is_tracked(inner: &std::sync::Arc<Inner>) -> bool {
+    let entries = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    contains(&entries, inner)
+}
+
 /// Flush and tear down every live kernel, discarding individual failures: the shutdown of one
 /// wedged kernel must not block the others. Mirrors the TS async shutdown handler (`snapshot:
 /// true`).

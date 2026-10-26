@@ -51,7 +51,7 @@ use probe::{clear_in_process_probe_memo_for_tests, installed_package_dir};
 pub(crate) use probe::{
     has_prime_agent_runtime, has_required_default_imports, has_state_snapshot_runtime,
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, spawn_environment_ready,
-    SUPPORTED_RLM_RUNTIME_ABI,
+    SpawnProbe, SUPPORTED_RLM_RUNTIME_ABI,
 };
 use probe::{has_prime_agent_runtime_memoized, installed_runtime_identity};
 use runtime_source::collect_python_files;
