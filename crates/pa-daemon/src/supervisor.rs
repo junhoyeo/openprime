@@ -24,6 +24,8 @@ use launch_budget::WORKER_AUTH_FLOOR_MS;
 use signals_shutdown::daemon_closing_shutdown_event;
 mod supervision;
 
+#[cfg(test)]
+mod attach_window_tests;
 #[cfg(all(test, unix))]
 mod dead_child_delete_tests;
 #[cfg(test)]
