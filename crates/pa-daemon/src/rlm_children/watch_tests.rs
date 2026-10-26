@@ -130,6 +130,9 @@ async fn spawn_fake_supervisor(
                     let id = value["id"].as_str().unwrap_or_default().to_string();
                     let command = value["command"].clone();
                     let command_type: &str = command["type"].as_str().unwrap_or_default();
+                    if command_type == "prompt" {
+                        child_subagents.prompt_calls.fetch_add(1, Ordering::SeqCst);
+                    }
                     let response = match command_type {
                         _ if matches!(
                             (child, command_type),
@@ -178,7 +181,6 @@ async fn spawn_fake_supervisor(
                             })),
                         ),
                         "prompt" => {
-                            child_subagents.prompt_calls.fetch_add(1, Ordering::SeqCst);
                             if matches!(child, FakeChild::FinalTurnFails) {
                                 use super::lifecycle::exit_capture_tests::{
                                     assistant_row_ending, retry_outcome_row,
@@ -1029,6 +1031,38 @@ async fn cancellation_between_kickoff_attempts_prevents_retry() {
         1,
         "no retry prompt"
     );
+}
+
+/// A cancel at the exact first-failure -> retry-dispatch boundary invalidates
+/// the retry before its RPC is sent.
+#[tokio::test]
+async fn cancel_at_retry_dispatch_boundary_sends_no_second_prompt() {
+    use super::host::{
+        KICKOFF_RETRY_GATE_ARMED, KICKOFF_RETRY_GATE_REACHED, KICKOFF_RETRY_GATE_RELEASE,
+    };
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let child = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::PromptFails,
+        Arc::clone(&child),
+    )
+    .await;
+    KICKOFF_RETRY_GATE_ARMED.store(true, Ordering::SeqCst);
+    let handle = spawn_child(&sessions).await;
+    let collect = {
+        let sessions = sessions.clone();
+        let id = handle.rlm_child_id.clone();
+        tokio::spawn(async move { sessions.collect(vec![id], 10_000).await })
+    };
+    KICKOFF_RETRY_GATE_REACHED.notified().await;
+    assert!(sessions.cancel_child_run(&handle.rlm_child_id).await);
+    KICKOFF_RETRY_GATE_RELEASE.notify_one();
+    let rows = collect.await.unwrap().unwrap();
+    assert_eq!(rows[0].status, "cancelled");
+    assert_eq!(child.prompt_calls.load(Ordering::SeqCst), 1);
 }
 
 /// A zero-timeout collect is a pure snapshot: it reports queued and does not

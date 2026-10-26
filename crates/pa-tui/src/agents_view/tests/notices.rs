@@ -153,3 +153,39 @@ fn the_status_expires_through_the_loop_deadline() {
     );
     assert_eq!(mode.status_text(), Some("Reply sent again"));
 }
+
+#[test]
+fn heartbeat_partial_and_legacy_failures_render_visible_stale_status() {
+    let mut mode = mode_with_notice("");
+    let healthy = crate::heartbeats_picker::parse_heartbeats(&serde_json::json!({
+        "heartbeats":[{"job":{"id":"healthy","status":"active"}}]
+    }));
+    apply_heartbeat_catalog_update(
+        &mut mode,
+        7,
+        7,
+        Some(healthy),
+        Some("Heartbeat catalog is partial: worker-a (omitted)".into()),
+    );
+    assert_eq!(mode.heartbeats.len(), 1);
+    assert_eq!(
+        mode.status_text(),
+        Some("Heartbeat catalog is partial: worker-a (omitted)")
+    );
+    apply_heartbeat_catalog_update(
+        &mut mode,
+        7,
+        7,
+        None,
+        Some("Heartbeat catalog refresh failed; showing stale badges".into()),
+    );
+    assert_eq!(
+        mode.heartbeats.len(),
+        1,
+        "legacy failure preserves stale rows"
+    );
+    assert_eq!(
+        mode.status_text(),
+        Some("Heartbeat catalog refresh failed; showing stale badges")
+    );
+}

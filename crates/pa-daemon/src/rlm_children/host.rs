@@ -77,6 +77,16 @@ fn create_session_launch_env(model: &str) -> std::collections::BTreeMap<String, 
     env
 }
 
+#[cfg(test)]
+pub(crate) static KICKOFF_RETRY_GATE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static KICKOFF_RETRY_GATE_REACHED: tokio::sync::Notify =
+    tokio::sync::Notify::const_new();
+#[cfg(test)]
+pub(crate) static KICKOFF_RETRY_GATE_RELEASE: tokio::sync::Notify =
+    tokio::sync::Notify::const_new();
+
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
@@ -300,6 +310,11 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         child_session_file.as_deref(),
                         &kickoff_row_id,
                     );
+                    #[cfg(test)]
+                    if KICKOFF_RETRY_GATE_ARMED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        KICKOFF_RETRY_GATE_REACHED.notify_one();
+                        KICKOFF_RETRY_GATE_RELEASE.notified().await;
+                    }
                     let retry_allowed = {
                         let record = watcher_record.lock().await;
                         !record.closed_by_parent
