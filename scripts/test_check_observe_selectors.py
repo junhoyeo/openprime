@@ -121,6 +121,20 @@ class SelectorReceiptTests(unittest.TestCase):
             with self.assertRaises(AssertionError, msg=key):
                 fixture.ready_children(snapshot, expected)
 
+    def test_queued_pre_kickoff_child_is_live_but_every_settled_status_is_rejected(self):
+        # The spawn cell's own snapshot predates the kickoff admission (ABI2 `queued`, as in the
+        # hosted Linux run 40403389562): live, not settled.
+        expected = {'observe-child-a': 'child-a', 'observe-child-b': 'child-b'}
+        snapshot = self.children()
+        for row in snapshot['children']:
+            row['status'] = 'queued'
+        self.assertEqual(len(fixture.ready_children(snapshot, expected)), 2)
+        for status in ('completed', 'done', 'error', 'cancelled'):
+            snapshot = self.children()
+            snapshot['children'][0]['status'] = status
+            with self.assertRaisesRegex(AssertionError, 'settled before identity proof', msg=status):
+                fixture.ready_children(snapshot, expected)
+
     def test_partial_publication_rejects_malformed_ids_before_any_poll(self):
         for key in ('active_session_id', 'session_id'):
             for value in (123, '', False, []):
