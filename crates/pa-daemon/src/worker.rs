@@ -1081,6 +1081,9 @@ mod worker_resume_settings_tests;
 #[cfg(test)]
 mod agent_message_tests;
 
+#[cfg(all(test, unix))]
+mod attach_window_tests;
+
 #[cfg(test)]
 mod prompt_image_tests;
 
