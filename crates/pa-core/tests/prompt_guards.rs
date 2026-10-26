@@ -371,9 +371,17 @@ fn settings_gated_bundled_skills() -> BTreeSet<String> {
     ["websearch".to_string()].into_iter().collect()
 }
 
-/// (import name, public functions) for every bundled Python skill that is
-/// always available (auth-gated integrations and the conditionally-available
-/// websearch skill excluded).
+/// Conditional fork skills are documented only by the resolved dynamic inventory and winning
+/// SKILL.md. They can be disabled, force-excluded, or replaced by a same-name user/project skill.
+fn dynamic_inventory_only_bundled_skills() -> BTreeSet<String> {
+    ["agent_sessions", "aside"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// (import name, public functions) for each bundled Python candidate that is not auth/settings
+/// gated. Resolution can still disable it or replace it with a user/project winner.
 fn bundled_python_skills() -> Vec<(String, Vec<String>)> {
     let gated = auth_gated_bundled_skills();
     let settings_gated = settings_gated_bundled_skills();
@@ -420,16 +428,22 @@ fn allowed_surface_tokens() -> BTreeSet<String> {
     allowed
 }
 
-/// The surface tokens the prompt MUST document. Stricter than the allowed set: skill entry points
-/// (`run`/`status`) are callable through the module itself, so the module bullet suffices for them.
+/// The static surface tokens the cache-stable core prompt MUST document. Conditional Python
+/// skills are guarded separately against the resolved dynamic inventory and winning SKILL.md.
+/// Static skill entry points (`run`/`status`) are callable through the module itself, so the
+/// module bullet suffices for them.
 fn required_surface_tokens() -> BTreeSet<String> {
     let mut required = BTreeSet::new();
+    let dynamic_only = dynamic_inventory_only_bundled_skills();
     for request in registered_host_requests() {
         if let Some(token) = prompt_token_for_host_request(&request) {
             required.insert(token);
         }
     }
     for (import, functions) in bundled_python_skills() {
+        if dynamic_only.contains(&import) {
+            continue;
+        }
         required.insert(import.clone());
         for function in functions {
             if function == "run" || function == "status" {
@@ -508,6 +522,14 @@ fn core_layer_documents_the_real_tool_surface() {
             documented_form,
             "tool {token:?} is on the registered surface but the prompt does not \
              document it: update prompts/layers/core.md"
+        );
+    }
+    for dynamic_import in dynamic_inventory_only_bundled_skills() {
+        assert!(
+            documented
+                .iter()
+                .all(|token| token != &dynamic_import && !token.starts_with(&format!("{dynamic_import}."))),
+            "conditional skill {dynamic_import:?} must be documented only by its resolved dynamic winner"
         );
     }
 }
@@ -612,6 +634,104 @@ fn openprime_python_skills_render_once_in_the_prompt_inventory() {
             inventory.contains(&format!("<python_import>{import_name}</python_import>")),
             "{name} must expose its real Python import {import_name}"
         );
+    }
+}
+
+/// Disabled or force-excluded conditional skills disappear from the resolved inventory and must not
+/// leak their bundled module/API contract through the cache-stable prompt prefix.
+#[test]
+fn excluded_openprime_skills_are_not_advertised_as_static_tools() {
+    let skills = sorted_bundled_skills()
+        .into_iter()
+        .filter(|skill| !matches!(skill.name.as_str(), "agent-sessions" | "aside"))
+        .collect();
+    let options = BuildSystemPromptOptions {
+        cwd: "/w".to_string(),
+        messages_path: Some("/log.jsonl".to_string()),
+        skills,
+        selected_tools: Some(vec!["python_repl"]),
+        ..Default::default()
+    };
+    let prompt = system_prompt_breakdown(&options).assembled;
+
+    for absent in [
+        "<name>agent-sessions</name>",
+        "<name>aside</name>",
+        "agent_sessions.grep_sessions",
+        "aside.repl",
+    ] {
+        assert!(
+            !prompt.contains(absent),
+            "excluded skills must not leak bundled API text: {absent}"
+        );
+    }
+}
+
+/// The already-resolved winner owns the dynamic contract. A same-name markdown winner has no
+/// Python import; a Python winner advertises its actual import exactly once, never the bundled one.
+#[test]
+fn same_name_skill_overrides_render_only_the_resolved_winner() {
+    let bundled = sorted_bundled_skills();
+    let bundled_aside = bundled
+        .iter()
+        .find(|skill| skill.name == "aside")
+        .expect("bundled Aside skill")
+        .clone();
+
+    for replacement_import in [None, Some("custom_aside")] {
+        let mut winner = bundled_aside.clone();
+        winner.description = "Resolved override contract".to_string();
+        winner.base_dir = "/resolved/override/aside".into();
+        winner.file_path = "/resolved/override/aside/SKILL.md".into();
+        match replacement_import {
+            None => {
+                winner.kind = pa_core::skills::SkillKind::Markdown;
+                winner.python = None;
+            }
+            Some(import_name) => {
+                let python = winner.python.as_mut().expect("Python metadata");
+                python.import_name = import_name.to_string();
+                python.package_path = "/resolved/override/aside".into();
+                python.pyproject_path = "/resolved/override/aside/pyproject.toml".into();
+            }
+        }
+        let skills = bundled
+            .iter()
+            .filter(|skill| skill.name != "aside")
+            .cloned()
+            .chain(std::iter::once(winner))
+            .collect();
+        let options = BuildSystemPromptOptions {
+            cwd: "/w".to_string(),
+            messages_path: Some("/log.jsonl".to_string()),
+            skills,
+            selected_tools: Some(vec!["python_repl"]),
+            ..Default::default()
+        };
+        let prompt = system_prompt_breakdown(&options).assembled;
+
+        assert_eq!(prompt.matches("<name>aside</name>").count(), 1);
+        let aside_start = prompt
+            .find("<name>aside</name>")
+            .expect("Aside winner block");
+        let aside_end = aside_start
+            + prompt[aside_start..]
+                .find("</skill>")
+                .expect("Aside winner block end");
+        let aside_block = &prompt[aside_start..aside_end];
+        assert!(aside_block.contains("<location>/resolved/override/aside/SKILL.md</location>"));
+        assert!(aside_block.contains("Resolved override contract"));
+        assert!(!prompt.contains("aside.repl"));
+        assert!(!aside_block.contains("<python_import>aside</python_import>"));
+        match replacement_import {
+            None => assert!(aside_block.contains("<type>markdown</type>")),
+            Some(import_name) => assert_eq!(
+                aside_block
+                    .matches(&format!("<python_import>{import_name}</python_import>"))
+                    .count(),
+                1
+            ),
+        }
     }
 }
 

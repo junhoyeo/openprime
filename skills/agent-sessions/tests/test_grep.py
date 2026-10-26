@@ -148,6 +148,7 @@ class AsideTest(unittest.TestCase):
         hits = sessions.grep_sessions("강의", session=self.chat)[0]["hits"]
         self.assertEqual({hit["kind"] for hit in hits}, {"user", "tool_call", "tool_result", "assistant"})
         self.assertEqual(len(sessions.grep_sessions("école", session=self.chat)), 1)
+        self.assertEqual(len(sessions.grep_sessions("École", session=self.chat)), 1)
 
     def test_discovery_and_scoped_grep_include_artifact_only_sessions_and_profiles(self) -> None:
         orphan = self.home / ".aside/u/1/sessions/2026-10-20_Orphan/artifacts/notes.md"
@@ -167,6 +168,8 @@ class AsideTest(unittest.TestCase):
         self.assertEqual(sessions.resolve_session(self.root)[1], self.chat)
         self.assertEqual(len(sessions.grep_sessions("강의", session=self.text)), 1)
         self.assertEqual(len(sessions.grep_sessions("école", session=self.text, fixed=True)), 1)
+        self.assertEqual(len(sessions.grep_sessions("École", session=self.text, fixed=True)), 1)
+        self.assertEqual(len(sessions.grep_sessions(r"\u00c9cole", session=self.text)), 1)
         self.assertEqual(sessions.grep_sessions("강의", session=self.text, kinds="chat"), [])
         self.assertEqual(len(sessions.find_sessions(harness="aside", project="lecture-transcripts")), 3)
         os.utime(self.text, (0, 0))
@@ -174,6 +177,12 @@ class AsideTest(unittest.TestCase):
         for path in (self.artifacts / "binary.txt", self.artifacts / "linked.txt", self.root / "tmp/noise.txt"):
             with self.subTest(path=path), self.assertRaises(sessions.SessionError):
                 sessions.load_session(path)
+        lowercase = self.artifacts / "lowercase.txt"
+        lowercase.write_text("école lowercase only", encoding="utf-8")
+        for fixed in (False, True):
+            with self.subTest(fixed=fixed):
+                self.assertEqual(sessions.grep_sessions("École", session=lowercase, fixed=fixed), [])
+                self.assertEqual(len(sessions.grep_sessions("école", session=lowercase, fixed=fixed)), 1)
 
     def test_artifact_names_cannot_shadow_session_ids(self) -> None:
         other = self.home / ".aside/u/1/sessions/2026-10-20_Other/artifacts"

@@ -156,9 +156,10 @@ from the gap between a tool call and its terminal update).
   deliberately `sessions/*/*.jsonl`, which excludes the sibling
   `<cwd>/extensions/goal/*.history.jsonl` extension-state files.
 
-- grep skips whole transcripts with a raw-byte prefilter before parsing, and
-  probes both the literal and its JSON-escaped form, so non-ASCII patterns
-  (Korean, emoji) still match escaped `\uXXXX` payloads.
+- grep skips whole transcripts with a raw-byte prefilter before parsing and
+  probes both ASCII literals and their JSON-escaped form. Non-ASCII literals
+  bypass that byte probe so Unicode smart-case and exact-case regex semantics
+  stay correct for both raw text and escaped `\uXXXX` payloads.
 - Sessions can exceed 10 MB. Prefer `grep` to locate an event, then `show` with
   `around=` rather than dumping a whole transcript into context.
 - Codex sub-agent rollouts are separate files whose `session_id` is their own

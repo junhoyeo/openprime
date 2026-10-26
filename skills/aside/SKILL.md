@@ -120,11 +120,12 @@ Prefer `models.json` over `settings.json`/`credentials.json` for this: the daemo
 **caches** those two, so edits there need a restart.
 
 `aside.models()` lists configured `provider/model` ids and `aside.providers()` maps
-provider ids to base URLs. If a provider's `baseUrl` points at this machine (loopback),
-`health()` probes its `/health` endpoint — but only when such a provider is actually
-configured, so a plain install still reports healthy. All three read the default
-account (`~/.aside/u/0`); pass `account="u1"` to read the account your browser
-calls target instead.
+provider ids to base URLs. If a provider's `baseUrl` is an exact loopback origin,
+`health()` probes its bounded `/health` endpoint without redirects — but only when
+such a provider is actually configured. Malformed or unreadable `models.json` data
+makes health report `ok: false` without exposing file contents. All three read the
+default account (`~/.aside/u/0`); pass `account="u1"` to read the account your
+browser calls target instead.
 
 ## Troubleshooting
 
