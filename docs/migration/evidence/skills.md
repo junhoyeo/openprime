@@ -120,3 +120,10 @@ index 68ac9d2a6..4e9665d57 100644
 - Terra finding 2 (Unicode prefilter): fixed by `de0de6fe9` + `75f27db46`, including raw/escaped uppercase, regex escapes, fixed mode, exact-case negatives, and Python I/K/S Unicode folds.
 - Terra finding 3 (config errors): fixed by `de0de6fe9`, `75f27db46`, and `e2ad4ac1b` with bounded regular reads, missing/unreadable/FIFO/oversize/deep/malformed shape handling, exact required origins, and honest health status.
 - Terra finding 4 (health probes): fixed by `de0de6fe9`, `75f27db46`, `f48f3fbd8`, and `4e386afdb`: exact loopback origin validation, no proxy/redirect layer, bounded manual HTTP parsing, capped concurrent cancellable probes under one deadline, generic secret-safe errors, and TLS setup regression.
+
+
+## Privacy scrub (final review F7)
+
+`final-review-opus` found owner-specific examples in the bundled `agent-sessions` skill: a real Aside session id, a personal search term, an artifact directory name in `SKILL.md`, and an owner path in a `sessions.py` docstring. `c3c74ae53` replaces them with synthetic placeholders. It is a text-only change: the only code-file edit is one docstring line. `skills/agent-sessions/tests` ran 25 tests, OK, under the egress sandbox.
+
+The original strings remain in git history in `4af3c6d89` (`feat/agent-sessions-aside`, the legacy PR #33 branch), `b704c720d` (`port/rust-skills`), and `d46fe9be5` (`feat/rust-migration` and its lane branches). They are not in the trees at `703367bad`, `e260085dd`, or the pre-merge `main`. History is not rewritten. The owner decides on branch deletion after the merge.
