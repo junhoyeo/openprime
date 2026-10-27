@@ -57,10 +57,10 @@
       "BLOCKED"
     ],
     "migration_status_counts": {
-      "ported": 47,
+      "ported": 50,
       "verified-upstream-equivalent": 23,
       "truly-obsolete": 18,
-      "BLOCKED": 11
+      "BLOCKED": 8
     },
     "classification_policy": "Inventory disposition and verification outcome are separate. A row closes only with a recorded proof at the frozen tip: named CI-ok tests (ported / verified-upstream-equivalent), an exact git show --stat closure verifier or a hunk-to-tracker map (truly-obsolete). Rows without that proof stay BLOCKED with the missing proof named. Confidence alone never proves parity.",
     "revision": "r3 (final ledger pass, a9ae2e3de): every row carries its final migration_status, an exact verification_outcome, and final_verification (CI run 40424205627 test names, caveats, closure verifier or tracker map); port_commits filled from git log c4c238ca0..a9ae2e3de; parent decisions applied (pre-cutover blockers, retain-only kernel divergence, tracker closures).",
@@ -90,19 +90,22 @@
         "07af2c24b",
         "0b5676b64",
         "aa3ae8fc0",
-        "fed4fd4c7"
+        "fed4fd4c7",
+        "843615757",
+        "837be6824"
       ],
-      "precondition": "PRE-CUTOVER BLOCKER (parent decision): stop every fork-TS daemon/worker/kernel before any Rust daemon touches real state; the ps2:/ps: normalization plus tests is the first item of the pre-cutover follow-up PR."
+      "precondition": "PRE-CUTOVER BLOCKER (parent decision): stop every fork-TS daemon/worker/kernel before any Rust daemon touches real state; the ps2:/ps: normalization plus tests is the first item of the pre-cutover follow-up PR.",
+      "follow_up": "the ps2:/ps: normalization plus tests (S1), the agents-view chat/reply client test, the aa3ae8fc0/fed4fd4c7 tests, and the /fast hint-text fix go in the pre-cutover follow-up PR"
     },
-    "awaiting_parent_decision": {
-      "fast_hint_text": [
+    "parent_approved_divergences": {
+      "kernel_retain_only": [
+        "2f2cdfb1e",
+        "632dd62f6"
+      ],
+      "fast_hint_text_cosmetic": [
         "41f5a313d",
         "0e87bcc3e",
         "6865437be"
-      ],
-      "agents_view_client_path": [
-        "843615757",
-        "837be6824"
       ]
     }
   },
@@ -943,7 +946,7 @@
               "0e87bcc3e",
               "6865437be"
             ],
-            "tracker_final": "BLOCKED on the /fast unavailable hint text (see those rows); this commit only moved TS tests",
+            "tracker_final": "ported (parent-approved cosmetic divergence: the /fast hint text keeps upstream wording); this commit only moved TS tests",
             "ci_ok_tests": []
           },
           {
@@ -1604,8 +1607,8 @@
         }
       ],
       "port_target": null,
-      "notes": "BLOCKED only on the /fast unavailable hint text; Fast-mode eligibility (compat.supportsFastMode, GPT-6 Astra) is ported and tested.",
-      "migration_status": "BLOCKED",
+      "notes": "Ported: Fast-mode eligibility (compat.supportsFastMode incl. opt-out, GPT-6 Astra) tested; the /fast hint text keeps upstream wording (parent-approved cosmetic divergence).",
+      "migration_status": "ported",
       "port_commits": [
         "931483e24",
         "051d5974e"
@@ -1622,10 +1625,10 @@
           "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
-      "migration_rationale": "A named invariant has no passing proof at the frozen tip; see final_verification.caveats for the exact missing proof.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "BLOCKED: BLOCKED only on the /fast unavailable hint text; Fast-mode eligibility (compat.supportsFastMode, GPT-6 Astra) is ported and tested. Proven parts: 9 named tests/suites ok on CI run 40424205627 at a9ae2e3de. Missing proof: extend the /fast UNAVAILABLE text (settings.rs:626) to name GPT-6 Astra plus a pa-tui test, or a parent decision accepting the hint-text divergence (Astra Fast eligibility is upstream and tested).",
-      "candidate_verification_status": "BLOCKED",
+      "migration_rationale": "The fork behavior is implemented by the listed port_commits (or upstream, for 0e87bcc3e eligibility) and verified by the named CI-ok tests; the hint text is a parent-approved cosmetic divergence.",
+      "proposed_final_status": "ported",
+      "verification_outcome": "ported: Fast-mode eligibility is ported and tested on CI run 40424205627 at a9ae2e3de (responses_compat_can_opt_a_custom_gateway_into_fast_mode, daemon_tier_clamp_honors_the_safe_fast_mode_capability, gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override, model_metadata_projects_fast_capability_without_request_secrets, malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok). Parent-approved cosmetic divergence: the /fast unavailable hint text (settings.rs:626) keeps upstream wording without the GPT-6 Astra / compat.supportsFastMode mention; the 2-line fix plus a test goes in the pre-cutover follow-up PR.",
+      "candidate_verification_status": "ported",
       "final_verification": {
         "ci_run": "https://github.com/junhoyeo/openprime/actions/runs/40424205627",
         "tip": "a9ae2e3defcbdfc4ad4d5d66c1d9b63e2d0a449d",
@@ -1642,13 +1645,21 @@
           "pa-ai#test:opencode_session 4/4 ok (shard 5/8)"
         ],
         "caveats": [
-          "Needs a parent decision: accept the hint-text divergence or extend the message (2-line change + test)."
+          "Parent-approved cosmetic divergence (see 'divergence'): the /fast unavailable hint text keeps upstream wording; Fast-mode eligibility is ported and tested."
         ],
         "lane_candidate_before_final_pass": "verified-upstream-equivalent",
-        "proposed_before_final_pass": "verified-upstream-equivalent",
-        "missing_proof": "extend the /fast UNAVAILABLE text (settings.rs:626) to name GPT-6 Astra plus a pa-tui test, or a parent decision accepting the hint-text divergence (Astra Fast eligibility is upstream and tested)."
+        "proposed_before_final_pass": "verified-upstream-equivalent"
       },
-      "inventory_notes": "Model + Fast mode both upstream (service tiers #2144)."
+      "inventory_notes": "Model + Fast mode both upstream (service tiers #2144).",
+      "divergence": {
+        "surface": "/fast unavailable hint text (crates/pa-tui/src/session_ui/settings.rs:626)",
+        "legacy": "\"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT authentication, or an openai-responses model with compat.supportsFastMode in models.json\"",
+        "rust": "keeps the upstream wording \"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication\"; the GPT-6 Astra / compat.supportsFastMode mention is not added",
+        "status": "parent-approved cosmetic divergence",
+        "approved_by": "mig-lead-opus (parent decision, final ledger pass)",
+        "eligibility": "ported and tested: pa-types#lib:pa_types::ai::tests::responses_compat_can_opt_a_custom_gateway_into_fast_mode ok (shard 2/8); pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::daemon_tier_clamp_honors_the_safe_fast_mode_capability ok (shard 3/8); pa-core#lib:pa_core::models::registry::tests::gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override ok (shard 2/8); pa-daemon#lib:pa_daemon::agent_engine::tests::model_resolution::model_metadata_projects_fast_capability_without_request_secrets ok (shard 3/8); pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok (shard 3/8)",
+        "follow_up": "the 2-line hint-text fix plus a pa-tui test goes in the pre-cutover follow-up PR"
+      }
     },
     {
       "hash": "ee7c91d058b23d289212a70953028cbd7972cc1a",
@@ -2333,13 +2344,13 @@
       "owner": "rust-port-sessions",
       "evidence": [],
       "port_target": null,
-      "notes": "BLOCKED only on the /fast unavailable hint text; Fast-mode eligibility (compat.supportsFastMode, GPT-6 Astra) is ported and tested.",
-      "migration_status": "BLOCKED",
+      "notes": "Ported: Fast-mode eligibility (compat.supportsFastMode incl. opt-out, GPT-6 Astra) tested; the /fast hint text keeps upstream wording (parent-approved cosmetic divergence).",
+      "migration_status": "ported",
       "port_commits": [],
       "integration_evidence": [],
-      "migration_rationale": "A named invariant has no passing proof at the frozen tip; see final_verification.caveats for the exact missing proof.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "BLOCKED: BLOCKED only on the /fast unavailable hint text; Fast-mode eligibility (compat.supportsFastMode, GPT-6 Astra) is ported and tested. Proven parts: 5 named tests/suites ok on CI run 40424205627 at a9ae2e3de. Missing proof: the Rust counterpart of this TS assertion: a pa-tui test pinning the extended /fast UNAVAILABLE text, or a parent decision accepting the hint-text divergence (same decision as 41f5a313d/0e87bcc3e).",
+      "migration_rationale": "TS test pinning the extended /fast hint text; the eligibility it guards is ported and tested, and the hint text is a parent-approved cosmetic divergence.",
+      "proposed_final_status": "ported",
+      "verification_outcome": "ported: Fast-mode eligibility is ported and tested on CI run 40424205627 at a9ae2e3de (responses_compat_can_opt_a_custom_gateway_into_fast_mode, daemon_tier_clamp_honors_the_safe_fast_mode_capability, gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override, model_metadata_projects_fast_capability_without_request_secrets, malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok). Parent-approved cosmetic divergence: the /fast unavailable hint text (settings.rs:626) keeps upstream wording without the GPT-6 Astra / compat.supportsFastMode mention; the 2-line fix plus a test goes in the pre-cutover follow-up PR.",
       "final_verification": {
         "ci_run": "https://github.com/junhoyeo/openprime/actions/runs/40424205627",
         "tip": "a9ae2e3defcbdfc4ad4d5d66c1d9b63e2d0a449d",
@@ -2352,12 +2363,20 @@
           "pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok (shard 3/8)"
         ],
         "caveats": [
-          "Needs a parent decision: accept the hint-text divergence or extend the message (2-line change + test)."
-        ],
-        "missing_proof": "the Rust counterpart of this TS assertion: a pa-tui test pinning the extended /fast UNAVAILABLE text, or a parent decision accepting the hint-text divergence (same decision as 41f5a313d/0e87bcc3e)."
+          "Parent-approved cosmetic divergence (see 'divergence'): the /fast unavailable hint text keeps upstream wording; Fast-mode eligibility is ported and tested."
+        ]
       },
       "inventory_notes": "TS fast-mode message test",
-      "candidate_verification_status": "BLOCKED"
+      "candidate_verification_status": "ported",
+      "divergence": {
+        "surface": "/fast unavailable hint text (crates/pa-tui/src/session_ui/settings.rs:626)",
+        "legacy": "\"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT authentication, or an openai-responses model with compat.supportsFastMode in models.json\"",
+        "rust": "keeps the upstream wording \"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication\"; the GPT-6 Astra / compat.supportsFastMode mention is not added",
+        "status": "parent-approved cosmetic divergence",
+        "approved_by": "mig-lead-opus (parent decision, final ledger pass)",
+        "eligibility": "ported and tested: pa-types#lib:pa_types::ai::tests::responses_compat_can_opt_a_custom_gateway_into_fast_mode ok (shard 2/8); pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::daemon_tier_clamp_honors_the_safe_fast_mode_capability ok (shard 3/8); pa-core#lib:pa_core::models::registry::tests::gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override ok (shard 2/8); pa-daemon#lib:pa_daemon::agent_engine::tests::model_resolution::model_metadata_projects_fast_capability_without_request_secrets ok (shard 3/8); pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok (shard 3/8)",
+        "follow_up": "the 2-line hint-text fix plus a pa-tui test goes in the pre-cutover follow-up PR"
+      }
     },
     {
       "hash": "cec974ddbddfafda20b8c7f0de452dab87a82de6",
@@ -2828,8 +2847,8 @@
         }
       ],
       "port_target": "crates/pa-core/src/models/custom.rs",
-      "notes": "BLOCKED only on the /fast unavailable hint text; Fast-mode eligibility (compat.supportsFastMode, GPT-6 Astra) is ported and tested.",
-      "migration_status": "BLOCKED",
+      "notes": "Ported: Fast-mode eligibility (compat.supportsFastMode incl. opt-out, GPT-6 Astra) tested; the /fast hint text keeps upstream wording (parent-approved cosmetic divergence).",
+      "migration_status": "ported",
       "port_commits": [
         "3e2c5680b",
         "6a197687a",
@@ -2848,10 +2867,10 @@
           "note": "Safe allowlisted producer net (never b444 alone) plus narrow consumer: secret/capability projection 1/1, tier consumer 2/2, public builder 1/1, raw epoch 18/18."
         }
       ],
-      "migration_rationale": "A named invariant has no passing proof at the frozen tip; see final_verification.caveats for the exact missing proof.",
-      "proposed_final_status": "BLOCKED",
-      "verification_outcome": "BLOCKED: BLOCKED only on the /fast unavailable hint text; Fast-mode eligibility (compat.supportsFastMode, GPT-6 Astra) is ported and tested. Proven parts: 8 named tests/suites ok on CI run 40424205627 at a9ae2e3de. Missing proof: extend the /fast UNAVAILABLE text in crates/pa-tui/src/session_ui/settings.rs:626 with the compat.supportsFastMode clause plus a pa-tui test, or a parent decision accepting the hint-text divergence (eligibility itself is ported and tested).",
-      "candidate_verification_status": "BLOCKED",
+      "migration_rationale": "The fork behavior is implemented by the listed port_commits (or upstream, for 0e87bcc3e eligibility) and verified by the named CI-ok tests; the hint text is a parent-approved cosmetic divergence.",
+      "proposed_final_status": "ported",
+      "verification_outcome": "ported: Fast-mode eligibility is ported and tested on CI run 40424205627 at a9ae2e3de (responses_compat_can_opt_a_custom_gateway_into_fast_mode, daemon_tier_clamp_honors_the_safe_fast_mode_capability, gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override, model_metadata_projects_fast_capability_without_request_secrets, malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok). Parent-approved cosmetic divergence: the /fast unavailable hint text (settings.rs:626) keeps upstream wording without the GPT-6 Astra / compat.supportsFastMode mention; the 2-line fix plus a test goes in the pre-cutover follow-up PR.",
+      "candidate_verification_status": "ported",
       "final_verification": {
         "ci_run": "https://github.com/junhoyeo/openprime/actions/runs/40424205627",
         "tip": "a9ae2e3defcbdfc4ad4d5d66c1d9b63e2d0a449d",
@@ -2867,13 +2886,21 @@
           "pa-ai#test:opencode_session 4/4 ok (shard 5/8)"
         ],
         "caveats": [
-          "Needs a parent decision: accept the hint-text divergence or extend the message (2-line change + test)."
+          "Parent-approved cosmetic divergence (see 'divergence'): the /fast unavailable hint text keeps upstream wording; Fast-mode eligibility is ported and tested."
         ],
         "lane_candidate_before_final_pass": "ported",
-        "proposed_before_final_pass": "ported",
-        "missing_proof": "extend the /fast UNAVAILABLE text in crates/pa-tui/src/session_ui/settings.rs:626 with the compat.supportsFastMode clause plus a pa-tui test, or a parent decision accepting the hint-text divergence (eligibility itself is ported and tested)."
+        "proposed_before_final_pass": "ported"
       },
-      "inventory_notes": "ai-gateway custom models need a models.json knob mapping to service-tier support; verify before porting."
+      "inventory_notes": "ai-gateway custom models need a models.json knob mapping to service-tier support; verify before porting.",
+      "divergence": {
+        "surface": "/fast unavailable hint text (crates/pa-tui/src/session_ui/settings.rs:626)",
+        "legacy": "\"Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT authentication, or an openai-responses model with compat.supportsFastMode in models.json\"",
+        "rust": "keeps the upstream wording \"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication\"; the GPT-6 Astra / compat.supportsFastMode mention is not added",
+        "status": "parent-approved cosmetic divergence",
+        "approved_by": "mig-lead-opus (parent decision, final ledger pass)",
+        "eligibility": "ported and tested: pa-types#lib:pa_types::ai::tests::responses_compat_can_opt_a_custom_gateway_into_fast_mode ok (shard 2/8); pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::daemon_tier_clamp_honors_the_safe_fast_mode_capability ok (shard 3/8); pa-core#lib:pa_core::models::registry::tests::gateway_custom_astra_keeps_endpoint_model_and_fast_mode_override ok (shard 2/8); pa-daemon#lib:pa_daemon::agent_engine::tests::model_resolution::model_metadata_projects_fast_capability_without_request_secrets ok (shard 3/8); pa-daemon#lib:pa_daemon::setting_switches::service_tier_compat_tests::malformed_or_missing_metadata_fails_safe_for_non_default_tiers ok (shard 3/8)",
+        "follow_up": "the 2-line hint-text fix plus a pa-tui test goes in the pre-cutover follow-up PR"
+      }
     },
     {
       "hash": "bd15cf317348b8e963463e3f774f0e7e12d8766f",
@@ -5392,7 +5419,7 @@
         }
       ],
       "port_target": null,
-      "notes": "BLOCKED: daemon-boundary replay proven; agents-view client/reply path not proven (revival.md:39).",
+      "notes": "BLOCKED (pre-cutover): daemon-boundary replay proven; agents-view chat/reply client path not proven (revival.md:39).",
       "migration_status": "BLOCKED",
       "port_commits": [
         "e31116ee4",
@@ -5417,7 +5444,7 @@
       ],
       "migration_rationale": "A named invariant has no passing proof at the frozen tip; see final_verification.caveats for the exact missing proof.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "BLOCKED: BLOCKED: daemon-boundary replay proven; agents-view client/reply path not proven (revival.md:39). Proven parts: 12 named tests/suites ok on CI run 40424205627 at a9ae2e3de. Missing proof: an agents-view reply-delivery test that wakes a passivated and a record-less saved session through the agents-view path and asserts the woken worker's runtime config, or a parent decision that daemon-side launch-record replay is the accepted design.",
+      "verification_outcome": "BLOCKED (pre-cutover): daemon-side launch-record replay proven (12 named tests/suites ok on CI run 40424205627 at a9ae2e3de). Missing proof: an agents-view chat/reply end-to-end client test (saved session without a launch record), in the pre-cutover follow-up PR alongside S1.",
       "candidate_verification_status": "BLOCKED",
       "final_verification": {
         "ci_run": "https://github.com/junhoyeo/openprime/actions/runs/40424205627",
@@ -5438,12 +5465,12 @@
           "root_identity*: 7 ok in pa-daemon#lib:pa_daemon (shard 3/8)"
         ],
         "caveats": [
-          "Needs an agents-view client test or a parent decision (revival.md:39).",
+          "PRE-CUTOVER BLOCKER (parent decision).",
           "Proven at the daemon boundary only: the create shape carries the opened-with config and the daemon replays its passivated launch record; the Rust agents-view client path is not separately tested (it carries no revive config of its own).",
           "Lane review is scope-limited (revival.md). Linux-only run."
         ],
         "lane_candidate_before_final_pass": "ported",
-        "missing_proof": "an agents-view reply-delivery test that wakes a passivated and a record-less saved session through the agents-view path and asserts the woken worker's runtime config, or a parent decision that daemon-side launch-record replay is the accepted design."
+        "missing_proof": "an agents-view chat/reply end-to-end client test (saved session without a launch record), in the pre-cutover follow-up PR alongside S1."
       },
       "inventory_notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff."
     },
@@ -5742,7 +5769,7 @@
         }
       ],
       "port_target": null,
-      "notes": "BLOCKED: daemon-boundary replay proven; agents-view client/reply path not proven (revival.md:39).",
+      "notes": "BLOCKED (pre-cutover): daemon-boundary replay proven; agents-view chat/reply client path not proven (revival.md:39).",
       "migration_status": "BLOCKED",
       "port_commits": [
         "e31116ee4",
@@ -5767,7 +5794,7 @@
       ],
       "migration_rationale": "A named invariant has no passing proof at the frozen tip; see final_verification.caveats for the exact missing proof.",
       "proposed_final_status": "BLOCKED",
-      "verification_outcome": "BLOCKED: BLOCKED: daemon-boundary replay proven; agents-view client/reply path not proven (revival.md:39). Proven parts: 12 named tests/suites ok on CI run 40424205627 at a9ae2e3de. Missing proof: an agents-view chat-open test that wakes a passivated and a record-less saved session through the agents-view path and asserts the woken worker's runtime config, or a parent decision that daemon-side launch-record replay is the accepted design.",
+      "verification_outcome": "BLOCKED (pre-cutover): daemon-side launch-record replay proven (12 named tests/suites ok on CI run 40424205627 at a9ae2e3de). Missing proof: an agents-view chat/reply end-to-end client test (saved session without a launch record), in the pre-cutover follow-up PR alongside S1.",
       "candidate_verification_status": "BLOCKED",
       "final_verification": {
         "ci_run": "https://github.com/junhoyeo/openprime/actions/runs/40424205627",
@@ -5788,12 +5815,12 @@
           "root_identity*: 7 ok in pa-daemon#lib:pa_daemon (shard 3/8)"
         ],
         "caveats": [
-          "Needs an agents-view client test or a parent decision (revival.md:39).",
+          "PRE-CUTOVER BLOCKER (parent decision).",
           "Proven at the daemon boundary only: the create shape carries the opened-with config and the daemon replays its passivated launch record; the Rust agents-view client path is not separately tested (it carries no revive config of its own).",
           "Lane review is scope-limited (revival.md). Linux-only run."
         ],
         "lane_candidate_before_final_pass": "ported",
-        "missing_proof": "an agents-view chat-open test that wakes a passivated and a record-less saved session through the agents-view path and asserts the woken worker's runtime config, or a parent decision that daemon-side launch-record replay is the accepted design."
+        "missing_proof": "an agents-view chat/reply end-to-end client test (saved session without a launch record), in the pre-cutover follow-up PR alongside S1."
       },
       "inventory_notes": "TS daemon lifecycle fix; the patched TS mechanism was deleted and the Rust daemon reimplements revival/attach/identity/catch-up natively with e2e coverage. Spot-check the specific invariant rather than porting the diff."
     },
