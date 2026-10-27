@@ -7,19 +7,22 @@ permissions:
   contents: read
 jobs:
   probe:
-    name: probe gap=${{ matrix.gap }} par=${{ matrix.par }}
+    name: probe ${{ matrix.mode }} gap=${{ matrix.gap }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { gap: "", par: 1 }
-          - { gap: "20", par: 1 }
+          - { mode: single-stress, gap: "" }
+          - { mode: single-stress, gap: "20" }
+          - { mode: full-lib, gap: "" }
+          - { mode: full-lib, gap: "" }
     env:
       DO_NOT_TRACK: "1"
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: never
+      TEST: worker::attach_window_tests::a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -29,6 +32,8 @@ jobs:
         with:
           shared-key: test-shards
           save-if: false
+      - name: Install gdb and stress-ng
+        run: sudo apt-get install -y gdb stress-ng > /dev/null
       - name: Build the pa-daemon lib test binary
         run: |
           set -euo pipefail
@@ -39,23 +44,45 @@ jobs:
               except Exception: continue
               if m.get("reason")=="compiler-artifact" and m.get("executable") and m["target"]["name"]=="pa_daemon" and "lib" in m["target"]["kind"]: print(m["executable"])' > "$RUNNER_TEMP/bin.txt"
           cat "$RUNNER_TEMP/bin.txt"
-      - name: Loop the test 50 times
+      - name: Loop the target
         env:
           ATTACH_PROBE_GAP_MS: ${{ matrix.gap }}
+          MODE: ${{ matrix.mode }}
         run: |
           set -uo pipefail
           bin="$(tail -1 "$RUNNER_TEMP/bin.txt")"
           export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
-          pass=0; fail=0
-          for i in $(seq 1 50); do
+          nproc
+          if [ "$MODE" = single-stress ]; then
+            stress-ng --cpu "$(nproc)" --timeout 2400s > /dev/null 2>&1 &
+            runs=300; args=(--exact "$TEST" --test-threads=1)
+          else
+            runs=12; args=(--test-threads="$(nproc)")
+          fi
+          pass=0; fail=0; dumped=0
+          for i in $(seq 1 "$runs"); do
+            log="$RUNNER_TEMP/run-$i.log"
             start=$(date +%s%N)
-            if timeout 120 "$bin" --exact worker::attach_window_tests::a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending --test-threads=1 > "$RUNNER_TEMP/run-$i.log" 2>&1; then
-              pass=$((pass+1)); r=ok
+            "$bin" "${args[@]}" > "$log" 2>&1 &
+            pid=$!
+            # Stack the stalled process once, while the holder still holds the lock.
+            if [ "$MODE" = single-stress ] && [ "$dumped" -lt 2 ]; then
+              ( sleep 3; if kill -0 "$pid" 2>/dev/null; then
+                  sudo gdb -p "$pid" -batch -ex "thread apply all bt 25" > "$RUNNER_TEMP/stack-$i.txt" 2>&1
+                fi ) &
+            fi
+            wait "$pid"; rc=$?
+            end=$(date +%s%N)
+            target_line="$(grep -E "^test $TEST \.\.\." "$log" | head -1)"
+            if [ "$rc" -eq 0 ] || ! grep -qE "^test $TEST \.\.\. FAILED" "$log"; then
+              case "$target_line" in *ok*) pass=$((pass+1)); r=ok;; *) r="OTHER(rc=$rc)";; esac
             else
               fail=$((fail+1)); r=FAIL
             fi
-            end=$(date +%s%N)
-            echo "run $i $r $(( (end-start)/1000000 ))ms"
-            if [ "$r" = FAIL ] && [ "$fail" -le 3 ]; then grep -E "panicked|SendError|left|right" "$RUNNER_TEMP/run-$i.log" | head -5; fi
+            echo "run $i $r $(( (end-start)/1000000 ))ms :: $target_line"
+            if [ "$r" = FAIL ]; then
+              grep -A4 -E "^---- $TEST" "$log" | head -8
+              if [ -f "$RUNNER_TEMP/stack-$i.txt" ]; then dumped=$((dumped+1)); echo "== stack of run $i =="; grep -E "^Thread|^#[0-9]+ .* in (pa_daemon|tokio|std::sync|parking_lot|epoll|syscall|__futex|futex)" "$RUNNER_TEMP/stack-$i.txt" | head -120; fi
+            fi
           done
-          echo "RESULT gap=${ATTACH_PROBE_GAP_MS:-none} pass=$pass fail=$fail"
+          echo "RESULT mode=$MODE gap=${ATTACH_PROBE_GAP_MS:-none} pass=$pass fail=$fail runs=$runs"
