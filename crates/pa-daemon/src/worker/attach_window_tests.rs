@@ -13,67 +13,97 @@
 #![cfg(unix)]
 
 use super::*;
-use tokio::io::AsyncWriteExt;
 
 const SESSION: &str = "window-session";
 const INSTANCE: &str = "window-instance";
 const GENERATION: &str = "window-generation";
 
-/// One framed connection to the worker socket.
+/// One framed connection to the worker socket, read and written with BLOCKING
+/// std I/O on the test thread. The window test parks a runtime worker on the core
+/// lock the holder thread owns; if that worker was the one that last left tokio's
+/// I/O driver, no runtime thread polls the driver until some outside wake arrives
+/// (tokio's eager driver handoff is unstable-only). A tokio client on this runtime
+/// would then never see its own reply. A std client never needs the driver, and
+/// every worker-side read the window depends on is either already buffered (see
+/// [`Link::send_all`]) or follows an emit, whose cross-thread wake of the fan-out
+/// unparks a worker that then takes the free driver.
 struct Link {
-    reader: crate::framing::PrivateFrameReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    stream: std::os::unix::net::UnixStream,
+    decoder: crate::framing::PrivateFrameDecoder,
+    queue: std::collections::VecDeque<crate::framing::PrivateFrame>,
     next_id: u64,
 }
 
 impl Link {
-    async fn connect(socket: &std::path::Path) -> Self {
-        let stream = tokio::net::UnixStream::connect(socket)
-            .await
-            .expect("connect the worker socket");
-        let (read_half, writer) = stream.into_split();
+    fn connect(socket: &std::path::Path) -> Self {
+        let stream =
+            std::os::unix::net::UnixStream::connect(socket).expect("connect the worker socket");
+        // Every blocking read is bounded: a stalled step fails the test, never hangs it.
+        stream
+            .set_read_timeout(Some(STEP_BOUND))
+            .expect("bound the reads");
         let mut link = Link {
-            reader: crate::framing::PrivateFrameReader::new(
-                read_half,
-                DEFAULT_PRIVATE_FRAME_LIMITS,
-            ),
-            writer,
+            stream,
+            decoder: crate::framing::PrivateFrameDecoder::new(DEFAULT_PRIVATE_FRAME_LIMITS),
+            queue: std::collections::VecDeque::new(),
             next_id: 0,
         };
-        let (header, _) = link.frame().await;
+        let (header, _) = link.frame();
         assert_eq!(header["outboundType"], "daemon_hello");
         link
     }
 
-    async fn frame(&mut self) -> (Value, Value) {
-        let frame = tokio::time::timeout(STEP_BOUND, self.reader.read_frame())
-            .await
-            .expect("the worker answers")
-            .expect("a frame")
-            .expect("the connection stays open");
-        let payload = serde_json::from_slice(&frame.payload).expect("frame payload");
-        (frame.header, payload)
+    fn frame(&mut self) -> (Value, Value) {
+        use std::io::Read;
+        let mut chunk = [0u8; 8192];
+        loop {
+            if let Some(frame) = self.queue.pop_front() {
+                let payload = serde_json::from_slice(&frame.payload).expect("frame payload");
+                return (frame.header, payload);
+            }
+            let read = self
+                .stream
+                .read(&mut chunk)
+                .expect("the worker answers within the step bound");
+            assert!(read > 0, "the worker closed the connection");
+            let frames = self
+                .decoder
+                .push(&chunk[..read])
+                .expect("well-formed frames");
+            self.queue.extend(frames);
+        }
     }
 
-    async fn send(&mut self, command_type: &str, payload: &Value) -> String {
-        self.next_id += 1;
-        let request_id = format!("req-{}", self.next_id);
-        let frame = crate::framing::encode_private_frame(
-            &json!({ "kind": "command", "requestId": request_id, "commandType": command_type }),
-            &serde_json::to_vec(payload).expect("payload"),
-            DEFAULT_PRIVATE_FRAME_LIMITS,
-        )
-        .expect("encode a command frame");
-        self.writer.write_all(&frame).await.expect("write a frame");
-        request_id
+    /// Write `commands` as ONE write, so the worker's reader takes them in one read:
+    /// a later command never waits for a readiness event the parked driver cannot
+    /// deliver. Returns the request ids in order.
+    fn send_all(&mut self, commands: &[(&str, &Value)]) -> Vec<String> {
+        use std::io::Write;
+        let mut bytes = Vec::new();
+        let mut ids = Vec::new();
+        for (command_type, payload) in commands {
+            self.next_id += 1;
+            let request_id = format!("req-{}", self.next_id);
+            bytes.extend(
+                crate::framing::encode_private_frame(
+                    &json!({ "kind": "command", "requestId": request_id, "commandType": command_type }),
+                    &serde_json::to_vec(payload).expect("payload"),
+                    DEFAULT_PRIVATE_FRAME_LIMITS,
+                )
+                .expect("encode a command frame"),
+            );
+            ids.push(request_id);
+        }
+        self.stream.write_all(&bytes).expect("write the frames");
+        ids
     }
 
     /// Read to the response for `request_id`; returns it and the session-event
     /// sequences streamed ahead of it.
-    async fn response(&mut self, request_id: &str) -> (Value, Vec<u64>) {
+    fn response(&mut self, request_id: &str) -> (Value, Vec<u64>) {
         let mut streamed = Vec::new();
         loop {
-            let (header, payload) = self.frame().await;
+            let (header, payload) = self.frame();
             match header["outboundType"].as_str() {
                 Some("response") if header["requestId"] == request_id => {
                     return (payload, streamed);
@@ -86,9 +116,9 @@ impl Link {
         }
     }
 
-    async fn request(&mut self, command_type: &str, payload: &Value) -> (Value, Vec<u64>) {
-        let request_id = self.send(command_type, payload).await;
-        self.response(&request_id).await
+    fn request(&mut self, command_type: &str, payload: &Value) -> (Value, Vec<u64>) {
+        let ids = self.send_all(&[(command_type, payload)]);
+        self.response(&ids[0])
     }
 }
 
@@ -130,19 +160,17 @@ async fn served_worker_with_session_client() -> (Arc<Worker>, Link, Link) {
         );
         tokio::task::yield_now().await;
     }
-    let mut supervisor = Link::connect(&socket).await;
-    let (auth, _) = supervisor
-        .request(
-            "worker_auth",
-            &json!({
-                "type": "worker_auth",
-                "token": "window-token",
-                "supervisorGeneration": GENERATION,
-                "supervisorPid": 4242,
-                "supervisorSocketPath": "/tmp/none.sock",
-            }),
-        )
-        .await;
+    let mut supervisor = Link::connect(&socket);
+    let (auth, _) = supervisor.request(
+        "worker_auth",
+        &json!({
+            "type": "worker_auth",
+            "token": "window-token",
+            "supervisorGeneration": GENERATION,
+            "supervisorPid": 4242,
+            "supervisorSocketPath": "/tmp/none.sock",
+        }),
+    );
     assert_eq!(auth["success"], true, "worker auth failed: {auth}");
     let grant = json!({
         "grantId": "window-grant",
@@ -153,29 +181,25 @@ async fn served_worker_with_session_client() -> (Arc<Worker>, Link, Link) {
         "activeSessionId": SESSION,
         "issuerGeneration": GENERATION,
     });
-    let (registered, _) = supervisor
-        .request(
-            "worker_register_peer_transport",
-            &json!({ "type": "worker_register_peer_transport", "grant": grant }),
-        )
-        .await;
+    let (registered, _) = supervisor.request(
+        "worker_register_peer_transport",
+        &json!({ "type": "worker_register_peer_transport", "grant": grant }),
+    );
     assert_eq!(
         registered["success"], true,
         "grant registration failed: {registered}"
     );
-    let mut client = Link::connect(&socket).await;
-    let (admitted, _) = client
-        .request(
-            "peer_auth",
-            &json!({
-                "type": "peer_auth",
-                "grantId": "window-grant",
-                "token": "window-grant-token",
-                "workerInstanceId": INSTANCE,
-                "purpose": "session_client",
-            }),
-        )
-        .await;
+    let mut client = Link::connect(&socket);
+    let (admitted, _) = client.request(
+        "peer_auth",
+        &json!({
+            "type": "peer_auth",
+            "grantId": "window-grant",
+            "token": "window-grant-token",
+            "workerInstanceId": INSTANCE,
+            "purpose": "session_client",
+        }),
+    );
     assert_eq!(admitted["success"], true, "peer auth failed: {admitted}");
     (worker, client, supervisor)
 }
@@ -249,8 +273,13 @@ async fn a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending(
     let (worker, mut client, _supervisor) = served_worker_with_session_client().await;
     // The attach parks on the held core lock, before its snapshot cut.
     let (step, emitted, holder) = hold_core_lock(&worker);
-    let attach = client
-        .send(
+    // The attach and the reader barrier travel in ONE write: the worker's reader
+    // takes both in one read, so the barrier's refusal proves the attach frame was
+    // read (and the stream opened) with no second readiness event needed while the
+    // attach task blocks a runtime worker on the held lock.
+    let barrier = reader_barrier();
+    let ids = client.send_all(&[
+        (
             "attach",
             &json!({
                 "type": "attach",
@@ -258,20 +287,22 @@ async fn a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending(
                 "clientId": "window-client",
                 "capabilities": ["attach_snapshot", "event_sequence", "slim_attach", "windowed_snapshot"],
             }),
-        )
-        .await;
-    let (refused, _) = client.request("list", &reader_barrier()).await;
+        ),
+        ("list", &barrier),
+    ]);
+    let (refused, _) = client.response(&ids[1]);
+    let attach = ids[0].clone();
     assert_eq!(refused["success"], false, "the peer gate refuses list");
     // An event emitted while the attach waits to cut its snapshot.
     step.send(HolderStep::Emit).expect("the holder is waiting");
     let sequence = emitted
         .recv_timeout(STEP_BOUND)
         .expect("the holder emits under the lock");
-    let (_, streamed) = client.request("list", &reader_barrier()).await;
+    let (_, streamed) = client.request("list", &reader_barrier());
     step.send(HolderStep::Release)
         .expect("the holder is waiting");
     holder.join().expect("the holder thread");
-    let (attached, after) = client.response(&attach).await;
+    let (attached, after) = client.response(&attach);
     assert_eq!(attached["success"], true, "attach failed: {attached}");
     assert_eq!(
         streamed,
@@ -290,12 +321,10 @@ async fn a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending(
 async fn a_refused_direct_attach_leaves_the_stream_closed() {
     let (worker, mut client, _supervisor) = served_worker_with_session_client().await;
     worker.core.lock().unwrap().shutdown_requested = true;
-    let (refused, _) = client
-        .request(
-            "attach",
-            &json!({ "type": "attach", "activeSessionId": SESSION, "clientId": "window-client" }),
-        )
-        .await;
+    let (refused, _) = client.request(
+        "attach",
+        &json!({ "type": "attach", "activeSessionId": SESSION, "clientId": "window-client" }),
+    );
     assert_eq!(
         refused["success"], false,
         "the closing session refuses the attach"
@@ -309,7 +338,7 @@ async fn a_refused_direct_attach_leaves_the_stream_closed() {
         }))
         .expect("event payload"),
     ));
-    let (_, streamed) = client.request("list", &reader_barrier()).await;
+    let (_, streamed) = client.request("list", &reader_barrier());
     assert!(
         streamed.is_empty(),
         "a refused attach streams nothing: {streamed:?}"
