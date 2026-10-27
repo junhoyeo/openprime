@@ -189,7 +189,7 @@ fn reader_barrier() -> Value {
 
 /// The bound on every step of the held-lock seam: a step that cannot finish within
 /// it fails the test instead of hanging it.
-const STEP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const STEP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One step the lock holder takes on the test's signal.
 enum HolderStep {
@@ -260,6 +260,10 @@ async fn a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending(
             }),
         )
         .await;
+    // PROBE ONLY (throwaway branch): widen the gap between the attach and list writes.
+    if let Some(ms) = std::env::var("ATTACH_PROBE_GAP_MS").ok().and_then(|ms| ms.parse().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let (refused, _) = client.request("list", &reader_barrier()).await;
     assert_eq!(refused["success"], false, "the peer gate refuses list");
     // An event emitted while the attach waits to cut its snapshot.
