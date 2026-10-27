@@ -1,0 +1,5 @@
+- Public zero-cost OpenCode Zen models can be selected explicitly without stored credentials while remaining out of automatic model discovery and cycling.
+- Custom OpenAI Responses gateway models honor `compat.supportsFastMode`, including explicit opt-out, in `/fast`, request service tiers, and pricing.
+- Agent retries use `retry.maxBackoffMs` (60 seconds by default, `0` for uncapped) without conflating the provider Retry-After cap, and authentication failures never erase stored credentials.
+- Interrupted tool-result repair anchors late results to their original calls, drops duplicates and orphans, synthesizes missing results, and stays idempotent.
+- Native Anthropic tool conversion preserves complete JSON Schema keywords instead of narrowing tool inputs to a lossy subset.

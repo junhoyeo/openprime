@@ -10,6 +10,9 @@ Two surfaces, one module:
   ``describe_tool`` (live tool metadata). Inventory calls are bounded and never
   return credentials; live tool schemas and results are passed through
   unmodified.
+- Host view: ``status(servers, timeout_ms)`` feeds the daemon's MCP
+  connections view (one bounded per-server listing, errors reported per
+  server).
 """
 
 from __future__ import annotations
@@ -589,6 +592,34 @@ async def _dispatch(
 
 async def list_tools(server: str) -> list[dict[str, Any]]:
     return await _dispatch(lambda: _registry.tools(server))
+
+
+async def status(servers: list[str], timeout_ms: float) -> list[dict[str, Any]]:
+    """Per-server tool listing for the host's MCP connections view.
+
+    Each requested server is listed concurrently, bounded by `timeout_ms`
+    per server; a server that fails or times out reports its error instead
+    of failing the whole request. Opening a not-yet-connected server is
+    intended: the view exists to show what each connection offers.
+    """
+    timeout = max(timeout_ms, 1.0) / 1000.0
+
+    async def _one(server: str) -> dict[str, Any]:
+        try:
+            tools = await asyncio.wait_for(list_tools(server), timeout=timeout)
+        except BaseException as exc:  # noqa: BLE001 - one broken server reports alone
+            return {"server": server, "tools": None, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "server": server,
+            "tools": [
+                {"name": tool.get("name"), "description": tool.get("description") or ""}
+                for tool in tools
+            ],
+            "error": None,
+        }
+
+    results = await asyncio.gather(*(_one(server) for server in servers))
+    return list(results)
 
 
 async def call_tool(server: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:

@@ -1,0 +1,997 @@
+//! Startup and child wiring: kernel process spawn, python resolution, stderr
+//! capture, and readiness handshake.
+
+use super::{
+    anyhow, live_kernels, lock, oneshot, orphan_journal, parse_event, Arc, AsyncReadExt, BufReader,
+    ChildHandle, Duration, ExitInfo, HashMap, Inner, KernelShutdownOptions, KernelStartOptions,
+    KernelState, Mutex, Ordering, Signal, StderrLog, Write, KERNEL_STDERR_LOG_BUDGET_MARKER,
+    MAX_KERNEL_STDERR_CHARS, MAX_KERNEL_STDERR_LOG_BYTES, MAX_PROTOCOL_LINE_BYTES,
+    READY_TIMEOUT_MS, REPL_PROTOCOL_VERSION,
+};
+
+use crate::kernel::bootstrap::venv::SpawnProbe;
+
+impl Inner {
+    /// True when a teardown (or newer start) superseded the start that
+    /// captured `generation`.
+    pub(crate) fn start_stale(&self, generation: u64) -> bool {
+        lock(&self.guarded).start_generation != generation
+    }
+
+    /// Child stderr tail for error messages: at most the last 1024 chars.
+    fn stderr_tail(&self, limit: usize) -> String {
+        let stderr = lock(&self.guarded).kernel_stderr.clone();
+        let chars: Vec<char> = stderr.chars().collect();
+        let start = chars.len().saturating_sub(limit);
+        chars[start..].iter().collect()
+    }
+
+    /// Append raw kernel stderr text to the diagnostics tail (last 8 KiB).
+    fn append_kernel_stderr_text(&self, text: &str) {
+        let mut g = lock(&self.guarded);
+        g.kernel_stderr.push_str(text);
+        if g.kernel_stderr.len() > MAX_KERNEL_STDERR_CHARS {
+            let chars: Vec<char> = g.kernel_stderr.chars().collect();
+            let start = chars.len().saturating_sub(MAX_KERNEL_STDERR_CHARS);
+            g.kernel_stderr = chars[start..].iter().collect();
+        }
+    }
+
+    /// Append one `[kernel]`-prefixed diagnostic line.
+    pub(crate) fn append_diagnostic(&self, message: &str) {
+        let line = if message.ends_with('\n') {
+            format!("[kernel] {message}")
+        } else {
+            format!("[kernel] {message}\n")
+        };
+        self.append_kernel_stderr_text(&line);
+    }
+
+    /// Open (and rotate when oversized) the kernel stderr log. The write budget is the file's
+    /// remaining capacity.
+    fn open_stderr_log(&self) -> Option<Arc<Mutex<StderrLog>>> {
+        let path = self.options.stderr_log_path.as_ref()?;
+        match self.open_stderr_log_at(path) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                self.append_diagnostic(&format!("cannot open kernel stderr log: {error}"));
+                None
+            }
+        }
+    }
+
+    fn open_stderr_log_at(&self, path: &std::path::Path) -> anyhow::Result<Arc<Mutex<StderrLog>>> {
+        if let Some(parent) = path.parent() {
+            // Owner-only directory, matching the other private session
+            // artifacts the kernel manager creates.
+            crate::platform::perms::create_dir_all_private(parent)?;
+        }
+        let mut size = path.metadata().map_or(0, |m| m.len());
+        if size > MAX_KERNEL_STDERR_LOG_BYTES {
+            let old = path.with_extension("log.old");
+            // Tighten before the move: a renamed log keeps its mode, and the
+            // rotated file holds the exception payloads worth protecting.
+            if let Err(error) = crate::platform::perms::restrict_file(path) {
+                self.append_diagnostic(&format!("cannot rotate kernel stderr log: {error}"));
+            } else {
+                let _ = std::fs::remove_file(&old);
+                match std::fs::rename(path, &old) {
+                    Ok(()) => size = 0,
+                    Err(error) => {
+                        // A failed rotation must not cost the log: keep appending.
+                        self.append_diagnostic(&format!(
+                            "cannot rotate kernel stderr log: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        // Owner-only file bits on create; kernel stderr can carry exception payloads.
+        crate::platform::perms::set_private_mode(&mut options);
+        let file = options.open(path)?;
+        // Exact bits despite the umask; tightens a pre-existing loose log.
+        crate::platform::perms::restrict_open_file(&file)?;
+        Ok(Arc::new(Mutex::new(StderrLog {
+            file,
+            budget: MAX_KERNEL_STDERR_LOG_BYTES.saturating_sub(size),
+        })))
+    }
+
+    /// The Python interpreter this kernel runs on: the explicit option when
+    /// present, else the auto-bootstrapped kernel venv.
+    async fn resolve_python(
+        self: &Arc<Self>,
+        options: &KernelStartOptions,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        if let Some(python) = &self.options.python {
+            // Resolve before `Command::current_dir` changes the child cwd.
+            return Ok(crate::kernel::bootstrap::venv::expand_home(
+                &python.to_string_lossy(),
+            ));
+        }
+        if let Some(cached) = lock(&self.resolved_python).clone() {
+            return Ok(cached);
+        }
+        let progress = options.on_bootstrap_progress.clone();
+        let skills = self.options.python_skills.clone();
+        let python = crate::kernel::bootstrap::ensure_kernel_python(
+            crate::kernel::bootstrap::EnsureKernelPythonOptions {
+                python_skills: skills,
+                on_progress: progress,
+            },
+        )
+        .await?;
+        *lock(&self.resolved_python) = Some(python.clone());
+        Ok(python)
+    }
+
+    /// Perform the startup: resolve the interpreter, spawn `python -m rlm.repl`,
+    /// complete the protocol handshake, and mark the kernel running.
+    pub(crate) async fn do_start(
+        self: &Arc<Self>,
+        options: &KernelStartOptions,
+    ) -> anyhow::Result<()> {
+        {
+            let mut g = lock(&self.guarded);
+            if g.state != KernelState::Idle {
+                return Ok(());
+            }
+            g.start_generation += 1;
+            g.state = KernelState::Starting;
+        }
+        // Tracked from the moment startup begins so cleanup can dispose a
+        // kernel that is still booting.
+        live_kernels::add(self);
+
+        let python = match self.resolve_python(options).await {
+            Ok(python) => python,
+            Err(error) => {
+                if self.start_stale(self.current_generation()) {
+                    // Never touch a newer start's state.
+                    return Err(error);
+                }
+                live_kernels::remove(self);
+                let mut g = lock(&self.guarded);
+                if g.state != KernelState::Shutdown {
+                    g.state = KernelState::Idle;
+                }
+                return Err(error);
+            }
+        };
+        let generation = self.current_generation();
+        if self.start_stale(generation) {
+            return Err(anyhow!("Kernel start superseded"));
+        }
+        if lock(&self.guarded).state == KernelState::Shutdown {
+            return Err(anyhow!("Kernel was disposed during startup"));
+        }
+        let env = kernel_spawn_env(&self.options.env);
+        let cwd = self.options.cwd.clone();
+        let wanted =
+            || !self.start_stale(generation) && lock(&self.guarded).state != KernelState::Shutdown;
+        let probe = crate::kernel::bootstrap::venv::spawn_environment_ready(
+            &python.to_string_lossy(),
+            &env,
+            cwd.as_deref(),
+            Duration::from_millis(READY_TIMEOUT_MS),
+            &wanted,
+        )
+        .await;
+        // The probe awaited child processes: a teardown or newer start may
+        // have landed meanwhile. Whatever the verdict, never touch a newer
+        // start's state, and never spawn after a teardown.
+        if self.start_stale(generation) {
+            return Err(anyhow!("Kernel start superseded"));
+        }
+        if lock(&self.guarded).state == KernelState::Shutdown {
+            return Err(anyhow!("Kernel was disposed during startup"));
+        }
+        let rejection = match probe {
+            SpawnProbe::Ready => None,
+            SpawnProbe::LaunchFailed(error) => {
+                // The interpreter itself cannot launch: the same outcome as a
+                // failed kernel spawn (c4c semantics), so the manager turns
+                // defunct and the stale runtime-ready memo is dropped.
+                crate::kernel::bootstrap::invalidate_runtime_probe_cache();
+                self.append_diagnostic(&format!("spawn error: {error}"));
+                lock(&self.guarded).state = KernelState::Shutdown;
+                live_kernels::remove(self);
+                self.cleanup_resources(Signal::Term);
+                return Err(anyhow!(
+                    "failed to spawn kernel python {}: {error}",
+                    python.display()
+                ));
+            }
+            // `wanted` turned false, which only a teardown or a newer start
+            // causes; both returned above.
+            SpawnProbe::Abandoned => Some(anyhow!("Kernel start superseded")),
+            SpawnProbe::TimedOut => Some(anyhow!(
+                "kernel python {} did not answer the runtime probe within {READY_TIMEOUT_MS}ms",
+                python.display()
+            )),
+            SpawnProbe::Rejected => Some(anyhow!(
+                "kernel spawn environment must provide exactly prime-agent-runtime ABI 2, dill, and required default Python imports: {}",
+                python.display()
+            )),
+        };
+        if let Some(error) = rejection {
+            live_kernels::remove(self);
+            let mut g = lock(&self.guarded);
+            if g.state != KernelState::Shutdown {
+                g.state = KernelState::Idle;
+            }
+            return Err(error);
+        }
+        // Bridge resolver ownership to the child-PID lease. If this host
+        // crashes after exec but before child publication, the durable handoff
+        // record remains conservative instead of making the generation GC-able.
+        let environment_handoff =
+            match crate::kernel::bootstrap::begin_kernel_lease_handoff(&python) {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    live_kernels::remove(self);
+                    let mut g = lock(&self.guarded);
+                    if g.state != KernelState::Shutdown {
+                        g.state = KernelState::Idle;
+                    }
+                    return Err(anyhow!(
+                        "failed to protect the kernel environment before spawn: {error:#}"
+                    ));
+                }
+            };
+
+        let mut command = tokio::process::Command::new(&python);
+        command
+            .args(["-m", "rlm.repl"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Hidden window on Windows (TS `spawnHidden`); the kernel stays in
+        // this process's group - its lifecycle is supervised directly.
+        crate::platform::process::set_no_window(command.as_std_mut());
+        if let Some(cwd) = &cwd {
+            command.current_dir(cwd);
+        }
+        command.env_clear().envs(env);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(handoff) = environment_handoff {
+                    handoff.release(); // no child was spawned
+                }
+                // Fail a pending start promptly instead of riding out the ready timeout. The
+                // interpreter itself failed to launch, so the memoized runtime-ready result
+                // is stale.
+                crate::kernel::bootstrap::invalidate_runtime_probe_cache();
+                self.append_diagnostic(&format!("spawn error: {error}"));
+                {
+                    let mut g = lock(&self.guarded);
+                    g.state = KernelState::Shutdown;
+                }
+                live_kernels::remove(self);
+                if let Some(tx) = lock(&self.guarded).ready_tx.take() {
+                    let _ = tx.send(Err(anyhow!("spawn error: {error}")));
+                }
+                self.cleanup_resources(Signal::Term);
+                return Err(anyhow!(
+                    "failed to spawn kernel python {}: {error}",
+                    python.display()
+                ));
+            }
+        };
+        let child_pid = child.id();
+        let pid = child_pid.map_or(-1, |value| value as i32);
+        orphan_journal::record_orphan_process_state(pid, true);
+        let environment_lease = match child_pid {
+            Some(child_pid) => {
+                match crate::kernel::bootstrap::register_kernel_python_lease(&python, child_pid) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        // The handoff stays live until death is observed. Never
+                        // let an unleased interpreter escape this failure path.
+                        let _ = child.start_kill();
+                        let exit_observed = child.wait().await.is_ok();
+                        if exit_observed {
+                            if let Some(handoff) = environment_handoff {
+                                handoff.release();
+                            }
+                            orphan_journal::record_orphan_process_state(pid, false);
+                        }
+                        live_kernels::remove(self);
+                        let mut g = lock(&self.guarded);
+                        g.state = KernelState::Shutdown;
+                        return Err(anyhow!(
+                            "failed to lease the spawned kernel environment: {error:#}"
+                        ));
+                    }
+                }
+            }
+            None if environment_handoff.is_some() => {
+                let _ = child.start_kill();
+                if child.wait().await.is_ok() {
+                    if let Some(handoff) = environment_handoff {
+                        handoff.release();
+                    }
+                }
+                live_kernels::remove(self);
+                let mut g = lock(&self.guarded);
+                g.state = KernelState::Shutdown;
+                return Err(anyhow!(
+                    "spawned kernel did not expose a pid for its environment lease"
+                ));
+            }
+            None => None,
+        };
+        // The child lease is now durable (or this is an unmanaged custom
+        // interpreter), so the crash-window handoff can be released.
+        if let Some(handoff) = environment_handoff {
+            handoff.release();
+        }
+        let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<i64>>();
+        {
+            let mut g = lock(&self.guarded);
+            g.startup_protocol_error = None;
+            g.ready_tx = Some(ready_tx);
+        }
+        self.wire_child(child, generation, environment_lease);
+
+        let protocol = match self.wait_for_ready(ready_rx, generation).await {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                if self.start_stale(generation) {
+                    // Never tear down a newer start's kernel.
+                    return Err(error);
+                }
+                // The child died or never reached ready, so the memoized runtime-ready
+                // result is stale: drop it and let a startup retry re-probe.
+                crate::kernel::bootstrap::invalidate_runtime_probe_cache();
+                let can_retry_startup = lock(&self.guarded).state != KernelState::Shutdown;
+                // Only the call that performed the cleanup may resurrect to
+                // idle; a concurrent kill()/teardown owns the state otherwise.
+                let performed = self
+                    .perform_shutdown(KernelShutdownOptions::default())
+                    .await;
+                if performed && can_retry_startup {
+                    lock(&self.guarded).state = KernelState::Idle;
+                }
+                return Err(error);
+            }
+        };
+        if self.start_stale(generation) {
+            return Err(anyhow!("Kernel start superseded"));
+        }
+        if let Some(startup_error) = lock(&self.guarded).startup_protocol_error.clone() {
+            return Err(anyhow!("{startup_error}"));
+        }
+        if protocol != REPL_PROTOCOL_VERSION as i64 {
+            // A stale runtime passed a memoized probe's key but speaks the
+            // wrong protocol: the memo is stale, so a retry re-probes.
+            crate::kernel::bootstrap::invalidate_runtime_probe_cache();
+            return Err(anyhow!(
+                "Kernel runtime speaks protocol {protocol}, expected {REPL_PROTOCOL_VERSION}. \
+                 Update prime-agent-runtime in the kernel Python (PRIME_AGENT_KERNEL_PYTHON) to match this prime-agent."
+            ));
+        }
+        {
+            let mut g = lock(&self.guarded);
+            g.state = KernelState::Running;
+            // The freshness memo describes the namespace of the kernel that committed it: a freshly
+            // started kernel has no committed description yet.
+            g.capture_freshness = None;
+            g.freshness_epoch += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn current_generation(&self) -> u64 {
+        lock(&self.guarded).start_generation
+    }
+
+    /// Wire the spawned child: protocol reader, stderr tail + log, and the
+    /// exit watcher that settles the manager when the process dies.
+    fn wire_child(
+        self: &Arc<Self>,
+        mut child: tokio::process::Child,
+        generation: u64,
+        environment_lease: Option<crate::kernel::bootstrap::GenerationLeaseGuard>,
+    ) {
+        let pid = child.id().map_or(-1, |p| p as i32);
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (exit_tx, exit_rx) = tokio::sync::watch::channel::<Option<ExitInfo>>(None);
+        *lock(&self.child) = Some(ChildHandle {
+            pid,
+            stdin: stdin.clone(),
+            exit_rx,
+        });
+
+        if let Some(stdout) = stdout {
+            // Weak,: the readers stay blocked on the child's pipes, so a strong handle would
+            // outlive every manager clone (#232: a dropped session leaked its live kernel).
+            let inner = Arc::downgrade(self);
+            let stdin_for_error = stdin;
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                // A poisoned child's residue must not grow the buffer again before the protocol
+                // repair kills it: keep draining the pipe and discard.
+                let mut poisoned = false;
+                let mut buffered: Vec<u8> = Vec::new();
+                let mut chunk = vec![0u8; 64 * 1024];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if poisoned {
+                                continue;
+                            }
+                            // `buffered` keeps only the newline-free tail of earlier reads, so only
+                            // the new bytes can hold a newline.
+                            let mut scan_from = buffered.len();
+                            buffered.extend_from_slice(&chunk[..n]);
+                            if buffered.len() > MAX_PROTOCOL_LINE_BYTES {
+                                poisoned = true;
+                                buffered.clear();
+                                let Some(inner) = inner.upgrade() else {
+                                    break;
+                                };
+                                inner.fail_protocol_frame(
+                                    generation,
+                                    &format!(
+                                        "oversized protocol line: exceeds {MAX_PROTOCOL_LINE_BYTES} bytes"
+                                    ),
+                                );
+                                continue;
+                            }
+                            // Consume by offset and drain the prefix once per read: per-frame
+                            // drains would shift the tail each iteration (quadratic copying).
+                            let mut consumed = 0;
+                            while let Some(rel) =
+                                buffered[scan_from..].iter().position(|&b| b == b'\n')
+                            {
+                                let end = scan_from + rel;
+                                // An invalid-UTF-8 stream ends the reader, like
+                                // read_line's decode error did before.
+                                let Ok(trimmed) = std::str::from_utf8(&buffered[consumed..end])
+                                else {
+                                    return;
+                                };
+                                consumed = end + 1;
+                                scan_from = consumed;
+                                // Large blank protocol lines are normally ASCII. Strip their
+                                // bytes before Unicode trimming, retaining the Unicode fallback
+                                // without decoding every byte of a multi-MiB ASCII padding line.
+                                if trimmed.trim_ascii().trim().is_empty() {
+                                    continue;
+                                }
+                                let Some(inner) = inner.upgrade() else {
+                                    return;
+                                };
+                                match parse_event(trimmed) {
+                                    Ok(event) => inner.handle_event(event),
+                                    Err(reason) => {
+                                        let _ = stdin_for_error;
+                                        inner.fail_protocol_frame(generation, &reason);
+                                    }
+                                }
+                            }
+                            buffered.drain(..consumed);
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(stderr) = stderr {
+            // Weak like the stdout reader (same drop semantics), upgraded
+            // per chunk; the log file drains to EOF regardless.
+            let inner = Arc::downgrade(self);
+            let log = self.open_stderr_log();
+            // Keep the host-side handle so teardown drops its reference; the
+            // reader task's handle closes the file when the stream ends.
+            (*lock(&self.stderr_log)).clone_from(&log);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut pending: Vec<u8> = Vec::new();
+                let mut buffer = [0u8; 4096];
+                // Incremental UTF-8 decoding: a chunk boundary can split a
+                // multi-byte character, so only complete sequences surface.
+                let decode = |pending: &mut Vec<u8>| {
+                    let text = String::from_utf8_lossy(pending);
+                    let decoded = text.into_owned();
+                    pending.clear();
+                    decoded
+                };
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            pending.extend_from_slice(&buffer[..n]);
+                            let decoded = decode(&mut pending);
+                            let Some(inner) = inner.upgrade() else {
+                                break;
+                            };
+                            inner.append_kernel_stderr_text(&decoded);
+                            if let Some(log) = &log {
+                                let mut log = lock(log);
+                                if log.budget >= n as u64 {
+                                    let _ = log.file.write_all(&buffer[..n]);
+                                    let _ = log.file.flush();
+                                    log.budget -= n as u64;
+                                } else if log.budget > 0 {
+                                    let _ = log
+                                        .file
+                                        .write_all(KERNEL_STDERR_LOG_BUDGET_MARKER.as_bytes());
+                                    let _ = log.file.flush();
+                                    log.budget = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(inner) = inner.upgrade() {
+                    if !pending.is_empty() {
+                        inner.append_kernel_stderr_text(&decode(&mut pending));
+                    }
+                    // Both the natural EOF and the kill path end here; the ready
+                    // handshake waits on this notification for the final tail.
+                    inner.stderr_closed_flag.store(true, Ordering::SeqCst);
+                    inner.stderr_closed.notify_waiters();
+                }
+            });
+        }
+
+        // Weak like the readers: the watcher stays blocked on the child's exit for the kernel's
+        // whole life.
+        let inner = Arc::downgrade(self);
+        tokio::spawn(async move {
+            // Signalling is not death. Hold the generation until wait() has
+            // observed process exit; dropping this task after that removes only
+            // its exact lease record.
+            let mut environment_lease = environment_lease;
+            let exit = match child.wait().await {
+                Ok(status) => {
+                    if let Some(lease) = environment_lease.take() {
+                        lease.release();
+                    }
+                    ExitInfo {
+                        code: status.code(),
+                        #[cfg(unix)]
+                        signal: unix_signal_of(status),
+                        #[cfg(not(unix))]
+                        signal: None,
+                    }
+                }
+                Err(_) => ExitInfo {
+                    // The lease stays on disk: wait did not prove death.
+                    code: None,
+                    signal: None,
+                },
+            };
+            let _ = exit_tx.send(Some(exit));
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if inner.start_stale(generation) {
+                return;
+            }
+            // append_diagnostic re-locks `guarded`, so it must run OUTSIDE
+            // this lock scope (a std Mutex is not reentrant).
+            let was_live = {
+                let mut g = lock(&inner.guarded);
+                let was_live = g.state != KernelState::Shutdown;
+                g.state = KernelState::Shutdown;
+                was_live
+            };
+            if was_live {
+                inner.append_diagnostic(&format!(
+                    "unexpected exit code={} signal={}",
+                    exit.code.map_or("null".to_string(), |c| c.to_string()),
+                    exit.signal.map_or("null".to_string(), |s| s.to_string()),
+                ));
+            }
+            live_kernels::remove(&inner);
+            // This exit is part of an in-flight graceful shutdown(): that call owns
+            // the teardown and runs cleanup itself.
+            // Scoped reads: locking the same std Mutex twice in one expression
+            // self-deadlocks (non-reentrant).
+            let graceful_in_flight = {
+                let g = lock(&inner.guarded);
+                g.graceful_shutdown_generation == Some(g.start_generation)
+            };
+            if graceful_in_flight {
+                return;
+            }
+            inner.cleanup_resources(Signal::Term);
+        });
+    }
+
+    /// The protocol handshake: the runtime's `ready` frame, the child dying
+    /// first, or the 30-second ceiling — whichever comes first.
+    async fn wait_for_ready(
+        &self,
+        ready_rx: oneshot::Receiver<anyhow::Result<i64>>,
+        generation: u64,
+    ) -> anyhow::Result<i64> {
+        let mut ready_rx = ready_rx;
+        let mut exit_rx = lock(&self.child)
+            .as_ref()
+            .map(|c| c.exit_rx.clone())
+            .ok_or_else(|| anyhow!("Kernel ready state is missing"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(READY_TIMEOUT_MS);
+        let mut protocol = None;
+        while protocol.is_none() {
+            let timeout = tokio::time::sleep_until(deadline);
+            tokio::select! {
+                ready = &mut ready_rx => {
+                    match ready {
+                        Ok(Ok(value)) => protocol = Some(value),
+                        Ok(Err(error)) => return Err(error),
+                        // Dropped only by teardown, which resolves the wait itself.
+                        Err(_) => return Err(anyhow!("Kernel ready state is missing")),
+                    }
+                }
+                _ = exit_rx.changed() => {
+                    if exit_rx.borrow().is_some() {
+                        // Final stderr chunks can still be in flight; wait for
+                        // the drained pipe (the ready deadline still bounds it).
+                        let stderr_drain = async {
+                            loop {
+                                if self.stderr_closed_flag.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                self.stderr_closed.notified().await;
+                            }
+                        };
+                        tokio::select! {
+                            () = stderr_drain => {}
+                            () = tokio::time::sleep_until(deadline) => {}
+                        }
+                        let tail = self.stderr_tail(1024);
+                        return Err(anyhow!("Kernel exited before ready. stderr:\n{}", if tail.is_empty() { "(empty)".to_string() } else { tail }));
+                    }
+                }
+                () = timeout => {
+                    let tail = self.stderr_tail(1024);
+                    return Err(anyhow!("Kernel did not become ready within {READY_TIMEOUT_MS}ms. stderr tail:\n{}", if tail.is_empty() { "(empty)".to_string() } else { tail }));
+                }
+            }
+        }
+        let _ = generation;
+        Ok(protocol.expect("loop only exits with a protocol value"))
+    }
+}
+
+/// The kernel child's env (TS repl-manager.ts:374-385): the worker env plus
+/// the provisioner's env, with UTF-8 mode forced on Windows (`CPython` must
+/// read UTF-8 regardless of the active legacy code page, overriding any
+/// provisioner-provided `PYTHONUTF8`) and the owner pid the runtime journals
+/// its process groups under.
+fn kernel_spawn_env(options_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    for (key, value) in options_env {
+        env.insert(key.clone(), value.clone());
+    }
+    if cfg!(windows) {
+        env.insert("PYTHONUTF8".to_string(), "1".to_string());
+    }
+    env.insert(
+        "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
+        std::process::id().to_string(),
+    );
+    env
+}
+
+#[cfg(unix)]
+fn unix_signal_of(status: std::process::ExitStatus) -> Option<i32> {
+    crate::platform::process::termination_signal(&status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::manager::ReplKernelManager;
+    use crate::kernel::shared::KernelManagerOptions;
+
+    fn manager() -> ReplKernelManager {
+        ReplKernelManager::new(KernelManagerOptions::default())
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pa-stderr-perms-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kernel_spawn_env_forces_utf8_mode() {
+        let mut options_env = HashMap::new();
+        options_env.insert("PYTHONUTF8".to_string(), "0".to_string());
+        let env = kernel_spawn_env(&options_env);
+        assert_eq!(env.get("PYTHONUTF8").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("PRIME_AGENT_KERNEL_OWNER_PID").map(String::as_str),
+            Some(std::process::id().to_string().as_str())
+        );
+    }
+
+    /// The pre-spawn interpreter probe runs inside the async start. A probe
+    /// interpreter that never exits must not block the runtime: a blocked
+    /// current-thread runtime cannot fire the caller's timeout, so the
+    /// caller (and every request queued behind it) would hang. The probe's
+    /// own bound is covered in `bootstrap::venv::probe`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wedged_pre_spawn_probe_does_not_block_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = dir.path().join("wedged-probe-python");
+        std::fs::write(
+            &python,
+            "#!/bin/sh\nif [ \"${1:-}\" = \"-c\" ]; then exec sleep 600; fi\nexit 1\n",
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.start(KernelStartOptions::default()),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the wedged probe must not settle the start"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the caller's timeout must fire while the probe runs"
+        );
+        // Dropping the runtime at test end drops the detached start, whose
+        // kill-on-drop probe child dies with it.
+        manager.kill();
+    }
+
+    /// A probe-gated fake interpreter: probe launch `n` (0-based) records
+    /// itself, waits for `gates/gate<n>`, and exits with the gate's content.
+    #[cfg(unix)]
+    fn gated_probe_python(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let python = dir.join("gated-probe-python");
+        let count = dir.join("probe-launches");
+        let gates = dir.join("gates");
+        std::fs::create_dir_all(&gates).expect("gates dir");
+        std::fs::write(&count, "").expect("count file");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"-c\" ]; then\n  n=$(wc -c < '{count}' | tr -d ' ')\n  printf x >> '{count}'\n  while [ ! -f '{gates}/gate'$n ] && [ -d '{gates}' ]; do sleep 0.02; done\n  exit $(cat '{gates}/gate'$n 2>/dev/null || echo 1)\nfi\nexit 1\n",
+                count = count.display(),
+                gates = gates.display(),
+            ),
+        )
+        .expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+        python
+    }
+
+    #[cfg(unix)]
+    fn probe_launches(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("probe-launches")).map_or(0, |text| text.len())
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_probe_launches(dir: &std::path::Path, launches: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while probe_launches(dir) < launches {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the probe launched");
+    }
+
+    /// A superseded start's failed probe must not touch the newer start:
+    /// A's probe is in flight, `restart()` puts B into Starting, then A's
+    /// probe fails. B stays Starting and tracked by the live-kernel registry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_probe_failure_leaves_the_newer_start_alone() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = gated_probe_python(dir.path());
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        let start_a = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start(KernelStartOptions::default()).await }
+        });
+        wait_for_probe_launches(dir.path(), 1).await;
+        let restart_b = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.restart().await }
+        });
+        wait_for_probe_launches(dir.path(), 2).await;
+        assert!(matches!(
+            lock(&manager.inner.guarded).state,
+            KernelState::Starting
+        ));
+        // A's probe now fails.
+        std::fs::write(dir.path().join("gates").join("gate0"), "1").expect("gate0");
+        let a = tokio::time::timeout(Duration::from_secs(10), start_a)
+            .await
+            .expect("the superseded start settles")
+            .expect("start task");
+        assert!(a.is_err(), "the superseded start fails");
+        let state = lock(&manager.inner.guarded).state;
+        assert!(
+            matches!(state, KernelState::Starting),
+            "the superseded start's probe failure must not reset the newer start: {state:?}"
+        );
+        assert!(
+            crate::kernel::live_kernels::is_tracked(&manager.inner),
+            "the newer start must stay tracked for cleanup"
+        );
+        manager.kill();
+        std::fs::write(dir.path().join("gates").join("gate1"), "1").expect("gate1");
+        let _ = tokio::time::timeout(Duration::from_secs(10), restart_b).await;
+    }
+
+    /// A start killed while its first probe runs launches no further probe
+    /// interpreters once that probe returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killed_start_launches_no_further_probes() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = gated_probe_python(dir.path());
+        let gates = dir.path().join("gates");
+        // Later probes would pass at once, so only the stale check stops them.
+        std::fs::write(gates.join("gate1"), "0").expect("gate1");
+        std::fs::write(gates.join("gate2"), "0").expect("gate2");
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start(KernelStartOptions::default()).await }
+        });
+        wait_for_probe_launches(dir.path(), 1).await;
+        manager.kill();
+        std::fs::write(gates.join("gate0"), "0").expect("gate0");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), start)
+            .await
+            .expect("the killed start settles")
+            .expect("start task");
+        assert!(outcome.is_err(), "a killed start fails");
+        assert_eq!(
+            probe_launches(dir.path()),
+            1,
+            "a killed start must not launch further probes"
+        );
+    }
+
+    /// P2-f: an interpreter the pre-spawn probe cannot launch fails the
+    /// start like c4c's spawn error: the manager turns defunct, leaves the
+    /// live-kernel registry, and drops the runtime-ready memo (both layers).
+    #[tokio::test]
+    async fn unlaunchable_probe_interpreter_makes_the_manager_defunct() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let disk_memo = dir.path().join("runtime-ready-memo.json");
+        std::fs::write(&disk_memo, "{}").expect("disk memo");
+        let key = format!("p2f-{}", std::process::id());
+        crate::kernel::bootstrap::venv::seed_probe_memo_for_tests(&key, disk_memo.clone());
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            python: Some(dir.path().join("nonexistent-python")),
+            ..Default::default()
+        });
+        let error = manager
+            .start(KernelStartOptions::default())
+            .await
+            .expect_err("an unlaunchable interpreter fails the start");
+        assert!(
+            format!("{error:#}").contains("failed to spawn kernel python"),
+            "{error:#}"
+        );
+        assert!(
+            manager.is_defunct(),
+            "an unlaunchable interpreter leaves the manager defunct, as at c4c"
+        );
+        assert!(
+            !crate::kernel::live_kernels::is_tracked(&manager.inner),
+            "a defunct manager leaves the live-kernel registry"
+        );
+        assert!(
+            !crate::kernel::bootstrap::venv::probe_memo_has_for_tests(&key),
+            "the in-process runtime-ready memo is dropped"
+        );
+        assert!(
+            !disk_memo.exists(),
+            "the on-disk runtime-ready memo is dropped"
+        );
+    }
+
+    #[test]
+    fn kernel_stderr_log_is_owner_only() {
+        let root = temp_root("create");
+        let path = root.join("artifacts").join("kernel-stderr.log");
+        let log = manager()
+            .inner
+            .open_stderr_log_at(&path)
+            .expect("stderr log opens");
+        drop(log);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                crate::platform::perms::file_mode(&path),
+                Some(crate::platform::perms::PRIVATE_FILE_MODE)
+            );
+            assert_eq!(
+                crate::platform::perms::file_mode(path.parent().expect("parent")),
+                Some(crate::platform::perms::PRIVATE_DIR_MODE)
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kernel_stderr_log_rotation_tightens_a_world_readable_log() {
+        use std::io::Write;
+
+        let root = temp_root("rotate");
+        let path = root.join("kernel-stderr.log");
+        std::fs::create_dir_all(&root).expect("dir");
+        let mut loose = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("loose log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = loose.set_permissions(std::fs::Permissions::from_mode(0o644));
+        }
+        loose
+            .write_all(&vec![0u8; (MAX_KERNEL_STDERR_LOG_BYTES + 1) as usize])
+            .expect("fill");
+        drop(loose);
+        let log = manager()
+            .inner
+            .open_stderr_log_at(&path)
+            .expect("stderr log opens");
+        drop(log);
+        #[cfg(unix)]
+        {
+            let old = path.with_extension("log.old");
+            assert_eq!(
+                crate::platform::perms::file_mode(&old),
+                Some(crate::platform::perms::PRIVATE_FILE_MODE),
+                "the rotated file holds the historical exception payloads"
+            );
+            assert_eq!(
+                crate::platform::perms::file_mode(&path),
+                Some(crate::platform::perms::PRIVATE_FILE_MODE),
+                "the fresh log is tightened despite a loose predecessor"
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(path.with_extension("log.old").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

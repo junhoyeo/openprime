@@ -1,0 +1,1 @@
+- Added the built-in `agent-sessions` skill for searching and reading Codex, Claude Code, Kimi, Kiro, Prime Agent, Senpi, Grok Build, and Aside chat transcripts and saved text artifacts.

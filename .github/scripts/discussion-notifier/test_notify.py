@@ -50,6 +50,12 @@ def trusted_run() -> dict:
     }
 
 
+class WorkflowPresenceTests(unittest.TestCase):
+    def test_scheduled_delivery_workflow_is_present(self):
+        workflow = Path(__file__).resolve().parents[2] / "workflows" / "discussion-slack.yml"
+        self.assertTrue(workflow.is_file(), "discussion delivery workflow must survive repository migrations")
+
+
 class NotificationTests(unittest.TestCase):
     def setUp(self):
         environment = patch.dict(
@@ -175,7 +181,6 @@ class NotificationTests(unittest.TestCase):
 
     def test_missing_body_does_not_checkpoint_reservations(self):
         for response in [
-            {"data": {"nodes": [None]}},
             {"data": {"nodes": [{"id": "discussion-1", "body": None}]}},
             {"data": {"nodes": []}, "errors": [{"message": "unavailable"}]},
         ]:
@@ -190,6 +195,51 @@ class NotificationTests(unittest.TestCase):
                     notify.plan(Path(directory), dry_run=True)
                 self.assertFalse((Path(directory) / "state.json").exists())
                 self.assertFalse((Path(directory) / "outbox.json").exists())
+
+    def test_unavailable_discussion_does_not_block_healthy_reports(self):
+        for errors in ([], [{"type": "NOT_FOUND", "path": ["nodes", 0]}]):
+            response = {"data": {"nodes": [None, report(2)]}, "errors": errors}
+            with (
+                self.subTest(errors=errors),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(notify, "restore_state", return_value=state()),
+                patch.object(notify, "fetch_page", return_value={"edges": [edge(1), edge(2)]}),
+                patch.object(notify, "gh", return_value=json.dumps(response)),
+            ):
+                notify.plan(Path(directory), dry_run=True)
+                saved = json.loads((Path(directory) / "state.json").read_text())
+                outbox = json.loads((Path(directory) / "outbox.json").read_text())
+                self.assertEqual(outbox, [report(2)])
+                self.assertEqual(saved["pending"], [])
+                self.assertEqual([item["id"] for item in saved["attempts"]],
+                                 ["discussion-1", "discussion-2"])
+
+    def test_partial_graphql_results_still_reject_other_errors(self):
+        for error in (
+            {"type": "FORBIDDEN", "path": ["nodes", 0]},
+            {"type": "NOT_FOUND", "path": ["repository"]},
+            {"type": "NOT_FOUND", "path": ["nodes", 9]},
+            {"type": "NOT_FOUND", "path": ["nodes", 1]},
+        ):
+            with self.subTest(error=error), patch.object(notify, "gh", return_value=json.dumps(
+                {"data": {"nodes": [None, report(2)]}, "errors": [error]}
+            )):
+                with self.assertRaisesRegex(RuntimeError, "state was not advanced"):
+                    notify.fetch_report_bodies([report(1), report(2)])
+
+    def test_gh_partial_response_requires_explicit_body_lookup_opt_in(self):
+        response = json.dumps({"data": {"nodes": [None]}, "errors": [
+            {"type": "NOT_FOUND", "path": ["nodes", 0]}]})
+        with patch.object(notify.subprocess, "run", return_value=Mock(returncode=1, stdout=response)):
+            with self.assertRaises(RuntimeError):
+                notify.gh("api", "graphql")
+            self.assertEqual(notify.gh("api", "graphql", allow_graphql_errors=True), response)
+            with self.assertRaises(RuntimeError):
+                notify.gh("api", "repos/example", allow_graphql_errors=True)
+        for response in ("", '{"message": "Bad credentials"}'):
+            with patch.object(notify.subprocess, "run", return_value=Mock(returncode=1, stdout=response)):
+                with self.assertRaises(RuntimeError):
+                    notify.gh("api", "graphql", allow_graphql_errors=True)
 
     def test_empty_selection_does_not_fetch_bodies(self):
         with patch.object(notify, "gh") as gh:
@@ -464,6 +514,87 @@ class NotificationTests(unittest.TestCase):
                     ]
                     self.assertEqual(len(downloads), 1)
                     self.assertEqual(downloads[0].args[2], "10")
+
+    def test_state_restore_reads_every_artifact_page(self):
+        stale = [
+            {
+                "id": index,
+                "expired": False,
+                "created_at": "2026-09-12T00:00:00Z",
+                "workflow_run": {"id": index, "head_branch": "main"},
+            }
+            for index in range(100)
+        ]
+        fresh = {
+            "id": 500,
+            "expired": False,
+            "created_at": "2026-09-12T09:00:00Z",
+            "workflow_run": {"id": 50, "head_branch": "main"},
+        }
+        listing = json.dumps({"artifacts": stale, "total_count": 101})
+        fresh_listing = json.dumps({"artifacts": [fresh], "total_count": 101})
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                notify,
+                "gh",
+                side_effect=[
+                    listing,
+                    fresh_listing,
+                    json.dumps(trusted_run()),
+                    "",
+                ],
+            ) as gh,
+        ):
+            path = Path(directory)
+            saved = state()
+            (path / "state.json").write_text(json.dumps(saved))
+            self.assertEqual(notify.restore_state(path), saved)
+            listings = [
+                call
+                for call in gh.call_args_list
+                if call.args[0] == "api" and "artifacts" in call.args[1]
+            ]
+            self.assertEqual(len(listings), 2)
+            self.assertIn("page=1", listings[0].args[1])
+            self.assertIn("page=2", listings[1].args[1])
+            downloads = [call for call in gh.call_args_list if call.args[0] == "run"]
+            self.assertEqual(downloads[0].args[2], "50")
+
+    def test_state_restore_stops_when_the_artifact_listing_is_complete(self):
+        artifacts = [
+            {
+                "id": index,
+                "expired": False,
+                "created_at": "2026-09-12T01:00:00Z",
+                "workflow_run": {"id": index * 10, "head_branch": "main"},
+            }
+            for index in range(1, 101)
+        ]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                notify,
+                "gh",
+                side_effect=[
+                    json.dumps({"artifacts": artifacts, "total_count": 100}),
+                    json.dumps(trusted_run()),
+                    "",
+                ],
+            ) as gh,
+        ):
+            path = Path(directory)
+            saved = state()
+            (path / "state.json").write_text(json.dumps(saved))
+            self.assertEqual(notify.restore_state(path), saved)
+            listings = [
+                call
+                for call in gh.call_args_list
+                if call.args[0] == "api" and "artifacts" in call.args[1]
+            ]
+            self.assertEqual(len(listings), 1)
+            downloads = [call for call in gh.call_args_list if call.args[0] == "run"]
+            self.assertEqual(downloads[0].args[2], "10")
 
     def test_expired_state_is_not_silently_reset(self):
         artifact = {
