@@ -9,15 +9,15 @@ jobs:
   probe:
     name: probe ${{ matrix.mode }} gap=${{ matrix.gap }} leg=${{ matrix.leg }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { mode: full-lib, gap: "", leg: 1 }
-          - { mode: full-lib, gap: "", leg: 2 }
-          - { mode: full-lib, gap: "", leg: 3 }
-          - { mode: full-lib, gap: "20", leg: 4 }
+          - { mode: full-lib-stack, gap: "", leg: 1 }
+          - { mode: full-lib-stack, gap: "", leg: 2 }
+          - { mode: full-lib-stack, gap: "", leg: 3 }
+          - { mode: full-lib-stack, gap: "", leg: 4 }
     env:
       DO_NOT_TRACK: "1"
       CARGO_INCREMENTAL: "0"
@@ -73,36 +73,48 @@ jobs:
           set -uo pipefail
           bin="$(tail -1 "$RUNNER_TEMP/bin.txt")"
           nproc
-          if [ "$MODE" = single-stress ]; then
-            stress-ng --cpu "$(nproc)" --timeout 2400s > /dev/null 2>&1 &
-            runs=300; args=(--exact "$TEST" --test-threads=1)
-          else
-            runs=12; args=()
-          fi
+          mkdir -p "$RUNNER_TEMP/stacks"
+          export PROBE_STEP_BOUND_S=150
           pass=0; fail=0; dumped=0
-          for i in $(seq 1 "$runs"); do
+          for i in $(seq 1 10); do
             log="$RUNNER_TEMP/run-$i.log"
-            start=$(date +%s%N)
-            "$bin" "${args[@]}" > "$log" 2>&1 &
+            "$bin" > "$log" 2>&1 &
             pid=$!
-            # Stack the stalled process once, while the holder still holds the lock.
-            if [ "$MODE" = single-stress ] && [ "$dumped" -lt 2 ]; then
-              ( sleep 3; if kill -0 "$pid" 2>/dev/null; then
-                  sudo gdb -p "$pid" -batch -ex "thread apply all bt 25" > "$RUNNER_TEMP/stack-$i.txt" 2>&1
-                fi ) &
-            fi
+            # A stall: libtest names the target at 60s while the holder still holds
+            # the lock (bound 150s): stack every thread of the live process then.
+            ( while kill -0 "$pid" 2>/dev/null; do
+                if grep -qF "$TEST has been running for over 60 seconds" "$log"; then
+                  sudo gdb -p "$pid" -batch -ex "thread apply all bt 30" > "$RUNNER_TEMP/stack-$i.txt" 2>&1
+                  sudo cp "$RUNNER_TEMP/stack-$i.txt" "$RUNNER_TEMP/stacks/" 2>/dev/null
+                  break
+                fi
+                sleep 1
+              done ) &
+            mon=$!
             wait "$pid"; rc=$?
-            end=$(date +%s%N)
-            target_line="$(grep -E "^test $TEST \.\.\." "$log" | head -1)"
-            if [ "$rc" -eq 0 ] || ! grep -qE "^test $TEST \.\.\. FAILED" "$log"; then
-              case "$target_line" in *ok*) pass=$((pass+1)); r=ok;; *) r="OTHER(rc=$rc)";; esac
-            else
-              fail=$((fail+1)); r=FAIL
-            fi
-            echo "run $i $r $(( (end-start)/1000000 ))ms :: $target_line"
-            if [ "$r" = FAIL ]; then
-              grep -A4 -E "^---- $TEST" "$log" | head -8
-              if [ -f "$RUNNER_TEMP/stack-$i.txt" ]; then dumped=$((dumped+1)); echo "== stack of run $i =="; grep -E "^Thread|^#[0-9]+ .* in (pa_daemon|tokio|std::sync|parking_lot|epoll|syscall|__futex|futex)" "$RUNNER_TEMP/stack-$i.txt" | head -120; fi
+            wait "$mon"
+            target_line="$(grep -E "^test $TEST \.\.\." "$log" | grep -v running | head -1)"
+            case "$target_line" in *" ok") pass=$((pass+1)); r=ok;; *FAILED) fail=$((fail+1)); r=FAIL;; *) r="OTHER";; esac
+            echo "run $i $r :: $target_line"
+            if [ -f "$RUNNER_TEMP/stack-$i.txt" ]; then
+              echo "== stack of run $i (threads touching pa_daemon/core lock/epoll) =="
+              python3 - "$RUNNER_TEMP/stack-$i.txt" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], errors="replace").read()
+          for block in re.split(r"\n(?=Thread \d+ )", text):
+              head = block.split("\n", 1)[0]
+              frames = [l for l in block.split("\n")[1:] if l.startswith("#")]
+              keys = ("pa_daemon", "epoll_wait", "futex", "mutex", "Condvar", "park", "attach_window", "recv_timeout", "core::ops")
+              hits = [re.sub(r"0x[0-9a-f]+ in ", "", f)[:170] for f in frames if any(k in f for k in keys)]
+              if any("pa_daemon" in f or "epoll" in f for f in frames):
+                  print(head[:120]); print("\n".join("   " + h for h in hits[:14]))
+          PY
             fi
           done
-          echo "RESULT mode=$MODE gap=${ATTACH_PROBE_GAP_MS:-none} pass=$pass fail=$fail runs=$runs"
+          echo "RESULT mode=$MODE pass=$pass fail=$fail runs=10"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: stacks-${{ matrix.leg }}
+          path: ${{ runner.temp }}/stacks/
+          if-no-files-found: ignore

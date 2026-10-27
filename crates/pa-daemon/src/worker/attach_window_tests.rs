@@ -46,7 +46,7 @@ impl Link {
     }
 
     async fn frame(&mut self) -> (Value, Value) {
-        let frame = tokio::time::timeout(STEP_BOUND, self.reader.read_frame())
+        let frame = tokio::time::timeout(*STEP_BOUND, self.reader.read_frame())
             .await
             .expect("the worker answers")
             .expect("a frame")
@@ -122,7 +122,7 @@ async fn served_worker_with_session_client() -> (Arc<Worker>, Link, Link) {
         .await;
     assert!(created.success, "create failed: {created:?}");
     tokio::spawn(Arc::clone(&worker).serve());
-    let deadline = std::time::Instant::now() + STEP_BOUND;
+    let deadline = std::time::Instant::now() + *STEP_BOUND;
     while tokio::net::UnixStream::connect(&socket).await.is_err() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -189,7 +189,12 @@ fn reader_barrier() -> Value {
 
 /// The bound on every step of the held-lock seam: a step that cannot finish within
 /// it fails the test instead of hanging it.
-const STEP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+// PROBE: the bound comes from PROBE_STEP_BOUND_S (default 5s) so a stall can be stacked.
+static STEP_BOUND: std::sync::LazyLock<std::time::Duration> = std::sync::LazyLock::new(|| {
+    std::time::Duration::from_secs(
+        std::env::var("PROBE_STEP_BOUND_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5),
+    )
+});
 
 /// One step the lock holder takes on the test's signal.
 enum HolderStep {
@@ -217,7 +222,7 @@ fn hold_core_lock(
     let holder = std::thread::spawn(move || {
         let mut core = worker.core.lock().unwrap();
         held_tx.send(()).expect("the test waits for the hold");
-        while let Ok(HolderStep::Emit) = step_rx.recv_timeout(STEP_BOUND) {
+        while let Ok(HolderStep::Emit) = step_rx.recv_timeout(*STEP_BOUND) {
             let sequence = core.last_event_sequence + 1;
             core.last_event_sequence = sequence;
             let meta = crate::protocol::create_daemon_event_meta(
@@ -239,7 +244,7 @@ fn hold_core_lock(
         }
     });
     held_rx
-        .recv_timeout(STEP_BOUND)
+        .recv_timeout(*STEP_BOUND)
         .expect("the holder takes the core lock");
     (step_tx, emitted_rx, holder)
 }
@@ -269,7 +274,7 @@ async fn a_direct_attach_streams_an_event_emitted_while_its_snapshot_is_pending(
     // An event emitted while the attach waits to cut its snapshot.
     step.send(HolderStep::Emit).expect("the holder is waiting");
     let sequence = emitted
-        .recv_timeout(STEP_BOUND)
+        .recv_timeout(*STEP_BOUND)
         .expect("the holder emits under the lock");
     let (_, streamed) = client.request("list", &reader_barrier()).await;
     step.send(HolderStep::Release)
