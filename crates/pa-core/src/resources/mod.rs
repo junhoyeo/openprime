@@ -96,6 +96,7 @@ pub struct ResourceLoaderOptions {
     pub bundled_skills_dir: BundledSkillsDir,
     /// Extra force-exclude patterns for built-in skills.
     pub extra_builtin_skill_overrides: Vec<String>,
+    pub scope: crate::packages::ResourceScope,
     pub additional_skill_paths: Vec<String>,
     pub additional_prompt_paths: Vec<String>,
     pub no_skills: bool,

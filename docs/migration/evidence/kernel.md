@@ -55,7 +55,9 @@ Path contract:
   until validation, resolver lease, and atomic publication marker complete.
 - `PRIME_AGENT_KERNEL_VENV` stays exact. A current path (including a current
   symlink) is reused read-only. A stale or unknown existing path errors without
-  mutation. A missing exact path is built directly there under its lock.
+  mutation, except an empty directory and this product's own interrupted build
+  (see "Interrupted explicit builds"). A missing exact path is built directly
+  there under its lock.
 - Automatic recursive generation GC is disabled. Inactive and abandoned
   generations are classified and reported but retained on disk; logical
   selection ignores them. A future explicit descriptor-relative doctor path
@@ -67,6 +69,142 @@ bootstrap marker records the exact requested fingerprint and a strict
 An identical failed request reuses that generation read-only; a changed
 `pyproject.toml` fingerprint selects a new generation. Runtime ABI and promised
 default imports remain fatal before publication.
+
+## Bootstrap skill identity
+
+`--prime-agent-bootstrap` now installs the Python skills a session requests.
+Before this fix it installed none, so the next session asked for a different
+environment identity. On an explicit `PRIME_AGENT_KERNEL_VENV`, that session
+refused the fresh environment as non-current, and the first `python_repl` cell
+failed.
+
+Deliberate internal divergence from TS:
+
+- TS bootstraps without skills and the session then installs its skills into
+  the same venv (`bootstrap.ts:991-1006`). The fork publishes immutable
+  generations and never installs into a published venv, so the bootstrap must
+  install the session's skill set up front. The user-visible TS behavior is
+  kept: bootstrap, then the session works.
+- The install set (the environment identity) is every resolved Python skill
+  before the host-capability filter. TS installs only the model-visible skills
+  (`agent-session.ts:10791`). Print, RPC, and daemon sessions wire different
+  controllers (`agent-message`, `agent-observe`, `rlm-heartbeat`), so a
+  filtered set would give each embedding its own identity. One identity across
+  embeddings is what immutable generations need. Pre-import and model
+  visibility are unchanged: a print session still does not pre-import
+  `agent_observe`.
+- Settings exclusions, sign-in gating of built-in integrations, and
+  user/project precedence still apply before the install set is taken.
+- `runtime_wiring::kernel_install_skills` computes the install set. Sessions
+  call it on their resolved skills. The bootstrap calls it through
+  `engine::global_kernel_install_skills`, which resolves the bundled and user
+  skills with the same settings and MCP gating, without the project layer.
+
+Consequences:
+
+- Bootstrap runs at install time outside any project, so it prepares the
+  global set: bundled plus user skills. A session inside a project that has its
+  own Python skills requests a different identity. On the default managed path
+  that publishes one more generation. On an explicit `PRIME_AGENT_KERNEL_VENV`
+  it is refused, not rebuilt (#44).
+- Existing managed installs publish one new generation on upgrade, because the
+  identity now includes the controller-backed skills in every embedding.
+- Remaining limitation (#44): an explicit `PRIME_AGENT_KERNEL_VENV` whose
+  requested skill set changes later is refused, not rebuilt.
+- With `PRIME_AGENT_KERNEL_PYTHON` set, the warning "Python skills unavailable
+  in PRIME_AGENT_KERNEL_PYTHON" now checks the install set. In a print
+  session it can name controller-backed skills (`agent_observe`,
+  `rlm_heartbeat`) that print never pre-imports. It is a warning only;
+  pre-import is unchanged.
+
+Tests: `engine::tests::kernel_install_identity_is_shared_across_embeddings_and_bootstrap`
+(print, RPC, and daemon install the same set; a settings-disabled Python skill
+is in neither list; bootstrap equals a project-less session) and
+`engine::tests::bootstrap_install_set_omits_project_local_skills`. The ignored
+network test `packaged_layout_e2e::bootstrap_kernel_venv_from_packaged_sidecar`
+now asserts the `python_repl` tool result, not the echoed cell source, and runs
+in the `packaged-bootstrap` CI job.
+
+## Interrupted explicit builds
+
+A short session can exit while its prewarm still builds a missing explicit
+`PRIME_AGENT_KERNEL_VENV` (for example `prime-agent -p 'Reply with exactly:
+pong'`, which answers without Python and exits in about 1.6 s). Before this
+fix that left a partial venv with no version file, and every later session
+refused the path forever.
+
+Now:
+
+- Right after the atomic `create_dir` and before uv runs, the attempt writes a
+  build record beside the path: `<venv>.prime-agent-build.json` (version,
+  token, directory identity, owner pid and process-start id). It cannot go
+  inside the directory, because uv 0.9.5 refuses `uv venv` on a non-empty
+  target. The record is removed when the build validates.
+- An attempt that fails, or is dropped before it validates (the print runtime
+  cancels the prewarm at exit), renames its own directory to
+  `<venv>.abandoned-<token>`. The rename runs only when the path still has the
+  recorded directory identity. Drop does nothing else on the runtime thread
+  except removing its own unchanged record.
+- Under the bootstrap lock, a non-current explicit path is recovered and then
+  built again in two cases only:
+  - An empty real directory is removed with a non-recursive `rmdir`, which
+    fails if anything appears.
+  - This product's own abandoned build: a valid record whose owner is dead
+    (the pid is gone or its start id differs), a direct directory with the
+    recorded identity, and no `.bootstrap-version`. It is renamed aside.
+- Everything else is refused untouched, as before: no record, an unreadable
+  record, a live or unknowable owner, another directory identity (a swapped
+  path), a symlink, or a path that got as far as a version file.
+
+Behavior change: our own unpublished failed or interrupted path is no longer
+left at `<venv>` for inspection. It moves aside to `<venv>.abandoned-<token>`.
+Foreign, unknown, and identity-mismatched paths are still retained untouched.
+
+Retain-only: abandoned directories are never deleted automatically. They
+accumulate beside the path. Each rename logs the kernel diagnostic
+`abandoned kernel build retained; automatic recursive deletion is disabled`
+with the retained path, and recovery also prints it to the user. Remove them
+manually when no longer needed.
+
+Residual: a process killed between `create_dir` and the record write leaves an
+empty directory with no record. The empty-directory rule above recovers it.
+
+Other consequences:
+
+- A non-current existing explicit path now takes the sibling bootstrap lock
+  before it is refused, so recovery can run under the lock. In a read-only
+  parent directory the user gets the lock error ("cannot create the bootstrap
+  lock ... choose a writable PRIME_AGENT_KERNEL_VENV or set
+  PRIME_AGENT_KERNEL_PYTHON") instead of the non-current refusal. When another
+  process holds the lock, the refusal can wait up to the lock timeout (120 s).
+- A path that cannot be inspected (for example an unreadable directory) is
+  left untouched and gets the unchanged non-current refusal with its path.
+- Asides accumulate: each failed or interrupted retry adds one
+  `<venv>.abandoned-<token>` directory. A setup that fails the same way every
+  time adds one per session.
+- If the rename aside fails while the path still holds the recorded directory,
+  the attempt keeps its build record, so a later run reclaims the path once
+  this owner is dead. Windows caveat: a killed uv or a probe may still hold
+  handles in the directory (`kill_on_drop` does not wait for exit), so the
+  rename can fail with a sharing violation. The kept record lets the next
+  session retry it.
+
+Tests (`kernel_bootstrap_generations`, red first on main):
+`explicit_build_dropped_mid_bootstrap_is_set_aside_and_rebuilt` (in-process
+abort while the fake uv is paused),
+`explicit_build_killed_mid_bootstrap_is_set_aside_and_rebuilt` (SIGKILL of the
+bootstrap process group; the next caller rebuilds and the abandoned directory
+is retained with its contents), and
+`empty_explicit_dir_is_removed_without_recursion_and_rebuilt`. Negative
+controls: `stale_explicit_kernel_venv_is_never_replaced_or_deleted` (foreign
+directory, no record), `explicit_build_record_with_a_live_owner_is_refused_untouched`,
+`explicit_build_record_for_another_directory_is_refused_untouched`, and
+`exact_override_identity_swap_is_retained_and_never_accepted` (swapped during
+the build: untouched, nothing set aside),
+`explicit_build_record_with_an_unknown_owner_is_refused_untouched`,
+`explicit_build_record_beside_a_version_file_is_refused_untouched`, and
+`unreadable_explicit_dir_gets_the_unchanged_refusal`.
+`failed_set_aside_keeps_the_build_record` covers the failed-rename case.
 
 ## Runtime ABI boundary
 

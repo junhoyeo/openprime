@@ -351,11 +351,10 @@ jobs:
           test -n "${kernel_python}"
           test -x "${kernel_python}"
 
-          # The bootstrap never syncs skills (TS parity) and generations are
-          # immutable, so one faux print-mode turn makes the product publish
-          # the skill-bearing generation a first session would use. Tests pin
-          # that interpreter; pinning the skill-less bootstrap one disables
-          # every bundled Python skill under the override.
+          # The bootstrap installs the global skill set a project-less
+          # session requests; one faux print-mode turn proves a session
+          # imports the bundled skills on that generation. Tests pin the
+          # interpreter the session resolved.
           runtime_script='{"responses":[{"content":[{"type":"toolCall","name":"python_repl","arguments":{"code":"import goal, agent_message\nprint(\"TEST_RUNTIME_\" + \"READY\")"}}]},{"text":"ready"}]}'
           DO_NOT_TRACK=1 PRIME_AGENT_FAUX_SCRIPT="${runtime_script}" \
             ./target/debug/prime-agent --mode json -p "prepare the test runtime" > "${RUNNER_TEMP}/test-runtime.jsonl"
@@ -451,6 +450,43 @@ jobs:
           python3 scripts/test_ci_pr_crates.py
           python3 scripts/test_ci_test_shard_summary.py
           python3 scripts/ci_test_shard_summary.py --total ${{ env.SHARD_COUNT }} --dir manifests
+
+  # The packaged-layout bootstrap e2e: `--prime-agent-bootstrap` builds a
+  # fresh explicit PRIME_AGENT_KERNEL_VENV from the exe-adjacent runtime
+  # sidecar (uv + PyPI), then a print session runs a python_repl cell on it.
+  # The test is #[ignore] (network, minutes), so the shards never run it;
+  # this job runs exactly that test and audits that it executed.
+  packaged-bootstrap:
+    name: packaged kernel bootstrap e2e
+    needs: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: needs.trust.result == 'success' && needs.trust.outputs.allowed == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1 action pin; the SHA selects the toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Restore the shards' shared entry and save nothing: the cache
+          # quota note on the test-shard job applies here too.
+          shared-key: test-shards
+          save-if: false
+      - name: Install uv (the product bootstrap under test uses it)
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run the packaged bootstrap e2e
+        env:
+          DO_NOT_TRACK: "1"
+        run: |
+          set -euo pipefail
+          test_name='bootstrap_kernel_venv_from_packaged_sidecar'
+          log="${RUNNER_TEMP}/packaged-bootstrap.log"
+          cargo test --locked -p pa-cli --test packaged_layout_e2e -- --ignored --exact "${test_name}" 2>&1 | tee "${log}"
+          grep -F "test ${test_name} ... ok" "${log}"
+          grep -F 'test result: ok. 1 passed; 0 failed' "${log}"
 
   # The vendored runtime suite (prime-agent-runtime): the kernel-side Python
   # (`bash()`, the repl protocol, the bounded-await contract) has no Rust test,
@@ -553,6 +589,7 @@ jobs:
         clippy-test,
         test-shard,
         test-summary,
+        packaged-bootstrap,
         runtime,
         windows-cross,
         deny,

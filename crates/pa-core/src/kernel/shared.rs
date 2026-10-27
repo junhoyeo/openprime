@@ -350,6 +350,8 @@ pub struct KernelManagerOptions {
     pub env: HashMap<String, String>,
     pub session_id: Option<String>,
     pub host_handlers: HostRequestHandlers,
+    /// The Python skills the auto-bootstrapped environment installs (its
+    /// identity); pre-imports ride `bootstrap_code`.
     pub python_skills: Vec<KernelPythonSkill>,
     /// Fires when the last live background `bash()` handle settles (its activity
     /// track empties or the kernel tears down), so owed continuations can resume.

@@ -40,6 +40,7 @@ impl Fixture {
             settings,
             bundled_skills_dir: BundledSkillsDir::Disabled,
             extra_builtin_skill_overrides: Vec::new(),
+            scope: crate::packages::ResourceScope::UserAndProject,
         });
         Self {
             root,
@@ -904,6 +905,7 @@ fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
         settings: SettingsManager::create(fixture.manager.cwd(), &fixture.agent_dir),
         bundled_skills_dir: BundledSkillsDir::Directory(bundled),
         extra_builtin_skill_overrides: vec!["-other-skill/SKILL.md".to_string()],
+        scope: crate::packages::ResourceScope::UserAndProject,
     });
     let result = manager.resolve().unwrap();
     let websearch = result
@@ -1002,6 +1004,7 @@ fn empty_bundled_skills_dir_warns() {
         settings,
         bundled_skills_dir: BundledSkillsDir::Directory(fixture.temp_dir.join("no-such-dir")),
         extra_builtin_skill_overrides: Vec::new(),
+        scope: crate::packages::ResourceScope::UserAndProject,
     });
 
     let result = manager.resolve().unwrap();
@@ -1032,6 +1035,7 @@ fn disabled_builtin_skills_are_not_collected() {
         settings,
         bundled_skills_dir: BundledSkillsDir::Directory(bundled),
         extra_builtin_skill_overrides: Vec::new(),
+        scope: crate::packages::ResourceScope::UserAndProject,
     });
 
     let result = manager.resolve().unwrap();

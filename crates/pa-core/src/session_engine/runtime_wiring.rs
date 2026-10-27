@@ -217,6 +217,16 @@ pub fn model_visible_skills(skills: Vec<Skill>, handlers: &HostRequestHandlers) 
         .collect()
 }
 
+/// The kernel environment's install identity: every resolved Python skill,
+/// BEFORE the host-capability filter of [`model_visible_skills`]. Print,
+/// RPC, and daemon sessions wire different controllers, so filtering first
+/// would give each embedding its own immutable environment. Settings
+/// exclusions and user/project precedence are already applied in `skills`.
+#[must_use]
+pub fn kernel_install_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
+    kernel_python_skills(skills)
+}
+
 /// Kernel-side Python skill modules, pre-imported at bootstrap.
 #[must_use]
 pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
@@ -246,6 +256,7 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 pub fn kernel_provisioner(
     session_id: String,
     handlers: HostRequestHandlers,
+    installed_python_skills: Vec<KernelPythonSkill>,
     python_skills: Vec<KernelPythonSkill>,
     cwd: std::path::PathBuf,
     agent_dir: &std::path::Path,
@@ -295,6 +306,7 @@ pub fn kernel_provisioner(
             shell_path,
             session_id: Some(session_id),
             host_handlers: handlers,
+            installed_python_skills,
             python_skills,
             // Only persistent sessions (which have an artifact dir) get
             // a revivable snapshot (TS `snapshotDir`).

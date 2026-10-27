@@ -26,9 +26,9 @@ use venv::{
     bootstrap_venv, expand_home, generation_identity, generation_root, has_prime_agent_runtime,
     kernel_ready, kernel_ready_read_only, kernel_runtime_ready, lease_for_resolver,
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
-    prepare_generation_root, published_candidates, recorded_unavailable_python_skills,
-    resolve_writable_kernel_venv_dir, BootstrapPythonSkill, GenerationBuild,
-    SUPPORTED_RLM_RUNTIME_ABI,
+    prepare_generation_root, published_candidates, reclaim_explicit_path,
+    recorded_unavailable_python_skills, resolve_writable_kernel_venv_dir, BootstrapPythonSkill,
+    ExplicitBuild, ExplicitReclaim, GenerationBuild, SUPPORTED_RLM_RUNTIME_ABI,
 };
 pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
 
@@ -276,8 +276,10 @@ fn exact_venv_stale_error(venv: &std::path::Path) -> anyhow::Error {
 }
 
 /// The explicit override is caller-owned and exact. A current path is read
-/// only; a stale, broken, symlinked-to-stale, or otherwise unknown path is
-/// never replaced. A missing path is the only path this process may build.
+/// only. A missing path is built directly there under its lock. A non-current
+/// existing path is refused untouched, except an empty directory (removed
+/// with a non-recursive rmdir) and this product's own abandoned build (moved
+/// aside, retained); both are then built again.
 async fn ensure_exact_kernel_venv(
     options: &EnsureKernelPythonOptions,
     python_skills: &[BootstrapPythonSkill],
@@ -291,16 +293,6 @@ async fn ensure_exact_kernel_venv(
         report_recorded_unavailable_skills(options, venv);
         return Ok(python);
     }
-    match std::fs::symlink_metadata(venv) {
-        Ok(_) => return Err(exact_venv_stale_error(venv)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(anyhow!(
-                "cannot inspect PRIME_AGENT_KERNEL_VENV at {} without risking another owner's files: {error}",
-                venv.display()
-            ));
-        }
-    }
 
     let release_lock = acquire_bootstrap_lock(venv).await.map_err(|error| {
         anyhow!(
@@ -312,6 +304,12 @@ async fn ensure_exact_kernel_venv(
         if kernel_ready_read_only(&python_str, venv, runtime_identity, python_skills) {
             report_recorded_unavailable_skills(options, venv);
             return Ok(python);
+        }
+        if let ExplicitReclaim::SetAside(aside) = reclaim_explicit_path(venv) {
+            options.report(&format!(
+                "Warning: an interrupted kernel setup was moved aside and retained at {}; remove it when no longer needed",
+                aside.display()
+            ));
         }
         match std::fs::symlink_metadata(venv) {
             Ok(_) => return Err(exact_venv_stale_error(venv)),
@@ -325,8 +323,8 @@ async fn ensure_exact_kernel_venv(
         }
         options.report("› setting up python kernel (one-time, ~30s)…");
         // Atomically reserve the exact missing path before uv. It remains at
-        // that path (never renamed), so Windows entry points and pyvenv.cfg
-        // embed the caller's exact directory.
+        // that path (never renamed while building), so Windows entry points
+        // and pyvenv.cfg embed the caller's exact directory.
         std::fs::create_dir(venv).map_err(|error| {
             anyhow!(
                 "could not atomically reserve PRIME_AGENT_KERNEL_VENV at {}: {error}",
@@ -334,14 +332,9 @@ async fn ensure_exact_kernel_venv(
             )
         })?;
         crate::platform::perms::restrict_dir(venv)?;
-        let Some(expected_identity) = crate::platform::directory_identity(venv)? else {
-            return Err(anyhow!(
-                "filesystem cannot prove PRIME_AGENT_KERNEL_VENV directory identity at {}",
-                venv.display()
-            ));
-        };
-        // A failed partial path is retained for explicit user inspection;
-        // deleting it cannot be made safe if an external process replaced it.
+        // Dropped unpublished (failure, or the runtime cancelling a prewarm),
+        // the claim moves its own partial directory aside, retained.
+        let build = ExplicitBuild::claim(venv)?;
         let bootstrap = bootstrap_venv(
             venv,
             source_dir,
@@ -351,7 +344,7 @@ async fn ensure_exact_kernel_venv(
             None,
         )
         .await;
-        if crate::platform::directory_identity(venv)?.as_ref() != Some(&expected_identity) {
+        if !build.owns_path() {
             return Err(anyhow!(
                 "PRIME_AGENT_KERNEL_VENV ownership changed during bootstrap; the path was retained without publication: {}",
                 venv.display()
@@ -359,6 +352,7 @@ async fn ensure_exact_kernel_venv(
         }
         bootstrap?;
         validate_built_environment(&python, venv, runtime_identity, python_skills)?;
+        build.publish();
         options.report("✓ ready");
         Ok(python)
     }

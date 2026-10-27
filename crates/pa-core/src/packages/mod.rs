@@ -17,7 +17,7 @@ mod tests;
 
 pub use manager::{
     BundledSkillsDir, ConfiguredPackage, PackageManager, PackageManagerOptions, PackageUpdate,
-    ProgressAction, ProgressEvent, ProgressEventKind, UserOrProject,
+    ProgressAction, ProgressEvent, ProgressEventKind, ResourceScope, UserOrProject,
 };
 pub use resolve::{
     MetadataSource, MissingSourceAction, PathMetadata, ResolvedPaths, ResolvedResource,

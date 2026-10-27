@@ -53,10 +53,6 @@ impl PackageManager {
         let user_dirs = RESOURCE_TYPES
             .map(|resource_type| global_base_dir.join(resource_type_dir_name(resource_type)));
         let user_agents_skills_dir = home_dir().join(".agents").join("skills");
-        let project_agents_skill_dirs = collect_ancestor_agents_skill_dirs(self.cwd())
-            .into_iter()
-            .filter(|dir| *dir != user_agents_skills_dir)
-            .collect::<Vec<PathBuf>>();
 
         let add_resources = |accumulator: &mut ResourceAccumulator,
                              resource_type: ResourceType,
@@ -72,37 +68,45 @@ impl PackageManager {
             }
         };
 
-        add_resources(
-            accumulator,
-            ResourceType::Skills,
-            [
-                collect_skill_entries(&project_dirs[0], SkillDiscoveryMode::Pi),
-                project_agents_skill_dirs
-                    .iter()
-                    .flat_map(|dir| collect_skill_entries(dir, SkillDiscoveryMode::Agents))
-                    .collect(),
-            ]
-            .concat(),
-            &project_metadata,
-            &project_overrides[0],
-            project_base_dir,
-        );
-        add_resources(
-            accumulator,
-            ResourceType::Prompts,
-            collect_auto_prompt_entries(&project_dirs[1]),
-            &project_metadata,
-            &project_overrides[1],
-            project_base_dir,
-        );
-        add_resources(
-            accumulator,
-            ResourceType::Themes,
-            collect_auto_theme_entries(&project_dirs[2]),
-            &project_metadata,
-            &project_overrides[2],
-            project_base_dir,
-        );
+        // Project layers: settings-base directories under `cwd` and the
+        // ancestor `.agents/skills` scan.
+        if self.includes_project() {
+            let project_agents_skill_dirs = collect_ancestor_agents_skill_dirs(self.cwd())
+                .into_iter()
+                .filter(|dir| *dir != user_agents_skills_dir)
+                .collect::<Vec<PathBuf>>();
+            add_resources(
+                accumulator,
+                ResourceType::Skills,
+                [
+                    collect_skill_entries(&project_dirs[0], SkillDiscoveryMode::Pi),
+                    project_agents_skill_dirs
+                        .iter()
+                        .flat_map(|dir| collect_skill_entries(dir, SkillDiscoveryMode::Agents))
+                        .collect(),
+                ]
+                .concat(),
+                &project_metadata,
+                &project_overrides[0],
+                project_base_dir,
+            );
+            add_resources(
+                accumulator,
+                ResourceType::Prompts,
+                collect_auto_prompt_entries(&project_dirs[1]),
+                &project_metadata,
+                &project_overrides[1],
+                project_base_dir,
+            );
+            add_resources(
+                accumulator,
+                ResourceType::Themes,
+                collect_auto_theme_entries(&project_dirs[2]),
+                &project_metadata,
+                &project_overrides[2],
+                project_base_dir,
+            );
+        }
 
         add_resources(
             accumulator,

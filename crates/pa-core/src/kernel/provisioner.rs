@@ -117,6 +117,10 @@ pub struct IpythonKernelProvisionerOptions {
     pub shell_path: Option<PathBuf>,
     pub session_id: Option<String>,
     pub host_handlers: HostRequestHandlers,
+    /// The Python skills the kernel environment installs: its identity.
+    /// A superset of `python_skills` (see `kernel_install_skills`).
+    pub installed_python_skills: Vec<KernelPythonSkill>,
+    /// The Python skills pre-imported into the kernel namespace.
     pub python_skills: Vec<KernelPythonSkill>,
     /// Artifact directory of a persistent session; the revivable snapshot and
     /// the stderr log live there. `None` for ephemeral sessions.
@@ -295,6 +299,13 @@ impl IpythonKernelProvisioner {
     #[must_use]
     pub(crate) fn python_skills(&self) -> &[KernelPythonSkill] {
         &self.inner.options.python_skills
+    }
+
+    /// The Python skills the kernel environment installs.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn installed_python_skills(&self) -> &[KernelPythonSkill] {
+        &self.inner.options.installed_python_skills
     }
 
     /// Result of reviving a prior session's namespace on the last kernel start.
@@ -1092,7 +1103,7 @@ async fn start_kernel_impl(
         env,
         session_id: options.session_id.clone(),
         host_handlers: options.host_handlers.clone(),
-        python_skills: options.python_skills.clone(),
+        python_skills: options.installed_python_skills.clone(),
         on_background_work_settled: options.on_background_work_settled.clone(),
         snapshot,
         bootstrap_code: Some(bootstrap_code.clone()),

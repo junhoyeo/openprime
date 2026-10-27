@@ -176,6 +176,7 @@ pub(crate) fn resolve_session_resources(
         settings,
         bundled_skills_dir: options.bundled_skills_dir.clone(),
         extra_builtin_skill_overrides: options.extra_builtin_skill_overrides.clone(),
+        scope: options.scope,
     });
     let resolved = manager.resolve()?;
 

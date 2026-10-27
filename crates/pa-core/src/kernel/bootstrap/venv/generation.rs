@@ -15,6 +15,11 @@ use sha2::Digest;
 use super::{default_rlm_extra_uv_args, kernel_venv_python, BootstrapPythonSkill, PYTHON_VERSION};
 use crate::platform::{directory_identity, DirectoryIdentity};
 
+mod explicit;
+pub(in crate::kernel::bootstrap) use explicit::{
+    reclaim_explicit_path, ExplicitBuild, ExplicitReclaim,
+};
+
 const GENERATION_PREFIX: &str = "generation-";
 const PUBLISHED_FILE: &str = ".generation-published";
 const OWNER_FILE: &str = ".generation-owner";

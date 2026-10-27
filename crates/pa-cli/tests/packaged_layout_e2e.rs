@@ -212,6 +212,40 @@ fn kernel_boot_script(receipt: &Path) -> serde_json::Value {
     })
 }
 
+/// The `python_repl` cell OUTPUT, not the echoed tool-call source: the text of
+/// every successful `tool_execution_end` result in the JSON event stream.
+fn python_repl_results(stdout: &str) -> (Vec<String>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut failed = Vec::new();
+    for event in stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "tool_execution_end" && event["toolName"] == "python_repl")
+    {
+        let text = event["result"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if event["isError"] == serde_json::Value::Bool(true) {
+            failed.push(text);
+        } else {
+            ok.push(text);
+        }
+    }
+    (ok, failed)
+}
+
+fn assert_kernel_cell_printed_boot_ok(stdout: &str, stderr: &str) {
+    let (ok, failed) = python_repl_results(stdout);
+    assert!(
+        ok.iter().any(|text| text.contains("KERNEL_BOOT_OK")),
+        "no successful python_repl result printed KERNEL_BOOT_OK; ok results: {ok:?}; failed results: {failed:?}; stderr: {stderr}"
+    );
+}
+
 fn run_json_turn(
     command: &mut Command,
     script: &serde_json::Value,
@@ -278,12 +312,7 @@ fn packaged_session_boots_kernel_without_pi_package_dir() {
     command.env("PRIME_AGENT_KERNEL_PYTHON", &kernel_python);
     let (stdout, stderr, code) = run_json_turn(&mut command, &script);
     assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
-    // The marker is supplemental only: the faux tool-call source also contains
-    // this text. The receipt assertions below are the execution proof.
-    assert!(
-        stdout.contains("KERNEL_BOOT_OK"),
-        "kernel cell output missing; stdout: {stdout}\nstderr: {stderr}"
-    );
+    assert_kernel_cell_printed_boot_ok(&stdout, &stderr);
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&receipt).unwrap_or_default())
             .unwrap_or(serde_json::Value::Null);
@@ -1001,11 +1030,8 @@ fn bootstrap_kernel_venv_from_packaged_sidecar() {
     let mut command = box_.command(staged);
     command.env("PRIME_AGENT_KERNEL_VENV", &venv);
     let (stdout, stderr, code) = run_json_turn(&mut command, &script);
-    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
-    assert!(
-        stdout.contains("KERNEL_BOOT_OK"),
-        "kernel cell output missing; stdout: {stdout}\nstderr: {stderr}"
-    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_kernel_cell_printed_boot_ok(&stdout, &stderr);
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&receipt).unwrap_or_default())
             .unwrap_or(serde_json::Value::Null);
