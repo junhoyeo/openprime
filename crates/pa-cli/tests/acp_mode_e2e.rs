@@ -2505,7 +2505,7 @@ fn acp_eof_during_settle_exits_and_leaves_resident_subagents() {
         match children[0]["status"].as_str() {
             Some("running") => break,
             Some("queued") => {}
-            _ => panic!("EOF left the resident child running: {children:?}"),
+            _ => panic!("EOF settled or cancelled the resident child: {children:?}"),
         }
         assert!(
             Instant::now() < deadline,
