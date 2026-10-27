@@ -87,6 +87,10 @@ if [ "$1" = "venv" ]; then
     exit 17
   fi
   if [ -n "${UV_OWNER_DIR:-}" ] && mkdir "$UV_OWNER_DIR" 2>/dev/null; then
+    if [ "${UV_PARTIAL:-}" = "1" ]; then
+      mkdir -p "$target/lib"
+      printf partial > "$target/lib/partial-install"
+    fi
     printf x > "$UV_STARTED_FIFO"
     cat "$UV_RELEASE_FIFO" >/dev/null
   fi
@@ -186,6 +190,7 @@ fn bootstrap_env(root: &Path, bin: &Path, package: &Path, log: &Path) -> EnvRest
         ("UV_OWNER_DIR", None),
         ("UV_STARTED_FIFO", None),
         ("UV_RELEASE_FIFO", None),
+        ("UV_PARTIAL", None),
     ])
 }
 
@@ -514,6 +519,306 @@ fn same_identity_cross_process_callers_publish_once() {
     );
 }
 
+fn build_record_path(exact: &Path) -> PathBuf {
+    exact.with_file_name(format!(
+        "{}.prime-agent-build.json",
+        exact.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn abandoned_siblings(exact: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}.abandoned-",
+        exact.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::read_dir(exact.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// The paused fake uv's `cat` may outlive its killed shell: release it when
+/// a reader is still there, never block when none is.
+fn release_paused_uv(release_fifo: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Ok(mut release) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(release_fifo)
+    {
+        let _ = release.write_all(b"x");
+    }
+}
+
+/// Blocks until the fake uv reaches its rendezvous inside `uv venv`.
+fn wait_for_paused_uv(started_fifo: &Path) {
+    use std::io::Read;
+
+    let mut started = std::fs::File::open(started_fifo).unwrap();
+    let mut byte = [0u8; 1];
+    started.read_exact(&mut byte).unwrap();
+}
+
+struct PauseFifos {
+    owner_dir: PathBuf,
+    started: PathBuf,
+    release: PathBuf,
+}
+
+fn pause_fifos(root: &Path) -> PauseFifos {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let fifos = PauseFifos {
+        owner_dir: root.join("uv-owner"),
+        started: root.join("uv-started.fifo"),
+        release: root.join("uv-release.fifo"),
+    };
+    mkfifo(&fifos.started, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    mkfifo(&fifos.release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    fifos
+}
+
+fn explicit_env(
+    bin: &Path,
+    package: &Path,
+    log: &Path,
+    exact: &Path,
+    pause: Option<&PauseFifos>,
+) -> EnvRestore {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let lossy = |path: &Path| Some(path.to_string_lossy().into_owned());
+    EnvRestore::configure(&[
+        ("PATH", Some(path)),
+        ("PI_PACKAGE_DIR", lossy(package)),
+        ("PRIME_AGENT_KERNEL_VENV", lossy(exact)),
+        ("PRIME_AGENT_KERNEL_PYTHON", None),
+        ("UV_LOG", lossy(log)),
+        ("UV_FAIL_VENV", None),
+        ("UV_SWAP_TARGET", None),
+        ("UV_FAIL_SKILL", None),
+        ("FAKE_MISSING_DEFAULT", None),
+        ("UV_OWNER_DIR", pause.and_then(|p| lossy(&p.owner_dir))),
+        ("UV_STARTED_FIFO", pause.and_then(|p| lossy(&p.started))),
+        ("UV_RELEASE_FIFO", pause.and_then(|p| lossy(&p.release))),
+        ("UV_PARTIAL", pause.map(|_| "1".to_string())),
+    ])
+}
+
+/// A short print session drops its prewarm mid-build (the runtime shuts
+/// down). The attempt moves its own partial directory aside, retained, so
+/// the next session builds the exact path again.
+#[tokio::test]
+async fn explicit_build_dropped_mid_bootstrap_is_set_aside_and_rebuilt() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let pause = pause_fifos(root.path());
+    let _env = explicit_env(&bin, &package, &log, &exact, Some(&pause));
+
+    let attempt = tokio::spawn(ensure_kernel_python(EnsureKernelPythonOptions::default()));
+    let started = pause.started.clone();
+    tokio::task::spawn_blocking(move || wait_for_paused_uv(&started))
+        .await
+        .unwrap();
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    release_paused_uv(&pause.release);
+
+    assert!(
+        std::fs::symlink_metadata(&exact).is_err(),
+        "the dropped attempt left its partial build at the exact path"
+    );
+    let abandoned = abandoned_siblings(&exact);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(
+        std::fs::read_to_string(abandoned[0].join("lib/partial-install")).unwrap(),
+        "partial",
+        "the abandoned build is retained with its contents"
+    );
+    assert!(!build_record_path(&exact).exists());
+
+    let python = ensure_kernel_python(EnsureKernelPythonOptions::default())
+        .await
+        .expect("the next session builds the exact path");
+    assert_eq!(python, exact.join("bin/python"));
+    assert!(!build_record_path(&exact).exists());
+}
+
+/// A bootstrap process killed mid-build (no destructor runs) leaves its
+/// partial directory and build record. The next caller proves the record
+/// is its own product's, the owner dead, and the directory the recorded
+/// one; it moves the directory aside, retained, and rebuilds.
+#[test]
+fn explicit_build_killed_mid_bootstrap_is_set_aside_and_rebuilt() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let pause = pause_fifos(root.path());
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "bootstrap_subprocess_entry", "--nocapture"])
+        .env("PATH", &path)
+        .env("PI_PACKAGE_DIR", &package)
+        .env("PRIME_AGENT_KERNEL_VENV", &exact)
+        .env("UV_LOG", &log)
+        .env("UV_OWNER_DIR", &pause.owner_dir)
+        .env("UV_STARTED_FIFO", &pause.started)
+        .env("UV_RELEASE_FIFO", &pause.release)
+        .env("UV_PARTIAL", "1")
+        .env(
+            "PA_KERNEL_BOOTSTRAP_CHILD_RESULT",
+            root.path().join("never-written"),
+        )
+        .env_remove("PRIME_AGENT_KERNEL_PYTHON")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_for_paused_uv(&pause.started);
+    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).unwrap();
+    child.wait().unwrap();
+    assert!(exact.join("lib/partial-install").is_file());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let python = runtime.block_on(async {
+        let _serial = ENV_LOCK.lock().await;
+        invalidate_runtime_probe_cache();
+        let _env = explicit_env(&bin, &package, &log, &exact, None);
+        ensure_kernel_python(EnsureKernelPythonOptions::default()).await
+    });
+    let python = python.expect("an abandoned own build is set aside and rebuilt");
+    assert_eq!(python, exact.join("bin/python"));
+    assert!(!exact.join("lib/partial-install").exists());
+    let abandoned = abandoned_siblings(&exact);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(
+        std::fs::read_to_string(abandoned[0].join("lib/partial-install")).unwrap(),
+        "partial",
+        "the abandoned build is retained with its contents"
+    );
+    assert!(!build_record_path(&exact).exists());
+}
+
+/// An EMPTY exact directory holds nothing to lose: a non-recursive rmdir
+/// (which fails if anything appears) clears it, then the path is built.
+#[tokio::test]
+async fn empty_explicit_dir_is_removed_without_recursion_and_rebuilt() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    std::fs::create_dir(&exact).unwrap();
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+
+    let python = ensure_kernel_python(EnsureKernelPythonOptions::default())
+        .await
+        .expect("an empty exact directory is rebuilt");
+    assert_eq!(python, exact.join("bin/python"));
+    assert!(abandoned_siblings(&exact).is_empty());
+}
+
+fn write_build_record(exact: &Path, identity_of: &Path, owner_pid: u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(identity_of).unwrap();
+    let record = serde_json::json!({
+        "version": 2,
+        "token": "00000000-0000-4000-8000-000000000000",
+        "directory_identity": { "volume": metadata.dev(), "file": metadata.ino() },
+        "owner": {
+            "pid": owner_pid,
+            "process_start_id": pa_types::platform::process::process_start_id(owner_pid),
+        },
+    });
+    std::fs::write(build_record_path(exact), format!("{record}\n")).unwrap();
+}
+
+async fn assert_refused_untouched(exact: &Path, log: &Path) {
+    let error = ensure_kernel_python(EnsureKernelPythonOptions::default())
+        .await
+        .expect_err("not provably an abandoned own build");
+    assert!(error.to_string().contains("will not replace"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(exact.join("lib/partial-install")).unwrap(),
+        "partial"
+    );
+    assert!(abandoned_siblings(exact).is_empty());
+    assert!(
+        !log.exists() || std::fs::read_to_string(log).unwrap().is_empty(),
+        "a refused explicit path must not start uv"
+    );
+}
+
+/// A record whose owner is alive is a build in progress (or unknowable):
+/// the directory is refused and untouched.
+#[tokio::test]
+async fn explicit_build_record_with_a_live_owner_is_refused_untouched() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    std::fs::create_dir_all(exact.join("lib")).unwrap();
+    std::fs::write(exact.join("lib/partial-install"), "partial").unwrap();
+    write_build_record(&exact, &exact, std::process::id());
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+
+    assert_refused_untouched(&exact, &log).await;
+    assert!(build_record_path(&exact).exists());
+}
+
+/// A record naming another directory (the path was swapped after the
+/// build began) never authorizes moving the current one.
+#[tokio::test]
+async fn explicit_build_record_for_another_directory_is_refused_untouched() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    std::fs::create_dir_all(exact.join("lib")).unwrap();
+    std::fs::write(exact.join("lib/partial-install"), "partial").unwrap();
+    let other = root.path().join("other-dir");
+    std::fs::create_dir(&other).unwrap();
+    // A dead owner: a reaped child's pid.
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    write_build_record(&exact, &other, dead_pid);
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+
+    assert_refused_untouched(&exact, &log).await;
+}
+
 #[tokio::test]
 async fn explicit_external_runtime_requires_the_subagent_row_abi_before_start() {
     let _serial = ENV_LOCK.lock().await;
@@ -834,6 +1139,8 @@ async fn exact_override_identity_swap_is_retained_and_never_accepted() {
         "foreign"
     );
     assert!(exact.with_extension("owned-before-swap").exists());
+    assert!(abandoned_siblings(&exact).is_empty());
+    assert!(!build_record_path(&exact).exists());
 }
 
 #[tokio::test]
