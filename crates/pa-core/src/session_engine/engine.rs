@@ -182,6 +182,38 @@ fn mcp_gating_blocking(
     crate::mcp::McpManager::prompt_gating(user_servers, agent_dir)
 }
 
+/// The kernel install set `--prime-agent-bootstrap` prepares: what a session
+/// outside any project requests (bundled plus user skills, settings and MCP
+/// sign-in overrides applied). Project-local skills are not part of it; a
+/// session inside a project with its own Python skills requests another
+/// environment.
+///
+/// # Errors
+///
+/// Returns an error when the MCP gating task fails or the skill resources
+/// cannot be loaded.
+pub async fn global_kernel_install_skills(
+    cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
+) -> anyhow::Result<Vec<crate::kernel::bootstrap::KernelPythonSkill>> {
+    let settings = crate::settings::SettingsManager::create_global(agent_dir);
+    let (extra_builtin_skill_overrides, _, _) =
+        mcp_gating(&settings, agent_dir.to_path_buf()).await?;
+    let resources = load_resources(ResourceLoaderOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        settings: Some(settings),
+        extra_builtin_skill_overrides,
+        scope: crate::packages::ResourceScope::UserOnly,
+        no_prompt_templates: true,
+        no_context_files: true,
+        ..Default::default()
+    })?;
+    Ok(super::runtime_wiring::kernel_install_skills(
+        &resources.skills,
+    ))
+}
+
 /// Assemble a session: load resources, build the system prompt, and start the
 /// loop with persistence wiring.
 ///
@@ -469,6 +501,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let model_visible_skills =
         super::runtime_wiring::model_visible_skills(resources.skills.clone(), &handlers);
     let python_skills = super::runtime_wiring::kernel_python_skills(&model_visible_skills);
+    let installed_python_skills = super::runtime_wiring::kernel_install_skills(&resources.skills);
     // TS resolves the serper credential on the host: `!command` key refs
     // cannot run in-kernel (the websearch skill's auth.json fallback reads
     // literals and env-var names, not commands). The credential is read
@@ -497,6 +530,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id.clone(),
         handlers,
+        installed_python_skills,
         python_skills.clone(),
         cwd.clone(),
         &config.agent_dir,

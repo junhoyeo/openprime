@@ -142,7 +142,11 @@ impl PackageManager {
         on_missing: Option<&mut dyn FnMut(&str) -> MissingSourceAction>,
     ) -> Result<ResolvedPaths> {
         let global = self.settings().global_settings().clone();
-        let project = self.settings().project_settings().clone();
+        let project = if self.includes_project() {
+            self.settings().project_settings().clone()
+        } else {
+            crate::settings::Settings::default()
+        };
         let mut accumulator = ResourceAccumulator::default();
 
         let mut all_packages: Vec<(serde_json::Value, SourceScope)> = Vec::new();

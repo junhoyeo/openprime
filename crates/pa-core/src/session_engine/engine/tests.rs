@@ -528,6 +528,18 @@ async fn engine_over(
     cron_store: Option<KernelCronWiring>,
     daemonless: bool,
 ) -> (SessionEngine, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = engine_in(tmp.path(), extra_host_handlers, cron_store, daemonless).await;
+    (engine, tmp)
+}
+
+/// A session over `root/agent` in the project-less cwd `root/project`.
+async fn engine_in(
+    root: &std::path::Path,
+    extra_host_handlers: Option<crate::kernel::shared::HostRequestHandlers>,
+    cron_store: Option<KernelCronWiring>,
+    daemonless: bool,
+) -> SessionEngine {
     let model = pa_agent::types::Model {
         id: "m".into(),
         name: "m".into(),
@@ -541,13 +553,12 @@ async fn engine_over(
         max_tokens_explicit: false,
     };
     let provider = Arc::new(ScriptedProvider::new(model.clone()));
-    let tmp = tempfile::tempdir().unwrap();
-    let cwd = tmp.path().join("project");
+    let cwd = root.join("project");
     std::fs::create_dir_all(&cwd).unwrap();
-    let engine = create_session(SessionEngineConfig {
+    create_session(SessionEngineConfig {
         cron_store,
-        cwd: cwd.clone(),
-        agent_dir: tmp.path().join("agent"),
+        cwd,
+        agent_dir: root.join("agent"),
         model: Some(model),
         stream_fn: Some(provider.stream_fn()),
         extra_host_handlers,
@@ -555,14 +566,22 @@ async fn engine_over(
         ..Default::default()
     })
     .await
-    .unwrap();
-    (engine, tmp)
+    .unwrap()
 }
 
 fn prompt_lists_skill(engine: &SessionEngine, name: &str) -> bool {
     engine
         .system_prompt
         .contains(&format!("<name>{name}</name>"))
+}
+
+fn kernel_install_imports(engine: &SessionEngine) -> Vec<String> {
+    engine
+        .provisioner
+        .installed_python_skills()
+        .iter()
+        .map(|skill| skill.import_name.clone())
+        .collect()
 }
 
 fn kernel_skill_imports(engine: &SessionEngine) -> Vec<String> {
@@ -630,6 +649,112 @@ async fn model_visible_skills_follow_the_embedding_wiring() {
             );
         }
     }
+}
+
+/// One kernel install identity across embeddings: print, RPC, and daemon
+/// sessions install the same Python skills (controller-backed ones too),
+/// while each pre-imports only its model-visible ones. A settings-disabled
+/// Python skill is in neither list. `--prime-agent-bootstrap` resolves the
+/// same set as a session outside any project.
+#[tokio::test]
+async fn kernel_install_identity_is_shared_across_embeddings_and_bootstrap() {
+    let root = tempfile::tempdir().unwrap();
+    let agent_dir = root.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"skills": ["-aside/SKILL.md"]}"#,
+    )
+    .unwrap();
+    let cron_dir = tempfile::tempdir().unwrap();
+    let all_controllers = [
+        "agent_message.send",
+        "agent_observe.list",
+        "rlm_heartbeat.create",
+    ];
+    let cases = [
+        ("print", &["agent_message.send"][..], None, true),
+        ("rpc", &[][..], None, true),
+        (
+            "daemon",
+            &all_controllers[..],
+            Some(cron_wiring(cron_dir.path())),
+            false,
+        ),
+    ];
+    let mut installs = Vec::new();
+    for (label, wired, cron, daemonless) in cases {
+        let engine = engine_in(root.path(), Some(handlers(wired)), cron, daemonless).await;
+        let installed = engine.provisioner.installed_python_skills().to_vec();
+        let imports = kernel_install_imports(&engine);
+        for import in ["agent_message", "agent_observe", "rlm_heartbeat", "compact"] {
+            assert!(
+                imports.iter().any(|name| name == import),
+                "{label}: {import}"
+            );
+        }
+        assert!(!imports.iter().any(|name| name == "aside"), "{label}");
+        assert!(!kernel_skill_imports(&engine)
+            .iter()
+            .any(|name| name == "aside"));
+        if label == "print" {
+            assert!(!kernel_skill_imports(&engine)
+                .iter()
+                .any(|name| name == "agent_observe"));
+        }
+        installs.push((label, installed));
+    }
+    let (_, print) = &installs[0];
+    for (label, installed) in &installs[1..] {
+        assert_eq!(installed, print, "{label} vs print");
+    }
+    let bootstrap = super::global_kernel_install_skills(&root.path().join("project"), &agent_dir)
+        .await
+        .unwrap();
+    assert_eq!(&bootstrap, print, "bootstrap vs a project-less session");
+}
+
+/// Project-local Python skills are a session's own layer: the bootstrap
+/// set leaves them out even when it runs inside that project.
+#[tokio::test]
+async fn bootstrap_install_set_omits_project_local_skills() {
+    let root = tempfile::tempdir().unwrap();
+    let agent_dir = root.path().join("agent");
+    let cwd = root.path().join("project");
+    let skill_dir = cwd
+        .join(".prime")
+        .join("agent")
+        .join("skills")
+        .join("proj-skill");
+    std::fs::create_dir_all(skill_dir.join("src").join("proj_skill")).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: proj-skill\ndescription: Project skill\n---\nBody.",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_dir.join("pyproject.toml"),
+        "[project]\nname = \"proj-skill\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_dir.join("src").join("proj_skill").join("__init__.py"),
+        "",
+    )
+    .unwrap();
+    let engine = engine_in(root.path(), None, None, true).await;
+    assert!(
+        kernel_install_imports(&engine)
+            .iter()
+            .any(|name| name == "proj_skill"),
+        "the fixture must be a resolvable project Python skill"
+    );
+    let bootstrap = super::global_kernel_install_skills(&cwd, &agent_dir)
+        .await
+        .unwrap();
+    assert!(!bootstrap
+        .iter()
+        .any(|skill| skill.import_name == "proj_skill"));
 }
 
 /// A receipt that landed after its cell's tool result persists as a

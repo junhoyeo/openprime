@@ -327,9 +327,21 @@ fn run_runtime_bootstrap() -> Result<i32, String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    match runtime.block_on(pa_core::kernel::ensure_kernel_python(
-        pa_core::kernel::EnsureKernelPythonOptions::default(),
-    )) {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let agent_dir = crate::config::get_agent_dir();
+    // The environment a session outside any project requests, so the next
+    // session reuses it instead of refusing an explicit
+    // PRIME_AGENT_KERNEL_VENV as non-current.
+    let bootstrap = async {
+        let python_skills =
+            pa_core::session_engine::engine::global_kernel_install_skills(&cwd, &agent_dir).await?;
+        pa_core::kernel::ensure_kernel_python(pa_core::kernel::EnsureKernelPythonOptions {
+            python_skills,
+            on_progress: None,
+        })
+        .await
+    };
+    match runtime.block_on(bootstrap) {
         Ok(python) => {
             println!("kernel python: {}", python.display());
             Ok(0)

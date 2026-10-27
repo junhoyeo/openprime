@@ -68,6 +68,56 @@ An identical failed request reuses that generation read-only; a changed
 `pyproject.toml` fingerprint selects a new generation. Runtime ABI and promised
 default imports remain fatal before publication.
 
+## Bootstrap skill identity
+
+`--prime-agent-bootstrap` now installs the Python skills a session requests.
+Before this fix it installed none, so the next session asked for a different
+environment identity. On an explicit `PRIME_AGENT_KERNEL_VENV`, that session
+refused the fresh environment as non-current, and the first `python_repl` cell
+failed.
+
+Deliberate internal divergence from TS:
+
+- TS bootstraps without skills and the session then installs its skills into
+  the same venv (`bootstrap.ts:991-1006`). The fork publishes immutable
+  generations and never installs into a published venv, so the bootstrap must
+  install the session's skill set up front. The user-visible TS behavior is
+  kept: bootstrap, then the session works.
+- The install set (the environment identity) is every resolved Python skill
+  before the host-capability filter. TS installs only the model-visible skills
+  (`agent-session.ts:10791`). Print, RPC, and daemon sessions wire different
+  controllers (`agent-message`, `agent-observe`, `rlm-heartbeat`), so a
+  filtered set would give each embedding its own identity. One identity across
+  embeddings is what immutable generations need. Pre-import and model
+  visibility are unchanged: a print session still does not pre-import
+  `agent_observe`.
+- Settings exclusions, sign-in gating of built-in integrations, and
+  user/project precedence still apply before the install set is taken.
+- `runtime_wiring::kernel_install_skills` computes the install set. Sessions
+  call it on their resolved skills. The bootstrap calls it through
+  `engine::global_kernel_install_skills`, which resolves the bundled and user
+  skills with the same settings and MCP gating, without the project layer.
+
+Consequences:
+
+- Bootstrap runs at install time outside any project, so it prepares the
+  global set: bundled plus user skills. A session inside a project that has its
+  own Python skills requests a different identity. On the default managed path
+  that publishes one more generation. On an explicit `PRIME_AGENT_KERNEL_VENV`
+  it is refused, not rebuilt (#44).
+- Existing managed installs publish one new generation on upgrade, because the
+  identity now includes the controller-backed skills in every embedding.
+- Remaining limitation (#44): an explicit `PRIME_AGENT_KERNEL_VENV` whose
+  requested skill set changes later is refused, not rebuilt.
+
+Tests: `engine::tests::kernel_install_identity_is_shared_across_embeddings_and_bootstrap`
+(print, RPC, and daemon install the same set; a settings-disabled Python skill
+is in neither list; bootstrap equals a project-less session) and
+`engine::tests::bootstrap_install_set_omits_project_local_skills`. The ignored
+network test `packaged_layout_e2e::bootstrap_kernel_venv_from_packaged_sidecar`
+now asserts the `python_repl` tool result, not the echoed cell source, and runs
+in the `packaged-bootstrap` CI job.
+
 ## Runtime ABI boundary
 
 Session/runtime producer commit `a032278ba` owns public integer

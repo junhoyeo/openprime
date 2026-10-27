@@ -53,7 +53,8 @@ pub trait SettingsStorage: Send + Sync {
 /// empty directory), retrying briefly on contention like the TS `acquireLockSyncWithRetry`.
 pub struct FileSettingsStorage {
     global_path: PathBuf,
-    project_path: PathBuf,
+    /// `None`: no project scope (reads as absent, never written).
+    project_path: Option<PathBuf>,
 }
 
 use crate::platform::lock_dir::LockDir as LockGuard;
@@ -66,14 +67,22 @@ impl FileSettingsStorage {
         let agent_dir: PathBuf = agent_dir.into();
         FileSettingsStorage {
             global_path: agent_dir.join("settings.json"),
-            project_path: cwd.into().join(CONFIG_DIR_NAME).join("settings.json"),
+            project_path: Some(cwd.into().join(CONFIG_DIR_NAME).join("settings.json")),
         }
     }
 
-    fn path(&self, scope: SettingsScope) -> &Path {
+    /// The user settings alone, for callers outside any project.
+    pub fn global_only(agent_dir: impl Into<PathBuf>) -> Self {
+        FileSettingsStorage {
+            global_path: agent_dir.into().join("settings.json"),
+            project_path: None,
+        }
+    }
+
+    fn path(&self, scope: SettingsScope) -> Option<&Path> {
         match scope {
-            SettingsScope::Global => &self.global_path,
-            SettingsScope::Project => &self.project_path,
+            SettingsScope::Global => Some(&self.global_path),
+            SettingsScope::Project => self.project_path.as_deref(),
         }
     }
 
@@ -181,7 +190,9 @@ impl SettingsStorage for FileSettingsStorage {
     /// on a miss, the full locked cycle, byte-identical to `with_lock`'s read arm, which
     /// also populates the cache. The same-process mutex still orders in-process writers.
     fn read(&self, scope: SettingsScope) -> Result<Option<String>> {
-        let path = self.path(scope);
+        let Some(path) = self.path(scope) else {
+            return Ok(None);
+        };
         let _process_guard = process_lock(path);
         let now_identity = fs::metadata(path)
             .ok()
@@ -222,7 +233,12 @@ impl SettingsStorage for FileSettingsStorage {
         scope: SettingsScope,
         update: &mut dyn FnMut(Option<String>) -> Option<String>,
     ) -> Result<()> {
-        let path = self.path(scope);
+        let Some(path) = self.path(scope) else {
+            return match update(None) {
+                None => Ok(()),
+                Some(_) => Err(anyhow!("these settings have no project scope to write")),
+            };
+        };
         let _process_guard = process_lock(path);
         let file_exists = path.exists();
         let mut held: Option<LockGuard> = None;

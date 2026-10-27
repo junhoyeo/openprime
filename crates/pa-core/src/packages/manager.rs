@@ -83,6 +83,18 @@ pub struct PackageManagerOptions {
     /// Extra force-exclude patterns for built-in skills (e.g. `-<server>/SKILL.md`
     /// overrides from integrations the user is not logged into).
     pub extra_builtin_skill_overrides: Vec<String>,
+    pub scope: ResourceScope,
+}
+
+/// The layers resource resolution reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResourceScope {
+    /// The user and project layers: a session in `cwd`.
+    #[default]
+    UserAndProject,
+    /// The user layer alone: no project settings, project directories, or
+    /// ancestor `.agents/skills` scan under `cwd`.
+    UserOnly,
 }
 
 /// The package manager. Owns a settings manager; mutates the `packages`
@@ -96,6 +108,7 @@ pub struct PackageManager {
     /// `None` disables built-in skills entirely.
     bundled_skills_dir: Option<PathBuf>,
     extra_builtin_skill_overrides: Vec<String>,
+    scope: ResourceScope,
 }
 
 impl PackageManager {
@@ -110,6 +123,7 @@ impl PackageManager {
             settings,
             bundled_skills_dir: BundledSkillsDir::Packaged,
             extra_builtin_skill_overrides: Vec::new(),
+            scope: ResourceScope::UserAndProject,
         })
     }
 
@@ -128,6 +142,7 @@ impl PackageManager {
             global_npm_root: None,
             bundled_skills_dir,
             extra_builtin_skill_overrides: options.extra_builtin_skill_overrides,
+            scope: options.scope,
         }
     }
 
@@ -147,6 +162,10 @@ impl PackageManager {
 
     pub(super) fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    pub(super) fn includes_project(&self) -> bool {
+        self.scope == ResourceScope::UserAndProject
     }
 
     pub(super) fn agent_dir(&self) -> &std::path::Path {

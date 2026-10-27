@@ -72,6 +72,14 @@ impl SettingsManager {
         Self::from_storage(storage)
     }
 
+    /// The user (agent-dir) settings alone, with no project layer.
+    pub fn create_global(agent_dir: impl AsRef<std::path::Path>) -> Self {
+        let storage: Arc<dyn SettingsStorage> = Arc::new(
+            super::storage::FileSettingsStorage::global_only(agent_dir.as_ref()),
+        );
+        Self::from_storage(storage)
+    }
+
     /// A new manager over the same settings store (a fresh read; the
     /// runtime overrides carry over), for long-lived readers such as the
     /// telemetry switch.
