@@ -7,17 +7,17 @@ permissions:
   contents: read
 jobs:
   probe:
-    name: probe ${{ matrix.mode }} gap=${{ matrix.gap }}
+    name: probe ${{ matrix.mode }} gap=${{ matrix.gap }} leg=${{ matrix.leg }}
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { mode: single-stress, gap: "" }
-          - { mode: single-stress, gap: "20" }
-          - { mode: full-lib, gap: "" }
-          - { mode: full-lib, gap: "" }
+          - { mode: full-lib, gap: "", leg: 1 }
+          - { mode: full-lib, gap: "", leg: 2 }
+          - { mode: full-lib, gap: "", leg: 3 }
+          - { mode: full-lib, gap: "20", leg: 4 }
     env:
       DO_NOT_TRACK: "1"
       CARGO_INCREMENTAL: "0"
@@ -34,6 +34,26 @@ jobs:
           save-if: false
       - name: Install gdb and stress-ng
         run: sudo apt-get install -y gdb stress-ng > /dev/null
+      - name: Build the workspace bins and bootstrap the CI test kernel (as ci.yml)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user uv > /dev/null
+          export PATH="$HOME/.local/bin:$PATH"
+          cargo build --locked --workspace --bins
+          bootstrap_output="$(./target/debug/prime-agent --prime-agent-bootstrap)"
+          printf '%s\n' "${bootstrap_output}" | tail -3
+          runtime_script='{"responses":[{"content":[{"type":"toolCall","name":"python_repl","arguments":{"code":"import goal, agent_message\nprint(\"TEST_RUNTIME_\" + \"READY\")"}}]},{"text":"ready"}]}'
+          DO_NOT_TRACK=1 PRIME_AGENT_FAUX_SCRIPT="${runtime_script}" \
+            ./target/debug/prime-agent --mode json -p "prepare the test runtime" > "${RUNNER_TEMP}/test-runtime.jsonl"
+          grep -qF TEST_RUNTIME_READY "${RUNNER_TEMP}/test-runtime.jsonl"
+          kernel_python="$(python3 scripts/ci_test_runtime.py)"
+          test -x "${kernel_python}"
+          {
+            echo "PRIME_AGENT_KERNEL_PYTHON=${kernel_python}"
+            echo "PA_CORE_KERNEL_PYTHON=${kernel_python}"
+            echo "PA_E2E_KERNEL_PYTHON=${kernel_python}"
+            echo "PA_TEST_RUNTIME_ABI_PYTHON=${kernel_python}"
+          } >> "${GITHUB_ENV}"
       - name: Build the pa-daemon lib test binary
         run: |
           set -euo pipefail
@@ -49,15 +69,15 @@ jobs:
           ATTACH_PROBE_GAP_MS: ${{ matrix.gap }}
           MODE: ${{ matrix.mode }}
         run: |
+          set +e
           set -uo pipefail
           bin="$(tail -1 "$RUNNER_TEMP/bin.txt")"
-          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
           nproc
           if [ "$MODE" = single-stress ]; then
             stress-ng --cpu "$(nproc)" --timeout 2400s > /dev/null 2>&1 &
             runs=300; args=(--exact "$TEST" --test-threads=1)
           else
-            runs=12; args=(--test-threads="$(nproc)")
+            runs=12; args=()
           fi
           pass=0; fail=0; dumped=0
           for i in $(seq 1 "$runs"); do
