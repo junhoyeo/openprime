@@ -2484,20 +2484,35 @@ fn acp_eof_during_settle_exits_and_leaves_resident_subagents() {
     client.close_stdin();
     assert!(client.child.wait().expect("the ACP child exits").success());
     // The resident session survives with the held child still running.
-    let roster = daemon_request(
-        &socket,
-        "children",
-        &json!({ "type": "get_rlm_children", "activeSessionId": active_session_id }),
-    );
-    let children = roster["data"]["children"]
-        .as_array()
-        .unwrap_or_else(|| panic!("a children roster: {roster}"))
-        .clone();
-    assert_eq!(children.len(), 1, "one spawned child: {children:?}");
-    assert_eq!(
-        children[0]["status"], "running",
-        "EOF left the resident child running: {children:?}"
-    );
+    // Fork semantics: a child reads `queued` until its detached kickoff
+    // prompt is admitted, and the settle can publish
+    // `outstandingSubagents == 1` inside that window. EOF must not cancel
+    // the kickoff, so the child leaves `queued` for `running`. Any settled
+    // status fails at once; a child that never leaves `queued` fails at the
+    // deadline (the worst-case kickoff is ~90 s to a terminal `error`).
+    let deadline = Instant::now() + Duration::from_mins(2);
+    loop {
+        let roster = daemon_request(
+            &socket,
+            "children",
+            &json!({ "type": "get_rlm_children", "activeSessionId": active_session_id }),
+        );
+        let children = roster["data"]["children"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a children roster: {roster}"))
+            .clone();
+        assert_eq!(children.len(), 1, "one spawned child: {children:?}");
+        match children[0]["status"].as_str() {
+            Some("running") => break,
+            Some("queued") => {}
+            _ => panic!("EOF settled or cancelled the resident child: {children:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "EOF left the resident child queued, its kickoff never admitted: {children:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A heartbeat change on the bound session broadcasts
