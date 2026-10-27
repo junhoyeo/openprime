@@ -451,10 +451,6 @@ jobs:
           python3 scripts/test_ci_test_shard_summary.py
           python3 scripts/ci_test_shard_summary.py --total ${{ env.SHARD_COUNT }} --dir manifests
 
-  # The vendored runtime suite (prime-agent-runtime): the kernel-side Python
-  # (`bash()`, the repl protocol, the bounded-await contract) has no Rust test,
-  # so this is its only CI gate — CPython 3.11, the minimum the runtime
-  # supports and the version the kernel venv pins.
   # The packaged-layout bootstrap e2e: `--prime-agent-bootstrap` builds a
   # fresh explicit PRIME_AGENT_KERNEL_VENV from the exe-adjacent runtime
   # sidecar (uv + PyPI), then a print session runs a python_repl cell on it.
@@ -492,6 +488,10 @@ jobs:
           grep -F "test ${test_name} ... ok" "${log}"
           grep -F 'test result: ok. 1 passed; 0 failed' "${log}"
 
+  # The vendored runtime suite (prime-agent-runtime): the kernel-side Python
+  # (`bash()`, the repl protocol, the bounded-await contract) has no Rust test,
+  # so this is its only CI gate — CPython 3.11, the minimum the runtime
+  # supports and the version the kernel venv pins.
   runtime:
     name: runtime suite (python 3.11)
     needs: trust
