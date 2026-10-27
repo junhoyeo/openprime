@@ -200,3 +200,34 @@ Conclusion: this is not a fork product regression. The failure depends only on w
 
 ## Process note
 During this round I ran `git checkout --detach` (no target) in ~/prime-agent-worktrees/rust-migration by mistake. It detached HEAD at its current commit 31e618be2 and changed no files. I immediately ran `git checkout feat/rust-migration`. The branch is at the same commit, up to date with origin, and the working tree is clean. Reflog entry: 2026-10-27 08:38:30 +0900.
+
+
+---
+
+# Round 3: P2-f delta 60d5f6d51..20a0d6adf
+
+**VERDICT: CLEAR for 20a0d6adf0fe58c28cc1ed432c8c8a900a86c957.** P2-f is resolved.
+Logs: /tmp/review-kernel-fix/r3/. All git commands ran only in the scratch worktree; it is clean at 20a0d6adf.
+
+## What the delta contains
+- One commit, 20a0d6adf, authored and committed as Junho Yeo <i@junho.io>. It changes 3 files (+58 lines).
+- New test: `kernel::manager::startup::tests::unlaunchable_probe_interpreter_makes_the_manager_defunct`.
+- Two new helpers, both `#[cfg(test)]`: `seed_probe_memo_for_tests` and `probe_memo_has_for_tests`, plus their re-export.
+- No product code changes.
+
+## Results (hermetic wrapper)
+- **At the tip:** the new test passes (tip.log).
+- **M-C** (the requested revert): LaunchFailed sets Idle again (if not Shutdown) and skips `cleanup_resources`. **FAILED** at startup.rs:908: "an unlaunchable interpreter leaves the manager defunct, as at c4c".
+- **M-D** (extra): remove `invalidate_runtime_probe_cache()` from the LaunchFailed branch. **FAILED** at startup.rs:916: "the in-process runtime-ready memo is dropped".
+- **M-E** (extra): remove `live_kernels::remove(self)` from the LaunchFailed branch. **FAILED** at startup.rs:912: "a defunct manager leaves the live-kernel registry".
+- I restored the source after each mutation. Final `git status` is clean.
+- Gates:
+  - `cargo fmt --check`: FMT=0.
+  - `clippy -p pa-core --all-targets -D warnings`: CLIPPY=0.
+  - `--lib kernel::` (skipping `lock_timeout_prevents_venv_rebuild`), run twice: 126 passed, 0 failed, 4 ignored both times. The new test runs in parallel there with no interference.
+  - `env -u PRIME_AGENT_KERNEL_VENV ... lock_timeout_prevents_venv_rebuild`: 1 passed.
+- I did not re-run the integration binaries. The delta is lib-only: one test plus `#[cfg(test)]` helpers, which are not compiled into the `tests/` crates. The round-2 integration results at 60d5f6d51 still apply.
+- No survivors in any run.
+
+## Note (P3, not blocking)
+The probe memo is global to the process. So the two memo assertions can only pass falsely: another test that runs `invalidate_runtime_probe_cache()` at the same time can also drop the seeded key. They cannot fail falsely, so the test is not flaky. M-D shows they catch the real regression when the test runs alone. The assertions on the defunct state and the registry are per manager and strict.
