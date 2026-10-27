@@ -88,7 +88,14 @@ impl Drop for ExplicitBuild {
         if self.published {
             return;
         }
-        set_aside(&self.venv, &self.record);
+        // A failed rename (Windows: a killed uv may still hold handles)
+        // keeps the record, so a later run reclaims the directory once this
+        // owner is dead.
+        if set_aside(&self.venv, &self.record).is_none()
+            && holds_recorded_directory(&self.venv, &self.record)
+        {
+            return;
+        }
         remove_file_if_unchanged(&record_path(&self.venv), &self.raw);
     }
 }
@@ -129,10 +136,9 @@ pub(in crate::kernel::bootstrap) enum ExplicitReclaim {
 /// directory is removed with a non-recursive rmdir; this product's own
 /// unpublished build whose owner is dead moves aside, retained. Anything
 /// else (no or unreadable record, live or unknowable owner, another
-/// directory, a symlink) stays untouched.
-pub(in crate::kernel::bootstrap) fn reclaim_explicit_path(
-    venv: &Path,
-) -> anyhow::Result<ExplicitReclaim> {
+/// directory, a symlink, a path it cannot inspect) stays untouched, so the
+/// caller's refusal reports it.
+pub(in crate::kernel::bootstrap) fn reclaim_explicit_path(venv: &Path) -> ExplicitReclaim {
     let record = match read_record::<ExplicitBuildRecord>(&record_path(venv)) {
         RecordState::Valid { value, raw }
             if value.version == RECORD_VERSION
@@ -142,12 +148,17 @@ pub(in crate::kernel::bootstrap) fn reclaim_explicit_path(
         }
         _ => None,
     };
-    let outcome = match symlink_metadata_state(venv)? {
-        Some(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            if std::fs::read_dir(venv)?.next().is_none() {
+    let outcome = match symlink_metadata_state(venv) {
+        Ok(Some(metadata))
+            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+        {
+            let Ok(mut entries) = std::fs::read_dir(venv) else {
+                return ExplicitReclaim::Untouched;
+            };
+            if entries.next().is_none() {
                 // Fails, and leaves the path alone, if anything appeared.
                 if std::fs::remove_dir(venv).is_err() {
-                    return Ok(ExplicitReclaim::Untouched);
+                    return ExplicitReclaim::Untouched;
                 }
                 ExplicitReclaim::RemovedEmpty
             } else {
@@ -157,17 +168,17 @@ pub(in crate::kernel::bootstrap) fn reclaim_explicit_path(
                 match record.as_ref().filter(|_| unpublished) {
                     Some((value, _)) => match set_aside(venv, value) {
                         Some(aside) => ExplicitReclaim::SetAside(aside),
-                        None => return Ok(ExplicitReclaim::Untouched),
+                        None => return ExplicitReclaim::Untouched,
                     },
-                    None => return Ok(ExplicitReclaim::Untouched),
+                    None => return ExplicitReclaim::Untouched,
                 }
             }
         }
-        Some(_) => return Ok(ExplicitReclaim::Untouched),
-        None => ExplicitReclaim::Untouched,
+        Ok(None) => ExplicitReclaim::Untouched,
+        Ok(Some(_)) | Err(_) => return ExplicitReclaim::Untouched,
     };
     if let Some((_, raw)) = &record {
         remove_file_if_unchanged(&record_path(venv), raw);
     }
-    Ok(outcome)
+    outcome
 }

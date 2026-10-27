@@ -745,6 +745,16 @@ async fn empty_explicit_dir_is_removed_without_recursion_and_rebuilt() {
 }
 
 fn write_build_record(exact: &Path, identity_of: &Path, owner_pid: u32) {
+    let start_id = pa_types::platform::process::process_start_id(owner_pid);
+    write_build_record_with_start_id(exact, identity_of, owner_pid, start_id.as_deref());
+}
+
+fn write_build_record_with_start_id(
+    exact: &Path,
+    identity_of: &Path,
+    owner_pid: u32,
+    start_id: Option<&str>,
+) {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = std::fs::metadata(identity_of).unwrap();
@@ -752,10 +762,7 @@ fn write_build_record(exact: &Path, identity_of: &Path, owner_pid: u32) {
         "version": 2,
         "token": "00000000-0000-4000-8000-000000000000",
         "directory_identity": { "volume": metadata.dev(), "file": metadata.ino() },
-        "owner": {
-            "pid": owner_pid,
-            "process_start_id": pa_types::platform::process::process_start_id(owner_pid),
-        },
+        "owner": { "pid": owner_pid, "process_start_id": start_id },
     });
     std::fs::write(build_record_path(exact), format!("{record}\n")).unwrap();
 }
@@ -774,6 +781,138 @@ async fn assert_refused_untouched(exact: &Path, log: &Path) {
         !log.exists() || std::fs::read_to_string(log).unwrap().is_empty(),
         "a refused explicit path must not start uv"
     );
+}
+
+fn dead_pid() -> u32 {
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let pid = dead.id();
+    dead.wait().unwrap();
+    pid
+}
+
+fn partial_explicit_dir(root: &Path) -> PathBuf {
+    let exact = root.join("explicit-kernel-venv");
+    std::fs::create_dir_all(exact.join("lib")).unwrap();
+    std::fs::write(exact.join("lib/partial-install"), "partial").unwrap();
+    exact
+}
+
+/// A live pid whose start id cannot be read is unknowable, never dead.
+#[tokio::test]
+async fn explicit_build_record_with_an_unknown_owner_is_refused_untouched() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = partial_explicit_dir(root.path());
+    write_build_record_with_start_id(&exact, &exact, std::process::id(), None);
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+
+    assert_refused_untouched(&exact, &log).await;
+    assert!(build_record_path(&exact).exists());
+}
+
+/// A path that got as far as a version file is a stale environment, not an
+/// abandoned build, whatever its record says.
+#[tokio::test]
+async fn explicit_build_record_beside_a_version_file_is_refused_untouched() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = partial_explicit_dir(root.path());
+    std::fs::write(exact.join(".bootstrap-version"), "{\"schema\":1}\n").unwrap();
+    write_build_record(&exact, &exact, dead_pid());
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+
+    assert_refused_untouched(&exact, &log).await;
+}
+
+/// An exact directory the caller cannot read gets the unchanged non-current
+/// refusal naming the path, not a bare I/O error, and stays untouched.
+#[tokio::test]
+async fn unreadable_explicit_dir_gets_the_unchanged_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = partial_explicit_dir(root.path());
+    std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let restore = RestoreMode(exact.clone());
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+
+    let error = ensure_kernel_python(EnsureKernelPythonOptions::default())
+        .await
+        .expect_err("an unreadable non-current path is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "PRIME_AGENT_KERNEL_VENV points to a non-current environment at {}",
+            exact.display()
+        )),
+        "{error:#}"
+    );
+    drop(restore);
+    assert_eq!(
+        std::fs::read_to_string(exact.join("lib/partial-install")).unwrap(),
+        "partial"
+    );
+    assert!(abandoned_siblings(&exact).is_empty());
+}
+
+/// When the attempt cannot move its own directory aside, it keeps the
+/// build record, so a later run (once this owner is dead) reclaims the
+/// path. A pre-existing aside target stands in for a failed rename (on
+/// Windows, a killed uv still holding handles).
+#[tokio::test]
+async fn failed_set_aside_keeps_the_build_record() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let pause = pause_fifos(root.path());
+    let _env = explicit_env(&bin, &package, &log, &exact, Some(&pause));
+
+    let attempt = tokio::spawn(ensure_kernel_python(EnsureKernelPythonOptions::default()));
+    let started = pause.started.clone();
+    tokio::task::spawn_blocking(move || wait_for_paused_uv(&started))
+        .await
+        .unwrap();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(build_record_path(&exact)).unwrap()).unwrap();
+    let blocker = exact.with_file_name(format!(
+        "explicit-kernel-venv.abandoned-{}",
+        record["token"].as_str().unwrap()
+    ));
+    std::fs::write(&blocker, "occupied").unwrap();
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    release_paused_uv(&pause.release);
+
+    assert_eq!(
+        std::fs::read_to_string(exact.join("lib/partial-install")).unwrap(),
+        "partial",
+        "the directory stays at the path when the rename cannot run"
+    );
+    assert!(
+        build_record_path(&exact).is_file(),
+        "the record must survive so a later run can reclaim the path"
+    );
+    assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "occupied");
 }
 
 /// A record whose owner is alive is a build in progress (or unknowable):
@@ -809,11 +948,7 @@ async fn explicit_build_record_for_another_directory_is_refused_untouched() {
     std::fs::write(exact.join("lib/partial-install"), "partial").unwrap();
     let other = root.path().join("other-dir");
     std::fs::create_dir(&other).unwrap();
-    // A dead owner: a reaped child's pid.
-    let mut dead = std::process::Command::new("true").spawn().unwrap();
-    let dead_pid = dead.id();
-    dead.wait().unwrap();
-    write_build_record(&exact, &other, dead_pid);
+    write_build_record(&exact, &other, dead_pid());
     let _env = explicit_env(&bin, &package, &log, &exact, None);
 
     assert_refused_untouched(&exact, &log).await;

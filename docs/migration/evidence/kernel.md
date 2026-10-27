@@ -111,6 +111,11 @@ Consequences:
   identity now includes the controller-backed skills in every embedding.
 - Remaining limitation (#44): an explicit `PRIME_AGENT_KERNEL_VENV` whose
   requested skill set changes later is refused, not rebuilt.
+- With `PRIME_AGENT_KERNEL_PYTHON` set, the warning "Python skills unavailable
+  in PRIME_AGENT_KERNEL_PYTHON" now checks the install set. In a print
+  session it can name controller-backed skills (`agent_observe`,
+  `rlm_heartbeat`) that print never pre-imports. It is a warning only;
+  pre-import is unchanged.
 
 Tests: `engine::tests::kernel_install_identity_is_shared_across_embeddings_and_bootstrap`
 (print, RPC, and daemon install the same set; a settings-disabled Python skill
@@ -164,6 +169,26 @@ manually when no longer needed.
 Residual: a process killed between `create_dir` and the record write leaves an
 empty directory with no record. The empty-directory rule above recovers it.
 
+Other consequences:
+
+- A non-current existing explicit path now takes the sibling bootstrap lock
+  before it is refused, so recovery can run under the lock. In a read-only
+  parent directory the user gets the lock error ("cannot create the bootstrap
+  lock ... choose a writable PRIME_AGENT_KERNEL_VENV or set
+  PRIME_AGENT_KERNEL_PYTHON") instead of the non-current refusal. When another
+  process holds the lock, the refusal can wait up to the lock timeout (120 s).
+- A path that cannot be inspected (for example an unreadable directory) is
+  left untouched and gets the unchanged non-current refusal with its path.
+- Asides accumulate: each failed or interrupted retry adds one
+  `<venv>.abandoned-<token>` directory. A setup that fails the same way every
+  time adds one per session.
+- If the rename aside fails while the path still holds the recorded directory,
+  the attempt keeps its build record, so a later run reclaims the path once
+  this owner is dead. Windows caveat: a killed uv or a probe may still hold
+  handles in the directory (`kill_on_drop` does not wait for exit), so the
+  rename can fail with a sharing violation. The kept record lets the next
+  session retry it.
+
 Tests (`kernel_bootstrap_generations`, red first on main):
 `explicit_build_dropped_mid_bootstrap_is_set_aside_and_rebuilt` (in-process
 abort while the fake uv is paused),
@@ -175,7 +200,11 @@ controls: `stale_explicit_kernel_venv_is_never_replaced_or_deleted` (foreign
 directory, no record), `explicit_build_record_with_a_live_owner_is_refused_untouched`,
 `explicit_build_record_for_another_directory_is_refused_untouched`, and
 `exact_override_identity_swap_is_retained_and_never_accepted` (swapped during
-the build: untouched, nothing set aside).
+the build: untouched, nothing set aside),
+`explicit_build_record_with_an_unknown_owner_is_refused_untouched`,
+`explicit_build_record_beside_a_version_file_is_refused_untouched`, and
+`unreadable_explicit_dir_gets_the_unchanged_refusal`.
+`failed_set_aside_keeps_the_build_record` covers the failed-rename case.
 
 ## Runtime ABI boundary
 

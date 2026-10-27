@@ -305,7 +305,7 @@ async fn ensure_exact_kernel_venv(
             report_recorded_unavailable_skills(options, venv);
             return Ok(python);
         }
-        if let ExplicitReclaim::SetAside(aside) = reclaim_explicit_path(venv)? {
+        if let ExplicitReclaim::SetAside(aside) = reclaim_explicit_path(venv) {
             options.report(&format!(
                 "Warning: an interrupted kernel setup was moved aside and retained at {}; remove it when no longer needed",
                 aside.display()
