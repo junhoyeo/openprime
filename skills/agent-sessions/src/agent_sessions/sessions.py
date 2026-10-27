@@ -846,7 +846,7 @@ def _parse_prime(path: Path, records: Iterable[dict[str, Any]], session: Session
 
 
 def _grok_cwd_from_dir(name: str) -> str:
-    """`%2FUsers%2Fjunhoyeo%2Ftokscale-io` -> `/Users/junhoyeo/tokscale-io`."""
+    """`%2FUsers%2Fexample%2Fproject` -> `/Users/example/project`."""
     return unquote(name)
 
 

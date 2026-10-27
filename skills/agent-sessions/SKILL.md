@@ -76,12 +76,12 @@ chat, user, assistant, reasoning, tools, tool_call, system, artifact` (grep defa
 Aside is included in `harness="all"`. Use `harness="aside"` to search only Aside:
 
 ```python
-print(await agent_sessions("grep", "개인투자조합", harness="aside"))
+print(await agent_sessions("grep", "release checklist", harness="aside"))
 # A session id/prefix includes the chat and its text artifacts.
-print(await agent_sessions("grep", "개인투자조합", session="TySYMMEDeQXWTWLR", harness="aside"))
+print(await agent_sessions("grep", "release checklist", session="ExampleSessionId", harness="aside"))
 # A directory scopes grep recursively, including artifact-only sessions.
-print(await agent_sessions("grep", "개인투자조합", session=
-    "~/.aside/u/0/sessions/2026-10-21_TySYMMEDeQXWTWLR/artifacts/lecture-transcripts"))
+print(await agent_sessions("grep", "release checklist", session=
+    "~/.aside/u/0/sessions/2026-01-01_ExampleSessionId/artifacts/notes"))
 # A file path scopes grep/show to that exact file. Use a path returned by grep:
 print(await agent_sessions("show", session=artifact_path, around=42, context=3))
 ```
