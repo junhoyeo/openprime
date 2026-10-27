@@ -9,7 +9,7 @@ Status: **integrated; independently CLEAR-FOR-INTEGRATION (scope-limited); final
 
 ## Product gaps closed
 
-1. Idle passivation (on by default) deleted the worker descriptor. The wake then rebuilt the session from the file header. Fallback-cwd sessions revived into a missing directory, a telemetry opt-out was lost, and the opened-with config was dropped. Fix: an in-memory passivated launch record that both wake paths replay. The record is written only after a successful idle stop and cleared on any launch over the file.
+1. Idle passivation (on by default) deleted the worker descriptor. The wake then rebuilt the session from the file header. Fallback-cwd sessions revived into a missing directory, a telemetry opt-out was lost, and the opened-with config was dropped. Fix: a durable passivated launch record (beside the descriptors) that both wake paths replay. The record is written before the idle stop, forgotten if the stop fails, and cleared on any launch over the file, on delete, and on a failed stop.
 2. A crash respawn after `switch_session` replayed the launch cwd for the switched-in transcript. Fix: the root-identity follow carries the live cwd into the durable create.
 
 ## Verification
@@ -36,6 +36,6 @@ Status: **integrated; independently CLEAR-FOR-INTEGRATION (scope-limited); final
 
 ## Scope limits and open items
 
-- `843615757` and `837be6824` are proven at the daemon boundary only (create shape). The agents-view client path is not separately proven.
-- `6470a60e7` holds because admission prompts never revive. R4 stays open.
+- `843615757` and `837be6824` are proven at the daemon boundary only (create shape). The agents-view client path is not separately proven. The ledger records this limit on those rows.
+- `6470a60e7` holds because admission prompts never revive. R4 is classified parity-equivalent (see Rounds 2-5 summary); it is not an open item.
 - Round 1 left R1-R4 and an env-replay P2 open. Rounds 2-5 closed or classified them (above).
