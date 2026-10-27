@@ -3,6 +3,8 @@
 > Reviewed source: `origin/port/rust-session-lifecycle@2e156424002bcfd7b1576e0ec8935144ac96db3f`.
 > Integrated source tip through `a02416f19`; all 40 lifecycle-owned paths byte-match the reviewed tree.
 > Combined hermetic evidence: RLM watch 54/54, exact retry-boundary 1/1, engine corrupt-pointer zero-provider 1/1, agents-view partial/legacy warning 1/1, Python runtime registry 30/30. Kernel ABI2/provider safe metadata are integrated separately. Native app/daemon/collect remains paused pending the reviewed read-only path manifest.
+>
+> **Superseded (final tip):** native runs resumed under the reviewed preflight and the hermetic wrapper; see [`native-collect.md`](native-collect.md) and the native final cases in [`../upstream-rust.md`](../upstream-rust.md). The kernel ABI2 seam is integrated (`9bf6b6a32`, with the CI/runtime preflight `ed0949308`), and every Linux CI shard runs the ABI2 live probe. The PAUSED and "not integrated" statements below are historical review text.
 
 # Final re-review — `2e156424002bcfd7b1576e0ec8935144ac96db3f`
 
