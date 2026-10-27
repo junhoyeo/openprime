@@ -481,6 +481,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         }
                     }
                 }
+                // TS publishes the `running` row once the run starts
+                // (agent-session.ts 12886-12887); without it, subscribers keep
+                // the spawn's `queued` row until the terminal one.
+                watcher_this.emit_child_update(&watcher_record).await;
                 watcher_this
                     .lifecycle_epoch
                     .send_modify(|epoch| *epoch = epoch.wrapping_add(1));

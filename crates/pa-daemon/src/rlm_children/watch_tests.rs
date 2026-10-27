@@ -1308,6 +1308,15 @@ async fn child_updates_surface_through_the_sink() {
         }),
         "the admission row carries the snapshot: {rows:?}"
     );
+    // TS publishes `running` once the run starts (agent-session.ts
+    // 12886-12887); subscribers must not keep the spawn's `queued` row until
+    // the terminal one.
+    assert!(
+        rows.iter().any(|row| {
+            row["id"] == json!(handle.rlm_child_id) && row["status"] == json!("running")
+        }),
+        "the prompt admission publishes the running row: {rows:?}"
+    );
     assert!(
         rows.iter().any(|row| {
             row["id"] == json!(handle.rlm_child_id)
