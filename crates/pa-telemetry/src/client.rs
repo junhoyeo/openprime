@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::catalog::sanitize;
 use crate::event::TelemetryEvent;
 use crate::properties::Properties;
+use crate::restriction::RestrictionToken;
 use crate::sink::{SinkOutcome, TelemetrySink};
 
 pub const DEFAULT_BATCH_SIZE: usize = 20;
@@ -44,6 +45,7 @@ impl Default for RetryPolicy {
 /// One queued event per sink channel.
 struct QueueEntry {
     event: TelemetryEvent,
+    restriction: Option<RestrictionToken>,
     attempts: u32,
 }
 
@@ -126,7 +128,7 @@ pub struct TelemetryClient {
 }
 
 enum Cmd {
-    Track(TelemetryEvent),
+    Track(TelemetryEvent, Option<RestrictionToken>),
     Flush(oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -190,10 +192,36 @@ impl TelemetryClient {
     // Workspace API consumed across crates (pa-cli, pa-core); the by-value signature is fleet-wide.
     #[allow(clippy::needless_pass_by_value)]
     pub fn track(&self, name: impl Into<String>, properties: Properties) {
+        self.capture(name, &properties, None);
+    }
+
+    /// Enqueue immutable properties for one admission. The same token identity
+    /// must follow the event through queueing, retry, and every sink delivery.
+    // Keep the same owned-property API as `track`; capture merges it immediately.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn track_scoped(
+        &self,
+        name: impl Into<String>,
+        properties: Properties,
+        restriction: &RestrictionToken,
+    ) {
+        if restriction.is_restricted() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.capture(name, &properties, Some(restriction.clone()));
+    }
+
+    fn capture(
+        &self,
+        name: impl Into<String>,
+        properties: &Properties,
+        restriction: Option<RestrictionToken>,
+    ) {
         let mut merged = self.base_properties.clone();
-        merged.merge(&properties);
+        merged.merge(properties);
         let event = TelemetryEvent::new(name, merged);
-        if self.tx.send(Cmd::Track(event)).is_err() {
+        if self.tx.send(Cmd::Track(event, restriction)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -263,15 +291,17 @@ impl Worker {
                         break;
                     };
                     match cmd {
-                        Cmd::Track(event) => {
+                        Cmd::Track(event, restriction) => {
                             // An event recorded while the switch is off is
                             // dropped now, so turning telemetry back on
                             // never sends what happened while it was off.
-                            if self.drop_while_disabled() {
+                            if self.drop_while_disabled()
+                                || restriction.as_ref().is_some_and(RestrictionToken::is_restricted)
+                            {
                                 self.queue_dropped.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            self.enqueue(&event);
+                            self.enqueue(&event, restriction.as_ref());
                             if self.channels.iter().any(|channel| {
                                 channel.queue.len() >= self.config.batch_size
                                     && channel.ready_for_send(tokio::time::Instant::now())
@@ -338,7 +368,7 @@ impl Worker {
         true
     }
 
-    fn enqueue(&mut self, event: &TelemetryEvent) {
+    fn enqueue(&mut self, event: &TelemetryEvent, restriction: Option<&RestrictionToken>) {
         for channel in &mut self.channels {
             if channel.queue.len() >= self.config.queue_capacity {
                 channel.queue.pop_front();
@@ -346,6 +376,7 @@ impl Worker {
             }
             channel.queue.push_back(QueueEntry {
                 event: event.clone(),
+                restriction: restriction.cloned(),
                 attempts: 0,
             });
         }
@@ -372,23 +403,9 @@ impl Worker {
             channel.next_retry_at = None;
             let mut retry_after: Option<u32> = None;
             while !channel.queue.is_empty() {
-                // Up to `batch_size` events within the byte budget (a
-                // single over-budget event still ships).
-                let mut take = 0usize;
-                let mut bytes = 0usize;
-                for entry in channel.queue.iter().take(self.config.batch_size) {
-                    let size = entry.event.wire_size_estimate();
-                    if take > 0 && bytes + size > self.config.max_batch_bytes {
-                        break;
-                    }
-                    bytes += size;
-                    take += 1;
-                }
-                let mut entries: Vec<QueueEntry> = Vec::with_capacity(take);
-                for _ in 0..take {
-                    if let Some(entry) = channel.queue.pop_front() {
-                        entries.push(entry);
-                    }
+                let entries = channel.take_batch(&self.config, &self.queue_dropped);
+                if entries.is_empty() {
+                    continue;
                 }
                 let mut events: Vec<TelemetryEvent> =
                     entries.iter().map(|entry| entry.event.clone()).collect();
@@ -412,6 +429,7 @@ impl Worker {
                         for entry in entries.into_iter().rev() {
                             channel.queue.push_front(QueueEntry {
                                 event: entry.event,
+                                restriction: entry.restriction,
                                 attempts: entry.attempts + 1,
                             });
                         }
@@ -435,24 +453,12 @@ impl Worker {
         }
         for channel in &mut self.channels {
             while !channel.queue.is_empty() {
-                // The final drain honors the same batch byte cap as the
-                // interval path.
-                let mut take = 0usize;
-                let mut bytes = 0usize;
-                for entry in channel.queue.iter().take(self.config.batch_size) {
-                    let size = entry.event.wire_size_estimate();
-                    if take > 0 && bytes + size > self.config.max_batch_bytes {
-                        break;
-                    }
-                    bytes += size;
-                    take += 1;
+                let entries = channel.take_batch(&self.config, &self.queue_dropped);
+                if entries.is_empty() {
+                    continue;
                 }
-                let mut events: Vec<TelemetryEvent> = Vec::with_capacity(take);
-                for _ in 0..take {
-                    if let Some(entry) = channel.queue.pop_front() {
-                        events.push(entry.event);
-                    }
-                }
+                let mut events: Vec<TelemetryEvent> =
+                    entries.into_iter().map(|entry| entry.event).collect();
                 for event in &mut events {
                     sanitize(&event.name, &mut event.properties);
                 }
@@ -466,6 +472,47 @@ impl Worker {
 }
 
 impl Channel {
+    /// Start delivery for this batch. These checks are the linearization point:
+    /// restriction after an entry's check cannot recall that in-flight delivery.
+    /// There is no await between these checks and the sink invocation. Repeated
+    /// for every sink, retry, and final drain, including after another sink awaits.
+    fn take_batch(
+        &mut self,
+        config: &TelemetryClientConfig,
+        dropped: &AtomicU64,
+    ) -> Vec<QueueEntry> {
+        if config.enabled.as_ref().is_some_and(|enabled| !enabled()) {
+            dropped.fetch_add(self.queue.len() as u64, Ordering::Relaxed);
+            self.queue.clear();
+            self.next_retry_at = None;
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        while let Some(entry) = self.queue.front() {
+            if entry
+                .restriction
+                .as_ref()
+                .is_some_and(RestrictionToken::is_restricted)
+            {
+                self.queue.pop_front();
+                dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let size = entry.event.wire_size_estimate();
+            if !entries.is_empty()
+                && (entries.len() >= config.batch_size || bytes + size > config.max_batch_bytes)
+            {
+                break;
+            }
+            bytes += size;
+            if let Some(entry) = self.queue.pop_front() {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
     /// True when the channel may send now (`next_retry_at` passed or no
     /// failed batch waiting).
     fn ready_for_send(&self, now: tokio::time::Instant) -> bool {
@@ -787,10 +834,12 @@ mod tests {
         };
         channel.queue.push_back(QueueEntry {
             event: fresh,
+            restriction: None,
             attempts: 0,
         });
         channel.queue.push_back(QueueEntry {
             event: stale,
+            restriction: None,
             attempts: 0,
         });
         let dropped = Arc::new(AtomicU64::new(0));
@@ -809,6 +858,7 @@ mod tests {
         };
         channel.queue.push_back(QueueEntry {
             event: TelemetryEvent::new("exhausted", Properties::new()),
+            restriction: None,
             attempts: 5,
         });
         let dropped = Arc::new(AtomicU64::new(0));
@@ -849,5 +899,315 @@ mod tests {
             "uncatalogued property dropped at the sink boundary"
         );
         client.shutdown().await.unwrap();
+    }
+    /// Records actual sink invocations and blocks only the sentinel batch.
+    struct GatedSink {
+        recorded: Arc<MockSink>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        gone: Arc<tokio::sync::Notify>,
+        outcome: SinkOutcome,
+        blocked: std::sync::atomic::AtomicBool,
+    }
+
+    impl Drop for GatedSink {
+        fn drop(&mut self) {
+            self.gone.notify_one();
+        }
+    }
+
+    impl TelemetrySink for GatedSink {
+        fn send_batch<'a>(
+            &'a self,
+            install_id: &'a str,
+            events: Vec<TelemetryEvent>,
+        ) -> Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                let sentinel = events.iter().any(|event| event.name == "sentinel");
+                self.recorded.send_batch(install_id, events).await;
+                if sentinel && !self.blocked.swap(true, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.outcome
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn issues_35_36_restrictions_follow_capture_through_worker_and_final_drain() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for finish in ["flush", "shutdown", "drop"] {
+                let recorded = Arc::new(MockSink::new());
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let gone = Arc::new(tokio::sync::Notify::new());
+                let directory = tempfile::tempdir().unwrap().keep();
+                let mirror = crate::FileSink::new(&directory);
+                let mirror_path = mirror.path().to_path_buf();
+                let mut config = TelemetryClientConfig::new("synthetic");
+                config.batch_size = 1;
+                config.flush_interval = Duration::from_hours(1);
+                config.enabled = Some(Arc::new(|| true));
+                config.sinks = vec![
+                    Arc::new(GatedSink {
+                        recorded: recorded.clone(),
+                        entered: entered.clone(),
+                        release: release.clone(),
+                        gone: gone.clone(),
+                        outcome: SinkOutcome::Sent,
+                        blocked: std::sync::atomic::AtomicBool::new(false),
+                    }),
+                    Arc::new(mirror),
+                ];
+                let client = TelemetryClient::spawn(config).unwrap();
+                client.track("sentinel", Properties::new());
+                entered.notified().await;
+                let private = crate::RestrictionToken::restricted();
+                client.track_scoped("private at capture", Properties::new(), &private);
+                let pending = crate::RestrictionToken::unrestricted();
+                client.track_scoped("restricted in queue", Properties::new(), &pending);
+                pending.clone().restrict();
+                let fresh = crate::RestrictionToken::unrestricted();
+                client.track_scoped("fresh public", Properties::new(), &fresh);
+                release.notify_one();
+                match finish {
+                    "flush" => {
+                        client.flush().await.unwrap();
+                        client.shutdown().await.unwrap();
+                    }
+                    "shutdown" => client.shutdown().await.unwrap(),
+                    "drop" => drop(client),
+                    _ => unreachable!(),
+                }
+                gone.notified().await;
+                eprintln!("synthetic telemetry receipt: {}", mirror_path.display());
+                let receipt = tokio::fs::read_to_string(&mirror_path).await.unwrap();
+                let rows: Vec<serde_json::Value> = receipt
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["sentinel", "fresh public"],
+                    "actual FileSink receipt: {finish}"
+                );
+                assert_eq!(
+                    recorded.event_names(),
+                    ["sentinel", "fresh public"],
+                    "{finish}"
+                );
+                assert_eq!(recorded.batches().len(), 2, "no empty sink calls");
+            }
+        })
+        .await
+        .expect("worker drains without waiting on suppressed items");
+    }
+
+    #[tokio::test]
+    async fn issues_35_36_recheck_between_sinks_and_on_retry_or_final_drain() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for finish in ["flush", "shutdown", "drop"] {
+                let first = Arc::new(MockSink::new());
+                let second = Arc::new(MockSink::new());
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let gone = Arc::new(tokio::sync::Notify::new());
+                let mut config = TelemetryClientConfig::new("synthetic");
+                config.flush_interval = Duration::from_hours(1);
+                config.sinks = vec![Arc::new(GatedSink {
+                    recorded: first.clone(), entered: entered.clone(),
+                    release: release.clone(), gone: gone.clone(), outcome: SinkOutcome::Dropped,
+                    blocked: std::sync::atomic::AtomicBool::new(false),
+                }), second.clone()];
+                let client = TelemetryClient::spawn(config).unwrap();
+                let token = crate::RestrictionToken::unrestricted();
+                client.track_scoped("sentinel", Properties::new(), &token);
+                {
+                    let flushing = client.flush();
+                    tokio::pin!(flushing);
+                    tokio::select! {
+                        () = entered.notified() => {}
+                        result = &mut flushing => panic!("flush finished before release: {result:?}"),
+                    }
+                    token.restrict();
+                    release.notify_one();
+                    flushing.await.unwrap();
+                }
+                match finish {
+                    "flush" => { client.flush().await.unwrap(); client.shutdown().await.unwrap(); }
+                    "shutdown" => client.shutdown().await.unwrap(),
+                    "drop" => {}
+                    _ => unreachable!(),
+                }
+                drop(client);
+                gone.notified().await;
+                assert_eq!(first.event_names(), ["sentinel"], "in-flight call is not recalled");
+                assert!(second.batches().is_empty(), "restriction checked after first sink awaits");
+            }
+        }).await.expect("restricted retries and final drain complete");
+    }
+
+    #[tokio::test]
+    async fn issues_35_36_global_policy_still_restricts_fresh_tokens() {
+        let recorded = Arc::new(MockSink::new());
+        let mut config = TelemetryClientConfig::new("synthetic");
+        config.enabled = Some(Arc::new(|| false));
+        config.sinks = vec![recorded.clone()];
+        let client = TelemetryClient::spawn(config).unwrap();
+        client.track_scoped(
+            "public token",
+            Properties::new(),
+            &crate::RestrictionToken::unrestricted(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recorded.batches().is_empty());
+    }
+
+    struct FailOnceRecordingSink {
+        recorded: Arc<MockSink>,
+        failed: std::sync::atomic::AtomicBool,
+        delivered: tokio::sync::Notify,
+    }
+
+    impl TelemetrySink for FailOnceRecordingSink {
+        fn send_batch<'a>(
+            &'a self,
+            install_id: &'a str,
+            events: Vec<TelemetryEvent>,
+        ) -> Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.recorded.send_batch(install_id, events).await;
+                if self.failed.swap(true, Ordering::SeqCst) {
+                    self.delivered.notify_one();
+                    SinkOutcome::Sent
+                } else {
+                    SinkOutcome::Dropped
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issues_35_36_scheduled_retry_keeps_public_event_and_drops_restricted_event() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let recorded = Arc::new(MockSink::new());
+            let sink = Arc::new(FailOnceRecordingSink {
+                recorded: recorded.clone(),
+                failed: std::sync::atomic::AtomicBool::new(false),
+                delivered: tokio::sync::Notify::new(),
+            });
+            let mut config = TelemetryClientConfig::new("synthetic");
+            config.flush_interval = Duration::from_secs(10);
+            config.sinks = vec![sink.clone()];
+            let client = TelemetryClient::spawn(config).unwrap();
+            let private = crate::RestrictionToken::unrestricted();
+            let public = crate::RestrictionToken::unrestricted();
+            client.track_scoped("private retry", Properties::new(), &private);
+            let mut properties = Properties::new();
+            properties.set("count", serde_json::Value::from(1));
+            client.track_scoped("public retry", properties.clone(), &public);
+            properties.set("count", serde_json::Value::from(2));
+            client.flush().await.unwrap();
+            let initial = recorded.batches();
+            assert_eq!(initial.len(), 1);
+            assert_eq!(initial[0].events.len(), 2);
+            private.restrict();
+            // Only the worker's scheduled timer can deliver the retry: no
+            // flush/shutdown command is sent until its successful receipt.
+            tokio::time::advance(Duration::from_secs(20)).await;
+            tokio::time::timeout(Duration::from_secs(1), sink.delivered.notified())
+                .await
+                .expect("eligible public retry delivered by scheduled timer");
+            let attempts = recorded.batches();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[1].events, vec![initial[0].events[1].clone()]);
+            assert_eq!(
+                attempts[1].events[0].properties.get("count"),
+                Some(&serde_json::Value::from(1))
+            );
+            client.shutdown().await.unwrap();
+            assert_eq!(
+                recorded.batches().len(),
+                2,
+                "accepted public retry is not replayed"
+            );
+        })
+        .await
+        .expect("scheduled retry is bounded");
+    }
+
+    #[tokio::test]
+    async fn issues_35_36_global_opt_out_during_sink_await_gates_later_sink() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let first = Arc::new(MockSink::new());
+            let second = Arc::new(MockSink::new());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let gone = Arc::new(tokio::sync::Notify::new());
+            let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let switch = on.clone();
+            let mut config = TelemetryClientConfig::new("synthetic");
+            config.flush_interval = Duration::from_hours(1);
+            config.enabled = Some(Arc::new(move || switch.load(Ordering::SeqCst)));
+            config.sinks = vec![
+                Arc::new(GatedSink {
+                    recorded: first.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                    gone: gone.clone(),
+                    outcome: SinkOutcome::Sent,
+                    blocked: std::sync::atomic::AtomicBool::new(false),
+                }),
+                second.clone(),
+            ];
+            let client = TelemetryClient::spawn(config).unwrap();
+            client.track_scoped(
+                "sentinel",
+                Properties::new(),
+                &crate::RestrictionToken::unrestricted(),
+            );
+            {
+                let flushing = client.flush();
+                tokio::pin!(flushing);
+                tokio::select! {
+                    () = entered.notified() => {}
+                    result = &mut flushing => panic!("flush finished before release: {result:?}"),
+                }
+                on.store(false, Ordering::SeqCst);
+                release.notify_one();
+                flushing.await.unwrap();
+            }
+            assert_eq!(
+                first.event_names(),
+                ["sentinel"],
+                "in-flight delivery cannot be recalled"
+            );
+            assert!(
+                second.batches().is_empty(),
+                "later sink must recheck global policy"
+            );
+            on.store(true, Ordering::SeqCst);
+            client.track_scoped(
+                "fresh public",
+                Properties::new(),
+                &crate::RestrictionToken::unrestricted(),
+            );
+            client.shutdown().await.unwrap();
+            gone.notified().await;
+            assert_eq!(first.event_names(), ["sentinel", "fresh public"]);
+            assert_eq!(
+                second.event_names(),
+                ["fresh public"],
+                "fresh enabled work still emits"
+            );
+        })
+        .await
+        .expect("global policy transition is bounded");
     }
 }

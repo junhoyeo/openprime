@@ -42,13 +42,16 @@ pseudonymous installation identity for Prime Agent product analytics.
   which call `track` with schema-documented events.
 - No prompt/session content, tool arguments, file paths, or user identity —
   by construction (primitives-only properties).
-- No retries or delivery guarantees: batches are best-effort and offline-safe
-  (dropped on failure), matching the TS product.
+- No delivery or exactly-once guarantee: failed batches use bounded best-effort
+  retries. An uncertain or partially accepted failure can produce duplicate
+  receipts; exhausted attempts are dropped.
 
 ## Public API
 
 - `TelemetryClient` / `TelemetryClientConfig` (`track`, `flush`, `shutdown`,
   `dropped_count`, `install_id`, `spawn`)
+- `RestrictionToken` (`unrestricted`, `restricted`, `restrict`, `is_restricted`)
+- `TelemetryClient::track_scoped(name, properties, &restriction)`
 - `TelemetrySink` trait, `SinkOutcome`
 - `Properties`, `TelemetryEvent`
 - `install_id(agent_dir)`
@@ -66,3 +69,26 @@ pseudonymous installation identity for Prime Agent product analytics.
 
 Depends on no workspace crate (sits beside pa-types at the bottom of the
 dependency graph). Consumers: pa-core, pa-daemon, pa-cli.
+
+## Admission-scoped delivery restrictions
+
+Attributed work uses `track_scoped` with its admission's `RestrictionToken`.
+The immutable event properties and a clone of that exact token travel together
+through the worker command, each sink queue, and retries. Clones share one atomic
+restriction; there is no reset. New unrestricted work requires a distinct token.
+Unscoped `track` remains available for genuinely global events. Callers own the
+attribution audit; adding this API alone does not make those callers private.
+
+`restrict()` is a short, nonblocking, sequentially consistent atomic store. Reads
+are sequentially consistent too. A restriction before delivery begins suppresses
+the event, including on explicit flush and shutdown. Delivery begins at the final
+restriction check when the worker selects that event for a sink batch. There is no
+await between selection and the sink invocation. The check is repeated for every
+sink and retry; it does not look up a mutable current-session token. Events whose
+delivery has already begun cannot be recalled, including a sink's in-flight await.
+No mutex is held over a sink await, and callers never await the worker to restrict.
+
+The global `enabled` callback remains an additional gate; an unrestricted token
+cannot enable telemetry. Suppressed items increment the existing dropped counter,
+produce no telemetry of their own, and never cause empty sink calls. Existing
+best-effort flush/retry behavior and sink timeout responsibility are unchanged.
