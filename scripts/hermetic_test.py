@@ -11,12 +11,12 @@ This wrapper runs the command under `env -i` with a fresh short root in /tmp:
 synthetic HOME/TMPDIR/XDG_DATA_HOME,
 and an explicit test kernel interpreter. On macOS the command also runs under a
 mandatory sandbox that denies filesystem writes outside the run root and private
-Cargo target. It permits loopback mocks except protected ports (8787, 53), and
+Cargo target. It permits loopback mocks except protected ports (53, 8787, 8791, 18789), and
 Unix sockets only under the run root. Direct external IP/DNS traffic is denied. Agent, session, and socket paths are
 not forced, so tests keep their own per-test roots. After the command, it
-reports any surviving process that references the root or the Cargo target
-directory, and exits non-zero if one exists. It never kills processes and
-never deletes the root (it is evidence).
+compares precise same-UID process identities before and after the subject. Any
+new unexplained process makes the run fail (unknown ownership, never a kill target). It only terminates/reaps its exact Popen-owned child on failure; it never signals
+discovered PIDs and never deletes the root (it is evidence).
 
 Usage:
     scripts/hermetic_test.py --kernel-python PATH -- cargo test -p pa-daemon
@@ -24,6 +24,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import pwd
 import platform
 import os
@@ -35,7 +36,8 @@ import sys
 import tempfile
 import time
 
-GRACE_SECONDS = 60
+from hermetic_processes import ProcessInventory, new_processes, reap_owned
+
 PASS_THROUGH = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "CARGO_HOME", "RUSTUP_HOME",
                 "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "CARGO_INCREMENTAL", "CARGO_NET_OFFLINE",
                 "RUST_TEST_THREADS")
@@ -88,7 +90,7 @@ def build_env(root, kernel_python, environ):
 # This fence blocks external IPs and protected ports, NOT every local service:
 # dynamic loopback mocks are supported, so an unknown local proxy remains outside
 # this guarantee. Proxy credentials/settings never enter build_env.
-def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787,)):
+def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8791, 18789)):
     quote = lambda value: json.dumps(str(value))
     paths = [Path(root).resolve(), *(Path(p).resolve() for p in writable)]
     private = [real_home() / ".prime", real_home() / ".prime-rust", *map(Path, protected)]
@@ -109,7 +111,7 @@ def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787,))
         f"(allow network-outbound (remote unix-socket (subpath {quote(paths[0])})))",
         '(deny mach-lookup (global-name "com.apple.mDNSResponder"))',
     ])
-    for port in sorted({53, 8787, *protected_ports}):
+    for port in sorted({53, 8787, 8791, 18789, *protected_ports}):
         if not 1 <= port <= 65535:
             raise ValueError(f"invalid protected port: {port}")
         lines.append(f'(deny network-outbound (remote ip "*:{port}"))')
@@ -117,7 +119,7 @@ def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787,))
     return "\n".join(lines) + "\n"
 
 
-def sandboxed(command, root, *, writable=(), protected=(), protected_ports=(8787,)):
+def sandboxed(command, root, *, writable=(), protected=(), protected_ports=(8787, 8791, 18789)):
     if platform.system() != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
         raise SystemExit("hermetic_test: enforced filesystem/network sandbox unavailable; refusing to run")
     profile = root / "isolation.sb"
@@ -136,35 +138,6 @@ def make_root():
     return root
 
 
-def leftovers(markers):
-    """Processes whose EXECUTABLE (argv[0]) lives under a marker path: the run's
-    root, the Cargo target directory, or the test kernel interpreter. Matching
-    argv[0] only keeps unrelated shells whose arguments merely mention a path,
-    and this wrapper's own ancestors, out of the report."""
-    result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,command="], capture_output=True,
-                            text=True, timeout=30, check=False)
-    if result.returncode:
-        raise RuntimeError(f"process inspection failed ({result.returncode}): {result.stderr}")
-    out = result.stdout
-    rows, parents = [], {}
-    for line in out.splitlines():
-        fields = line.split(None, 2)
-        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
-            continue
-        pid, ppid, command = int(fields[0]), int(fields[1]), fields[2]
-        parents[pid] = ppid
-        rows.append((pid, command))
-    ancestors, cursor = set(), os.getpid()
-    while cursor and cursor not in ancestors:
-        ancestors.add(cursor)
-        cursor = parents.get(cursor, 0)
-    found = []
-    for pid, command in rows:
-        executable = command.split(" ", 1)[0]
-        if pid not in ancestors and any(executable == m or executable.startswith(m.rstrip("/") + "/")
-                                        for m in markers if m):
-            found.append(f"{pid} {command}")
-    return found
 
 
 def private_target(environ):
@@ -190,7 +163,7 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=1800,
                         help="command deadline in seconds (default: 1800)")
     parser.add_argument("--protect-port", type=int, action="append", default=[],
-                        help="deny an additional local service port (8787 and DNS are always denied)")
+                        help="deny an additional local service port (8787, 8791, 18789 and DNS are always denied)")
     parser.add_argument("--do-not-track", action="store_true",
                         help="set DO_NOT_TRACK=1 for the command (some telemetry tests then fail by design)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -201,8 +174,8 @@ def main(argv=None):
     # DO_NOT_TRACK is not a security boundary and cannot replace the OS fence.
     if platform.system() != "Darwin":
         parser.error("enforced filesystem/network sandbox unavailable; refusing to run")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
     target = private_target(os.environ)
     kernel_python = resolve_kernel_python(args.kernel_python, os.environ)
     root = make_root()
@@ -237,46 +210,54 @@ def main(argv=None):
             return result.returncode or 4
         print(f"hermetic_test: OS-fence preflight {result.stdout.strip()}", file=sys.stderr)
         argv = sandboxed(argv, root, **policy)
-    child = subprocess.Popen(argv, env=env, start_new_session=True)
-    identity = subprocess.run(["/bin/ps", "-p", str(child.pid), "-o", "pid=,lstart=,command="],
-                              capture_output=True, text=True, timeout=10, check=False)
-    receipt = {"pid": child.pid, "identity": identity.stdout.strip(), "command": argv,
-               "root": str(root), "target": str(target), "started_monotonic": time.monotonic()}
-    (root / "command.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    return run_subject(argv, env, root, target, args.timeout)
+
+
+def run_subject(argv, env, root, target, timeout, inventory=None):
+    """Execute and account for one subject. Tests inject only the inventory seam."""
+    inventory = inventory or ProcessInventory()
+    before = inventory.snapshot()
+    (root / "process-baseline.json").write_text(json.dumps(list(before.values()), indent=2))
+    child = None
+    code = 1
+    failure = None
     try:
-        code = child.wait(timeout=args.timeout)
+        child = subprocess.Popen(argv, env=env, start_new_session=True)
+        identity = inventory.identity(child.pid)
+        if identity is None and child.poll() is None:
+            raise RuntimeError("child identity disappeared while the child is still live")
+        receipt = {"pid": child.pid, "identity": identity, "command": argv,
+                   "root": str(root), "target": str(target), "started_monotonic": time.monotonic()}
+        (root / "command.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        code = child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # Popen retains this exact unreaped child; never signal a discovered PID.
-        child.terminate()
-        try:
-            child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait(timeout=5)
         code = 124
-        print(f"hermetic_test: command timed out; owned child {child.pid} reaped", file=sys.stderr)
-    # The kernel interpreter marker catches orphaned `python -m rlm.repl` kernels, whose
-    # command lines name neither the root nor the target. Another live user of the same
-    # test runtime would also match; the report lists exact PIDs for review.
-    markers = [str(root), os.path.realpath(root), kernel_python]
-    if env.get("CARGO_TARGET_DIR"):
-        markers.append(env["CARGO_TARGET_DIR"])
-    else:
-        markers.append(str(Path.cwd() / "target"))
-    # Test workers that lose their supervisor exit on their own after a bounded
-    # window (WORKER_SUPERVISOR_LOST_EXIT_MS in e2e helpers); report only what is
-    # still alive once that observable condition has had time to settle.
-    deadline = time.monotonic() + GRACE_SECONDS
-    survivors = leftovers(markers)
-    while survivors and time.monotonic() < deadline:
-        time.sleep(1)
-        survivors = leftovers(markers)
+        print("hermetic_test: command deadline exceeded", file=sys.stderr)
+    except BaseException as error:
+        failure = error
+    finally:
+        try:
+            if child is not None:
+                reap_owned(child)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+        try:
+            after = inventory.snapshot()
+            survivors = new_processes(before, after)
+            (root / "process-after.json").write_text(json.dumps(list(after.values()), indent=2))
+        except BaseException as error:
+            survivors = None
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
     if survivors:
-        print("hermetic_test: processes survived the command (not killed):", file=sys.stderr)
-        for row in survivors:
-            print("  " + row, file=sys.stderr)
+        print("hermetic_test: new same-UID processes remain (ownership UNKNOWN; not killed):", file=sys.stderr)
+        for identity in survivors:
+            print("  " + json.dumps(identity, sort_keys=True), file=sys.stderr)
         return code or 3
-    print(f"hermetic_test: exit {code}; no surviving processes; root kept at {root}", file=sys.stderr)
+    print(f"hermetic_test: exit {code}; no new same-UID processes; root kept at {root}", file=sys.stderr)
     return code
 
 

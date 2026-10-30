@@ -89,7 +89,7 @@ Every contributor (human or agent) must read this before working on this repo.
   `PA_E2E_KERNEL_PYTHON`, never one under the real owner's `.prime`/`.prime-rust`).
   `CARGO_TARGET_DIR` must be an existing owner-private `/private/tmp/pa-<unique>/target`.
   On macOS a mandatory sandbox allows writes only under that target and the fresh
-  root; it denies external traffic, DNS, and the real gateway port 8787. Unix sockets
+  root; it denies external traffic, DNS, and the real gateway ports 8787, 8791 and 18789. Unix sockets
   stay inside the root. Dynamic loopback mocks remain allowed, not arbitrary proxy
   relays. An actual synthetic canary preflight must pass before the subject starts.
   Other platforms fail closed until an equivalent fence exists. Per-test HOME path

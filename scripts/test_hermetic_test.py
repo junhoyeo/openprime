@@ -1,6 +1,7 @@
 """Guard checks. Run through hermetic_test.py; never start a product binary here."""
 import importlib.util
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -14,7 +15,6 @@ SPEC.loader.exec_module(ht)
 
 class HermeticTest(unittest.TestCase):
     def setUp(self):
-        ht.GRACE_SECONDS = 0
         self.tmp = Path(tempfile.mkdtemp(prefix="guard-", dir=os.environ["TMPDIR"])).resolve()
         self.root = self.tmp / "run"
         self.root.mkdir()
@@ -62,13 +62,92 @@ class HermeticTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     ht.main([*opt, "--kernel-python", str(self.python), "--", sys.executable, "-c", "pass"])
 
-    def test_leftover_report_matches_executables_not_mentions(self):
-        listing = ("10 1 /private/target/debug/pa-daemon worker\n"
-                   "11 1 /bin/bash -c cd /private/target && cargo test\n"
-                   f"12 1 {self.python} -m rlm.repl\n")
-        with mock.patch.object(ht.subprocess, "run", return_value=mock.Mock(stdout=listing, returncode=0)):
-            found = ht.leftovers(["/private/target", str(self.python)])
-        self.assertEqual([row.split()[0] for row in found], ["10", "12"])
+    def test_target_is_explicit_canonical_private_and_not_a_broad_ancestor(self):
+        self.assertEqual(ht.private_target(os.environ), Path(os.environ["CARGO_TARGET_DIR"]))
+        for value in (None, "/private/tmp", "/private/tmp/pa-test", str(self.root / "target"),
+                      str(Path(os.environ["CARGO_TARGET_DIR"]) / ".." / "target")):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                ht.private_target({} if value is None else {"CARGO_TARGET_DIR": value})
+
+    def test_nonfinite_or_nonpositive_deadline_is_refused(self):
+        for value in ("nan", "inf", "-inf", "0", "-1"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                ht.main(["--timeout=" + value, "--kernel-python", str(self.python), "--", "true"])
+
+    def test_receipt_write_failure_reaps_the_actual_child(self):
+        children = []
+        real_popen = subprocess.Popen
+        real_write = Path.write_text
+
+        def launch(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        def write(path, *args, **kwargs):
+            if path.name == "command.json":
+                raise OSError("injected receipt failure")
+            return real_write(path, *args, **kwargs)
+
+        with mock.patch.object(ht.subprocess, "Popen", side_effect=launch), \
+             mock.patch.object(Path, "write_text", new=write):
+            with self.assertRaisesRegex(OSError, "injected receipt failure"):
+                ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
+                               self.root, self.root, 10)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode, "owned external child was not reaped")
+
+    def test_identity_failure_and_interrupt_reap_the_actual_child(self):
+        for failure in (RuntimeError("injected identity failure"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                children = []
+                real_popen = subprocess.Popen
+                inventory = ht.ProcessInventory()
+                probe = mock.Mock()
+                probe.snapshot.side_effect = inventory.snapshot
+                probe.identity.side_effect = failure
+
+                def launch(*args, **kwargs):
+                    child = real_popen(*args, **kwargs)
+                    children.append(child)
+                    return child
+
+                with mock.patch.object(ht.subprocess, "Popen", side_effect=launch):
+                    with self.assertRaises(type(failure)):
+                        ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
+                                       self.root, self.root, 10, inventory=probe)
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(children[0].returncode)
+
+    def test_external_executable_survivor_is_unknown_and_never_killed(self):
+        # Capture before the external process exists, just as a real launch does.
+        inventory = ht.ProcessInventory()
+        before = inventory.snapshot()
+        child = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            identity = inventory.identity(child.pid)
+            self.assertIsNotNone(identity)
+            after = inventory.snapshot()
+            self.assertIn(identity, ht.new_processes(before, after))
+            # Feed the real census into the subject-result branch. Unlike argv[0]
+            # marker matching, this reports the external executable as UNKNOWN.
+            probe = mock.Mock()
+            probe.snapshot.side_effect = [before, after]
+            probe.identity.side_effect = inventory.identity
+            code = ht.run_subject(["/usr/bin/true"], ht.build_env(self.root, sys.executable, {}),
+                                  self.root, self.root, 10, inventory=probe)
+            self.assertEqual(code, 3)
+            self.assertIsNone(child.poll(), "discovered PID must not be signalled")
+        finally:
+            ht.reap_owned(child)
+
+    def test_unknown_inventory_is_not_reported_as_no_survivors(self):
+        inventory = mock.Mock()
+        inventory.snapshot.side_effect = RuntimeError("injected inventory failure")
+        with mock.patch.object(ht.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(RuntimeError, "injected inventory failure"):
+                ht.run_subject(["/usr/bin/true"], {}, self.root, self.root, 10, inventory=inventory)
+            launch.assert_not_called()
 
 
 if __name__ == "__main__":
