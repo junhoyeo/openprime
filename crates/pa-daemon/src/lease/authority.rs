@@ -40,8 +40,11 @@ impl RuntimeSessionAuthority {
     /// # Errors
     /// Returns an error when the configured path identity cannot be verified.
     pub fn for_agent_dir(agent_dir: &Path) -> Result<Self> {
+        // Ledger namespaces retain the configured spelling. Canonical target
+        // identity is not a migration of legacy missing-directory ledger keys.
+        let sessions_dir = crate::paths::sessions_dir(agent_dir)?;
+        super::checked_session_path(&sessions_dir)?;
         let agent_dir = super::checked_session_path(agent_dir)?;
-        let sessions_dir = super::checked_session_path(&crate::paths::sessions_dir(&agent_dir)?)?;
         Ok(Self::resolved(agent_dir, sessions_dir))
     }
 
@@ -71,7 +74,8 @@ impl RuntimeSessionAuthority {
         let configured = config.default_session_dir.as_deref()
             .filter(|path| Path::new(path).is_absolute())
             .ok_or_else(|| anyhow::anyhow!("supervisor authority has no absolute default sessions directory"))?;
-        let sessions_dir = super::checked_session_path(Path::new(configured))?;
+        let sessions_dir = PathBuf::from(configured);
+        super::checked_session_path(&sessions_dir)?;
         Ok(Self::resolved(agent_dir, sessions_dir))
     }
 
@@ -115,5 +119,58 @@ impl RuntimeSessionAuthority {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_42_authority_keeps_a_missing_default_roots_legacy_alias_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let default_sessions = alias.join("missing-default");
+        let agent = root.path().join("agent");
+        let socket = root.path().join("supervisor.sock");
+        crate::descriptor::persist_supervisor_config(
+            &crate::descriptor::descriptor_dir(&agent, &socket).join(SUPERVISOR_CONFIG_FILE_NAME),
+            &PersistedSupervisorConfig { version: 1, socket_path: socket.to_string_lossy().into_owned(),
+                default_session_dir: Some(default_sessions.to_string_lossy().into_owned()) },
+        ).unwrap();
+        let storage = root.path().join("custom-storage");
+        std::fs::create_dir(&storage).unwrap();
+        let child = storage.join("child.jsonl");
+        let parent = storage.join("parent.jsonl");
+        for path in [&child, &parent] {
+            std::fs::write(path, format!("{}\n", serde_json::json!({
+                "type": "session", "version": 3,
+                "id": path.file_stem().unwrap().to_string_lossy(),
+                "timestamp": "t", "cwd": root.path(),
+            }))).unwrap();
+        }
+        let ledger = RlmSpawnLedger::new(&agent, &default_sessions, |_| {});
+        ledger.append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+            child_id: "sub-child".into(), parent: parent.to_string_lossy().into_owned(),
+            child: child.to_string_lossy().into_owned(), depth: 1, name: "child".into(),
+        }).unwrap();
+        ledger.append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User).unwrap();
+        let before = std::fs::read(ledger.ledger_path()).unwrap();
+        assert!(!default_sessions.exists(), "custom storage must leave the default root missing");
+        let authority = RuntimeSessionAuthority::for_supervisor(&agent, &socket).unwrap();
+        assert_eq!(authority.ledger.ledger_path(), ledger.ledger_path());
+        assert!(authority.acquire(&child).is_err(), "the real acquire cannot shed the legacy tombstone");
+        assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), before);
+        // Namespace continuity is also required after the formerly missing root
+        // appears. This remains a real regression until legacy-key selection
+        // composes; raw caller spelling alone is not a complete fix.
+        std::fs::create_dir_all(&default_sessions).unwrap();
+        assert!(authority.acquire(&child).is_err(), "captured authority must retain or refuse its namespace");
+        let reopened = RuntimeSessionAuthority::for_supervisor(&agent, &socket).unwrap();
+        assert!(reopened.acquire(&child).is_err(), "fresh authority must not select an empty bucket after root creation");
+        assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), before);
     }
 }
