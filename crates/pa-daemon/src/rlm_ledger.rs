@@ -31,6 +31,12 @@ use crate::util::now_iso;
 
 mod replay;
 
+#[derive(Clone, Copy)]
+enum LedgerReadPolicy {
+    BestEffort,
+    Authority,
+}
+
 use replay::{
     canonicalize_dir, edge_key, file_identity, is_file, parse_ledger_line, sole_edge_by_child_id,
     DeletedBucket, LedgerRecord, LivePathResolver, ReplaySnapshot, ReplayState,
@@ -662,6 +668,15 @@ impl RlmSpawnLedger {
             .collect())
     }
 
+    /// Authority reads must not interpret unreadable or partially understood
+    /// topology as an empty tree. Keep ordinary display reads best-effort; this
+    /// uncached path propagates seeding, I/O, malformed and unknown-op errors.
+    pub(crate) fn strict_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
+        self.seed()?;
+        let state = fold_records(self.read_records_with(LedgerReadPolicy::Authority)?, |_| true);
+        Ok(state.edges)
+    }
+
     /// Live edges reconciled by liveness of their recorded endpoints: a dead endpoint drops the
     /// edge; a MOVED path resolves through its durable session id first.
     ///
@@ -805,8 +820,24 @@ impl RlmSpawnLedger {
     /// ledger reads empty, and one torn or unknown line skips that
     /// record only.
     fn read_records(&self) -> Result<Vec<LedgerRecord>> {
-        let Ok(bytes) = fs::read(&self.path) else {
-            return Ok(Vec::new());
+        self.read_records_with(LedgerReadPolicy::BestEffort)
+    }
+
+    fn read_records_with(&self, policy: LedgerReadPolicy) -> Result<Vec<LedgerRecord>> {
+        if matches!(policy, LedgerReadPolicy::Authority) {
+            match fs::symlink_metadata(&self.path) {
+                Ok(metadata) if !metadata.is_file() => bail!("authority ledger is not a regular file"),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error).context("inspect authority ledger"),
+            }
+        }
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read RLM ledger {}", self.path.display()));
+            }
         };
         if bytes.len() as u64 > RLM_LEDGER_MAX_BYTES {
             bail!(
@@ -814,8 +845,28 @@ impl RlmSpawnLedger {
                 self.path.display()
             );
         }
+        if matches!(policy, LedgerReadPolicy::Authority) {
+            if std::str::from_utf8(&bytes).is_err() {
+                bail!("cleanup topology contains invalid UTF-8");
+            }
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                bail!("cleanup topology has an unterminated record");
+            }
+            let header = bytes.split(|byte| *byte == b'\n')
+                .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+                .ok_or_else(|| anyhow::anyhow!("authority ledger has no ownership header"))?;
+            let header: Value = serde_json::from_slice(header)
+                .map_err(|_| anyhow::anyhow!("authority ledger has a malformed ownership header"))?;
+            let scope = header.get("sessionsDir").and_then(Value::as_str)
+                .filter(|scope| Path::new(scope).is_absolute());
+            if header.get("op").and_then(Value::as_str) != Some("meta")
+                || !scope.is_some_and(|scope| canonicalize_dir(Path::new(scope)) == self.canonical_sessions_dir)
+            {
+                bail!("authority ledger ownership does not match its sessions directory");
+            }
+        }
         // A torn write inside a multibyte name must spoil one line, not
-        // the whole file.
+        // the whole file for ordinary display reads.
         let content = String::from_utf8_lossy(&bytes);
         let mut records = Vec::new();
         let mut lines = 0usize;
@@ -833,12 +884,22 @@ impl RlmSpawnLedger {
             match parse_ledger_line(line, index) {
                 Ok(Some(record)) => records.push(record),
                 Ok(None) => {
+                    if matches!(policy, LedgerReadPolicy::Authority) {
+                        let value: Value = serde_json::from_str(line)?;
+                        if value.get("op").and_then(Value::as_str) != Some("meta") {
+                            bail!("cleanup topology contains an unknown operation on line {}", index + 1);
+                        }
+                        continue;
+                    }
                     self.log(&format!(
                         "RLM ledger: skipped record with unknown op on line {}",
                         index + 1
                     ));
                 }
                 Err(error) => {
+                    if matches!(policy, LedgerReadPolicy::Authority) {
+                        return Err(error).context("cleanup topology is malformed; refusing partial tree");
+                    }
                     self.log(&format!(
                         "RLM ledger {}: skipped {error:#}",
                         self.path.display()
@@ -1000,3 +1061,5 @@ impl RlmSpawnLedger {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod strict_tests;
