@@ -182,6 +182,31 @@ class HermeticTest(unittest.TestCase):
         self.assertEqual(outcome["wrapper_decision"], "timeout")
         self.assertIsNone(outcome["failure_type"])
 
+    def test_log_tail_does_not_move_an_inherited_writer_offset(self):
+        with ht.ControlDirectory(self.root) as control, control.create_file("shared.log") as output:
+            output.write(b"before")
+            output.flush()
+            os.lseek(output.fileno(), 3, os.SEEK_SET)
+            writer = os.dup(output.fileno())
+            try:
+                self.assertEqual(ht.read_log_tail(output), b"before")
+                self.assertEqual(os.lseek(writer, 0, os.SEEK_CUR), 3)
+                os.write(writer, b"X")
+                self.assertEqual(ht.read_log_tail(output), b"befXre")
+            finally:
+                os.close(writer)
+
+    def test_large_log_tail_is_bounded_and_full_log_is_retained(self):
+        payload = b"01234567" * (200 * 1024 // 8)
+        with ht.ControlDirectory(self.root) as control, control.create_file("large.log") as output:
+            output.write(payload)
+            output.flush()
+            os.lseek(output.fileno(), 17, os.SEEK_SET)
+            self.assertEqual(ht.read_log_tail(output), payload[-128 * 1024:])
+            self.assertEqual(os.lseek(output.fileno(), 0, os.SEEK_CUR), 17)
+            self.assertEqual(os.fstat(output.fileno()).st_size, len(payload))
+            self.assertEqual(os.pread(output.fileno(), len(payload), 0), payload)
+
     def test_parent_receipt_writer_refuses_an_owned_symlink_canary(self):
         forbidden = self.tmp / "forbidden-receipt-canary"
         forbidden.write_text("preserve")

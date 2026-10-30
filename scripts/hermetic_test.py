@@ -221,6 +221,11 @@ def main(argv=None):
         return run_subject(argv, env, root, target, args.timeout, control=control)
 
 
+def read_log_tail(output):
+    fd = output.fileno()
+    return os.pread(fd, 128 * 1024, max(0, os.fstat(fd).st_size - 128 * 1024))
+
+
 def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
     """Execute and account for one subject. Tests inject only the inventory seam."""
     child = None
@@ -301,10 +306,9 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
             if output is not None:
                 try:
                     output.flush()
-                    output.seek(0, os.SEEK_END)
-                    # Keep the full log; mirror a bounded tail after the subject.
-                    output.seek(max(0, output.tell() - 128 * 1024))
-                    sys.stdout.write(output.read().decode("utf-8", errors="replace"))
+                    # Descendants may retain stdout: pread must not move their
+                    # shared open-file offset while we mirror a bounded tail.
+                    sys.stdout.write(read_log_tail(output).decode("utf-8", errors="replace"))
                     sys.stdout.flush()
                 finally:
                     output.close()

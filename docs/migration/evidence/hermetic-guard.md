@@ -157,3 +157,17 @@ failure/live-child cleanup and normal outcomes are covered in the same run.
 The prior 16-control result is valid for its narrower checks, not proof of the
 ancestor-safe contract. This change remains a targeted guard fix, not a claim of
 complete adversarial-code isolation or a replacement for native runtime gates.
+
+## Bounded captured-log read
+
+Review found that seek/read tail mirroring could move the open-file offset shared
+with a surviving descendant, and an unbounded read could follow appended output.
+The final mirror uses one `os.pread(fd, 128 * 1024, offset)` call. It cannot move
+that shared offset and reads at most 128 KiB. Actual duplicated-fd and 200 KiB-log
+regressions verify the preserved writer position, bounded tail and intact full log.
+
+The seventh run passed **19 OS controls + 17 tests**, subject exit 0 and observed
+outer exit 0, with no new same-UID processes. Final control:
+`/private/tmp/pa-control-eo0vltkx`; subject root: `/private/tmp/pa-hb24r66ud`; launch
+log: `/private/tmp/pa-guardcheck-yahbygbl/seventh.log`. This corrects only the
+captured-log seam; all prior evidence remains retained.
