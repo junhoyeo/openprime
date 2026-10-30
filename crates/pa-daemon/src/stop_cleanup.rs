@@ -131,13 +131,28 @@ pub(crate) fn cancel_scheduled_jobs_for_tree(
     }
     let now = crate::util::now_ms();
     let mut cancelled = 0;
-    for member in &members {
+    // The cron store deliberately retains the path written by its worker. Its
+    // matcher is lexical, whereas tree membership and live coverage use real paths.
+    // Join both sides here, then cancel with the stored key (including legacy aliases).
+    // Never widen this to a session-id OR match: a stale binding must not cancel a
+    // different transcript merely because a copied job reused its id.
+    let member_paths: HashSet<PathBuf> = members
+        .iter()
+        .map(|member| canonical_session_path(&member.session_file))
+        .collect();
+    let stored_paths: HashSet<String> = store
+        .list()
+        .into_iter()
+        .filter(|job| member_paths.contains(&canonical_session_path(Path::new(&job.session_file))))
+        .map(|job| job.session_file)
+        .collect();
+    for session_file in stored_paths {
         cancelled += store
             .cancel_jobs_for_session(
                 &CancelJobsFilter {
                     active_session_id: None,
                     session_id: None,
-                    session_file: Some(member.session_file.to_string_lossy().to_string()),
+                    session_file: Some(session_file),
                 },
                 now,
             )?
@@ -494,6 +509,9 @@ impl Supervisor {
 }
 
 #[cfg(test)]
+mod path_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_store::{session_file_name, SessionFile};
@@ -506,7 +524,7 @@ mod tests {
         dir
     }
 
-    fn write_session(dir: &Path, name: Option<&str>) -> (String, PathBuf) {
+    pub(super) fn write_session(dir: &Path, name: Option<&str>) -> (String, PathBuf) {
         let mut session = SessionFile::create("/work", None, 0);
         if let Some(name) = name {
             session.append_session_info(name);
@@ -523,7 +541,7 @@ mod tests {
         (session.session_id().to_string(), path)
     }
 
-    fn write_job(session_file: &Path, session_id: &str, job_id: &str) {
+    pub(super) fn write_job(session_file: &Path, session_id: &str, job_id: &str) {
         let dir = session_artifact_dir(session_file, session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let jobs = serde_json::json!([{
@@ -550,7 +568,7 @@ mod tests {
         .unwrap();
     }
 
-    fn read_job(session_file: &Path, session_id: &str) -> AgentCronJob {
+    pub(super) fn read_job(session_file: &Path, session_id: &str) -> AgentCronJob {
         let dir = session_artifact_dir(session_file, session_id).unwrap();
         let raw: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("scheduled-jobs.json")).unwrap(),
