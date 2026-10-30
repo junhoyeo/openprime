@@ -575,10 +575,10 @@ fn an_unbuilt_engine_branch_summary_carries_the_request_session_id() {
         queued_steering_probe: None,
     })
     .unwrap();
-    engine.resolve_model().expect("faux model");
+    let model = engine.resolve_model().expect("faux model");
     assert!(engine.session.blocking_lock().is_none(), "no session built");
     let recorder = pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
-        api: Some("faux".to_string()),
+        api: Some(model.api),
         provider: Some("faux".to_string()),
         ..Default::default()
     });

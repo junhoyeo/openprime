@@ -1,6 +1,6 @@
 //! Agent engine tests.
-/// The faux provider registry is process-global; faux-driven tests must
-/// not register concurrently (each registration replaces the queue).
+/// Tests that explicitly register or replace the shared `faux` API still
+/// serialize that global seam. Script-configured engines own private APIs.
 #[cfg(test)]
 pub(crate) static FAUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -11,6 +11,7 @@ mod abort;
 mod autonomous;
 mod compaction;
 mod failover_facts;
+mod faux_isolation;
 mod goal;
 mod model_resolution;
 mod quota_park;
