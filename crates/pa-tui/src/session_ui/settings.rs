@@ -623,7 +623,7 @@ impl SessionUi {
     /// Toggle the priority service tier. TS serializes toggles through a queue; here the dispatch
     /// awaits to completion, so toggles cannot interleave.
     pub(super) async fn handle_fast_command(&mut self, view: &mut AgentView) {
-        const UNAVAILABLE: &str = "Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication";
+        const UNAVAILABLE: &str = "Fast mode requires a model that supports the priority service tier. For custom gateways, use openai-responses and set compat.supportsFastMode to true in models.json";
         let eligible = self
             .current_model_entry(view)
             .is_some_and(pa_types::ai::supports_fast_mode);
