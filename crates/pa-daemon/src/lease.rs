@@ -71,28 +71,63 @@ impl SessionAlreadyActiveError {
 
 #[must_use]
 pub fn canonical_session_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
-    // A lease can be acquired before the nested session directory/file exists.
-    // Canonicalize the nearest existing ancestor, then append the missing suffix,
-    // so platform aliases (macOS `/var` -> `/private/var`) cannot change the
-    // lease identity once the file is created.
+    resolve_session_path(path, PathResolutionPolicy::BestEffort)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Destructive cleanup needs a proven path, not a best-effort spelling after an
+/// I/O error. Only genuinely missing suffixes may use the shared ancestor walk;
+/// dangling symlinks, permission failures and unresolvable components refuse.
+pub(crate) fn checked_session_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    resolve_session_path(&absolute, PathResolutionPolicy::Checked)
+}
+
+#[derive(Clone, Copy)]
+enum PathResolutionPolicy {
+    BestEffort,
+    Checked,
+}
+
+fn resolve_session_path(path: &Path, policy: PathResolutionPolicy) -> std::io::Result<PathBuf> {
+    // The same nearest-existing-ancestor algorithm serves leases and checked
+    // cleanup; the legacy caller retains its historical best-effort fallback.
     let mut cursor = path;
     let mut suffix = Vec::new();
     loop {
-        if let Ok(mut canonical) = cursor.canonicalize() {
-            for component in suffix.iter().rev() {
-                canonical.push(component);
+        let error = match cursor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
             }
-            return canonical;
+            Err(error) => error,
+        };
+        if matches!(policy, PathResolutionPolicy::Checked) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            match cursor.symlink_metadata() {
+                // An existing entry that cannot resolve is not an absent
+                // suffix (notably a dangling symlink). Do not guess its owner.
+                Ok(_) => return Err(error),
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                Err(other) => return Err(other),
+            }
         }
         let Some(name) = cursor.file_name() else {
-            return path.to_path_buf();
+            return match policy {
+                PathResolutionPolicy::BestEffort => Ok(path.to_path_buf()),
+                PathResolutionPolicy::Checked => Err(error),
+            };
         };
         suffix.push(name.to_os_string());
         let Some(parent) = cursor.parent() else {
-            return path.to_path_buf();
+            return match policy {
+                PathResolutionPolicy::BestEffort => Ok(path.to_path_buf()),
+                PathResolutionPolicy::Checked => Err(error),
+            };
         };
         cursor = parent;
     }
@@ -618,6 +653,9 @@ pub(crate) fn reclaim_dead_owner_leases(agent_dir: &Path) -> usize {
     }
     removed
 }
+
+#[cfg(test)]
+mod path_tests;
 
 #[cfg(test)]
 mod tests {
