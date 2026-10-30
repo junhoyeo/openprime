@@ -8,9 +8,11 @@ A plain `cargo test` with the real HOME can therefore start or rebuild the
 live kernel venv and write live agent state.
 
 This wrapper runs the command under `env -i` with a fresh short root in /tmp:
-synthetic HOME/TMPDIR/XDG_DATA_HOME, PRIME_AGENT_KERNEL_VENV inside the root,
+synthetic HOME/TMPDIR/XDG_DATA_HOME,
 and an explicit test kernel interpreter. On macOS the command also runs under a
-sandbox profile that denies outbound network except loopback and Unix sockets. Agent, session, and socket paths are
+mandatory sandbox that denies filesystem writes outside the run root and private
+Cargo target. It permits loopback mocks except protected ports (8787, 53), and
+Unix sockets only under the run root. Direct external IP/DNS traffic is denied. Agent, session, and socket paths are
 not forced, so tests keep their own per-test roots. After the command, it
 reports any surviving process that references the root or the Cargo target
 directory, and exits non-zero if one exists. It never kills processes and
@@ -21,10 +23,13 @@ Usage:
     scripts/hermetic_test.py -- make check   # uses PA_E2E_KERNEL_PYTHON
 """
 import argparse
+import json
+import pwd
 import platform
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -39,7 +44,7 @@ KERNEL_VARS = ("PRIME_AGENT_KERNEL_PYTHON", "PA_CORE_KERNEL_PYTHON",
 
 
 def real_home():
-    return Path(os.environ.get("HOME") or Path.home()).resolve()
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 
 
 def resolve_kernel_python(explicit, environ):
@@ -50,11 +55,12 @@ def resolve_kernel_python(explicit, environ):
     path = Path(raw)
     if not path.exists():
         raise SystemExit(f"hermetic_test: kernel python {path} does not exist")
-    live = real_home() / ".prime"
-    if path.resolve().is_relative_to(live.resolve()) or path.absolute().is_relative_to(live):
-        raise SystemExit(f"hermetic_test: refusing the live install interpreter {path}; "
-                         "use a separate test runtime")
-    return str(path)
+    for live in (real_home() / ".prime", real_home() / ".prime-rust"):
+        if path.resolve().is_relative_to(live.resolve()) or path.absolute().is_relative_to(live):
+            raise SystemExit(f"hermetic_test: refusing the live install interpreter {path}; "
+                             "use a separate test runtime")
+    # Keep the lexical venv path: resolving a venv symlink here would lose sys.prefix.
+    return str(path.absolute())
 
 
 def build_env(root, kernel_python, environ):
@@ -66,7 +72,6 @@ def build_env(root, kernel_python, environ):
     env.update({
         "HOME": str(root / "h"), "TMPDIR": str(root / "t"), "XDG_DATA_HOME": str(root / "x"),
         "XDG_CONFIG_HOME": str(root / "c"), "XDG_CACHE_HOME": str(root / "cache"),
-        "PRIME_AGENT_KERNEL_VENV": str(root / "k"),
         "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPYCACHEPREFIX": str(root / "pycache"),
         "NO_COLOR": "1",
@@ -77,26 +82,47 @@ def build_env(root, kernel_python, environ):
     return env
 
 
-# macOS: deny outbound network except loopback and Unix sockets, so tests that would
-# reach a real endpoint (telemetry, catalogs) fail loudly instead of egressing.
-# DNS through mDNSResponder stays allowed for localhost resolution. /bin/ps is setuid
-# and cannot exec inside a sandbox, so it runs unsandboxed (it opens no sockets);
-# process-identity code and tests read process start times through it.
-EGRESS_PROFILE = """(version 1)
-(allow default)
-(deny network-outbound)
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-outbound (remote unix-socket))
-(allow network-outbound (literal "/private/var/run/mDNSResponder"))
-(allow process-exec (literal "/bin/ps") (with no-sandbox))
-"""
+# ps is a fixed, OS-supplied, read-only process inspector. macOS refuses to exec
+# this setuid binary in a sandbox. This is the ONLY no-sandbox executable; it
+# cannot launch user commands. Product identity probes depend on its start time.
+# This fence blocks external IPs and protected ports, NOT every local service:
+# dynamic loopback mocks are supported, so an unknown local proxy remains outside
+# this guarantee. Proxy credentials/settings never enter build_env.
+def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787,)):
+    quote = lambda value: json.dumps(str(value))
+    paths = [Path(root).resolve(), *(Path(p).resolve() for p in writable)]
+    private = [real_home() / ".prime", real_home() / ".prime-rust", *map(Path, protected)]
+    lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
+    for path in paths:
+        lines.append(f"(allow file-write* (subpath {quote(path)}))")
+    # PTYs and null are device I/O, not a writable filesystem escape.
+    lines.extend(['(allow file-write* (literal "/dev/null") (literal "/dev/tty") '
+                  '(regex #"^/dev/ttys[0-9]+$"))'])
+    for path in private:
+        for spelling in {path.absolute(), path.resolve()}:
+            lines.append(f"(deny file-read* file-write* (subpath {quote(spelling)}))")
+    lines.extend([
+        "(deny network-outbound)",
+        '(allow network-outbound (remote ip "localhost:*"))',
+        # Restrict Unix sockets to the owned run root (not mDNSResponder, Docker,
+        # the live daemon, or an arbitrary pre-existing local service).
+        f"(allow network-outbound (remote unix-socket (subpath {quote(paths[0])})))",
+        '(deny mach-lookup (global-name "com.apple.mDNSResponder"))',
+    ])
+    for port in sorted({53, 8787, *protected_ports}):
+        if not 1 <= port <= 65535:
+            raise ValueError(f"invalid protected port: {port}")
+        lines.append(f'(deny network-outbound (remote ip "*:{port}"))')
+    lines.append('(allow process-exec (literal "/bin/ps") (with no-sandbox))')
+    return "\n".join(lines) + "\n"
 
 
-def sandboxed(command, root):
-    if platform.system() != "Darwin":
-        return command
-    profile = root / "deny-egress.sb"
-    profile.write_text(EGRESS_PROFILE)
+def sandboxed(command, root, *, writable=(), protected=(), protected_ports=(8787,)):
+    if platform.system() != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        raise SystemExit("hermetic_test: enforced filesystem/network sandbox unavailable; refusing to run")
+    profile = root / "isolation.sb"
+    profile.write_text(sandbox_profile(root, writable=writable, protected=protected,
+                                       protected_ports=protected_ports))
     return ["/usr/bin/sandbox-exec", "-f", str(profile), *command]
 
 
@@ -115,8 +141,11 @@ def leftovers(markers):
     root, the Cargo target directory, or the test kernel interpreter. Matching
     argv[0] only keeps unrelated shells whose arguments merely mention a path,
     and this wrapper's own ancestors, out of the report."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True,
-                         timeout=30, check=False).stdout
+    result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,command="], capture_output=True,
+                            text=True, timeout=30, check=False)
+    if result.returncode:
+        raise RuntimeError(f"process inspection failed ({result.returncode}): {result.stderr}")
+    out = result.stdout
     rows, parents = [], {}
     for line in out.splitlines():
         fields = line.split(None, 2)
@@ -138,12 +167,30 @@ def leftovers(markers):
     return found
 
 
+def private_target(environ):
+    raw = environ.get("CARGO_TARGET_DIR")
+    if not raw:
+        raise SystemExit("hermetic_test: CARGO_TARGET_DIR must name an existing owned /private/tmp/pa-*/target")
+    path = Path(raw)
+    temporary = Path("/tmp").resolve()
+    if (not path.is_absolute() or path != path.resolve() or not path.is_dir()
+            or path.name != "target" or path.parent.parent != temporary
+            or not path.parent.name.startswith("pa-")):
+        raise SystemExit(f"hermetic_test: target must be canonical {temporary}/pa-*/target: {path}")
+    for directory in (path.parent, path):
+        stat = directory.stat()
+        if stat.st_uid != os.getuid() or stat.st_mode & 0o022:
+            raise SystemExit(f"hermetic_test: target directory is not private/owned: {directory}")
+    return path
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--kernel-python")
-    parser.add_argument("--allow-egress", action="store_true",
-                        help="do not wrap the command in the macOS loopback-only network sandbox "
-                             "(requires --do-not-track)")
+    parser.add_argument("--timeout", type=float, default=1800,
+                        help="command deadline in seconds (default: 1800)")
+    parser.add_argument("--protect-port", type=int, action="append", default=[],
+                        help="deny an additional local service port (8787 and DNS are always denied)")
     parser.add_argument("--do-not-track", action="store_true",
                         help="set DO_NOT_TRACK=1 for the command (some telemetry tests then fail by design)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -151,11 +198,12 @@ def main(argv=None):
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("missing command")
-    # Every product run needs a telemetry guard: the egress sandbox (macOS) or
-    # DO_NOT_TRACK=1. Refuse to start without one of the two.
-    sandbox_available = platform.system() == "Darwin" and not args.allow_egress
-    if not sandbox_available and not args.do_not_track:
-        parser.error("no telemetry guard: the egress sandbox is unavailable or disabled; pass --do-not-track")
+    # DO_NOT_TRACK is not a security boundary and cannot replace the OS fence.
+    if platform.system() != "Darwin":
+        parser.error("enforced filesystem/network sandbox unavailable; refusing to run")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    target = private_target(os.environ)
     kernel_python = resolve_kernel_python(args.kernel_python, os.environ)
     root = make_root()
     env = build_env(root, kernel_python, os.environ)
@@ -164,9 +212,49 @@ def main(argv=None):
     executable = shutil.which(command[0], path=env["PATH"]) or command[0]
     print(f"hermetic_test: root {root}", file=sys.stderr)
     argv = [executable, *command[1:]]
-    if not args.allow_egress:
-        argv = sandboxed(argv, root)
-    code = subprocess.run(argv, env=env, check=False).returncode
+    env["CARGO_TARGET_DIR"] = str(target)
+    # The same profile fences the canary and the actual command. Never test this
+    # by attempting writes to real owner files or connections to a real gateway.
+    forbidden_fd, forbidden_name = tempfile.mkstemp(prefix="pa-forbidden-", dir="/tmp")
+    with os.fdopen(forbidden_fd, "w") as stream:
+        stream.write("preserve")
+    forbidden = Path(forbidden_name).resolve()
+    private = root / "private-canary"
+    private.write_text("synthetic secret")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        policy = dict(writable=(target,), protected=(private,), protected_ports=[*args.protect_port, port])
+        preflight = [kernel_python, str(Path(__file__).with_name("hermetic_preflight.py")),
+                     str(root), str(forbidden), str(private), str(port)]
+        result = subprocess.run(sandboxed(preflight, root, **policy), env=env,
+                                text=True, capture_output=True, timeout=20, check=False)
+        (root / "preflight.json").write_text(json.dumps({"exit": result.returncode,
+            "stdout": result.stdout, "stderr": result.stderr, "forbidden": str(forbidden)}, indent=2))
+        if result.returncode or forbidden.read_text() != "preserve" or private.read_text() != "synthetic secret":
+            print(f"hermetic_test: OS-fence preflight failed: {result.stderr}", file=sys.stderr)
+            return result.returncode or 4
+        print(f"hermetic_test: OS-fence preflight {result.stdout.strip()}", file=sys.stderr)
+        argv = sandboxed(argv, root, **policy)
+    child = subprocess.Popen(argv, env=env, start_new_session=True)
+    identity = subprocess.run(["/bin/ps", "-p", str(child.pid), "-o", "pid=,lstart=,command="],
+                              capture_output=True, text=True, timeout=10, check=False)
+    receipt = {"pid": child.pid, "identity": identity.stdout.strip(), "command": argv,
+               "root": str(root), "target": str(target), "started_monotonic": time.monotonic()}
+    (root / "command.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    try:
+        code = child.wait(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        # Popen retains this exact unreaped child; never signal a discovered PID.
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
+        code = 124
+        print(f"hermetic_test: command timed out; owned child {child.pid} reaped", file=sys.stderr)
     # The kernel interpreter marker catches orphaned `python -m rlm.repl` kernels, whose
     # command lines name neither the root nor the target. Another live user of the same
     # test runtime would also match; the report lists exact PIDs for review.

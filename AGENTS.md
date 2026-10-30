@@ -84,10 +84,18 @@ Every contributor (human or agent) must read this before working on this repo.
   `cargo test` there. `kernel_venv_dir` resolves from `HOME`, and many e2e helpers fall back to
   `$HOME/.prime/agent/kernel-venv/bin/python` when `PA_E2E_KERNEL_PYTHON` is unset. With the real
   `HOME`, a test run can start or rebuild the live kernel venv and write live agent state. The
-  wrapper uses `env -i`, a fresh `/tmp` root (synthetic `HOME`/`TMPDIR`/XDG and
-  `PRIME_AGENT_KERNEL_VENV`), an explicit test kernel interpreter (`--kernel-python` or
-  `PA_E2E_KERNEL_PYTHON`, never one under the live `~/.prime`), and, on macOS, a sandbox that
-  denies outbound network except loopback. It then reports any surviving test process.
+  wrapper uses a scrubbed environment, a fresh canonical `/tmp` root (synthetic
+  `HOME`/`TMPDIR`/XDG), and an explicit test kernel interpreter (`--kernel-python` or
+  `PA_E2E_KERNEL_PYTHON`, never one under the real owner's `.prime`/`.prime-rust`).
+  `CARGO_TARGET_DIR` must be an existing owner-private `/private/tmp/pa-<unique>/target`.
+  On macOS a mandatory sandbox allows writes only under that target and the fresh
+  root; it denies external traffic, DNS, and the real gateway port 8787. Unix sockets
+  stay inside the root. Dynamic loopback mocks remain allowed, not arbitrary proxy
+  relays. An actual synthetic canary preflight must pass before the subject starts.
+  Other platforms fail closed until an equivalent fence exists. Per-test HOME path
+  resolution remains intact; no global session-dir or kernel-venv override is forced.
+  The wrapper reports survivors and retains evidence. See
+  `docs/migration/evidence/hermetic-guard.md` for exact guarantees and limitations.
 
 ## Lint discipline
 
