@@ -8,12 +8,18 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::descriptor::{PersistedSupervisorConfig, SUPERVISOR_CONFIG_FILE_NAME};
 use crate::rlm_ledger::RlmSpawnLedger;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Cannot revive deleted RLM child: {path}")]
+pub(crate) struct DeletedSessionError {
+    path: String,
+}
 
 /// The agent root and default RLM ledger scope of one runtime invocation.
 /// Clones retain the same scope; switching a transcript never changes it.
@@ -101,6 +107,27 @@ impl RuntimeSessionAuthority {
         })
     }
 
+    /// Cleanup proof for one already-committed child deletion, called under M.
+    /// This is not admission permission or authorization to discard private data.
+    pub(crate) fn check_committed_deletion(&self, target: &Path, child_id: &str) -> Result<()> {
+        anyhow::ensure!(!child_id.is_empty() && !target.as_os_str().is_empty(), "Deleted child identity is incomplete");
+        let target = super::checked_session_path(target)?;
+        let mut matches = Vec::new();
+        for edge in self.ledger.strict_edges()? {
+            anyhow::ensure!(Path::new(&edge.child).is_absolute(), "Deletion authority contains a non-absolute child identity");
+            if super::checked_session_path(Path::new(&edge.child))? == target { matches.push(edge); }
+        }
+        anyhow::ensure!(matches.len() == 1, "Committed child deletion is missing or ambiguous");
+        let edge = &matches[0];
+        anyhow::ensure!(edge.child_id == child_id && edge.deleted.is_some(),
+            "Exact child deletion is not committed in this authority scope");
+        Ok(())
+    }
+
+    pub(crate) fn is_deleted_refusal(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<DeletedSessionError>().is_some()
+    }
+
     /// Called only while the canonical target's common lease fence is held.
     pub(crate) fn check_admission(&self, target: &Path) -> Result<()> {
         anyhow::ensure!(!target.as_os_str().is_empty(), "Fileless session has no runtime target");
@@ -115,7 +142,7 @@ impl RuntimeSessionAuthority {
                 "session authority contains a non-absolute child identity");
             let child = super::checked_session_path(Path::new(&edge.child))?;
             if edge.deleted.is_some() && child == target {
-                bail!("Cannot revive deleted RLM child: {}", target.display());
+                return Err(DeletedSessionError { path: target.display().to_string() }.into());
             }
         }
         Ok(())
