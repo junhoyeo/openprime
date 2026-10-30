@@ -42,7 +42,7 @@ import time
 
 from hermetic_ownership import OwnershipTracker, ReferenceProbe
 from hermetic_control import ControlDirectory, write_receipt
-from hermetic_processes import ProcessInventory, new_processes, reap_owned
+from hermetic_processes import ProcessInventory, UnknownObservation, new_processes, reap_owned, snapshot_receipt
 
 PASS_THROUGH = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "CARGO_HOME", "RUSTUP_HOME",
                 "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "CARGO_INCREMENTAL", "CARGO_NET_OFFLINE",
@@ -244,11 +244,14 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
     failure = None
     cleanup_failure = None
     tracking_failure = None
+    launch_observation = None
+    last_observation = None
     phase = "initial_inventory"
     try:
         inventory = inventory or ProcessInventory()
         before = inventory.snapshot()
-        write_receipt(control, "process-baseline.json", list(before.values()))
+        last_observation = before
+        write_receipt(control, "process-baseline.json", snapshot_receipt(before))
         # Open the owned log before launch; stdout/stderr never name a path the
         # subject can replace. Directory/receipt descriptors remain CLOEXEC.
         phase = "launch_setup"
@@ -262,16 +265,21 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
                                  stdout=output, stderr=subprocess.STDOUT)
         phase = "launch_identity"
         identity = inventory.identity(child.pid)
+        if isinstance(identity, UnknownObservation):
+            launch_observation = identity.receipt()
+            raise RuntimeError("direct child identity is Unknown; required launch tracking failed")
         if identity is None and child.poll() is None:
             raise RuntimeError("child identity disappeared while the child is still live")
         tracker = OwnershipTracker(child.pid, identity)
+        tracker.observe(before)
         receipt = {"pid": child.pid, "identity": identity, "command": argv,
                    "root": str(root), "target": str(target), "started_monotonic": started,
                    "control": str(control.path), "control_identity": control.identity}
         phase = "launch_receipt"
         write_receipt(control, "command.json", receipt)
         phase = "tracking"
-        tracker.observe(inventory.snapshot())
+        last_observation = inventory.snapshot()
+        tracker.observe(last_observation)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -288,7 +296,8 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
                 # A bounded child-wait checkpoint, not retrying a failed test.
                 # Preserve observed descendant identities before reparenting.
                 phase = "tracking"
-                tracker.observe(inventory.snapshot())
+                last_observation = inventory.snapshot()
+                tracker.observe(last_observation)
         if timed_out:
             print("hermetic_test: command deadline exceeded", file=sys.stderr)
     except BaseException as error:
@@ -305,9 +314,10 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
             if before is not None:
                 phase = "final_inventory"
                 after = inventory.snapshot()
+                last_observation = after
                 survivors = new_processes(before, after)
                 phase = "final_receipt"
-                write_receipt(control, "process-after.json", list(after.values()))
+                write_receipt(control, "process-after.json", snapshot_receipt(after))
                 if tracker is not None:
                     phase = "final_classification"
                     ownership = tracker.classify(before, after, references)
@@ -340,6 +350,8 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
                    "failure_type": type(failure).__name__ if failure is not None else None,
                    "cleanup_failure_type": type(cleanup_failure).__name__ if cleanup_failure is not None else None,
                    "tracking_failure_type": tracking_failure,
+                   "launch_observation": launch_observation,
+                   "last_observation": snapshot_receipt(last_observation) if last_observation is not None else None,
                    "direct_child_reaped": child is not None and child.returncode is not None,
                    "survivors": survivors, "ownership": ownership,
                    "control_identity": control.identity}

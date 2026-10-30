@@ -25,6 +25,7 @@ class OwnershipTest(unittest.TestCase):
         self.subject = row(100, 50, 10, sid=100, pgid=100)
         self.empty_probe = mock.Mock()
         self.empty_probe.inspect.return_value = {"matches": [], "errors": []}
+        self.empty_probe.inventory.identity.return_value = None
 
     def test_observed_owned_orphan_stays_blocking_after_reparenting(self):
         child = row(101, 100, 11, sid=100, pgid=100)
@@ -48,6 +49,7 @@ class OwnershipTest(unittest.TestCase):
         broker = row(103, 1, 13)
         artifact_holder = row(104, 1, 14)
         probe = mock.Mock()
+        probe.inventory.identity.return_value = None
         probe.inspect.side_effect = [
             {"matches": [], "errors": ["cwd metadata unavailable"]},
             {"matches": [{"kind": "open_artifact", "path": "/private/tmp/owned/receipt"}], "errors": []},
@@ -91,6 +93,15 @@ class OwnershipTest(unittest.TestCase):
                 self.assertIn({"kind": "cwd", "path": str(root)}, evidence["matches"])
                 self.assertTrue(any(entry["kind"] == "subject_log_inode" for entry in evidence["matches"]), evidence)
                 self.assertIsNone(child.poll(), "metadata inspection never signals the candidate")
+                from hermetic_processes import UnknownObservation
+                denied = UnknownObservation(child.pid, "sid_2", None, 1, "injected final SID denial", [identity])
+                failed_revalidation = mock.Mock()
+                failed_revalidation.lib = inventory.lib
+                failed_revalidation.identity.side_effect = [identity, denied]
+                retained = ReferenceProbe(failed_revalidation, [root], (stat.st_dev, stat.st_ino)).inspect(identity)
+                self.assertIn({"kind": "cwd", "path": str(root)}, retained["matches"])
+                self.assertIn(denied.receipt(), retained["errors"])
+                self.assertFalse(retained.get("gone", False))
             finally:
                 child.stdin.close()
                 reap_owned(child)

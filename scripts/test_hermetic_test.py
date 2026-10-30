@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from test_hermetic_ownership import OwnershipTest
+from test_hermetic_unknown import UnknownObservationTest
 
 SPEC = importlib.util.spec_from_file_location("hermetic_test", Path(__file__).with_name("hermetic_test.py"))
 ht = importlib.util.module_from_spec(SPEC)
@@ -275,6 +276,87 @@ class HermeticTest(unittest.TestCase):
                     probe.watcher.close()
                 os.close(ack_fd)
                 os.close(stop_fd)
+
+    def test_typed_unknown_direct_live_child_fails_and_is_reaped(self):
+        from hermetic_processes import UnknownObservation
+        inventory = ht.ProcessInventory()
+        injected = mock.Mock()
+        injected.lib = inventory.lib
+        injected.snapshot.side_effect = inventory.snapshot
+        injected.identity.side_effect = lambda pid: UnknownObservation(pid, "bsd_1", 0, 1, "injected EPERM")
+        with self.assertRaisesRegex(RuntimeError, "direct child identity is Unknown"):
+            self.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
+                             self.root, self.root, 10, inventory=injected)
+        outcome = json.loads((self.root / "outcome.json").read_text())
+        self.assertEqual(outcome["wrapper_decision"], "ownership_tracking_failure")
+        self.assertTrue(outcome["direct_child_reaped"])
+        self.assertEqual(outcome["launch_observation"]["errno"], 1)
+        self.assertEqual(outcome["launch_observation"]["kind"], "unknown")
+        self.assertLess(outcome["subject_exit_code"], 0)
+
+    def test_host_only_typed_unknown_preserves_child_exit_and_receipt_failures(self):
+        from hermetic_processes import ProcessSnapshot, UnknownObservation
+        inventory = ht.ProcessInventory()
+        native_inspect = ht.ReferenceProbe.inspect
+        unavailable = UnknownObservation(2_147_483_000, "bsd_1", 0, 1, "synthetic EPERM")
+        def inspect(probe, observation):
+            if isinstance(observation, UnknownObservation):
+                return {"matches": [], "errors": [observation.receipt()]}
+            return native_inspect(probe, observation)
+        for exit_code in (0, 3, 7, -15):
+            case_root = self.root / f"typed-{exit_code}"
+            case_root.mkdir()
+            def scan():
+                result = inventory.snapshot()
+                result.unknown[unavailable.pid] = unavailable
+                return result
+            injected = mock.Mock()
+            injected.lib = inventory.lib
+            injected.identity.side_effect = inventory.identity
+            injected.snapshot.side_effect = scan
+            command = (["/bin/sh", "-c", "kill -TERM $$"] if exit_code == -15 else
+                       [sys.executable, "-c", f"raise SystemExit({exit_code})"])
+            with mock.patch.object(ht.ReferenceProbe, "inspect", new=inspect):
+                code = self.run_subject(command, ht.build_env(case_root, sys.executable, {}),
+                                        case_root, case_root, 10, inventory=injected)
+            self.assertEqual(code, exit_code)
+            outcome = json.loads((case_root / "outcome.json").read_text())
+            self.assertEqual(outcome["subject_exit_code"], exit_code)
+            self.assertEqual(outcome["wrapper_decision"], "subject_exit_with_host_warnings")
+            self.assertIn(unavailable.receipt(), outcome["last_observation"]["unknown"])
+            self.assertIn(unavailable.pid, [entry["unknown"]["pid"] for entry in outcome["ownership"]["host_warnings"] if "unknown" in entry])
+        failure_root = self.root / "typed-receipt-error"
+        failure_root.mkdir()
+        original_write = ht.write_receipt
+        def fail_command(control, name, value):
+            if name == "command.json":
+                raise OSError("typed receipt failure")
+            return original_write(control, name, value)
+        with mock.patch.object(ht, "write_receipt", new=fail_command), \
+             mock.patch.object(ht.ReferenceProbe, "inspect", new=inspect), \
+             self.assertRaisesRegex(OSError, "typed receipt failure"):
+            self.run_subject(["/bin/sleep", "30"], ht.build_env(failure_root, sys.executable, {}),
+                             failure_root, failure_root, 10, inventory=injected)
+        outcome = json.loads((failure_root / "outcome.json").read_text())
+        self.assertTrue(outcome["direct_child_reaped"])
+        self.assertEqual(outcome["failure_type"], "OSError")
+        self.assertIn(unavailable.receipt(), outcome["last_observation"]["unknown"])
+        cleanup_root = self.root / "typed-cleanup-error"
+        cleanup_root.mkdir()
+        original_reap = ht.reap_owned
+        def fail_after_owned_reap(child):
+            original_reap(child)
+            raise OSError("typed cleanup reporting failure")
+        with mock.patch.object(ht, "reap_owned", new=fail_after_owned_reap), \
+             mock.patch.object(ht.ReferenceProbe, "inspect", new=inspect), \
+             self.assertRaisesRegex(OSError, "typed cleanup reporting failure"):
+            self.run_subject(["/usr/bin/true"], ht.build_env(cleanup_root, sys.executable, {}),
+                             cleanup_root, cleanup_root, 10, inventory=injected)
+        outcome = json.loads((cleanup_root / "outcome.json").read_text())
+        self.assertEqual(outcome["cleanup_failure_type"], "OSError")
+        self.assertTrue(outcome["direct_child_reaped"])
+        self.assertNotEqual(outcome["wrapper_exit_code"], 0)
+        self.assertIn(unavailable.receipt(), outcome["last_observation"]["unknown"])
 
     def test_command_timeout_records_actual_reaped_exit(self):
         code = self.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
