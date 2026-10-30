@@ -1,6 +1,9 @@
 """Guard checks. Run through hermetic_test.py; never start a product binary here."""
 import importlib.util
+import contextlib
+import io
 import os
+import json
 import subprocess
 from pathlib import Path
 import sys
@@ -77,7 +80,7 @@ class HermeticTest(unittest.TestCase):
     def test_receipt_write_failure_reaps_the_actual_child(self):
         children = []
         real_popen = subprocess.Popen
-        real_write = Path.write_text
+        real_write = ht.write_receipt
 
         def launch(*args, **kwargs):
             child = real_popen(*args, **kwargs)
@@ -90,16 +93,23 @@ class HermeticTest(unittest.TestCase):
             return real_write(path, *args, **kwargs)
 
         with mock.patch.object(ht.subprocess, "Popen", side_effect=launch), \
-             mock.patch.object(Path, "write_text", new=write):
+             mock.patch.object(ht, "write_receipt", new=write):
             with self.assertRaisesRegex(OSError, "injected receipt failure"):
                 ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
                                self.root, self.root, 10)
         self.assertEqual(len(children), 1)
         self.assertIsNotNone(children[0].returncode, "owned external child was not reaped")
+        outcome = json.loads((self.root / "outcome.json").read_text())
+        self.assertEqual(outcome["subject_exit_code"], children[0].returncode)
+        self.assertEqual(outcome["wrapper_decision"], "error")
+        self.assertEqual(outcome["failure_type"], "OSError")
+        self.assertTrue(outcome["direct_child_reaped"])
 
     def test_identity_failure_and_interrupt_reap_the_actual_child(self):
         for failure in (RuntimeError("injected identity failure"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__):
+                case_root = self.root / type(failure).__name__
+                case_root.mkdir()
                 children = []
                 real_popen = subprocess.Popen
                 inventory = ht.ProcessInventory()
@@ -114,10 +124,14 @@ class HermeticTest(unittest.TestCase):
 
                 with mock.patch.object(ht.subprocess, "Popen", side_effect=launch):
                     with self.assertRaises(type(failure)):
-                        ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
-                                       self.root, self.root, 10, inventory=probe)
+                        ht.run_subject(["/bin/sleep", "30"], ht.build_env(case_root, sys.executable, {}),
+                                       case_root, case_root, 10, inventory=probe)
                 self.assertEqual(len(children), 1)
                 self.assertIsNotNone(children[0].returncode)
+                outcome = json.loads((case_root / "outcome.json").read_text())
+                self.assertEqual(outcome["subject_exit_code"], children[0].returncode)
+                self.assertEqual(outcome["failure_type"], type(failure).__name__)
+                self.assertTrue(outcome["direct_child_reaped"])
 
     def test_external_executable_survivor_is_unknown_and_never_killed(self):
         # Capture before the external process exists, just as a real launch does.
@@ -129,17 +143,61 @@ class HermeticTest(unittest.TestCase):
             self.assertIsNotNone(identity)
             after = inventory.snapshot()
             self.assertIn(identity, ht.new_processes(before, after))
-            # Feed the real census into the subject-result branch. Unlike argv[0]
-            # marker matching, this reports the external executable as UNKNOWN.
-            probe = mock.Mock()
-            probe.snapshot.side_effect = [before, after]
-            probe.identity.side_effect = inventory.identity
-            code = ht.run_subject(["/usr/bin/true"], ht.build_env(self.root, sys.executable, {}),
-                                  self.root, self.root, 10, inventory=probe)
-            self.assertEqual(code, 3)
-            self.assertIsNone(child.poll(), "discovered PID must not be signalled")
+            # Both wrapper exits are 3, but the immutable outcome must distinguish
+            # a passing subject from a genuinely failing subject.
+            for subject_exit in (0, 3, 7):
+                case_root = self.root / f"exit-{subject_exit}"
+                case_root.mkdir()
+                probe = mock.Mock()
+                probe.snapshot.side_effect = [before, after]
+                probe.identity.side_effect = inventory.identity
+                code = ht.run_subject([sys.executable, "-c", f"raise SystemExit({subject_exit})"],
+                                      ht.build_env(case_root, sys.executable, {}),
+                                      case_root, case_root, 10, inventory=probe)
+                self.assertEqual(code, subject_exit or 3)
+                outcome = json.loads((case_root / "outcome.json").read_text())
+                self.assertEqual(outcome["subject_exit_code"], subject_exit)
+                self.assertEqual(outcome["wrapper_exit_code"], subject_exit or 3)
+                self.assertEqual(outcome["wrapper_decision"], "unknown_processes")
+                self.assertIn(identity, outcome["survivors"])
+                self.assertFalse(outcome["timed_out"])
+                self.assertIsNone(child.poll(), "discovered PID must not be signalled")
         finally:
             ht.reap_owned(child)
+
+    def test_command_timeout_records_actual_reaped_exit(self):
+        code = ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
+                              self.root, self.root, 0.01)
+        self.assertEqual(code, 124)
+        outcome = json.loads((self.root / "outcome.json").read_text())
+        self.assertTrue(outcome["timed_out"])
+        self.assertTrue(outcome["direct_child_reaped"])
+        self.assertLess(outcome["subject_exit_code"], 0)
+        self.assertEqual(outcome["wrapper_decision"], "timeout")
+        self.assertIsNone(outcome["failure_type"])
+
+    def test_parent_receipt_writer_refuses_an_owned_symlink_canary(self):
+        forbidden = self.tmp / "forbidden-receipt-canary"
+        forbidden.write_text("preserve")
+        link = self.root / "command.json"
+        link.symlink_to(forbidden)
+        with self.assertRaises(FileExistsError):
+            ht.write_receipt(link, {"unsafe": "must not overwrite the canary"})
+        self.assertEqual(forbidden.read_text(), "preserve")
+        self.assertTrue(link.is_symlink(), "existing evidence is retained")
+
+    def test_outcome_receipt_cannot_silently_overwrite_existing_evidence(self):
+        (self.root / "outcome.json").write_text("preserve")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(FileExistsError):
+            ht.run_subject(["/usr/bin/true"], ht.build_env(self.root, sys.executable, {}),
+                           self.root, self.root, 10)
+        self.assertEqual((self.root / "outcome.json").read_text(), "preserve")
+        fallback = json.loads(stderr.getvalue().split("fallback ", 1)[1])
+        self.assertEqual(fallback["subject_exit_code"], 0)
+        self.assertEqual(fallback["wrapper_exit_code"], 1)
+        self.assertEqual(fallback["wrapper_decision"], "outcome_receipt_error")
+        self.assertEqual(fallback["outcome_receipt_failure_type"], "FileExistsError")
 
     def test_unknown_inventory_is_not_reported_as_no_survivors(self):
         inventory = mock.Mock()

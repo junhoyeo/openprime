@@ -97,6 +97,11 @@ def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8
     lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
     for path in paths:
         lines.append(f"(allow file-write* (subpath {quote(path)}))")
+    # The unsandboxed controller owns these paths. A subject must not replace a
+    # receipt with a symlink or alter the policy/evidence used by the controller.
+    for name in ("isolation.sb", "preflight.json", "process-baseline.json", "command.json",
+                 "process-after.json", "outcome.json"):
+        lines.append(f"(deny file-write* (literal {quote(paths[0] / name)}))")
     # PTYs and null are device I/O, not a writable filesystem escape.
     lines.extend(['(allow file-write* (literal "/dev/null") (literal "/dev/tty") '
                   '(regex #"^/dev/ttys[0-9]+$"))'])
@@ -157,6 +162,12 @@ def private_target(environ):
     return path
 
 
+def write_receipt(path, value):
+    """Create controller evidence once; O_EXCL refuses existing files/symlinks."""
+    with path.open("x") as stream:
+        stream.write(json.dumps(value, indent=2) + "\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--kernel-python")
@@ -203,8 +214,8 @@ def main(argv=None):
                      str(root), str(forbidden), str(private), str(port)]
         result = subprocess.run(sandboxed(preflight, root, **policy), env=env,
                                 text=True, capture_output=True, timeout=20, check=False)
-        (root / "preflight.json").write_text(json.dumps({"exit": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr, "forbidden": str(forbidden)}, indent=2))
+        write_receipt(root / "preflight.json", {"exit": result.returncode,
+            "stdout": result.stdout, "stderr": result.stderr, "forbidden": str(forbidden)})
         if result.returncode or forbidden.read_text() != "preserve" or private.read_text() != "synthetic secret":
             print(f"hermetic_test: OS-fence preflight failed: {result.stderr}", file=sys.stderr)
             return result.returncode or 4
@@ -215,24 +226,28 @@ def main(argv=None):
 
 def run_subject(argv, env, root, target, timeout, inventory=None):
     """Execute and account for one subject. Tests inject only the inventory seam."""
-    inventory = inventory or ProcessInventory()
-    before = inventory.snapshot()
-    (root / "process-baseline.json").write_text(json.dumps(list(before.values()), indent=2))
     child = None
-    code = 1
+    before = None
+    survivors = None
+    timed_out = False
     failure = None
+    cleanup_failure = None
     try:
+        inventory = inventory or ProcessInventory()
+        before = inventory.snapshot()
+        write_receipt(root / "process-baseline.json", list(before.values()))
         child = subprocess.Popen(argv, env=env, start_new_session=True)
         identity = inventory.identity(child.pid)
         if identity is None and child.poll() is None:
             raise RuntimeError("child identity disappeared while the child is still live")
         receipt = {"pid": child.pid, "identity": identity, "command": argv,
                    "root": str(root), "target": str(target), "started_monotonic": time.monotonic()}
-        (root / "command.json").write_text(json.dumps(receipt, indent=2) + "\n")
-        code = child.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        code = 124
-        print("hermetic_test: command deadline exceeded", file=sys.stderr)
+        write_receipt(root / "command.json", receipt)
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            print("hermetic_test: command deadline exceeded", file=sys.stderr)
     except BaseException as error:
         failure = error
     finally:
@@ -240,23 +255,55 @@ def run_subject(argv, env, root, target, timeout, inventory=None):
             if child is not None:
                 reap_owned(child)
         except BaseException as error:
-            if failure is None:
-                failure = error
+            cleanup_failure = error
         try:
-            after = inventory.snapshot()
-            survivors = new_processes(before, after)
-            (root / "process-after.json").write_text(json.dumps(list(after.values()), indent=2))
+            if before is not None:
+                after = inventory.snapshot()
+                survivors = new_processes(before, after)
+                write_receipt(root / "process-after.json", list(after.values()))
         except BaseException as error:
-            survivors = None
             if failure is None:
                 failure = error
+        subject_exit = child.returncode if child is not None else None
+        if failure is not None or cleanup_failure is not None:
+            decision = "error"
+            code = 130 if isinstance(failure or cleanup_failure, KeyboardInterrupt) else 1
+        elif timed_out:
+            decision, code = "timeout", 124
+        elif subject_exit is None or survivors is None:
+            decision, code = "unresolved", 4
+        elif survivors:
+            decision, code = "unknown_processes", subject_exit or 3
+        else:
+            decision, code = "subject_exit", subject_exit
+        outcome = {"subject_exit_code": subject_exit, "timed_out": timed_out,
+                   "wrapper_decision": decision, "wrapper_exit_code": code & 255,
+                   "wrapper_return_code": code,
+                   "failure_type": type(failure).__name__ if failure is not None else None,
+                   "cleanup_failure_type": type(cleanup_failure).__name__ if cleanup_failure is not None else None,
+                   "direct_child_reaped": child is not None and child.returncode is not None,
+                   "survivors": survivors}
+        try:
+            # One immutable final receipt per run; never overwrite earlier evidence.
+            write_receipt(root / "outcome.json", outcome)
+        except BaseException as receipt_error:
+            outcome["planned_wrapper_decision"] = outcome["wrapper_decision"]
+            outcome["wrapper_decision"] = "outcome_receipt_error"
+            outcome["wrapper_exit_code"] = 130 if isinstance(receipt_error, KeyboardInterrupt) else 1
+            outcome["wrapper_return_code"] = outcome["wrapper_exit_code"]
+            outcome["outcome_receipt_failure_type"] = type(receipt_error).__name__
+            print("hermetic_test: outcome receipt write failed; fallback " + json.dumps(outcome), file=sys.stderr)
+            raise
+    print(f"hermetic_test: subject exit {subject_exit}; wrapper decision {decision} ({code})", file=sys.stderr)
     if failure is not None:
         raise failure
+    if cleanup_failure is not None:
+        raise cleanup_failure
     if survivors:
         print("hermetic_test: new same-UID processes remain (ownership UNKNOWN; not killed):", file=sys.stderr)
         for identity in survivors:
             print("  " + json.dumps(identity, sort_keys=True), file=sys.stderr)
-        return code or 3
+        return code
     print(f"hermetic_test: exit {code}; no new same-UID processes; root kept at {root}", file=sys.stderr)
     return code
 

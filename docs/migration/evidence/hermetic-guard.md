@@ -92,3 +92,35 @@ verify they are reaped. A real external `/bin/sleep` is reported UNKNOWN, and
 remains alive until the test's own Popen handle cleans it up. Invalid nonfinite
 deadlines and missing/unsafe target paths are refused. This remains guard-only
 proof, not a runtime ABI or product-test gate.
+
+## Final outcome and controller-metadata proof
+
+Every launched subject now has an exclusive-create `outcome.json` written after
+bounded cleanup. It records the actual child return code (negative values mean a
+POSIX signal), timeout state, raw wrapper return code, normalized 8-bit CLI exit
+code, decision, failure/cleanup types, direct-child reap result and full unknown
+process evidence. Consumers must combine a fresh valid receipt with the observed
+outer process status; a planned outcome or fallback cannot certify success.
+Receipt creation errors stay nonzero and emit a distinctly failed stderr fallback.
+
+The controller's six reserved metadata paths are write-denied to the subject.
+All JSON receipts use exclusive creation, so a subject-created symlink cannot
+redirect an unsandboxed controller write. The tests use only an owned forbidden
+canary; no live owner file or service is probed.
+
+The fourth run completed 14 controls and 13 tests with subject exit 0 but outer
+exit 3 because of one new external process. Its raw evidence remains retained at
+`/private/tmp/pa-hhdbgy3d2` and `guardcheck/fourth.log`; this was not rewritten as
+an unqualified pass. A further concrete correction fixed receipt-error fallback
+exit reporting and the metadata symlink seam; it was not a census retry.
+
+Final tested source: **16/16 actual OS controls + 14/14 tests**, subject exit 0,
+outer wrapper exit 0, no new same-UID identities. Root:
+`/private/tmp/pa-h8lhgnjxh`; log:
+`/private/tmp/pa-guardcheck-yahbygbl/fifth.log`. The subject 0/3/7 plus unknown-census
+cases preserve both facts. Timeout, identity, interruption and receipt failure
+cases reap the exact owned child. Metadata create/overwrite denial runs under the
+real sandbox, and the exclusive writer rejects an actual owned symlink canary.
+
+These remain guard-only gates. PR CI and Rust fixture verification are separate;
+no product-test or full-CI success follows from this result.

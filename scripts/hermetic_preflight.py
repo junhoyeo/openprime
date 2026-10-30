@@ -33,8 +33,11 @@ def main():
     denied(lambda: alias.write_text("corrupted"), "symlink write")
     denied(lambda: private.write_text("corrupted"), "protected write")
     denied(private.read_text, "protected read")
+    denied(lambda: (root / "command.json").write_text("forged"), "controller metadata create")
+    denied(lambda: (root / "isolation.sb").write_text("forged"), "controller policy overwrite")
     checks = ["owned-write", "outside-write-denied", "symlink-write-denied",
-              "protected-write-denied", "protected-read-denied"]
+              "protected-write-denied", "protected-read-denied",
+              "metadata-create-denied", "metadata-overwrite-denied"]
     # Parent holds an actual listener at this dynamically allocated protected port.
     # Check every IP spelling against that port, NEVER the real gateway.
     for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"):
