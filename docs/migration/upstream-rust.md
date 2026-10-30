@@ -169,6 +169,12 @@ Test-only macOS assumptions in upstream tests (`/proc` reads, `proc:` start-id p
 
 ## Rollback and cutover plan
 
+The [safe cutover runbook](cutover-runbook.md) and `scripts/cutover_preflight.py`
+provide read-only artifact preflight and an owned synthetic stop/start/rollback
+rehearsal. They do not activate Rust, stop live processes, replace an install,
+change the default branch, or remove incident evidence. Live activation remains
+an explicit owner decision after the acceptance gates.
+
 Rollback evidence is the untouched `origin/develop` tip `703367badf5c84e48e8c8cd986fbcda882b6378c` and the currently installed TypeScript runtime. The migration does not rewrite or delete either.
 
 After every blocker is closed, the integration lead will provide the tested Rust artifact identity, package checksums, fixture hashes, exact cutover commands, and rollback commands. The parent owns merge, default-branch selection, installation, daemon restart, and live verification. Until that explicit action, this branch is not the served runtime.
