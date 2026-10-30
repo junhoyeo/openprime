@@ -443,7 +443,7 @@ fn tier_command_shows_applies_and_rejects() {
 /// must show actionable configuration advice without issuing a tier mutation.
 #[test]
 fn fast_command_honors_custom_gateway_capability_and_explains_opt_in() {
-    const HINT: &str = "Fast mode requires a model that supports the priority service tier. For custom gateways, use openai-responses and set compat.supportsFastMode to true in models.json";
+    const HINT: &str = "Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra with ChatGPT or OpenAI API key authentication, or an openai-responses model with compat.supportsFastMode in models.json";
     for (api, capability, provider, model_id, eligible) in [
         (
             "openai-responses",
