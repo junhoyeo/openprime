@@ -39,16 +39,20 @@ live installation. It now fails closed when the OS fence is unavailable. Setting
   identity errors and interruption still reap the exact retained Popen child.
 - The wrapper records microsecond birth identity, UID, PPID, PGID and SID from
   native libproc (SDK `proc_bsdinfo`, checked size/offsets), without private argv
-  or environment reads. It inventories same-UID identities before and after
-  the subject. New unexplained identities cause a nonzero UNKNOWN result,
-  including external-toolchain and detached/reparented executables; they are
-  never presumed owned and never signalled. Concurrent unrelated new processes
-  can therefore reject a run. Inspection errors also fail closed.
-- No claim of complete OS process containment is made. The census accounts for
-  identities observable at its boundaries, not ownership of every descendant.
-  Only the direct retained Popen child is cleanup authority. Independent slot
-  verification must resolve unknown processes; absent argv markers are not proof.
-  All receipts and canaries are retained.
+  or environment reads. It retains the full before/after same-UID census and
+  observes subject relationships at bounded child-wait checkpoints. Stable
+  observed parent/birth links identify owned survivors; unstable links, matching
+  session/group evidence, and private executable/cwd/open-artifact references
+  identify blocking candidates. Required tracking failures also block.
+- Unattributed host additions are retained warnings, not ownership proof or a
+  reason to mask the child exit. They are never called proven unrelated or safe.
+  `ownership.json` separates owned survivors, candidates and host warnings;
+  `outcome.json` keeps the actual child result and wrapper decision distinct.
+- No claim of complete OS process containment is made. Snapshots/checkpoints are
+  non-atomic and can miss rapid detachment. Final classification has no separate
+  wall-clock deadline: the command timeout is not a whole-wrapper timeout.
+  Only the exact retained Popen child is cleanup authority. No census process is
+  signalled; missing argv markers are not proof. All evidence is retained.
 
 ## Mandatory actual enforcement preflight
 
@@ -60,8 +64,8 @@ allowed dynamic loopback/owned Unix sockets. UDP-connect checks send no packets.
 It never writes real owner files or contacts the real gateway. The parent also
 verifies both forbidden canaries remain unchanged. Any failure prevents launch.
 
-The successful probe emits all 14 check labels. `preflight.json` and `command.json`
-remain in the printed run root. This is actual OS enforcement evidence, not a
+The current successful probe emits all 19 check labels. `preflight.json` and
+`command.json` remain in the separately printed parent-control directory. This is actual OS enforcement evidence, not a
 profile-source assertion.
 
 ## Local evidence (2026-10-30)
@@ -171,3 +175,31 @@ outer exit 0, with no new same-UID processes. Final control:
 `/private/tmp/pa-control-eo0vltkx`; subject root: `/private/tmp/pa-hb24r66ud`; launch
 log: `/private/tmp/pa-guardcheck-yahbygbl/seventh.log`. This corrects only the
 captured-log seam; all prior evidence remains retained.
+
+## Observational ownership policy revision (1fa194e8e)
+
+A shared TEST_RT executable or library path alone is not ownership evidence.
+Profiles must use a unique run root, a private target, and a dedicated owned cwd.
+
+The revised policy does not equate same-UID arrival with ownership. Stable birth,
+parent, session, process-group and UID observations are distinguished from
+unstable topology. The full raw census remains available. Positive private-root,
+working-directory, executable or open-artifact evidence blocks as a candidate;
+unknown global arrivals without subject evidence remain warnings. This is an
+observational limit, never a declaration that OS-broker processes are unrelated.
+
+The authorized v2 self-gate ran **24 actual tests + 19 real controls**, with
+subject exit 0 and observed outer exit 0. Evidence:
+`/private/tmp/pa-control-gkttue9m` and
+`/private/tmp/pa-guardcheck-yahbygbl/ownership-v2-selfgate.log`.
+A real cooperative child detached, survived its parent's exit, and was reported
+as an owned blocker. It remained alive until the test wrote its preowned control
+pipe; a bounded kqueue exit event confirmed termination without signalling a
+census PID. A real native probe verified owned cwd and log-inode references.
+Those exercised native fields; static layout arithmetic is not a blanket SDK or
+all-ABI proof. Warning fixtures preserved child exits 0, 3, 7 and SIGTERM.
+
+This is reviewed candidate source and self-gate evidence, not automatic global
+activation. Existing native lanes retain their coordinator-approved frozen
+helper until their invocation manifest is explicitly updated. No whole-workspace
+CI success or native product-test success follows from this tooling gate.
