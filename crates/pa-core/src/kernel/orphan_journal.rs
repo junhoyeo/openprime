@@ -244,6 +244,26 @@ pub fn reap_worker_orphan_processes(path: &Path, worker_pid: i32) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn issue_37_unknown_orphan_identity_retains_the_live_child_and_journal() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphans.jsonl");
+        let bytes = format!("{}\n", json!({
+            "version": 1, "pid": child.0.id(), "ownerPid": std::process::id(),
+            "active": true, "recordedAt": iso8601_now(), "processStartId": "unsupported:birth"
+        }));
+        std::fs::write(&path, &bytes).unwrap();
+        reap_worker_orphan_processes(&path, std::process::id() as i32);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
     #[test]
     fn process_start_id_reads_the_platform_ladder() {
         // Linux answers from /proc (`proc:`); macOS/BSD answer

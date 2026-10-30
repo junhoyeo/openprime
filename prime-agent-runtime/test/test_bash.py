@@ -1619,12 +1619,44 @@ class PersistentBashTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rows[plain.pid]["persistent"])
         await plain
 
-    async def test_a_watched_leader_exit_kills_the_members_it_leaves_behind(self):
-        handle = bash("( sleep 30 & ); exit 0", persistent=True)
-        self.pgids.append(handle.pid)
-        self.assertEqual((await handle).exit_code, 0)
-        self.assertEqual(self.files(), [])
-        await _poll_group_dead(handle.pid)
+    async def test_issue_38_watched_leader_exit_retains_uncertain_group_without_signalling(self):
+        leader = subprocess.Popen(
+            ["sh", "-c", "printf 'ready\n'; read gate"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, process_group=0,
+        )
+        self.addCleanup(leader.wait)
+        self.addCleanup(leader.kill)
+        try:
+            ready = await asyncio.wait_for(asyncio.to_thread(leader.stdout.readline), 5)
+        except BaseException:
+            leader.kill()
+            leader.wait()
+            raise
+        finally:
+            leader.stdout.close()
+        self.assertEqual(ready, b"ready\n")
+        member = subprocess.Popen(["sleep", "60"], process_group=leader.pid)
+        self.addCleanup(member.wait)
+        self.addCleanup(member.kill)
+        shell_id = "4" * 32
+        start_id = bash_module._process_start_id(leader.pid)
+        print(json.dumps({"fixture": "leaderless-group", "leader_pid": leader.pid,
+                          "leader_start_id": start_id, "member_pid": member.pid,
+                          "member_start_id": bash_module._process_start_id(member.pid)}), flush=True)
+        self.write_record(self.record(shell_id, leader.pid, start_id))
+        handle = bash_module.PersistentBashHandle(
+            "owned fixture", shell_id, leader.pid, start_id,
+            "2026-01-01T00:00:00+00:00", self.home, leader,
+        )
+        with mock.patch.object(bash_module, "_signal_group", wraps=bash_module._signal_group) as signals:
+            leader.stdin.close()
+            with self.assertRaisesRegex(RuntimeError, "unverifiable group cleanup"):
+                await asyncio.wait_for(handle, 5)
+            signals.assert_not_called()
+        self.assertIsNone(member.poll())
+        self.assertEqual([record["id"] for record in self.records()], [shell_id])
+        with self.assertRaisesRegex(RuntimeError, "unverifiable group cleanup"):
+            handle.poll()
 
     async def test_persistent_requires_a_saved_session(self):
         with mock.patch.dict(os.environ):
@@ -1649,6 +1681,7 @@ class PersistentBashTest(unittest.IsolatedAsyncioTestCase):
     def sleeper(self):
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
         self.pgids.append(proc.pid)
         return proc
 
@@ -1667,6 +1700,28 @@ class PersistentBashTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(claimed & {"1" * 32, "2" * 32, "3" * 32})
         self.assertEqual(self.files(), before)
         self.assertIsNone(live.poll())
+
+    async def test_issue_37_unknown_start_token_keeps_live_record_and_never_signals(self):
+        stranger = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(stranger.wait)
+        self.addCleanup(stranger.kill)
+        print(json.dumps({"fixture": "unknown-token", "pid": stranger.pid,
+                          "start_id": bash_module._process_start_id(stranger.pid)}), flush=True)
+        shell_id = "7" * 32
+        self.write_record(self.record(shell_id, stranger.pid, "unsupported:birth"))
+        def snapshot():
+            result = {}
+            for name in self.files():
+                with open(os.path.join(self.home, name), "rb") as stream:
+                    result[name] = stream.read()
+            return result
+        before = snapshot()
+        with mock.patch.object(bash_module, "_signal_group", wraps=bash_module._signal_group) as signals:
+            bash_module._rehydrate_persistent_shells()
+            signals.assert_not_called()
+        self.assertIsNone(stranger.poll())
+        self.assertIsNone(self.handle_for(stranger.pid))
+        self.assertEqual(snapshot(), before)
 
     async def test_recycled_pid_is_never_claimed_or_signalled(self):
         stranger = self.sleeper()

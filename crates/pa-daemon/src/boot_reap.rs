@@ -850,32 +850,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_recycled_pid_is_never_signaled() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let mut stale = target(pid);
-        stale.start_id = stale.start_id.map(|id| id + "recycled");
-        assert_eq!(stop_target(&stale).await, ReapOutcome::AlreadyGone);
-        assert!(
-            child.try_wait().expect("child alive").is_none(),
-            "the recycled identity must not have been signaled"
-        );
-        let mut unobservable = target(pid);
-        unobservable.start_id = None;
-        assert_eq!(
-            stop_target(&unobservable).await,
-            ReapOutcome::AlreadyGone,
-            "an unverifiable identity is never signaled"
-        );
-        assert!(
-            child.try_wait().expect("child alive").is_none(),
-            "the unverifiable identity must not have been signaled"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
+    async fn issue_38_unverifiable_process_is_never_signaled_or_reported_gone() {
+        let child = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let mut guard = ReapOnDrop(Some(child));
+        let pid = guard.0.as_ref().unwrap().id();
+        let mut unverified = target(pid);
+        for start_id in [Some("unsupported:birth".to_string()), None] {
+            unverified.start_id = start_id;
+            assert_eq!(stop_target(&unverified).await, ReapOutcome::Survived);
+            assert!(guard.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        }
     }
 
     #[test]
