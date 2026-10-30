@@ -319,6 +319,51 @@ mod tests {
     }
 
     #[test]
+    fn issue_38_leaderless_escalation_retains_group_without_using_historical_term() {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        struct OwnedChildren(Vec<Child>);
+        impl Drop for OwnedChildren {
+            fn drop(&mut self) {
+                for child in &mut self.0 { let _ = child.kill(); let _ = child.wait(); }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut leader_command = Command::new("sleep");
+        leader_command.arg("60").process_group(0);
+        let mut children = OwnedChildren(vec![leader_command.spawn().unwrap()]);
+        let pid = children.0[0].id();
+        let start = crate::lease::get_process_start_id(pid).unwrap();
+        children.0.push(Command::new("sh")
+            .args(["-c", "trap '' TERM; printf 'ready\n'; read answer"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).process_group(pid as i32).spawn().unwrap());
+        let stdout = children.0[1].stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+        if ready.is_err() {
+            let _ = children.0[1].kill();
+            let _ = children.0[1].wait();
+        }
+        reader.join().unwrap();
+        assert_eq!(ready.unwrap().unwrap(), "ready\n");
+        let id = register(root.path(), pid, &start, "owned-fixture");
+        let record = shell_file(root.path(), &id, "json");
+        let before = std::fs::read(&record).unwrap();
+        assert!(signal_process_group(pid as i32, Signal::Term));
+        children.0[0].wait().unwrap();
+        let shell = find_shell(root.path(), &id).unwrap();
+        assert!(kill_group(&shell).is_err());
+        assert!(children.0[1].try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read(record).unwrap(), before);
+        assert_eq!(shell_rows(root.path())[0]["status"], "unverified");
+    }
+
+    #[test]
     fn recycled_pid_is_neither_reported_nor_killed() {
         let root = tempfile::tempdir().unwrap();
         let stranger = registered_sleeper(root.path(), "s1", Some("proc:not-this-process"));

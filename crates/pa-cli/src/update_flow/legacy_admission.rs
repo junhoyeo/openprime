@@ -210,6 +210,18 @@ async fn guarded<T>(directory: &Path, operation: impl FnOnce() -> Result<T>) -> 
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn issue_37_unverifiable_live_shutdown_admission_blocks_takeover() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shutdown-admission.json");
+        let owner = json!({"version":1, "token":"original", "pid":std::process::id(),
+            "processStartId":"unsupported:birth", "expiresAt":"2099-01-01T00:00:00.000Z"});
+        super::super::legacy_restart::persist(&path, &owner).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(Admission::acquire(&[directory.path().to_path_buf()]).await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn release_preserves_a_replacement_owners_token() {
         let directory = tempfile::tempdir().unwrap();

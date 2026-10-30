@@ -642,6 +642,132 @@ mod tests {
     }
 
     #[test]
+    fn issue_37_release_retains_ownership_until_admitted_mutation_settles() {
+        use std::io::Write;
+        struct FinishMutation {
+            signal: Option<std::sync::mpsc::Sender<()>>,
+            writer: Option<std::thread::JoinHandle<Result<()>>>,
+        }
+        impl FinishMutation {
+            fn finish(&mut self) -> std::thread::Result<Result<()>> {
+                if let Some(signal) = self.signal.take() { let _ = signal.send(()); }
+                self.writer.take().map_or(Ok(Ok(())), std::thread::JoinHandle::join)
+            }
+        }
+        impl Drop for FinishMutation {
+            fn drop(&mut self) { let _ = self.finish(); }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.jsonl");
+        fs::write(&path, b"initial\n").unwrap();
+        let lease = std::sync::Arc::new(acquire_runtime_session_lease(&path, dir.path()).unwrap());
+        let owner_path = lease.directory.join("owner.json");
+        let before = fs::read(&owner_path).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let writing_lease = std::sync::Arc::clone(&lease);
+        let writing_path = path.clone();
+        let writer = std::thread::spawn(move || writing_lease.with_owned_mutation(&writing_path, || {
+            started_tx.send(()).map_err(|error| anyhow!("mutation admission: {error}"))?;
+            finish_rx.recv_timeout(Duration::from_secs(30)).map_err(|error| anyhow!("mutation completion: {error}"))?;
+            fs::OpenOptions::new().append(true).open(&writing_path)?.write_all(b"settled\n")?;
+            Ok(())
+        }));
+        let mut finish = FinishMutation { signal: Some(finish_tx), writer: Some(writer) };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The existing ten-second release deadline expires while the admitted
+        // writer is held by a concrete barrier, not a readiness sleep.
+        lease.release();
+        assert_eq!(fs::read(&owner_path).unwrap(), before);
+        assert!(acquire_runtime_session_lease(&path, dir.path()).is_err());
+        finish.finish().unwrap().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"initial\nsettled\n");
+        lease.release();
+        assert!(!lease.directory.exists());
+    }
+
+    #[test]
+    fn issue_37_existing_ownerless_lease_is_not_replaced_by_candidate_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("ownerless.jsonl");
+        fs::write(&session, "{}\n").unwrap();
+        let lease = lease_directory(dir.path(), &session);
+        fs::create_dir_all(&lease).unwrap();
+        assert!(acquire_runtime_session_lease(&session, dir.path()).is_err());
+        assert!(lease.is_dir());
+        assert_eq!(fs::read_dir(&lease).unwrap().count(), 0);
+        assert_eq!(reclaim_dead_owner_leases(dir.path()), 0);
+        assert!(lease.is_dir());
+    }
+
+    #[test]
+    fn issue_37_ownerless_quarantine_is_not_deleted_from_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let quarantine = dir.path().join("session-leases/unknown.lock.stale-123-token");
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::write(quarantine.join("retained"), b"unknown ownership").unwrap();
+        assert_eq!(reclaim_dead_owner_leases(dir.path()), 0);
+        assert_eq!(fs::read(quarantine.join("retained")).unwrap(), b"unknown ownership");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_37_unknown_and_legacy_start_formats_cannot_steal_a_live_lease() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(Command::new("sh")
+            .args(["-c", "printf 'ready\n'; read answer"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+        if ready.is_err() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        reader.join().unwrap();
+        assert_eq!(ready.unwrap().unwrap(), "ready\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        let directory = lease_directory(dir.path(), &path);
+        fs::create_dir_all(&directory).unwrap();
+        let observed = get_process_start_id(child.0.id()).unwrap();
+        let mut starts = match observed.strip_prefix("ps:").or_else(|| observed.strip_prefix("ps2:")) {
+            Some(payload) => vec![format!("ps:{payload}"), format!("ps2:{payload}")],
+            None => vec![observed],
+        };
+        starts.extend(["future:opaque", "unsupported:identity", "proc:malformed"].map(str::to_string));
+        for start in &starts {
+            let owner = LeaseOwner {
+                version: 1, token: "original-holder".into(), pid: child.0.id(),
+                process_start_id: Some(start.clone()), active_session_id: Some("legacy".into()),
+                session_path: canonical_session_path(&path).to_string_lossy().into_owned(),
+                created_at: crate::util::now_iso(),
+            };
+            let bytes = serde_json::to_vec(&owner).unwrap();
+            fs::write(directory.join("owner.json"), &bytes).unwrap();
+            assert!(acquire_runtime_session_lease(&path, dir.path()).is_err(), "stole {start}");
+            assert_eq!(reclaim_dead_owner_leases(dir.path()), 0);
+            assert_eq!(fs::read(directory.join("owner.json")).unwrap(), bytes);
+            assert_eq!(live_lease_owner(dir.path(), &path).unwrap().pid, child.0.id());
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn process_start_id_reflects_the_platform_ladder() {
         // Linux answers from /proc (`proc:`); macOS/BSD answer
         // `ps:<lstart>` - the same ladder TS `getProcessStartId` walks.

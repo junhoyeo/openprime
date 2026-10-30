@@ -130,6 +130,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn issue_37_unverifiable_live_predecessor_does_not_count_as_exited() {
+        let observed = pa_daemon::lease::get_process_start_id(std::process::id()).unwrap();
+        let mut starts = match observed.strip_prefix("ps:").or_else(|| observed.strip_prefix("ps2:")) {
+            Some(payload) => vec![format!("ps:{payload}"), format!("ps2:{payload}")],
+            None => vec![observed],
+        };
+        starts.extend(["future:opaque", "unsupported:birth", "proc:malformed"].map(str::to_string));
+        for start in &starts {
+            let identity = identity_from_hello(&json!({
+                "supervisorPid": std::process::id(), "supervisorProcessStartId": start
+            }));
+            assert!(!wait_for_exit(&identity, 1).await, "reported exit for {start}");
+        }
+    }
+
     #[test]
     fn unknown_process_probes_do_not_prove_predecessor_exit() {
         assert!(!process_exit_observed(None, Some("birth"), None));

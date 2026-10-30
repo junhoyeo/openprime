@@ -291,6 +291,30 @@ mod tests {
     }
 
     #[test]
+    fn issue_37_corrupt_lease_owner_vetoes_revival_without_spending_metadata() {
+        let file = session_file(Some("active"));
+        let agent_dir = agent_dir();
+        let _lease = crate::lease::acquire_runtime_session_lease(&file, &agent_dir).unwrap();
+        let lease_dir = std::fs::read_dir(agent_dir.join("session-leases")).unwrap()
+            .map(Result::unwrap).find(|entry| entry.path().extension().is_some_and(|extension| extension == "lock"))
+            .unwrap().path();
+        let owner = lease_dir.join("owner.json");
+        let corrupt = b"{truncated owner";
+        std::fs::write(&owner, corrupt).unwrap();
+        let descriptor = descriptor(Some(&file));
+        let saved = agent_dir.join("retained-descriptor.json");
+        let before = serde_json::to_vec(&descriptor).unwrap();
+        std::fs::write(&saved, &before).unwrap();
+        let session_before = std::fs::read(&file).unwrap();
+        // Exercise the actual file-backed ownership gate, without allowing a
+        // failing baseline to spawn the unit-test executable as a worker.
+        assert!(revival_veto(&agent_dir, &descriptor, true, None).is_some());
+        assert_eq!(std::fs::read(owner).unwrap(), corrupt);
+        assert_eq!(std::fs::read(saved).unwrap(), before);
+        assert_eq!(std::fs::read(file).unwrap(), session_before);
+    }
+
+    #[test]
     fn a_live_foreign_lease_vetoes_the_revival() {
         let file = session_file(Some("active"));
         let recorded_at = iso_from_unix_ms(now_ms());

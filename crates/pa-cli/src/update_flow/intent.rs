@@ -182,6 +182,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue_37_corrupt_coordinator_ownership_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = socket_update_directory(dir.path(), "/fixture/daemon.sock");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let path = update_intent_path(&socket_dir);
+        let bytes = b"{truncated ownership";
+        std::fs::write(&path, bytes).unwrap();
+        assert!(acquire(dir.path(), "/fixture/daemon.sock", &UpdateId::from("new".to_string()), &socket_dir.join("status.json")).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn issue_37_handoff_requires_verified_current_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = socket_update_directory(dir.path(), "/fixture/daemon.sock");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let path = update_intent_path(&socket_dir);
+        let id = UpdateId::from("original".to_string());
+        let status = socket_dir.join("status.json");
+        let mut owner = intent_record(&id, u64::from(std::process::id()), &status);
+        owner.process_start_id = Some("unsupported:birth".into());
+        write_atomically(&path, &owner).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(hand_over(dir.path(), "/fixture/daemon.sock", &id, u64::from(std::process::id()), &status).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn issue_37_release_retains_unverifiable_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = socket_update_directory(dir.path(), "/fixture/daemon.sock");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let path = update_intent_path(&socket_dir);
+        let id = UpdateId::from("original".to_string());
+        let mut owner = intent_record(&id, u64::from(std::process::id()), &socket_dir.join("status.json"));
+        owner.process_start_id = Some("unsupported:birth".into());
+        write_atomically(&path, &owner).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(release(dir.path(), "/fixture/daemon.sock").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn issue_37_unknown_live_coordinator_is_joined_without_rewriting_its_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = socket_update_directory(dir.path(), "/fixture/daemon.sock");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let path = update_intent_path(&socket_dir);
+        let status = socket_dir.join("original-status.json");
+        let mut owner = intent_record(&UpdateId::from("original".to_string()), u64::from(std::process::id()), &status);
+        owner.process_start_id = Some("unsupported:birth".into());
+        write_atomically(&path, &owner).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = acquire(dir.path(), "/fixture/daemon.sock", &UpdateId::from("new".to_string()), &status).unwrap();
+        assert!(matches!(result, AcquireOutcome::Join { status_path } if status_path == status));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
     fn acquire_then_join_then_stale_steal() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path();
