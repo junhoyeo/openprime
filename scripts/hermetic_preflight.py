@@ -24,6 +24,7 @@ def denied(action, label):
 def main():
     root, forbidden, private = map(Path, sys.argv[1:4])
     port = int(sys.argv[4])
+    control = Path(sys.argv[5])
     allowed = root / "canary-allowed"
     allowed.write_text("allowed")
     assert allowed.read_text() == "allowed"
@@ -33,11 +34,15 @@ def main():
     denied(lambda: alias.write_text("corrupted"), "symlink write")
     denied(lambda: private.write_text("corrupted"), "protected write")
     denied(private.read_text, "protected read")
-    denied(lambda: (root / "command.json").write_text("forged"), "controller metadata create")
-    denied(lambda: (root / "isolation.sb").write_text("forged"), "controller policy overwrite")
+    denied(lambda: (control / "command.json").write_text("forged"), "controller metadata create")
+    denied(lambda: (control / "isolation.sb").write_text("forged"), "controller policy overwrite")
+    denied(lambda: control.rename(root / "stolen-control"), "controller ancestor rename")
+    denied(lambda: (control / "preflight.json").symlink_to(forbidden), "controller symlink create")
+    denied(lambda: (control / "isolation.sb").unlink(), "controller policy unlink")
     checks = ["owned-write", "outside-write-denied", "symlink-write-denied",
               "protected-write-denied", "protected-read-denied",
-              "metadata-create-denied", "metadata-overwrite-denied"]
+              "metadata-create-denied", "metadata-overwrite-denied", "metadata-ancestor-rename-denied",
+              "metadata-symlink-denied", "metadata-unlink-denied"]
     # Parent holds an actual listener at this dynamically allocated protected port.
     # Check every IP spelling against that port, NEVER the real gateway.
     for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"):

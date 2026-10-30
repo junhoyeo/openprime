@@ -36,6 +36,7 @@ import sys
 import tempfile
 import time
 
+from hermetic_control import ControlDirectory, write_receipt
 from hermetic_processes import ProcessInventory, new_processes, reap_owned
 
 PASS_THROUGH = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "CARGO_HOME", "RUSTUP_HOME",
@@ -97,11 +98,6 @@ def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8
     lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
     for path in paths:
         lines.append(f"(allow file-write* (subpath {quote(path)}))")
-    # The unsandboxed controller owns these paths. A subject must not replace a
-    # receipt with a symlink or alter the policy/evidence used by the controller.
-    for name in ("isolation.sb", "preflight.json", "process-baseline.json", "command.json",
-                 "process-after.json", "outcome.json"):
-        lines.append(f"(deny file-write* (literal {quote(paths[0] / name)}))")
     # PTYs and null are device I/O, not a writable filesystem escape.
     lines.extend(['(allow file-write* (literal "/dev/null") (literal "/dev/tty") '
                   '(regex #"^/dev/ttys[0-9]+$"))'])
@@ -124,12 +120,9 @@ def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8
     return "\n".join(lines) + "\n"
 
 
-def sandboxed(command, root, *, writable=(), protected=(), protected_ports=(8787, 8791, 18789)):
+def sandboxed(command, profile):
     if platform.system() != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
         raise SystemExit("hermetic_test: enforced filesystem/network sandbox unavailable; refusing to run")
-    profile = root / "isolation.sb"
-    profile.write_text(sandbox_profile(root, writable=writable, protected=protected,
-                                       protected_ports=protected_ports))
     return ["/usr/bin/sandbox-exec", "-f", str(profile), *command]
 
 
@@ -162,10 +155,6 @@ def private_target(environ):
     return path
 
 
-def write_receipt(path, value):
-    """Create controller evidence once; O_EXCL refuses existing files/symlinks."""
-    with path.open("x") as stream:
-        stream.write(json.dumps(value, indent=2) + "\n")
 
 
 def main(argv=None):
@@ -197,36 +186,45 @@ def main(argv=None):
     print(f"hermetic_test: root {root}", file=sys.stderr)
     argv = [executable, *command[1:]]
     env["CARGO_TARGET_DIR"] = str(target)
-    # The same profile fences the canary and the actual command. Never test this
-    # by attempting writes to real owner files or connections to a real gateway.
-    forbidden_fd, forbidden_name = tempfile.mkstemp(prefix="pa-forbidden-", dir="/tmp")
-    with os.fdopen(forbidden_fd, "w") as stream:
-        stream.write("preserve")
-    forbidden = Path(forbidden_name).resolve()
-    private = root / "private-canary"
-    private.write_text("synthetic secret")
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        listener.listen()
-        port = listener.getsockname()[1]
-        policy = dict(writable=(target,), protected=(private,), protected_ports=[*args.protect_port, port])
-        preflight = [kernel_python, str(Path(__file__).with_name("hermetic_preflight.py")),
-                     str(root), str(forbidden), str(private), str(port)]
-        result = subprocess.run(sandboxed(preflight, root, **policy), env=env,
-                                text=True, capture_output=True, timeout=20, check=False)
-        write_receipt(root / "preflight.json", {"exit": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr, "forbidden": str(forbidden)})
-        if result.returncode or forbidden.read_text() != "preserve" or private.read_text() != "synthetic secret":
-            print(f"hermetic_test: OS-fence preflight failed: {result.stderr}", file=sys.stderr)
-            return result.returncode or 4
-        print(f"hermetic_test: OS-fence preflight {result.stdout.strip()}", file=sys.stderr)
-        argv = sandboxed(argv, root, **policy)
-    return run_subject(argv, env, root, target, args.timeout)
+    # A separate fresh sibling is NEVER in the subject's writable allowlist.
+    # Keep its directory fd open so even ancestor replacement cannot redirect a
+    # controller receipt. No descriptor for this directory reaches the subject.
+    control_path = Path(tempfile.mkdtemp(prefix="pa-control-", dir="/tmp")).resolve()
+    print(f"hermetic_test: control {control_path}", file=sys.stderr)
+    with ControlDirectory(control_path) as control:
+        forbidden_fd, forbidden_name = tempfile.mkstemp(prefix="pa-forbidden-", dir="/tmp")
+        with os.fdopen(forbidden_fd, "w") as stream:
+            stream.write("preserve")
+        forbidden = Path(forbidden_name).resolve()
+        private = root / "private-canary"
+        private.write_text("synthetic secret")
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            profile = sandbox_profile(root, writable=(target,), protected=(private,),
+                                      protected_ports=[*args.protect_port, port])
+            control.write_text("isolation.sb", profile)
+            profile_path = control.path / "isolation.sb"
+            preflight = [kernel_python, str(Path(__file__).with_name("hermetic_preflight.py")),
+                         str(root), str(forbidden), str(private), str(port), str(control.path)]
+            result = subprocess.run(sandboxed(preflight, profile_path), env=env,
+                                    text=True, capture_output=True, timeout=20, check=False)
+            write_receipt(control, "preflight.json", {"exit": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr, "forbidden": str(forbidden),
+                "control_identity": control.identity, "root": str(root)})
+            if result.returncode or forbidden.read_text() != "preserve" or private.read_text() != "synthetic secret":
+                print(f"hermetic_test: OS-fence preflight failed: {result.stderr}", file=sys.stderr)
+                return result.returncode or 4
+            print(f"hermetic_test: OS-fence preflight {result.stdout.strip()}", file=sys.stderr)
+            argv = sandboxed(argv, profile_path)
+        return run_subject(argv, env, root, target, args.timeout, control=control)
 
 
-def run_subject(argv, env, root, target, timeout, inventory=None):
+def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
     """Execute and account for one subject. Tests inject only the inventory seam."""
     child = None
+    output = None
     before = None
     survivors = None
     timed_out = False
@@ -235,14 +233,19 @@ def run_subject(argv, env, root, target, timeout, inventory=None):
     try:
         inventory = inventory or ProcessInventory()
         before = inventory.snapshot()
-        write_receipt(root / "process-baseline.json", list(before.values()))
-        child = subprocess.Popen(argv, env=env, start_new_session=True)
+        write_receipt(control, "process-baseline.json", list(before.values()))
+        # Open the owned log before launch; stdout/stderr never name a path the
+        # subject can replace. Directory/receipt descriptors remain CLOEXEC.
+        output = control.create_file("subject.log")
+        child = subprocess.Popen(argv, env=env, start_new_session=True,
+                                 stdout=output, stderr=subprocess.STDOUT)
         identity = inventory.identity(child.pid)
         if identity is None and child.poll() is None:
             raise RuntimeError("child identity disappeared while the child is still live")
         receipt = {"pid": child.pid, "identity": identity, "command": argv,
-                   "root": str(root), "target": str(target), "started_monotonic": time.monotonic()}
-        write_receipt(root / "command.json", receipt)
+                   "root": str(root), "target": str(target), "started_monotonic": time.monotonic(),
+                   "control": str(control.path), "control_identity": control.identity}
+        write_receipt(control, "command.json", receipt)
         try:
             child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -260,7 +263,7 @@ def run_subject(argv, env, root, target, timeout, inventory=None):
             if before is not None:
                 after = inventory.snapshot()
                 survivors = new_processes(before, after)
-                write_receipt(root / "process-after.json", list(after.values()))
+                write_receipt(control, "process-after.json", list(after.values()))
         except BaseException as error:
             if failure is None:
                 failure = error
@@ -282,10 +285,10 @@ def run_subject(argv, env, root, target, timeout, inventory=None):
                    "failure_type": type(failure).__name__ if failure is not None else None,
                    "cleanup_failure_type": type(cleanup_failure).__name__ if cleanup_failure is not None else None,
                    "direct_child_reaped": child is not None and child.returncode is not None,
-                   "survivors": survivors}
+                   "survivors": survivors, "control_identity": control.identity}
         try:
             # One immutable final receipt per run; never overwrite earlier evidence.
-            write_receipt(root / "outcome.json", outcome)
+            write_receipt(control, "outcome.json", outcome)
         except BaseException as receipt_error:
             outcome["planned_wrapper_decision"] = outcome["wrapper_decision"]
             outcome["wrapper_decision"] = "outcome_receipt_error"
@@ -294,6 +297,17 @@ def run_subject(argv, env, root, target, timeout, inventory=None):
             outcome["outcome_receipt_failure_type"] = type(receipt_error).__name__
             print("hermetic_test: outcome receipt write failed; fallback " + json.dumps(outcome), file=sys.stderr)
             raise
+        finally:
+            if output is not None:
+                try:
+                    output.flush()
+                    output.seek(0, os.SEEK_END)
+                    # Keep the full log; mirror a bounded tail after the subject.
+                    output.seek(max(0, output.tell() - 128 * 1024))
+                    sys.stdout.write(output.read().decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+                finally:
+                    output.close()
     print(f"hermetic_test: subject exit {subject_exit}; wrapper decision {decision} ({code})", file=sys.stderr)
     if failure is not None:
         raise failure

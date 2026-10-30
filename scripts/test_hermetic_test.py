@@ -26,6 +26,12 @@ class HermeticTest(unittest.TestCase):
         self.python = self.tmp / "python"
         self.python.write_text("")
 
+    def run_subject(self, argv, env, root, target, timeout, inventory=None):
+        # Unit fixture only: the outer real wrapper has its controller outside
+        # its writable root. This local fd lets us inject parent-side failures.
+        with ht.ControlDirectory(root) as control:
+            return ht.run_subject(argv, env, root, target, timeout, control=control, inventory=inventory)
+
     def test_env_is_scrubbed_and_keeps_per_test_home_resolution(self):
         environ = {"HOME": "/fake/home", "PATH": "/usr/bin", "ANTHROPIC_API_KEY": "secret",
                    "HTTPS_PROXY": "http://proxy", "PRIME_AGENT_CODING_AGENT_DIR": "/live",
@@ -87,15 +93,15 @@ class HermeticTest(unittest.TestCase):
             children.append(child)
             return child
 
-        def write(path, *args, **kwargs):
-            if path.name == "command.json":
+        def write(control, name, value):
+            if name == "command.json":
                 raise OSError("injected receipt failure")
-            return real_write(path, *args, **kwargs)
+            return real_write(control, name, value)
 
         with mock.patch.object(ht.subprocess, "Popen", side_effect=launch), \
              mock.patch.object(ht, "write_receipt", new=write):
             with self.assertRaisesRegex(OSError, "injected receipt failure"):
-                ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
+                self.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
                                self.root, self.root, 10)
         self.assertEqual(len(children), 1)
         self.assertIsNotNone(children[0].returncode, "owned external child was not reaped")
@@ -124,7 +130,7 @@ class HermeticTest(unittest.TestCase):
 
                 with mock.patch.object(ht.subprocess, "Popen", side_effect=launch):
                     with self.assertRaises(type(failure)):
-                        ht.run_subject(["/bin/sleep", "30"], ht.build_env(case_root, sys.executable, {}),
+                        self.run_subject(["/bin/sleep", "30"], ht.build_env(case_root, sys.executable, {}),
                                        case_root, case_root, 10, inventory=probe)
                 self.assertEqual(len(children), 1)
                 self.assertIsNotNone(children[0].returncode)
@@ -151,7 +157,7 @@ class HermeticTest(unittest.TestCase):
                 probe = mock.Mock()
                 probe.snapshot.side_effect = [before, after]
                 probe.identity.side_effect = inventory.identity
-                code = ht.run_subject([sys.executable, "-c", f"raise SystemExit({subject_exit})"],
+                code = self.run_subject([sys.executable, "-c", f"raise SystemExit({subject_exit})"],
                                       ht.build_env(case_root, sys.executable, {}),
                                       case_root, case_root, 10, inventory=probe)
                 self.assertEqual(code, subject_exit or 3)
@@ -166,7 +172,7 @@ class HermeticTest(unittest.TestCase):
             ht.reap_owned(child)
 
     def test_command_timeout_records_actual_reaped_exit(self):
-        code = ht.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
+        code = self.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
                               self.root, self.root, 0.01)
         self.assertEqual(code, 124)
         outcome = json.loads((self.root / "outcome.json").read_text())
@@ -181,16 +187,31 @@ class HermeticTest(unittest.TestCase):
         forbidden.write_text("preserve")
         link = self.root / "command.json"
         link.symlink_to(forbidden)
-        with self.assertRaises(FileExistsError):
-            ht.write_receipt(link, {"unsafe": "must not overwrite the canary"})
+        with ht.ControlDirectory(self.root) as control, self.assertRaises(FileExistsError):
+            ht.write_receipt(control, "command.json", {"unsafe": "must not overwrite the canary"})
         self.assertEqual(forbidden.read_text(), "preserve")
         self.assertTrue(link.is_symlink(), "existing evidence is retained")
+
+    def test_parent_receipt_stays_on_held_directory_after_ancestor_replacement(self):
+        original = self.tmp / "controller"
+        original.mkdir()
+        moved = self.tmp / "moved-controller"
+        forbidden = self.tmp / "forbidden-controller-canary"
+        forbidden.mkdir()
+        (forbidden / "outcome.json").write_text("preserve")
+        with ht.ControlDirectory(original) as control:
+            original.rename(moved)
+            original.symlink_to(forbidden, target_is_directory=True)
+            ht.write_receipt(control, "outcome.json", {"held_inode": True})
+        self.assertEqual((forbidden / "outcome.json").read_text(), "preserve")
+        self.assertEqual(json.loads((moved / "outcome.json").read_text()), {"held_inode": True})
+        self.assertTrue(original.is_symlink(), "retain synthetic redirection evidence")
 
     def test_outcome_receipt_cannot_silently_overwrite_existing_evidence(self):
         (self.root / "outcome.json").write_text("preserve")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), self.assertRaises(FileExistsError):
-            ht.run_subject(["/usr/bin/true"], ht.build_env(self.root, sys.executable, {}),
+            self.run_subject(["/usr/bin/true"], ht.build_env(self.root, sys.executable, {}),
                            self.root, self.root, 10)
         self.assertEqual((self.root / "outcome.json").read_text(), "preserve")
         fallback = json.loads(stderr.getvalue().split("fallback ", 1)[1])
@@ -204,7 +225,7 @@ class HermeticTest(unittest.TestCase):
         inventory.snapshot.side_effect = RuntimeError("injected inventory failure")
         with mock.patch.object(ht.subprocess, "Popen") as launch:
             with self.assertRaisesRegex(RuntimeError, "injected inventory failure"):
-                ht.run_subject(["/usr/bin/true"], {}, self.root, self.root, 10, inventory=inventory)
+                self.run_subject(["/usr/bin/true"], {}, self.root, self.root, 10, inventory=inventory)
             launch.assert_not_called()
 
 

@@ -124,3 +124,36 @@ real sandbox, and the exclusive writer rejects an actual owned symlink canary.
 
 These remain guard-only gates. PR CI and Rust fixture verification are separate;
 no product-test or full-CI success follows from this result.
+
+## Parent-controlled directory contract (final)
+
+The leaf-exclusive writer alone did not address ancestor replacement. The final
+controller allocates a separate canonical `/private/tmp/pa-control-*` directory
+**outside both subject write allowlists**, before launch. It holds an
+`O_DIRECTORY | O_NOFOLLOW` directory descriptor (CLOEXEC) and records its device,
+inode and UID. Fixed, bounded receipt names are opened descriptor-relative with
+`O_CREAT | O_EXCL | O_NOFOLLOW`; no post-launch receipt resolves a subject-writable
+ancestor. Existing files remain untouched. The same held descriptor owns the
+preopened `subject.log` passed as stdout/stderr. No control descriptor reaches
+the subject except the intended log stdio descriptors.
+
+Receipt protocol: the wrapper prints both `root` (subject scratch) and `control`
+(parent evidence). Read `CONTROL/preflight.json`, `command.json`,
+`process-baseline.json`, `process-after.json`, `outcome.json`, `isolation.sb`, and
+`subject.log`. **Full formatter output is in `CONTROL/subject.log`**; outer stdout
+mirrors only a bounded 128 KiB tail after completion. Earlier run roots retained
+above use the older protocol and are not relabeled.
+
+The sixth run passed **19/19 real OS controls + 15/15 unit tests**, subject exit 0,
+observed outer exit 0, no new same-UID identities. Subject root:
+`/private/tmp/pa-h8ensfrjd`; control root: `/private/tmp/pa-control-t56eri33`; launch
+log: `/private/tmp/pa-guardcheck-yahbygbl/sixth.log`. New real policy checks deny
+control ancestor rename, symlink creation and unlink, in addition to metadata
+creation/overwrite. A synthetic test replaces the original control path with a
+symlink to an owned protected directory: the held-fd writer still publishes only
+under the original inode and leaves the protected canary unchanged. Receipt
+failure/live-child cleanup and normal outcomes are covered in the same run.
+
+The prior 16-control result is valid for its narrower checks, not proof of the
+ancestor-safe contract. This change remains a targeted guard fix, not a claim of
+complete adversarial-code isolation or a replacement for native runtime gates.
