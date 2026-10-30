@@ -14,8 +14,12 @@ mandatory sandbox that denies filesystem writes outside the run root and private
 Cargo target. It permits loopback mocks except protected ports (53, 8787, 8791, 18789), and
 Unix sockets only under the run root. Direct external IP/DNS traffic is denied. Agent, session, and socket paths are
 not forced, so tests keep their own per-test roots. After the command, it
-compares precise same-UID process identities before and after the subject. Any
-new unexplained process makes the run fail (unknown ownership, never a kill target). It only terminates/reaps its exact Popen-owned child on failure; it never signals
+compares precise same-UID process identities and observed subject relationships.
+Observed owned survivors, subject-related candidates, and required tracking failures
+block the run. Unattributed host arrivals are retained warnings, not proof of independence
+or kill targets. Checkpoints are non-atomic; final classification has no separate wall-clock
+deadline. The command timeout is not a whole-wrapper timeout or containment guarantee.
+It only terminates/reaps its exact Popen-owned child on failure; it never signals
 discovered PIDs and never deletes the root (it is evidence).
 
 Usage:
@@ -36,6 +40,7 @@ import sys
 import tempfile
 import time
 
+from hermetic_ownership import OwnershipTracker, ReferenceProbe
 from hermetic_control import ControlDirectory, write_receipt
 from hermetic_processes import ProcessInventory, new_processes, reap_owned
 
@@ -232,32 +237,64 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
     output = None
     before = None
     survivors = None
+    ownership = None
+    tracker = None
+    references = None
     timed_out = False
     failure = None
     cleanup_failure = None
+    tracking_failure = None
+    phase = "initial_inventory"
     try:
         inventory = inventory or ProcessInventory()
         before = inventory.snapshot()
         write_receipt(control, "process-baseline.json", list(before.values()))
         # Open the owned log before launch; stdout/stderr never name a path the
         # subject can replace. Directory/receipt descriptors remain CLOEXEC.
+        phase = "launch_setup"
         output = control.create_file("subject.log")
+        log_info = os.fstat(output.fileno())
+        references = ReferenceProbe(inventory, (root.resolve(), target.resolve(), Path.cwd().resolve()),
+                                    (log_info.st_dev, log_info.st_ino))
+        started = time.monotonic()
+        deadline = started + timeout
         child = subprocess.Popen(argv, env=env, start_new_session=True,
                                  stdout=output, stderr=subprocess.STDOUT)
+        phase = "launch_identity"
         identity = inventory.identity(child.pid)
         if identity is None and child.poll() is None:
             raise RuntimeError("child identity disappeared while the child is still live")
+        tracker = OwnershipTracker(child.pid, identity)
         receipt = {"pid": child.pid, "identity": identity, "command": argv,
-                   "root": str(root), "target": str(target), "started_monotonic": time.monotonic(),
+                   "root": str(root), "target": str(target), "started_monotonic": started,
                    "control": str(control.path), "control_identity": control.identity}
+        phase = "launch_receipt"
         write_receipt(control, "command.json", receipt)
-        try:
-            child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        phase = "tracking"
+        tracker.observe(inventory.snapshot())
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                phase = "wait"
+                child.wait(timeout=min(1.0, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                # A bounded child-wait checkpoint, not retrying a failed test.
+                # Preserve observed descendant identities before reparenting.
+                phase = "tracking"
+                tracker.observe(inventory.snapshot())
+        if timed_out:
             print("hermetic_test: command deadline exceeded", file=sys.stderr)
     except BaseException as error:
         failure = error
+        if phase in ("initial_inventory", "launch_identity", "tracking"):
+            tracking_failure = type(error).__name__
     finally:
         try:
             if child is not None:
@@ -266,22 +303,35 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
             cleanup_failure = error
         try:
             if before is not None:
+                phase = "final_inventory"
                 after = inventory.snapshot()
                 survivors = new_processes(before, after)
+                phase = "final_receipt"
                 write_receipt(control, "process-after.json", list(after.values()))
+                if tracker is not None:
+                    phase = "final_classification"
+                    ownership = tracker.classify(before, after, references)
+                    phase = "final_receipt"
+                    write_receipt(control, "ownership.json", ownership)
         except BaseException as error:
+            if phase in ("final_inventory", "final_classification"):
+                tracking_failure = type(error).__name__
             if failure is None:
                 failure = error
         subject_exit = child.returncode if child is not None else None
         if failure is not None or cleanup_failure is not None:
-            decision = "error"
+            decision = "ownership_tracking_failure" if tracking_failure is not None else "error"
             code = 130 if isinstance(failure or cleanup_failure, KeyboardInterrupt) else 1
         elif timed_out:
             decision, code = "timeout", 124
-        elif subject_exit is None or survivors is None:
-            decision, code = "unresolved", 4
-        elif survivors:
-            decision, code = "unknown_processes", subject_exit or 3
+        elif subject_exit is None or ownership is None:
+            decision, code = "ownership_tracking_failure", 4
+        elif ownership["observed_owned_survivors"]:
+            decision, code = "owned_survivors", subject_exit or 3
+        elif ownership["unverified_subject_candidates"]:
+            decision, code = "unverified_subject_candidates", subject_exit or 3
+        elif ownership["host_warnings"]:
+            decision, code = "subject_exit_with_host_warnings", subject_exit
         else:
             decision, code = "subject_exit", subject_exit
         outcome = {"subject_exit_code": subject_exit, "timed_out": timed_out,
@@ -289,8 +339,10 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
                    "wrapper_return_code": code,
                    "failure_type": type(failure).__name__ if failure is not None else None,
                    "cleanup_failure_type": type(cleanup_failure).__name__ if cleanup_failure is not None else None,
+                   "tracking_failure_type": tracking_failure,
                    "direct_child_reaped": child is not None and child.returncode is not None,
-                   "survivors": survivors, "control_identity": control.identity}
+                   "survivors": survivors, "ownership": ownership,
+                   "control_identity": control.identity}
         try:
             # One immutable final receipt per run; never overwrite earlier evidence.
             write_receipt(control, "outcome.json", outcome)
@@ -317,12 +369,13 @@ def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
         raise failure
     if cleanup_failure is not None:
         raise cleanup_failure
-    if survivors:
-        print("hermetic_test: new same-UID processes remain (ownership UNKNOWN; not killed):", file=sys.stderr)
-        for identity in survivors:
-            print("  " + json.dumps(identity, sort_keys=True), file=sys.stderr)
-        return code
-    print(f"hermetic_test: exit {code}; no new same-UID processes; root kept at {root}", file=sys.stderr)
+    if ownership is not None:
+        for category in ("observed_owned_survivors", "unverified_subject_candidates", "host_warnings"):
+            if ownership[category]:
+                print(f"hermetic_test: {category} (not signalled): " + json.dumps(ownership[category]), file=sys.stderr)
+        if not ownership["observed_owned_survivors"] and not ownership["unverified_subject_candidates"]:
+            print("hermetic_test: no observed owned survivors; host-wide attribution incomplete", file=sys.stderr)
+    print(f"hermetic_test: exit {code}; root kept at {root}", file=sys.stderr)
     return code
 
 

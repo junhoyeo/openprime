@@ -5,11 +5,14 @@ import io
 import os
 import json
 import subprocess
+import select
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest import mock
+
+from test_hermetic_ownership import OwnershipTest
 
 SPEC = importlib.util.spec_from_file_location("hermetic_test", Path(__file__).with_name("hermetic_test.py"))
 ht = importlib.util.module_from_spec(SPEC)
@@ -139,37 +142,139 @@ class HermeticTest(unittest.TestCase):
                 self.assertEqual(outcome["failure_type"], type(failure).__name__)
                 self.assertTrue(outcome["direct_child_reaped"])
 
-    def test_external_executable_survivor_is_unknown_and_never_killed(self):
+    def test_unattributed_host_arrival_warns_without_masking_subject_exit(self):
         # Capture before the external process exists, just as a real launch does.
         inventory = ht.ProcessInventory()
         before = inventory.snapshot()
-        child = subprocess.Popen(["/bin/sleep", "30"])
+        child = subprocess.Popen(["/bin/sleep", "30"], cwd=self.tmp)
         try:
             identity = inventory.identity(child.pid)
             self.assertIsNotNone(identity)
             after = inventory.snapshot()
+            from hermetic_processes import key
+            self.assertIn(key(identity), after)
+            identity = after[key(identity)]
             self.assertIn(identity, ht.new_processes(before, after))
-            # Both wrapper exits are 3, but the immutable outcome must distinguish
-            # a passing subject from a genuinely failing subject.
-            for subject_exit in (0, 3, 7):
+            # An unattributed process is not an ownership proof. Preserve actual
+            # subject status while retaining the warning and never signalling it.
+            for subject_exit in (0, 3, 7, -15):
                 case_root = self.root / f"exit-{subject_exit}"
                 case_root.mkdir()
                 probe = mock.Mock()
-                probe.snapshot.side_effect = [before, after]
+                probe.snapshot.side_effect = [before, after, after]
                 probe.identity.side_effect = inventory.identity
-                code = self.run_subject([sys.executable, "-c", f"raise SystemExit({subject_exit})"],
+                probe.lib = inventory.lib
+                command = (["/bin/sh", "-c", "kill -TERM $$"] if subject_exit == -15 else
+                           [sys.executable, "-c", f"raise SystemExit({subject_exit})"])
+                code = self.run_subject(command,
                                       ht.build_env(case_root, sys.executable, {}),
                                       case_root, case_root, 10, inventory=probe)
-                self.assertEqual(code, subject_exit or 3)
+                self.assertEqual(code, subject_exit)
                 outcome = json.loads((case_root / "outcome.json").read_text())
                 self.assertEqual(outcome["subject_exit_code"], subject_exit)
-                self.assertEqual(outcome["wrapper_exit_code"], subject_exit or 3)
-                self.assertEqual(outcome["wrapper_decision"], "unknown_processes")
+                self.assertEqual(outcome["wrapper_exit_code"], subject_exit & 255)
+                self.assertEqual(outcome["wrapper_decision"], "subject_exit_with_host_warnings")
+                self.assertIn(identity, [row["identity"] for row in outcome["ownership"]["host_warnings"]])
+                self.assertEqual(outcome["ownership"]["observed_owned_survivors"], [])
+                self.assertEqual(outcome["ownership"]["unverified_subject_candidates"], [])
                 self.assertIn(identity, outcome["survivors"])
                 self.assertFalse(outcome["timed_out"])
                 self.assertIsNone(child.poll(), "discovered PID must not be signalled")
         finally:
             ht.reap_owned(child)
+
+    def test_observed_orphan_blocks_and_exits_only_via_its_owned_control_pipe(self):
+        ack_path = self.root / "parent-ack.fifo"
+        stop_path = self.root / "child-stop.fifo"
+        pid_path = self.root / "fixture-child.pid"
+        os.mkfifo(ack_path)
+        os.mkfifo(stop_path)
+        ack_fd = os.open(ack_path, os.O_RDWR | os.O_NONBLOCK)
+        stop_fd = os.open(stop_path, os.O_RDWR | os.O_NONBLOCK)
+        real = ht.ProcessInventory()
+
+        class CooperativeInventory:
+            def __init__(self):
+                self.lib = real.lib
+                self.parent_pid = None
+                self.child_identity = None
+                self.watcher = None
+
+            def identity(self, pid):
+                identity = real.identity(pid)
+                if self.parent_pid is None:
+                    self.parent_pid = pid
+                return identity
+
+            def snapshot(self):
+                observed = real.snapshot()
+                if self.parent_pid is not None and self.child_identity is None:
+                    for identity in observed.values():
+                        if identity["ppid"] == self.parent_pid and identity.get("topology_stable", True):
+                            self.child_identity = identity
+                            self.watcher = select.kqueue()
+                            event = select.kevent(identity["pid"], filter=select.KQ_FILTER_PROC,
+                                                 flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                                 fflags=select.KQ_NOTE_EXIT)
+                            self.watcher.control([event], 0, 0)
+                            # Release the fixture parent only after native parent/
+                            # child identities are actually observable together.
+                            os.write(ack_fd, b"release")
+                            break
+                return observed
+
+        probe = CooperativeInventory()
+        script = (
+            "import os\n"
+            f"ack = os.open({str(ack_path)!r}, os.O_RDONLY)\n"
+            f"stop = os.open({str(stop_path)!r}, os.O_RDONLY)\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.close(ack)\n"
+            "    os.setsid()\n"
+            "    os.read(stop, 1)\n"
+            "    os._exit(0)\n"
+            "os.close(stop)\n"
+            f"open({str(pid_path)!r}, 'w').write(str(child))\n"
+            "os.read(ack, 1)\n"
+            "os._exit(0)\n"
+        )
+        try:
+            code = self.run_subject([sys.executable, "-c", script],
+                                    ht.build_env(self.root, sys.executable, {}),
+                                    self.root, self.root, 10, inventory=probe)
+            self.assertEqual(code, 3)
+            self.assertIsNotNone(probe.child_identity)
+            outcome = json.loads((self.root / "outcome.json").read_text())
+            self.assertEqual(outcome["subject_exit_code"], 0)
+            self.assertEqual(outcome["wrapper_decision"], "owned_survivors")
+            from hermetic_processes import key
+            self.assertIn(key(probe.child_identity), {
+                key(entry["identity"]) for entry in outcome["ownership"]["observed_owned_survivors"]})
+            live = real.identity(probe.child_identity["pid"])
+            self.assertIsNotNone(live, "the classifier must not signal an observed orphan")
+            self.assertEqual(key(live), key(probe.child_identity))
+            self.assertNotEqual(live["ppid"], probe.parent_pid, "the fixture parent actually exited")
+        finally:
+            # Never signal a census PID. The test owns this pipe from before
+            # launch; its byte is the cooperative child's only exit instruction.
+            os.write(stop_fd, b"stop")
+            try:
+                if probe.watcher is not None:
+                    events = probe.watcher.control(None, 1, 5)
+                    self.assertTrue(any(event.fflags & select.KQ_NOTE_EXIT for event in events),
+                                    "owned fixture did not exit after its control pipe instruction")
+                elif pid_path.exists():
+                    # Setup failed before installing the normal watcher. Keep the
+                    # failed test non-green; the outer guard retains any survivor.
+                    identity = real.identity(int(pid_path.read_text()))
+                    self.assertTrue(identity is None or identity.get("status") == 5,
+                                    "fixture cleanup could not prove exit; retain for owned review")
+            finally:
+                if probe.watcher is not None:
+                    probe.watcher.close()
+                os.close(ack_fd)
+                os.close(stop_fd)
 
     def test_command_timeout_records_actual_reaped_exit(self):
         code = self.run_subject(["/bin/sleep", "30"], ht.build_env(self.root, sys.executable, {}),
@@ -252,6 +357,10 @@ class HermeticTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected inventory failure"):
                 self.run_subject(["/usr/bin/true"], {}, self.root, self.root, 10, inventory=inventory)
             launch.assert_not_called()
+        outcome = json.loads((self.root / "outcome.json").read_text())
+        self.assertEqual(outcome["wrapper_decision"], "ownership_tracking_failure")
+        self.assertEqual(outcome["tracking_failure_type"], "RuntimeError")
+        self.assertIsNone(outcome["subject_exit_code"])
 
 
 if __name__ == "__main__":

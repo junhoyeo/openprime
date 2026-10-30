@@ -49,9 +49,16 @@ class ProcessInventory:
         if size != ctypes.sizeof(again) or (info.start_seconds, info.start_microseconds) != (
                 again.start_seconds, again.start_microseconds):
             raise RuntimeError(f"process identity changed during inspection: {pid}")
-        return {"pid": pid, "ppid": info.ppid, "pgid": info.pgid, "sid": session, "uid": info.uid,
-                "start_seconds": info.start_seconds, "start_microseconds": info.start_microseconds,
-                "name": bytes(info.name or info.comm).decode("utf-8", errors="replace")}
+        try:
+            session_again = os.getsid(pid)
+        except ProcessLookupError:
+            return None
+        previous = {"ppid": info.ppid, "pgid": info.pgid, "sid": session, "uid": info.uid}
+        current = {"ppid": again.ppid, "pgid": again.pgid, "sid": session_again, "uid": again.uid}
+        return {"pid": pid, **current, "previous_topology": previous,
+                "topology_stable": previous == current, "status": again.status,
+                "start_seconds": again.start_seconds, "start_microseconds": again.start_microseconds,
+                "name": bytes(again.name or again.comm).decode("utf-8", errors="replace")}
 
     def snapshot(self):
         # PROC_UID_ONLY: no private argv/env or other users' process details.
