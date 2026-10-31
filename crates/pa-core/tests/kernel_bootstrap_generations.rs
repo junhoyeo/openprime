@@ -1542,12 +1542,14 @@ async fn issue44_public_entry_refusal_creates_no_explicit_parent() {
 
 /// Explicit acceptance verifier: uses real offline uv installs and the approved
 /// read-only CPython toolchain. Run with --ignored --exact, never auto-skip.
+/// It proves sequential selection, real imports, and old-kernel survival; it
+/// does not prove cross-process publication (same-key calls in one process
+/// share one in-flight bootstrap).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "manual: requires a coordinator-owned offline uv cache and ABI-2 test runtime"]
 async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
     use pa_core::kernel::shared::{ExecuteOptions, ExecuteStatus, KernelShutdownOptions};
-    use sha2::Digest;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let _serial = ENV_LOCK.lock().await;
     invalidate_runtime_probe_cache();
@@ -1556,12 +1558,16 @@ async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
     let cache = PathBuf::from(std::env::var("PA_KERNEL_VERIFY_CACHE").expect("explicit private offline cache required"));
     let target = PathBuf::from(std::env::var("CARGO_TARGET_DIR").expect("private Cargo target required"));
     assert!(cache.canonicalize().unwrap().starts_with(target.canonicalize().unwrap()));
+    let contents = issue44_cache_contents(&cache);
+    std::fs::write(root.join("cache-contents.json"), serde_json::to_vec_pretty(&contents).unwrap()).unwrap();
+    let missing: Vec<_> = contents.iter().filter(|(_, found)| !**found).map(|(name, _)| name.clone()).collect();
+    assert!(missing.is_empty(), "fixture: offline cache lacks {missing:?}; not product evidence");
     let approved = PathBuf::from(std::env::var("PA_E2E_KERNEL_PYTHON").expect("approved ABI-2 runtime required"));
     let interpreter = approved.canonicalize().unwrap();
-    let toolchain = interpreter.parent().unwrap().parent().unwrap();
+    let toolchain = interpreter.parent().unwrap().parent().unwrap().to_path_buf();
     let toolchains = root.join("python-toolchains");
     std::fs::create_dir(&toolchains).unwrap();
-    std::os::unix::fs::symlink(toolchain, toolchains.join(toolchain.file_name().unwrap())).unwrap();
+    std::os::unix::fs::symlink(&toolchain, toolchains.join(toolchain.file_name().unwrap())).unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prime-agent-runtime");
     let package = root.join("package");
     let runtime_source = package.join("prime-agent-runtime");
@@ -1583,82 +1589,184 @@ async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
         ("PI_PACKAGE_DIR", Some(package.display().to_string())),
         ("UV_CACHE_DIR", Some(cache.display().to_string())),
         ("UV_PYTHON_INSTALL_DIR", Some(toolchains.display().to_string())),
+        ("UV_PYTHON_PREFERENCE", Some("only-managed".into())),
         ("UV_OFFLINE", Some("1".into())),
         ("UV_PYTHON_DOWNLOADS", Some("never".into())),
         ("UV_LINK_MODE", Some("copy".into())),
     ]);
-    let mut managers = Vec::new();
-    let outcome = tokio::time::timeout(Duration::from_secs(240), async {
+    let generations = exact.with_file_name(format!("{}.generations", exact.file_name().unwrap().to_string_lossy()));
+    let mut managers: Vec<ReplKernelManager> = Vec::new();
+    let mut receipts: Vec<serde_json::Value> = Vec::new();
+    let mut timings: Vec<(String, f64)> = Vec::new();
+    let write_evidence = |name: &str, value: &serde_json::Value| {
+        std::fs::write(root.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(480), async {
+        let started = Instant::now();
         let first = ensure_kernel_python(EnsureKernelPythonOptions::default()).await?;
+        timings.push(("base".into(), started.elapsed().as_secs_f64()));
         anyhow::ensure!(first == exact.join("bin/python"), "first bootstrap must use exact base");
         let original_marker = std::fs::read(exact.join(".bootstrap-version"))?;
-        let first_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(first.clone()), cwd: Some(root.clone()), ..Default::default() });
-        managers.push(first_manager.clone());
-        first_manager.start(KernelStartOptions::default()).await?;
-        let (second, concurrent) = tokio::join!(ensure_kernel_python(options()), ensure_kernel_python(options()));
-        let second = second?;
-        anyhow::ensure!(second == concurrent? && second != first, "changed skill request must publish exactly one sibling");
-        let second_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(second.clone()), cwd: Some(root.clone()), ..Default::default() });
-        managers.push(second_manager.clone());
-        second_manager.start(KernelStartOptions::default()).await?;
-        let mut receipts = Vec::new();
-        let mut installed_hashes = Vec::new();
-        for (manager, python, skill_expected) in [(&first_manager, &first, false), (&second_manager, &second, true)] {
-            let expected = python.parent().unwrap().parent().unwrap();
-            let check = format!("import sys, json, importlib.util, rlm\nfrom pathlib import Path\nassert Path(sys.prefix) == Path({:?})\nassert Path(rlm.__file__).is_relative_to(Path(sys.prefix))\nassert type(rlm.RLM_RUNTIME_ABI) is int and rlm.RLM_RUNTIME_ABI == 2\nassert rlm.ISSUE44_RUNTIME == 1\nassert (importlib.util.find_spec('issue44_skill') is not None) == {}\nprint(json.dumps(dict(prefix=sys.prefix, runtime=rlm.__file__, abi=rlm.RLM_RUNTIME_ABI, code=rlm.ISSUE44_RUNTIME)))", expected.display().to_string(), if skill_expected { "True" } else { "False" });
-            let observed = manager.execute(&check, ExecuteOptions::default()).await?;
-            anyhow::ensure!(observed.status == ExecuteStatus::Ok, "real kernel check failed: {:?}", observed.error);
-            let observation: serde_json::Value = serde_json::from_str(observed.stdout.trim())?;
-            let installed = PathBuf::from(observation["runtime"].as_str().ok_or_else(|| anyhow::anyhow!("missing actual module origin"))?);
-            anyhow::ensure!(installed.starts_with(expected), "actual runtime module escaped selected environment");
-            let hash = format!("{:x}", sha2::Sha256::digest(std::fs::read(&installed)?));
-            installed_hashes.push((installed, hash));
-            let pid = manager.process_id().ok_or_else(|| anyhow::anyhow!("missing owned kernel PID"))?;
-            receipts.push(serde_json::json!({"python": python, "pid": pid, "start": pa_types::platform::process::process_start_id(u32::try_from(pid)?), "observed": observed.stdout}));
+        let started = Instant::now();
+        let second = ensure_kernel_python(options()).await?;
+        timings.push(("skill-added".into(), started.elapsed().as_secs_f64()));
+        anyhow::ensure!(second != first, "a changed skill request must select a sibling generation");
+        for (python, version, skill) in [(&first, 1, false), (&second, 1, true)] {
+            let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(python.clone()), cwd: Some(root.clone()), ..Default::default() });
+            managers.push(manager.clone());
+            manager.start(KernelStartOptions::default()).await?;
+            receipts.push(issue44_observe_kernel(&manager, python, &toolchain, version, skill).await?);
+            write_evidence("receipts.json", &serde_json::Value::from(receipts.clone()));
         }
-        std::fs::write(root.join("receipts.json"), serde_json::to_vec_pretty(&receipts)?)?;
-        let imported = second_manager.execute("import issue44_skill\nassert issue44_skill.VALUE == 44", ExecuteOptions::default()).await?;
+        let imported = managers[1].execute("import issue44_skill\nassert issue44_skill.VALUE == 44", ExecuteOptions::default()).await?;
         anyhow::ensure!(imported.status == ExecuteStatus::Ok, "actual skill import failed");
         std::fs::write(&runtime_init, format!("{original_init}\nISSUE44_RUNTIME = 2\n"))?;
+        let started = Instant::now();
         let third = ensure_kernel_python(options()).await?;
+        timings.push(("runtime-updated".into(), started.elapsed().as_secs_f64()));
         anyhow::ensure!(third != second, "runtime update must select another generation");
-        let third_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(third.clone()), cwd: Some(root.clone()), ..Default::default() });
-        managers.push(third_manager.clone());
-        third_manager.start(KernelStartOptions::default()).await?;
-        let third_pid = third_manager.process_id().ok_or_else(|| anyhow::anyhow!("missing third kernel PID"))?;
-        receipts.push(serde_json::json!({"python": third, "pid": third_pid, "start": pa_types::platform::process::process_start_id(u32::try_from(third_pid)?)}));
-        std::fs::write(root.join("receipts.json"), serde_json::to_vec_pretty(&receipts)?)?;
-        for (manager, version) in [(&first_manager, 1), (&second_manager, 1), (&third_manager, 2)] {
-            let observed = manager.execute(&format!("import importlib, rlm\nimportlib.reload(rlm)\nassert rlm.ISSUE44_RUNTIME == {version}"), ExecuteOptions::default()).await?;
+        let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(third.clone()), cwd: Some(root.clone()), ..Default::default() });
+        managers.push(manager.clone());
+        manager.start(KernelStartOptions::default()).await?;
+        receipts.push(issue44_observe_kernel(&manager, &third, &toolchain, 2, true).await?);
+        write_evidence("receipts.json", &serde_json::Value::from(receipts.clone()));
+        for (index, version) in [(0, 1), (1, 1), (2, 2)] {
+            let observed = managers[index].execute(&format!("import importlib, rlm\nimportlib.reload(rlm)\nassert rlm.ISSUE44_RUNTIME == {version}"), ExecuteOptions::default()).await?;
             anyhow::ensure!(observed.status == ExecuteStatus::Ok, "active kernel code changed: {:?}", observed.error);
         }
-        for (path, before) in &installed_hashes {
-            anyhow::ensure!(format!("{:x}", sha2::Sha256::digest(std::fs::read(path)?)) == *before, "old installed runtime file changed: {}", path.display());
+        for receipt in &receipts[..2] {
+            let path = Path::new(receipt["runtime"].as_str().unwrap_or_default());
+            anyhow::ensure!(issue44_sha256(path)? == receipt["runtime_sha256"].as_str().unwrap_or_default(), "old installed runtime file changed: {}", path.display());
         }
-        std::fs::write(root.join("installed-runtime-hashes.json"), serde_json::to_vec_pretty(&installed_hashes)?)?;
+        let started = Instant::now();
         let removed = ensure_kernel_python(EnsureKernelPythonOptions::default()).await?;
-        anyhow::ensure!(removed != third, "removing a skill selects another environment");
-        let removed_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(removed.clone()), cwd: Some(root.clone()), ..Default::default() });
-        managers.push(removed_manager.clone());
-        removed_manager.start(KernelStartOptions::default()).await?;
-        let removed_pid = removed_manager.process_id().ok_or_else(|| anyhow::anyhow!("missing removed-skill kernel PID"))?;
-        receipts.push(serde_json::json!({"python": removed, "pid": removed_pid, "start": pa_types::platform::process::process_start_id(u32::try_from(removed_pid)?)}));
-        let observed = removed_manager.execute("import importlib.util, rlm\nassert rlm.ISSUE44_RUNTIME == 2\nassert importlib.util.find_spec('issue44_skill') is None", ExecuteOptions::default()).await?;
-        anyhow::ensure!(observed.status == ExecuteStatus::Ok, "removed skill is still installed: {:?}", observed.error);
+        timings.push(("skill-removed".into(), started.elapsed().as_secs_f64()));
+        anyhow::ensure!(removed != third && removed != first, "removing a skill selects another environment");
+        let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(removed.clone()), cwd: Some(root.clone()), ..Default::default() });
+        managers.push(manager.clone());
+        manager.start(KernelStartOptions::default()).await?;
+        receipts.push(issue44_observe_kernel(&manager, &removed, &toolchain, 2, false).await?);
+        write_evidence("receipts.json", &serde_json::Value::from(receipts.clone()));
         anyhow::ensure!(std::fs::read(exact.join(".bootstrap-version"))? == original_marker, "published base was mutated");
+        let started = Instant::now();
         anyhow::ensure!(ensure_kernel_python(options()).await? == third, "identical request must reuse matching published generation");
-        std::fs::write(root.join("receipts.json"), serde_json::to_vec_pretty(&receipts)?)?;
+        timings.push(("reuse".into(), started.elapsed().as_secs_f64()));
+        let published = std::fs::read_dir(&generations)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join(".generation-published").is_file())
+            .count();
+        anyhow::ensure!(published == 3, "expected exactly three published sibling generations, found {published}");
         Ok::<_, anyhow::Error>(())
     }).await;
-    let mut shutdown_errors = Vec::new();
+    let mut shutdown = Vec::new();
     for manager in &managers {
-        match tokio::time::timeout(Duration::from_secs(20), manager.shutdown(KernelShutdownOptions::default())).await {
-            Ok(Ok(_)) => {}
-            failure => { manager.kill(); shutdown_errors.push(format!("{failure:?}")); }
-        }
+        let status = match tokio::time::timeout(Duration::from_secs(20), manager.shutdown(KernelShutdownOptions::default())).await {
+            Ok(Ok(true)) => "performed".to_string(),
+            Ok(Ok(false)) => { manager.kill(); "not-performed-then-killed".to_string() }
+            Ok(Err(error)) => { manager.kill(); format!("error-then-killed: {error:#}") }
+            Err(_) => { manager.kill(); "timeout-then-killed".to_string() }
+        };
+        shutdown.push(status);
     }
-    assert!(shutdown_errors.is_empty(), "owned kernel shutdown failures: {shutdown_errors:?}");
-    outcome.expect("bounded real-uv verifier").expect("real installs, imports, and generations must agree");
+    let survivors: Vec<_> = receipts
+        .iter()
+        .filter(|receipt| {
+            let Some(pid) = receipt["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()) else {
+                return true;
+            };
+            match pa_types::platform::process::is_process_alive(pid) {
+                Ok(false) => false,
+                Err(_) => true,
+                Ok(true) => {
+                    let recorded = receipt["start"].as_str();
+                    recorded.is_none() || pa_types::platform::process::process_start_id(pid).as_deref() == recorded
+                }
+            }
+        })
+        .cloned()
+        .collect();
+    let sizes: Vec<_> = receipts
+        .iter()
+        .map(|receipt| (receipt["prefix"].clone(), issue44_tree_bytes(Path::new(receipt["prefix"].as_str().unwrap_or_default()))))
+        .collect();
+    write_evidence("shutdown.json", &serde_json::json!({
+        "outcome": outcome.as_ref().map_or_else(|_| "timeout".to_string(), |result| result.as_ref().map_or_else(|error| format!("error: {error:#}"), |_| "ok".to_string())),
+        "kernels_started": managers.len(),
+        "shutdown": shutdown,
+        "owned_survivors": survivors,
+        "timings_seconds": timings,
+        "environment_bytes": sizes,
+    }));
+    assert!(survivors.is_empty(), "owned kernel survived shutdown: {survivors:?}");
+    assert!(shutdown.iter().all(|status| status == "performed"), "owned kernel shutdown not performed: {shutdown:?}");
+    outcome.expect("bounded real-uv verifier (timeout is a fixture failure, not product evidence)").expect("real installs, imports, and generations must agree");
+}
+
+/// One live kernel's own report: prefix, base interpreter, version, runtime
+/// module origin and bytes, ABI, runtime marker, and skill visibility.
+async fn issue44_observe_kernel(
+    manager: &ReplKernelManager,
+    python: &Path,
+    toolchain: &Path,
+    runtime_version: u32,
+    skill_expected: bool,
+) -> anyhow::Result<serde_json::Value> {
+    use pa_core::kernel::shared::{ExecuteOptions, ExecuteStatus};
+    let prefix = python.parent().and_then(Path::parent).ok_or_else(|| anyhow::anyhow!("python has no environment"))?;
+    let skill = if skill_expected { "True" } else { "False" };
+    let check = format!(
+        "import sys, json, importlib.util, rlm\nfrom pathlib import Path\nassert Path(sys.prefix) == Path({prefix:?})\nassert Path(sys.base_prefix).resolve() == Path({toolchain:?}).resolve()\nassert Path(rlm.__file__).is_relative_to(Path(sys.prefix))\nassert type(rlm.RLM_RUNTIME_ABI) is int and rlm.RLM_RUNTIME_ABI == 2\nassert rlm.ISSUE44_RUNTIME == {runtime_version}\nassert (importlib.util.find_spec('issue44_skill') is not None) == {skill}\nprint(json.dumps(dict(prefix=sys.prefix, base_prefix=sys.base_prefix, version=sys.version, executable=sys.executable, runtime=rlm.__file__, abi=rlm.RLM_RUNTIME_ABI, code=rlm.ISSUE44_RUNTIME, skill={skill})))",
+        prefix = prefix.display().to_string(),
+        toolchain = toolchain.display().to_string(),
+    );
+    let observed = manager.execute(&check, ExecuteOptions::default()).await?;
+    anyhow::ensure!(observed.status == ExecuteStatus::Ok, "real kernel check failed: {:?}", observed.error);
+    let mut observation: serde_json::Value = serde_json::from_str(observed.stdout.trim())?;
+    let runtime = PathBuf::from(observation["runtime"].as_str().ok_or_else(|| anyhow::anyhow!("missing actual module origin"))?);
+    anyhow::ensure!(runtime.starts_with(prefix), "actual runtime module escaped selected environment");
+    let pid = manager.process_id().ok_or_else(|| anyhow::anyhow!("missing owned kernel PID"))?;
+    let pid = u32::try_from(pid)?;
+    observation["runtime_sha256"] = serde_json::Value::from(issue44_sha256(&runtime)?);
+    observation["python"] = serde_json::Value::from(python.display().to_string());
+    observation["pid"] = serde_json::Value::from(pid);
+    observation["start"] = serde_json::Value::from(pa_types::platform::process::process_start_id(pid));
+    Ok(observation)
+}
+
+fn issue44_sha256(path: &Path) -> anyhow::Result<String> {
+    use sha2::Digest;
+    Ok(format!("{:x}", sha2::Sha256::digest(std::fs::read(path)?)))
+}
+
+/// Total file bytes under one environment (symlinks not followed).
+fn issue44_tree_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => issue44_tree_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |metadata| metadata.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Which required build backends and default packages the offline cache holds.
+fn issue44_cache_contents(cache: &Path) -> Vec<(String, bool)> {
+    let names = [
+        "hatchling", "packaging", "pathspec", "pluggy", "trove_classifiers",
+        "mcp", "tyro", "dill", "requests", "httpx", "yaml", "tomli", "dotenv",
+        "pandas", "numpy", "scipy", "bs4", "lxml", "pydantic",
+    ];
+    let archives: Vec<PathBuf> = std::fs::read_dir(cache.join("archive-v0"))
+        .map(|entries| entries.filter_map(Result::ok).map(|entry| std::fs::DirEntry::path(&entry)).collect())
+        .unwrap_or_default();
+    names
+        .iter()
+        .map(|name| ((*name).to_string(), archives.iter().any(|archive| archive.join(name).exists())))
+        .collect()
 }
 
 fn copy_runtime_fixture(source: &Path, target: &Path) {
