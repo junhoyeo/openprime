@@ -660,14 +660,13 @@ mod tests {
 
 // --- Permanent runtime-session metadata fence (#37/#38): a single stable,
 // owner-checked coordination file, distinct from the directory-based
-// LockDir above. Never removed by lease release/reclaim. ---
-
-//! Stable, owner-checked carrier for permanent cross-process coordination files.
-//! Closing the handle releases the OS lock. This module never unlinks the file.
+// LockDir above. Never removed by lease release/reclaim.
+//
+// Stable, owner-checked carrier for permanent cross-process coordination
+// files. Closing the handle releases the OS lock. This module never
+// unlinks the file. ---
 
 use std::fs::{File, OpenOptions};
-use std::io;
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
