@@ -304,7 +304,7 @@ fn control_plane_stays_responsive_while_a_large_adoption_pass_recovers() {
     }
 
     let restart_before = pa_daemon::util::now_iso();
-    let daemon2 = spawn_supervisor(&socket, &agent_dir);
+    let _daemon2 = spawn_supervisor(&socket, &agent_dir);
     wait_socket_ready(&socket);
 
     // The control plane answers mid-recovery: hello within the latency bound while
