@@ -1760,7 +1760,7 @@ impl Issue44RealUv {
         .unwrap();
         let missing: Vec<_> = contents
             .iter()
-            .filter(|(_, found)| !**found)
+            .filter(|(_, found)| !*found)
             .map(|(name, _)| name.clone())
             .collect();
         assert!(
