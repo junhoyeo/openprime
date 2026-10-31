@@ -319,7 +319,7 @@ impl AgentSessionEngine {
             let model = if let Some(model) = self.faux_model.get() {
                 model.clone()
             } else {
-                let model = faux_model_from_script(script)?;
+                let model = faux_model_from_script(script, &self.faux_provider)?;
                 let _ = self.faux_model.set(model.clone());
                 model
             };
@@ -335,7 +335,13 @@ impl AgentSessionEngine {
             if names_script_model {
                 return Ok(model);
             }
-            return self.resolve_registry_model();
+            let mut selected = self.resolve_registry_model()?;
+            // A scripted session's catalog aliases still use its own provider.
+            // Real provider APIs are not rewritten.
+            if selected.api == "faux" {
+                selected.api = model.api;
+            }
+            return Ok(selected);
         }
         self.resolve_registry_model()
     }
@@ -567,9 +573,35 @@ pub(crate) fn saved_session_context_from_parts(
 /// Register the faux provider from a script and return its model. Scripts
 /// carry plain-text responses or content-block arrays (thinking, text, tool
 /// calls) so harnesses can script full turns. Verification harness only.
-fn faux_model_from_script(script: &str) -> anyhow::Result<Model> {
+fn faux_model_from_script(
+    script: &str,
+    provider: &std::sync::OnceLock<ScriptedFauxProvider>,
+) -> anyhow::Result<Model> {
     let script: serde_json::Value = serde_json::from_str(script)?;
     let parsed = pa_ai::faux::script::parse_faux_script(&script).map_err(anyhow::Error::msg)?;
-    let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
-    Ok(registration.get_model())
+    let registration = provider.get_or_init(|| {
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                // None uses the faux provider's existing unique API allocator. The
+                // visible provider/model names and response script stay unchanged.
+                api: None,
+                provider: Some("faux".to_string()),
+                models: Some(vec![parsed.model]),
+                tokens_per_second: parsed.tokens_per_second,
+                ..Default::default()
+            });
+        registration.set_responses(parsed.responses);
+        registration.set_repeat_last_response(parsed.repeat_last_response);
+        ScriptedFauxProvider(registration)
+    });
+    Ok(registration.0.get_model())
+}
+
+/// Own the isolated script registration for as long as its engine can request it.
+pub(super) struct ScriptedFauxProvider(pa_ai::faux::FauxProviderRegistration);
+
+impl Drop for ScriptedFauxProvider {
+    fn drop(&mut self) {
+        self.0.unregister();
+    }
 }
