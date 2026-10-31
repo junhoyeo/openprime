@@ -10,6 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod authority;
+mod fence;
+
+pub(crate) use authority::RuntimeSessionAuthority;
+pub(crate) use fence::{with_runtime_session_fence, HeldRuntimeSessionFence};
+
 pub const SESSION_LEASES_ENABLED_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 pub const SESSION_LEASE_OWNER_ID_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
 
@@ -150,7 +156,13 @@ pub fn is_process_alive(pid: u32) -> anyhow::Result<bool> {
 }
 
 fn lease_directory(agent_dir: &Path, session_path: &Path) -> PathBuf {
-    let canonical = canonical_session_path(session_path);
+    lease_directory_for_canonical(agent_dir, &canonical_session_path(session_path))
+}
+
+/// Same key derivation as [`lease_directory`], for a caller (the M fence)
+/// that already holds a resolved, revalidated canonical target and must
+/// not re-derive it from a possibly-stale raw path.
+pub(crate) fn lease_directory_for_canonical(agent_dir: &Path, canonical: &Path) -> PathBuf {
     let key = Sha256::digest(canonical.to_string_lossy().as_bytes())
         .iter()
         .fold(String::new(), |mut key, b| {
@@ -184,26 +196,143 @@ fn read_owner(directory: &Path) -> Result<Option<LeaseOwner>> {
     Ok(Some(owner))
 }
 
-fn owner_alive(owner: &LeaseOwner) -> bool {
-    match is_process_alive(owner.pid) {
-        Ok(true) => {}
-        // A provably-dead owner is stale; an unverifiable one counts as
-        // alive, like the TS lease (reclaiming a live owner is worse).
-        Ok(false) => return false,
-        Err(_) => return true,
-    }
-    match owner.process_start_id.as_deref() {
-        None => true,
-        Some(expected) => match get_process_start_id(owner.pid) {
-            Some(current) => current == expected,
-            // Unobservable identity counts as alive, like the TS lease.
-            None => true,
-        },
+/// Tri-state proof of a session lease's ownership, distinguishing "no
+/// lease file at all" from "an owner file exists but cannot be proven live
+/// or gone": unknown must never be treated as absent, and must never be
+/// treated as a dead owner safe to reclaim (#37/#38).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaseOwnerProof {
+    /// No owner record exists at this lease directory (it may not even
+    /// exist, or it may be an ownerless directory with no owner.json).
+    Absent,
+    /// An owner record exists and its process is confirmed exited, or a
+    /// comparable start token proves the pid was recycled: safe to reclaim.
+    Gone,
+    /// An owner record exists, is readable, and its process is confirmed live.
+    Held(LiveLeaseOwner),
+    /// An owner record exists but cannot be proven live or gone: corrupt
+    /// JSON, unreadable, or an unverifiable (ambiguous/legacy/malformed)
+    /// process-identity token comparison.
+    Unknown,
+}
+
+fn classify_owner(directory: &Path) -> LeaseOwnerProof {
+    let owner = match read_owner(directory) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return LeaseOwnerProof::Absent,
+        Err(_) => return LeaseOwnerProof::Unknown,
+    };
+    match pa_types::platform::process::observe_process_identity(
+        owner.pid,
+        owner.process_start_id.as_deref(),
+    ) {
+        pa_types::platform::process::ProcessIdentity::Gone => LeaseOwnerProof::Gone,
+        pa_types::platform::process::ProcessIdentity::Unknown => LeaseOwnerProof::Unknown,
+        pa_types::platform::process::ProcessIdentity::Matching => {
+            LeaseOwnerProof::Held(LiveLeaseOwner {
+                pid: owner.pid,
+                active_session_id: owner.active_session_id.filter(|id| !id.is_empty()),
+                process_start_id: owner.process_start_id.clone(),
+            })
+        }
     }
 }
 
+/// Whether the recorded owner is live, unknown, or gone, for a lease
+/// directory known to already exist (an `Absent` classification here
+/// means "owner record missing", i.e. ambiguous, not "nothing to reclaim";
+/// callers that must distinguish a never-created directory use
+/// [`classify_owner`]/[`LeaseOwnerProof`] directly).
+fn owner_alive(owner: &LeaseOwner) -> bool {
+    match pa_types::platform::process::observe_process_identity(
+        owner.pid,
+        owner.process_start_id.as_deref(),
+    ) {
+        pa_types::platform::process::ProcessIdentity::Gone => false,
+        pa_types::platform::process::ProcessIdentity::Matching
+        | pa_types::platform::process::ProcessIdentity::Unknown => true,
+    }
+}
+
+/// Only a positively-proven-dead owner is reclaimable. A missing/corrupt
+/// owner record (`None`) at an existing lease directory is ambiguous, not
+/// proof the lease is free — it must never be silently replaced or swept.
 fn lease_reclaimable(owner: Option<&LeaseOwner>) -> bool {
-    owner.is_none_or(|owner| !owner_alive(owner))
+    owner.is_some_and(|owner| !owner_alive(owner))
+}
+
+/// Strict proof of a runtime lease's ownership at the moment the M fence is
+/// held: `Unknown` must never be treated as `Absent` by a caller deciding
+/// whether admission/revival may proceed (the v3 common-fence contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeLeaseOwnership {
+    /// No owner record exists for this canonical target (never published,
+    /// or a prior holder's cleanup fully removed it).
+    Absent,
+    /// An owner record exists and its process is confirmed exited, or a
+    /// comparable start token proves the pid was recycled.
+    Stale,
+    /// An owner record exists and is confirmed live.
+    Held(LiveLeaseOwner),
+    /// An owner record exists but cannot be proven live or gone.
+    Unknown,
+}
+
+/// Called only while the canonical target's M fence is held
+/// ([`HeldRuntimeSessionFence::inspect_ownership`]).
+fn inspect_runtime_ownership_at(target: &fence::RuntimeSessionTarget) -> Result<RuntimeLeaseOwnership> {
+    Ok(match classify_owner(&target.directory) {
+        LeaseOwnerProof::Absent => RuntimeLeaseOwnership::Absent,
+        LeaseOwnerProof::Gone => RuntimeLeaseOwnership::Stale,
+        LeaseOwnerProof::Held(owner) => RuntimeLeaseOwnership::Held(owner),
+        LeaseOwnerProof::Unknown => RuntimeLeaseOwnership::Unknown,
+    })
+}
+
+/// Called only while the canonical target's M fence is held
+/// ([`HeldRuntimeSessionFence::acquire_runtime_lease`]): checks the
+/// authority's deletion ledger before publishing a new owner, then
+/// publishes directly via `publish_owner_at` — never through
+/// `acquire_runtime_session_lease`, which takes the legacy directory
+/// `.guard` lock itself. A real (blocking, retrying) lock acquisition
+/// must never nest inside a held M closure; M's own exclusivity (plus
+/// `coordinate()`'s existing non-blocking legacy-`.guard` existence
+/// check, which refuses if a live legacy holder is found) is what
+/// serializes this path instead.
+fn publish_runtime_owner(
+    target: &fence::RuntimeSessionTarget,
+    authority: &RuntimeSessionAuthority,
+) -> Result<SessionLease> {
+    authority.check_admission(&target.canonical)?;
+    // M is already held for this exact canonical target (by the caller's
+    // `coordinate()`), which has already refused if a live legacy `.guard`
+    // exists for this same key (a non-blocking existence read, not a lock
+    // acquisition). Publish directly here instead of calling
+    // `acquire_runtime_session_lease`: that function takes the legacy
+    // directory-guard lock itself, and a real (blocking, retrying) lock
+    // acquisition must never nest inside a held M closure.
+    publish_owner_at(&target.directory, &target.canonical, target.opened_path())
+}
+
+/// Called only while the canonical target's M fence is held
+/// ([`HeldRuntimeSessionFence::revalidate_lease`]): strict identity/path
+/// checks against the on-disk owner record, no recursive owner acquisition.
+fn revalidate_owned_lease(target: &fence::RuntimeSessionTarget, lease: &SessionLease) -> Result<()> {
+    anyhow::ensure!(
+        !lease.released.load(std::sync::atomic::Ordering::SeqCst),
+        "runtime session lease was already released"
+    );
+    anyhow::ensure!(
+        lease.directory == target.directory && lease.session_path == target.canonical,
+        "runtime session lease does not match this fence's canonical target"
+    );
+    let owner = read_owner(&lease.directory)?
+        .ok_or_else(|| anyhow!("runtime session lease owner record is missing"))?;
+    anyhow::ensure!(
+        owner.token == lease.token && owner.pid == std::process::id(),
+        "runtime session lease owner record no longer matches this process"
+    );
+    Ok(())
 }
 
 /// Whether a failed candidate-onto-lease-directory rename means the lease
@@ -381,6 +510,13 @@ pub struct SessionLease {
     /// drains this before removing the lease directory, so no row lands
     /// behind a successor's acquire.
     append_in_flight: std::sync::atomic::AtomicUsize,
+    /// Guards the destructive cleanup step only (owner reclaim/directory
+    /// removal), separate from `released` (which gates new admissions as
+    /// soon as the first `release()` call starts). Reset to `false` when
+    /// a cleanup attempt defers past the drain deadline, so a later
+    /// explicit `release()` (or `Drop`) retries the full protocol instead
+    /// of silently no-op'ing forever (#37).
+    cleanup_claimed: std::sync::atomic::AtomicBool,
 }
 
 impl SessionLease {
@@ -399,8 +535,13 @@ impl SessionLease {
     }
 
     pub fn release(&self) {
+        // Stop admitting new owned mutations immediately and idempotently;
+        // this is independent of whether the destructive cleanup below
+        // actually runs on this call.
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if self
-            .released
+            .cleanup_claimed
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             return;
@@ -409,7 +550,7 @@ impl SessionLease {
         // released-check must land before the lease directory is removed,
         // or its row reaches the file after a successor acquires and the
         // window cache certifies a generation the new owner never saw.
-        // New appends are refused from the swap above; this only drains
+        // New appends are refused from the store above; this only drains
         // writes already in flight.
         let drain_deadline = Instant::now() + APPEND_DRAIN_AFTER;
         while self
@@ -419,6 +560,19 @@ impl SessionLease {
             && Instant::now() < drain_deadline
         {
             std::thread::yield_now();
+        }
+        if self
+            .append_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            // The admitted mutation is still unsettled past the drain
+            // bound: this attempt must not hand off or erase ownership it
+            // cannot prove is safe to release. Allow a later explicit
+            // `release()` (or `Drop`) to retry the full protocol.
+            self.cleanup_claimed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
         }
         self.write_sidecars();
         let _ = with_lease_guard(&self.directory, GuardWait::Fast, || {
@@ -498,6 +652,13 @@ pub struct LiveLeaseOwner {
     /// The owner's recorded active session id: the holder identity the
     /// session-hold refusal names.
     pub active_session_id: Option<String>,
+    /// The owner's recorded process-start identity (`ps2:`/`win2:`/`proc:`,
+    /// or an older `ps:`/`win:` token on a lease published before this
+    /// field existed): callers that need to re-verify this exact owner
+    /// later (rather than re-reading the owner file) use this, not a
+    /// fresh `get_process_start_id` call, which answers the pid's
+    /// *current* identity, not the one this lease was published under.
+    pub process_start_id: Option<String>,
 }
 
 /// Whether a live process holds the session file's runtime lease: read
@@ -505,15 +666,20 @@ pub struct LiveLeaseOwner {
 /// a dead, missing, or unreadable owner answers `None`.
 #[must_use]
 pub fn live_lease_owner(agent_dir: &Path, session_path: &Path) -> Option<LiveLeaseOwner> {
-    let directory = lease_directory(agent_dir, session_path);
-    let owner = read_owner(&directory).ok()??;
-    if !owner_alive(&owner) {
-        return None;
+    match classify_owner(&lease_directory(agent_dir, session_path)) {
+        LeaseOwnerProof::Held(owner) => Some(owner),
+        LeaseOwnerProof::Absent | LeaseOwnerProof::Gone | LeaseOwnerProof::Unknown => None,
     }
-    Some(LiveLeaseOwner {
-        pid: owner.pid,
-        active_session_id: owner.active_session_id.filter(|id| !id.is_empty()),
-    })
+}
+
+/// Tri-state ownership proof for a boot-time veto (the automatic-revival
+/// gate): unlike [`live_lease_owner`], this keeps `Unknown` distinguishable
+/// from `Absent`, because a revival veto must defer on uncertainty rather
+/// than treat unreadable/corrupt owner metadata as "no lease" and relaunch
+/// (#37).
+#[must_use]
+pub(crate) fn lease_owner_proof(agent_dir: &Path, session_path: &Path) -> LeaseOwnerProof {
+    classify_owner(&lease_directory(agent_dir, session_path))
 }
 
 /// Acquire the lease for one session file. Returns `None` when leases are
@@ -555,71 +721,108 @@ pub fn acquire_runtime_session_lease(
     let directory = lease_directory(agent_dir, &canonical);
 
     // The open path outlasts the stale window (see `GuardWait::ThroughStale`).
+    // This legacy directory-guard lock is for callers outside the M fence
+    // (the TS-compatible path and every pre-fence Rust caller); it must
+    // never be acquired from inside a held M closure (see
+    // `publish_owner_at`, which the M-fence path calls directly instead).
     with_lease_guard(&directory, GuardWait::ThroughStale, || {
-        for _ in 0..3 {
-            let token = uuid::Uuid::new_v4().to_string();
-            let candidate = directory.with_extension(format!(
-                "lock.candidate-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
-            fs::create_dir_all(&candidate)?;
-            let owner = LeaseOwner {
-                version: 1,
-                token: token.clone(),
-                pid: std::process::id(),
-                process_start_id: get_process_start_id(std::process::id()),
-                active_session_id: std::env::var(SESSION_LEASE_OWNER_ID_ENV).ok(),
-                session_path: canonical.to_string_lossy().to_string(),
-                created_at: crate::util::now_iso(),
-            };
-            let owner_path = candidate.join("owner.json");
-            fs::write(&owner_path, serde_json::to_string_pretty(&owner)? + "\n")?;
-            match fs::rename(&candidate, &directory) {
-                Ok(()) => {
-                    return Ok(SessionLease {
-                        session_path: canonical.clone(),
-                        opened_path: session_path.to_path_buf(),
-                        directory: directory.clone(),
-                        token,
-                        released: std::sync::atomic::AtomicBool::new(false),
-                        append_in_flight: std::sync::atomic::AtomicUsize::new(0),
-                    });
+        publish_owner_at(&directory, &canonical, session_path)
+    })
+}
+
+/// The actual candidate-write-then-atomic-rename publication, shared by the
+/// legacy caller above (under its own `.guard` directory lock) and the M
+/// fence's `publish_runtime_owner` (under M instead - never both at once
+/// for the same acquisition; M's `coordinate()` already refuses when a
+/// live legacy `.guard` exists, so the two paths cannot race on the same
+/// directory without one of them refusing first).
+fn publish_owner_at(
+    directory: &Path,
+    canonical: &Path,
+    opened_path: &Path,
+) -> Result<SessionLease> {
+    for _ in 0..3 {
+        // POSIX `rename()` silently replaces an existing *empty*
+        // directory target: a blind candidate-then-rename would steal
+        // an ownerless (or ambiguous) directory without ever checking
+        // its owner. Resolve a known pre-existing target through the
+        // same checked-owner path contention already uses, instead of
+        // ever renaming onto it.
+        if directory.try_exists().unwrap_or(true) {
+            let existing = read_owner(directory)?;
+            if !lease_reclaimable(existing.as_ref()) {
+                return Err(SessionAlreadyActiveError::for_owner(
+                    &canonical.to_string_lossy(),
+                    existing.as_ref(),
+                )
+                .into());
+            }
+            reclaim_stale(directory);
+            continue;
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        let candidate = directory.with_extension(format!(
+            "lock.candidate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&candidate)?;
+        let owner = LeaseOwner {
+            version: 1,
+            token: token.clone(),
+            pid: std::process::id(),
+            process_start_id: get_process_start_id(std::process::id()),
+            active_session_id: std::env::var(SESSION_LEASE_OWNER_ID_ENV).ok(),
+            session_path: canonical.to_string_lossy().to_string(),
+            created_at: crate::util::now_iso(),
+        };
+        let owner_path = candidate.join("owner.json");
+        fs::write(&owner_path, serde_json::to_string_pretty(&owner)? + "\n")?;
+        match fs::rename(&candidate, directory) {
+            Ok(()) => {
+                return Ok(SessionLease {
+                    session_path: canonical.to_path_buf(),
+                    opened_path: opened_path.to_path_buf(),
+                    directory: directory.to_path_buf(),
+                    token,
+                    released: std::sync::atomic::AtomicBool::new(false),
+                    append_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                    cleanup_claimed: std::sync::atomic::AtomicBool::new(false),
+                });
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&candidate);
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
                 }
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&candidate);
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        continue;
+                if is_rename_target_contention(directory, &error, cfg!(windows)) {
+                    let existing = read_owner(directory)?;
+                    if !lease_reclaimable(existing.as_ref()) {
+                        return Err(SessionAlreadyActiveError::for_owner(
+                            &canonical.to_string_lossy(),
+                            existing.as_ref(),
+                        )
+                        .into());
                     }
-                    if is_rename_target_contention(&directory, &error, cfg!(windows)) {
-                        let existing = read_owner(&directory)?;
-                        if !lease_reclaimable(existing.as_ref()) {
-                            return Err(SessionAlreadyActiveError::for_owner(
-                                &canonical.to_string_lossy(),
-                                existing.as_ref(),
-                            )
-                            .into());
-                        }
-                        reclaim_stale(&directory);
-                        continue;
-                    }
-                    return Err(error.into());
+                    reclaim_stale(directory);
+                    continue;
                 }
+                return Err(error.into());
             }
         }
-        let existing = read_owner(&directory)?;
-        if !lease_reclaimable(existing.as_ref()) {
-            return Err(SessionAlreadyActiveError::for_owner(
-                &canonical.to_string_lossy(),
-                existing.as_ref(),
-            )
-            .into());
-        }
-        Err(anyhow!(
-            "Could not acquire session lease: {}",
-            canonical.display()
-        ))
-    })
+    }
+    let existing = read_owner(directory)?;
+    if !lease_reclaimable(existing.as_ref()) {
+        return Err(SessionAlreadyActiveError::for_owner(
+            &canonical.to_string_lossy(),
+            existing.as_ref(),
+        )
+        .into());
+    }
+    Err(anyhow!(
+        "Could not acquire session lease: {}",
+        canonical.display()
+    ))
 }
 
 pub(crate) fn reclaim_dead_owner_leases(agent_dir: &Path) -> usize {
@@ -647,9 +850,13 @@ pub(crate) fn reclaim_dead_owner_leases(agent_dir: &Path) -> usize {
             if reclaimed.unwrap_or(false) {
                 removed += 1;
             }
-        } else if name.contains(".lock.stale-") && fs::remove_dir_all(&path).is_ok() {
-            removed += 1;
         }
+        // A `.lock.stale-*` quarantine directory is never swept here by its
+        // name alone: `reclaim_stale` already removes the one it just
+        // renamed, synchronously, in the same call. A survivor found by a
+        // later directory scan has no verifiable provenance — it may be an
+        // unrelated/adversarial name, not evidence of a dead owner — and a
+        // bare name match is not an ownership certificate (#37).
     }
     removed
 }
