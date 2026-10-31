@@ -227,9 +227,9 @@ pub fn read_scheduled_jobs_artifact_strict(path: &Path) -> anyhow::Result<Vec<Ag
 ///
 /// Returns an error when the file's state lock cannot be acquired or the
 /// write fails.
-pub fn cancel_matching_ids_in_file(
+pub fn cancel_matching_ids_in_file<S: std::hash::BuildHasher>(
     path: &Path,
-    ids: &std::collections::HashSet<String>,
+    ids: &std::collections::HashSet<String, S>,
     now: u64,
 ) -> anyhow::Result<usize> {
     if ids.is_empty() {
