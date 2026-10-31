@@ -1,47 +1,41 @@
 //! The supervisor process-exit paths - the shutdown command and the SIGTERM
-//! graceful drain - with the /proc process-tree helpers they lean on.
+//! graceful drain - with the owned-descriptor worker lookup and the
+//! product's own portable liveness probe they lean on.
+
+use std::path::Path;
 
 use super::*;
 
-fn child_pids_of(ppid: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let entries = std::fs::read_dir("/proc").expect("read /proc");
-    for entry in entries.flatten() {
-        let Ok(entry_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+/// The one worker spawned for `session_id`, read from its durable
+/// descriptor (`agent_dir/daemon-workers/<socket-key>/<session_id>.json`),
+/// the same lookup `idle_passivation_e2e.rs::worker_pid` already uses.
+/// Reading the owned descriptor instead of walking every host process
+/// for children of the supervisor's pid is both portable (no `/proc`
+/// dependency) and a strictly more precise invariant: it names the
+/// worker this test's own session actually has, rather than whatever the
+/// host census of the supervisor's children happens to turn up.
+fn worker_pid(agent_dir: &Path, session_id: &str) -> Option<u32> {
+    let instances = std::fs::read_dir(agent_dir.join("daemon-workers")).ok()?;
+    for instance in instances.flatten() {
+        let descriptor_path = instance.path().join(format!("{session_id}.json"));
+        let Ok(content) = std::fs::read_to_string(&descriptor_path) else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else {
-            continue;
-        };
-        // `comm` can contain spaces and parens, so parse after the last ')'.
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut fields = rest.split_whitespace();
-        fields.next(); // process state
-        let Ok(parent) = fields.next().unwrap_or_default().parse::<u32>() else {
-            continue;
-        };
-        if parent == ppid {
-            pids.push(entry_pid);
+        if let Ok(descriptor) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(pid) = descriptor.get("pid").and_then(serde_json::Value::as_u64) {
+                return u32::try_from(pid).ok();
+            }
         }
     }
-    pids
+    None
 }
 
-/// Liveness that ignores zombies: a detached child nobody reaps keeps its
-/// `/proc` entry (exit status pending), so path existence alone would call
-/// an exited process alive.
+/// Portable liveness (the product's own probe - Linux `/proc` state,
+/// macOS `kill(0)` + the Darwin zombie check): the assertions below keep
+/// their meaning on every platform instead of reading a `/proc` that
+/// does not exist on macOS.
 fn process_alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // `comm` can contain spaces and parens, so parse after the last ')'.
-    let Some((_, rest)) = stat.rsplit_once(')') else {
-        return false;
-    };
-    let state = rest.split_whitespace().next().unwrap_or_default();
-    !state.starts_with('Z') && !state.starts_with('X')
+    pa_daemon::lease::is_process_alive(pid).expect("process liveness probe")
 }
 
 fn wait_child_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -66,7 +60,6 @@ fn shutdown_command_exits_the_supervisor_process() {
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
     let mut daemon = spawn_daemon(&socket, &agent_dir);
-    let supervisor_pid = daemon.child.id();
     let (mut client, _hello) = Client::connect(&socket);
 
     let script_path = dir.path().join("script.json");
@@ -88,17 +81,20 @@ fn shutdown_command_exits_the_supervisor_process() {
     );
     let created = client.read_response("c1");
     assert_eq!(created["success"], true, "create failed: {created}");
-    // The supervisor spawned exactly one worker child for the session.
+    let session_id = created["data"]["id"]
+        .as_str()
+        .or_else(|| created["data"]["sessionId"].as_str())
+        .expect("create response names the session id")
+        .to_string();
+
     let deadline = Instant::now() + Duration::from_secs(10);
-    let worker_pids = loop {
-        let children = child_pids_of(supervisor_pid);
-        if !children.is_empty() {
-            break children;
+    let pid = loop {
+        if let Some(pid) = worker_pid(&agent_dir, &session_id) {
+            break pid;
         }
         assert!(Instant::now() < deadline, "worker never spawned");
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(worker_pids.len(), 1, "one worker per session");
 
     client.send_command("sd", &serde_json::json!({ "type": "shutdown" }));
     let shutdown = client.read_response("sd");
@@ -110,14 +106,12 @@ fn shutdown_command_exits_the_supervisor_process() {
     assert!(!socket.exists(), "the socket file is removed on exit");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    for pid in worker_pids {
-        while process_alive(pid) {
-            assert!(
-                Instant::now() < deadline,
-                "worker {pid} leaked after shutdown"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    while process_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "worker {pid} leaked after shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

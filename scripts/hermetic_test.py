@@ -8,29 +8,47 @@ A plain `cargo test` with the real HOME can therefore start or rebuild the
 live kernel venv and write live agent state.
 
 This wrapper runs the command under `env -i` with a fresh short root in /tmp:
-synthetic HOME/TMPDIR/XDG_DATA_HOME, PRIME_AGENT_KERNEL_VENV inside the root,
+synthetic HOME/TMPDIR/XDG_DATA_HOME,
 and an explicit test kernel interpreter. On macOS the command also runs under a
-sandbox profile that denies outbound network except loopback and Unix sockets. Agent, session, and socket paths are
+mandatory sandbox that denies filesystem writes outside the run root and private
+Cargo target. It permits loopback mocks except protected ports (53, 8787, 8791, 18789), and
+Unix sockets only under the run root. Direct external IP/DNS traffic is denied.
+The sandbox also denies known trash executables and Apple Event file operations
+(Apple Event sends, the Apple Events, DesktopServicesHelper and FileProvider
+services, and the real ~/.Trash), and routes known `trash` CLI calls to an owned
+fake first on PATH. It does not prevent all deletion or detect every attempt. Agent, session, and socket paths are
 not forced, so tests keep their own per-test roots. After the command, it
-reports any surviving process that references the root or the Cargo target
-directory, and exits non-zero if one exists. It never kills processes and
-never deletes the root (it is evidence).
+compares precise same-UID process identities and observed subject relationships.
+Observed owned survivors, subject-related candidates, and required tracking failures
+block the run. Unattributed host arrivals are retained warnings, not proof of independence
+or kill targets. Checkpoints are non-atomic; final classification has no separate wall-clock
+deadline. The command timeout is not a whole-wrapper timeout or containment guarantee.
+It only terminates/reaps its exact Popen-owned child on failure; it never signals
+discovered PIDs and never deletes the root (it is evidence).
 
 Usage:
     scripts/hermetic_test.py --kernel-python PATH -- cargo test -p pa-daemon
     scripts/hermetic_test.py -- make check   # uses PA_E2E_KERNEL_PYTHON
 """
 import argparse
+import json
+import math
+import pwd
 import platform
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 
-GRACE_SECONDS = 60
+from hermetic_ownership import OwnershipTracker, ReferenceProbe
+from hermetic_control import ControlDirectory, write_receipt
+import hermetic_trash
+from hermetic_processes import ProcessInventory, UnknownObservation, new_processes, reap_owned, snapshot_receipt
+
 PASS_THROUGH = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "CARGO_HOME", "RUSTUP_HOME",
                 "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "CARGO_INCREMENTAL", "CARGO_NET_OFFLINE",
                 "RUST_TEST_THREADS")
@@ -39,7 +57,7 @@ KERNEL_VARS = ("PRIME_AGENT_KERNEL_PYTHON", "PA_CORE_KERNEL_PYTHON",
 
 
 def real_home():
-    return Path(os.environ.get("HOME") or Path.home()).resolve()
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 
 
 def resolve_kernel_python(explicit, environ):
@@ -50,11 +68,12 @@ def resolve_kernel_python(explicit, environ):
     path = Path(raw)
     if not path.exists():
         raise SystemExit(f"hermetic_test: kernel python {path} does not exist")
-    live = real_home() / ".prime"
-    if path.resolve().is_relative_to(live.resolve()) or path.absolute().is_relative_to(live):
-        raise SystemExit(f"hermetic_test: refusing the live install interpreter {path}; "
-                         "use a separate test runtime")
-    return str(path)
+    for live in (real_home() / ".prime", real_home() / ".prime-rust"):
+        if path.resolve().is_relative_to(live.resolve()) or path.absolute().is_relative_to(live):
+            raise SystemExit(f"hermetic_test: refusing the live install interpreter {path}; "
+                             "use a separate test runtime")
+    # Keep the lexical venv path: resolving a venv symlink here would lose sys.prefix.
+    return str(path.absolute())
 
 
 def build_env(root, kernel_python, environ):
@@ -66,7 +85,6 @@ def build_env(root, kernel_python, environ):
     env.update({
         "HOME": str(root / "h"), "TMPDIR": str(root / "t"), "XDG_DATA_HOME": str(root / "x"),
         "XDG_CONFIG_HOME": str(root / "c"), "XDG_CACHE_HOME": str(root / "cache"),
-        "PRIME_AGENT_KERNEL_VENV": str(root / "k"),
         "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPYCACHEPREFIX": str(root / "pycache"),
         "NO_COLOR": "1",
@@ -77,26 +95,47 @@ def build_env(root, kernel_python, environ):
     return env
 
 
-# macOS: deny outbound network except loopback and Unix sockets, so tests that would
-# reach a real endpoint (telemetry, catalogs) fail loudly instead of egressing.
-# DNS through mDNSResponder stays allowed for localhost resolution. /bin/ps is setuid
-# and cannot exec inside a sandbox, so it runs unsandboxed (it opens no sockets);
-# process-identity code and tests read process start times through it.
-EGRESS_PROFILE = """(version 1)
-(allow default)
-(deny network-outbound)
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-outbound (remote unix-socket))
-(allow network-outbound (literal "/private/var/run/mDNSResponder"))
-(allow process-exec (literal "/bin/ps") (with no-sandbox))
-"""
+# ps is a fixed, OS-supplied, read-only process inspector. macOS refuses to exec
+# this setuid binary in a sandbox. This is the ONLY no-sandbox executable; it
+# cannot launch user commands. Product identity probes depend on its start time.
+# This fence blocks external IPs and protected ports, NOT every local service:
+# dynamic loopback mocks are supported, so an unknown local proxy remains outside
+# this guarantee. Proxy credentials/settings never enter build_env.
+def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8791, 18789),
+                    trash_rules=()):
+    quote = lambda value: json.dumps(str(value))
+    paths = [Path(root).resolve(), *(Path(p).resolve() for p in writable)]
+    private = [real_home() / ".prime", real_home() / ".prime-rust", *map(Path, protected)]
+    lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
+    for path in paths:
+        lines.append(f"(allow file-write* (subpath {quote(path)}))")
+    # PTYs and null are device I/O, not a writable filesystem escape.
+    lines.extend(['(allow file-write* (literal "/dev/null") (literal "/dev/tty") '
+                  '(regex #"^/dev/ttys[0-9]+$"))'])
+    for path in private:
+        for spelling in {path.absolute(), path.resolve()}:
+            lines.append(f"(deny file-read* file-write* (subpath {quote(spelling)}))")
+    lines.extend([
+        "(deny network-outbound)",
+        '(allow network-outbound (remote ip "localhost:*"))',
+        # Restrict Unix sockets to the owned run root (not mDNSResponder, Docker,
+        # the live daemon, or an arbitrary pre-existing local service).
+        f"(allow network-outbound (remote unix-socket (subpath {quote(paths[0])})))",
+        '(deny mach-lookup (global-name "com.apple.mDNSResponder"))',
+    ])
+    for port in sorted({53, 8787, 8791, 18789, *protected_ports}):
+        if not 1 <= port <= 65535:
+            raise ValueError(f"invalid protected port: {port}")
+        lines.append(f'(deny network-outbound (remote ip "*:{port}"))')
+    lines.append('(allow process-exec (literal "/bin/ps") (with no-sandbox))')
+    # Trash rules come last: their CONTROL fake allow must be the final exec match.
+    lines.extend(trash_rules)
+    return "\n".join(lines) + "\n"
 
 
-def sandboxed(command, root):
-    if platform.system() != "Darwin":
-        return command
-    profile = root / "deny-egress.sb"
-    profile.write_text(EGRESS_PROFILE)
+def sandboxed(command, profile):
+    if platform.system() != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        raise SystemExit("hermetic_test: enforced filesystem/network sandbox unavailable; refusing to run")
     return ["/usr/bin/sandbox-exec", "-f", str(profile), *command]
 
 
@@ -110,40 +149,34 @@ def make_root():
     return root
 
 
-def leftovers(markers):
-    """Processes whose EXECUTABLE (argv[0]) lives under a marker path: the run's
-    root, the Cargo target directory, or the test kernel interpreter. Matching
-    argv[0] only keeps unrelated shells whose arguments merely mention a path,
-    and this wrapper's own ancestors, out of the report."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True,
-                         timeout=30, check=False).stdout
-    rows, parents = [], {}
-    for line in out.splitlines():
-        fields = line.split(None, 2)
-        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
-            continue
-        pid, ppid, command = int(fields[0]), int(fields[1]), fields[2]
-        parents[pid] = ppid
-        rows.append((pid, command))
-    ancestors, cursor = set(), os.getpid()
-    while cursor and cursor not in ancestors:
-        ancestors.add(cursor)
-        cursor = parents.get(cursor, 0)
-    found = []
-    for pid, command in rows:
-        executable = command.split(" ", 1)[0]
-        if pid not in ancestors and any(executable == m or executable.startswith(m.rstrip("/") + "/")
-                                        for m in markers if m):
-            found.append(f"{pid} {command}")
-    return found
+
+
+def private_target(environ):
+    raw = environ.get("CARGO_TARGET_DIR")
+    if not raw:
+        raise SystemExit("hermetic_test: CARGO_TARGET_DIR must name an existing owned /private/tmp/pa-*/target")
+    path = Path(raw)
+    temporary = Path("/tmp").resolve()
+    if (not path.is_absolute() or path != path.resolve() or not path.is_dir()
+            or path.name != "target" or path.parent.parent != temporary
+            or not path.parent.name.startswith("pa-")):
+        raise SystemExit(f"hermetic_test: target must be canonical {temporary}/pa-*/target: {path}")
+    for directory in (path.parent, path):
+        stat = directory.stat()
+        if stat.st_uid != os.getuid() or stat.st_mode & 0o022:
+            raise SystemExit(f"hermetic_test: target directory is not private/owned: {directory}")
+    return path
+
+
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--kernel-python")
-    parser.add_argument("--allow-egress", action="store_true",
-                        help="do not wrap the command in the macOS loopback-only network sandbox "
-                             "(requires --do-not-track)")
+    parser.add_argument("--timeout", type=float, default=1800,
+                        help="command deadline in seconds (default: 1800)")
+    parser.add_argument("--protect-port", type=int, action="append", default=[],
+                        help="deny an additional local service port (8787, 8791, 18789 and DNS are always denied)")
     parser.add_argument("--do-not-track", action="store_true",
                         help="set DO_NOT_TRACK=1 for the command (some telemetry tests then fail by design)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -151,11 +184,12 @@ def main(argv=None):
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("missing command")
-    # Every product run needs a telemetry guard: the egress sandbox (macOS) or
-    # DO_NOT_TRACK=1. Refuse to start without one of the two.
-    sandbox_available = platform.system() == "Darwin" and not args.allow_egress
-    if not sandbox_available and not args.do_not_track:
-        parser.error("no telemetry guard: the egress sandbox is unavailable or disabled; pass --do-not-track")
+    # DO_NOT_TRACK is not a security boundary and cannot replace the OS fence.
+    if platform.system() != "Darwin":
+        parser.error("enforced filesystem/network sandbox unavailable; refusing to run")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
+    target = private_target(os.environ)
     kernel_python = resolve_kernel_python(args.kernel_python, os.environ)
     root = make_root()
     env = build_env(root, kernel_python, os.environ)
@@ -164,31 +198,225 @@ def main(argv=None):
     executable = shutil.which(command[0], path=env["PATH"]) or command[0]
     print(f"hermetic_test: root {root}", file=sys.stderr)
     argv = [executable, *command[1:]]
-    if not args.allow_egress:
-        argv = sandboxed(argv, root)
-    code = subprocess.run(argv, env=env, check=False).returncode
-    # The kernel interpreter marker catches orphaned `python -m rlm.repl` kernels, whose
-    # command lines name neither the root nor the target. Another live user of the same
-    # test runtime would also match; the report lists exact PIDs for review.
-    markers = [str(root), os.path.realpath(root), kernel_python]
-    if env.get("CARGO_TARGET_DIR"):
-        markers.append(env["CARGO_TARGET_DIR"])
-    else:
-        markers.append(str(Path.cwd() / "target"))
-    # Test workers that lose their supervisor exit on their own after a bounded
-    # window (WORKER_SUPERVISOR_LOST_EXIT_MS in e2e helpers); report only what is
-    # still alive once that observable condition has had time to settle.
-    deadline = time.monotonic() + GRACE_SECONDS
-    survivors = leftovers(markers)
-    while survivors and time.monotonic() < deadline:
-        time.sleep(1)
-        survivors = leftovers(markers)
-    if survivors:
-        print("hermetic_test: processes survived the command (not killed):", file=sys.stderr)
-        for row in survivors:
-            print("  " + row, file=sys.stderr)
-        return code or 3
-    print(f"hermetic_test: exit {code}; no surviving processes; root kept at {root}", file=sys.stderr)
+    env["CARGO_TARGET_DIR"] = str(target)
+    # A separate fresh sibling is NEVER in the subject's writable allowlist.
+    # Keep its directory fd open so even ancestor replacement cannot redirect a
+    # controller receipt. No descriptor for this directory reaches the subject.
+    control_path = Path(tempfile.mkdtemp(prefix="pa-control-", dir="/tmp")).resolve()
+    print(f"hermetic_test: control {control_path}", file=sys.stderr)
+    with ControlDirectory(control_path) as control:
+        forbidden_fd, forbidden_name = tempfile.mkstemp(prefix="pa-forbidden-", dir="/tmp")
+        with os.fdopen(forbidden_fd, "w") as stream:
+            stream.write("preserve")
+        forbidden = Path(forbidden_name).resolve()
+        private = root / "private-canary"
+        private.write_text("synthetic secret")
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            nonce = "patrash" + os.urandom(8).hex()
+            real_trash = hermetic_trash.discover_real_trash(env["PATH"])
+            fake = hermetic_trash.install_fake(control, kernel_python, root, target)
+            env["PATH"] = f"{fake.parent}{os.pathsep}{env['PATH']}"
+            trash_rules = hermetic_trash.profile_rules(control.path, nonce, real_trash, json.dumps)
+            write_receipt(control, "trash-policy.json", {**hermetic_trash.policy_receipt(real_trash, nonce),
+                                                        "subject_path": env["PATH"], "fake": str(fake)})
+            profile = sandbox_profile(root, writable=(target,), protected=(private,),
+                                      protected_ports=[*args.protect_port, port], trash_rules=trash_rules)
+            control.write_text("isolation.sb", profile)
+            profile_path = control.path / "isolation.sb"
+            preflight = [kernel_python, str(Path(__file__).with_name("hermetic_preflight.py")),
+                         str(root), str(forbidden), str(private), str(port), str(control.path),
+                         json.dumps({"real_trash": sorted(set(real_trash) | set(real_trash.values())),
+                                     "fake": str(fake), "nonce": nonce,
+                                     "owner_trash": hermetic_trash.owner_trash(),
+                                     "services": [name for name, _ in hermetic_trash.DENIED_MACH_SERVICES],
+                                     "regex_probes": list(hermetic_trash.MACH_REGEX_PROBES)})]
+            result = subprocess.run(sandboxed(preflight, profile_path), env=env,
+                                    text=True, capture_output=True, timeout=20, check=False)
+            write_receipt(control, "preflight.json", {"exit": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr, "forbidden": str(forbidden),
+                "control_identity": control.identity, "root": str(root)})
+            if result.returncode or forbidden.read_text() != "preserve" or private.read_text() != "synthetic secret":
+                print(f"hermetic_test: OS-fence preflight failed: {result.stderr}", file=sys.stderr)
+                return result.returncode or 4
+            print(f"hermetic_test: OS-fence preflight {result.stdout.strip()}", file=sys.stderr)
+            argv = sandboxed(argv, profile_path)
+        try:
+            return run_subject(argv, env, root, target, args.timeout, control=control)
+        finally:
+            # Evidence only: an inventory or receipt failure must never replace the
+            # subject's decision or hide an exception from run_subject.
+            try:
+                write_receipt(control, "fake-trash-inventory.json", hermetic_trash.store_inventory(root))
+            except Exception as failure:
+                print(f"hermetic_test: fake-trash inventory not recorded: {type(failure).__name__}: {failure}",
+                      file=sys.stderr)
+
+
+def read_log_tail(output):
+    fd = output.fileno()
+    return os.pread(fd, 128 * 1024, max(0, os.fstat(fd).st_size - 128 * 1024))
+
+
+def run_subject(argv, env, root, target, timeout, *, control, inventory=None):
+    """Execute and account for one subject. Tests inject only the inventory seam."""
+    child = None
+    output = None
+    before = None
+    survivors = None
+    ownership = None
+    tracker = None
+    references = None
+    timed_out = False
+    failure = None
+    cleanup_failure = None
+    tracking_failure = None
+    launch_observation = None
+    last_observation = None
+    phase = "initial_inventory"
+    try:
+        inventory = inventory or ProcessInventory()
+        before = inventory.snapshot()
+        last_observation = before
+        write_receipt(control, "process-baseline.json", snapshot_receipt(before))
+        # Open the owned log before launch; stdout/stderr never name a path the
+        # subject can replace. Directory/receipt descriptors remain CLOEXEC.
+        phase = "launch_setup"
+        output = control.create_file("subject.log")
+        log_info = os.fstat(output.fileno())
+        references = ReferenceProbe(inventory, (root.resolve(), target.resolve(), Path.cwd().resolve()),
+                                    (log_info.st_dev, log_info.st_ino))
+        started = time.monotonic()
+        deadline = started + timeout
+        child = subprocess.Popen(argv, env=env, start_new_session=True,
+                                 stdout=output, stderr=subprocess.STDOUT)
+        phase = "launch_identity"
+        identity = inventory.identity(child.pid)
+        if isinstance(identity, UnknownObservation):
+            launch_observation = identity.receipt()
+            raise RuntimeError("direct child identity is Unknown; required launch tracking failed")
+        if identity is None and child.poll() is None:
+            raise RuntimeError("child identity disappeared while the child is still live")
+        tracker = OwnershipTracker(child.pid, identity)
+        tracker.observe(before)
+        receipt = {"pid": child.pid, "identity": identity, "command": argv,
+                   "root": str(root), "target": str(target), "started_monotonic": started,
+                   "control": str(control.path), "control_identity": control.identity}
+        phase = "launch_receipt"
+        write_receipt(control, "command.json", receipt)
+        phase = "tracking"
+        last_observation = inventory.snapshot()
+        tracker.observe(last_observation)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                phase = "wait"
+                child.wait(timeout=min(1.0, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                # A bounded child-wait checkpoint, not retrying a failed test.
+                # Preserve observed descendant identities before reparenting.
+                phase = "tracking"
+                last_observation = inventory.snapshot()
+                tracker.observe(last_observation)
+        if timed_out:
+            print("hermetic_test: command deadline exceeded", file=sys.stderr)
+    except BaseException as error:
+        failure = error
+        if phase in ("initial_inventory", "launch_identity", "tracking"):
+            tracking_failure = type(error).__name__
+    finally:
+        try:
+            if child is not None:
+                reap_owned(child)
+        except BaseException as error:
+            cleanup_failure = error
+        try:
+            if before is not None:
+                phase = "final_inventory"
+                after = inventory.snapshot()
+                last_observation = after
+                survivors = new_processes(before, after)
+                phase = "final_receipt"
+                write_receipt(control, "process-after.json", snapshot_receipt(after))
+                if tracker is not None:
+                    phase = "final_classification"
+                    ownership = tracker.classify(before, after, references)
+                    phase = "final_receipt"
+                    write_receipt(control, "ownership.json", ownership)
+        except BaseException as error:
+            if phase in ("final_inventory", "final_classification"):
+                tracking_failure = type(error).__name__
+            if failure is None:
+                failure = error
+        subject_exit = child.returncode if child is not None else None
+        if failure is not None or cleanup_failure is not None:
+            decision = "ownership_tracking_failure" if tracking_failure is not None else "error"
+            code = 130 if isinstance(failure or cleanup_failure, KeyboardInterrupt) else 1
+        elif timed_out:
+            decision, code = "timeout", 124
+        elif subject_exit is None or ownership is None:
+            decision, code = "ownership_tracking_failure", 4
+        elif ownership["observed_owned_survivors"]:
+            decision, code = "owned_survivors", subject_exit or 3
+        elif ownership["unverified_subject_candidates"]:
+            decision, code = "unverified_subject_candidates", subject_exit or 3
+        elif ownership["host_warnings"]:
+            decision, code = "subject_exit_with_host_warnings", subject_exit
+        else:
+            decision, code = "subject_exit", subject_exit
+        outcome = {"subject_exit_code": subject_exit, "timed_out": timed_out,
+                   "wrapper_decision": decision, "wrapper_exit_code": code & 255,
+                   "wrapper_return_code": code,
+                   "failure_type": type(failure).__name__ if failure is not None else None,
+                   "cleanup_failure_type": type(cleanup_failure).__name__ if cleanup_failure is not None else None,
+                   "tracking_failure_type": tracking_failure,
+                   "launch_observation": launch_observation,
+                   "last_observation": snapshot_receipt(last_observation) if last_observation is not None else None,
+                   "direct_child_reaped": child is not None and child.returncode is not None,
+                   "survivors": survivors, "ownership": ownership,
+                   "control_identity": control.identity}
+        try:
+            # One immutable final receipt per run; never overwrite earlier evidence.
+            write_receipt(control, "outcome.json", outcome)
+        except BaseException as receipt_error:
+            outcome["planned_wrapper_decision"] = outcome["wrapper_decision"]
+            outcome["wrapper_decision"] = "outcome_receipt_error"
+            outcome["wrapper_exit_code"] = 130 if isinstance(receipt_error, KeyboardInterrupt) else 1
+            outcome["wrapper_return_code"] = outcome["wrapper_exit_code"]
+            outcome["outcome_receipt_failure_type"] = type(receipt_error).__name__
+            print("hermetic_test: outcome receipt write failed; fallback " + json.dumps(outcome), file=sys.stderr)
+            raise
+        finally:
+            if output is not None:
+                try:
+                    output.flush()
+                    # Descendants may retain stdout: pread must not move their
+                    # shared open-file offset while we mirror a bounded tail.
+                    sys.stdout.write(read_log_tail(output).decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+                finally:
+                    output.close()
+    print(f"hermetic_test: subject exit {subject_exit}; wrapper decision {decision} ({code})", file=sys.stderr)
+    if failure is not None:
+        raise failure
+    if cleanup_failure is not None:
+        raise cleanup_failure
+    if ownership is not None:
+        for category in ("observed_owned_survivors", "unverified_subject_candidates", "host_warnings"):
+            if ownership[category]:
+                print(f"hermetic_test: {category} (not signalled): " + json.dumps(ownership[category]), file=sys.stderr)
+        if not ownership["observed_owned_survivors"] and not ownership["unverified_subject_candidates"]:
+            print("hermetic_test: no observed owned survivors; host-wide attribution incomplete", file=sys.stderr)
+    print(f"hermetic_test: exit {code}; root kept at {root}", file=sys.stderr)
     return code
 
 

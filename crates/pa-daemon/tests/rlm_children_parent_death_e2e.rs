@@ -350,8 +350,18 @@ fn create_parent(
     created["data"].clone()
 }
 
-/// The parent worker's process id, read from its durable descriptor; the environ check
-/// guards the kill against a stale pid.
+/// The parent worker's process id, read from its durable descriptor; the
+/// start-id check guards the kill against a stale (recycled) pid.
+///
+/// The descriptor's `processStartId` is stamped at spawn time
+/// (`supervisor::supervision`, `process_start_id(child_pid)`) from the
+/// same identity scheme `pa_types::platform::process::process_start_id`
+/// implements everywhere else in the product (Linux `/proc` starttime,
+/// macOS `kinfo_proc`/`ps` fallback, Windows creation ticks). Comparing
+/// it against a fresh read for the live pid is the portable equivalent
+/// of the old `/proc/<pid>/environ` grep, which only ever worked on
+/// Linux and is not a liveness or identity check the product makes
+/// elsewhere.
 fn parent_worker_pid(agent_dir: &Path, socket: &Path, parent_id: &str) -> u32 {
     let descriptor_path =
         pa_daemon::descriptor::descriptor_dir(agent_dir, socket).join(format!("{parent_id}.json"));
@@ -361,12 +371,12 @@ fn parent_worker_pid(agent_dir: &Path, socket: &Path, parent_id: &str) -> u32 {
     )
     .expect("parent descriptor json");
     let pid = descriptor["pid"].as_u64().expect("descriptor pid") as u32;
-    let environ = std::fs::read_to_string(format!("/proc/{pid}/environ"))
-        .unwrap_or_else(|_| panic!("read /proc/{pid}/environ"));
+    let recorded_start_id = descriptor["processStartId"].as_str().map(str::to_string);
+    let observed_start_id = pa_daemon::protocol::process_start_id(pid);
     assert!(
-        environ.contains(&format!("={parent_id}\0"))
-            && environ.contains(pa_daemon::worker::WORKER_ACTIVE_SESSION_ID_ENV),
-        "pid {pid} is not the worker for session {parent_id}"
+        recorded_start_id.is_some() && recorded_start_id == observed_start_id,
+        "pid {pid} is not the worker for session {parent_id}: recorded start id \
+         {recorded_start_id:?} does not match the live pid's {observed_start_id:?}"
     );
     pid
 }

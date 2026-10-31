@@ -90,19 +90,23 @@ fn wait_socket_ready(socket: &Path) {
     }
 }
 
-/// Liveness that ignores zombies (a re-parented child nobody reaps keeps its
-/// /proc entry until the status is collected).
+/// Portable liveness (the product's own probe - Linux `/proc` state,
+/// macOS `kill(0)` + the Darwin zombie check): keeps the call sites'
+/// meaning on every platform instead of reading a `/proc` that does not
+/// exist on macOS.
 fn process_alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let Some((_, rest)) = stat.rsplit_once(')') else {
-        return false;
-    };
-    let state = rest.split_whitespace().next().unwrap_or_default();
-    !state.starts_with('Z') && !state.starts_with('X')
+    pa_daemon::lease::is_process_alive(pid).expect("process liveness probe")
 }
 
+/// The LIVE children of `ppid` right now - deliberately a process
+/// census, not a descriptor lookup. Every call site's own comment
+/// explains why: a mid-test supervisor replacement can leave a worker
+/// descriptor stale, and killing a stale descriptor pid would miss the
+/// real worker (or, worse, signal an unrelated process that later
+/// reused the pid). This census is the only way to name "whichever
+/// workers are actually running under this supervisor right now",
+/// which the test needs for correctness, not just for portability.
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -123,6 +127,42 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         };
         if parent == ppid {
             pids.push(entry_pid);
+        }
+    }
+    pids
+}
+
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` for the
+/// pid/ppid columns. NOT the same mechanism as `pty_holder_pids`'s
+/// macOS fallback (`pa-cli/tests/termios_process_exit_e2e.rs`), which
+/// shells to `lsof` for fd-ownership of one specific path - a different
+/// tool and output shape. This full-table pid/ppid census is new code
+/// for this triage; `kernel_dispose_e2e.rs::kernel_pids` shells to `ps`
+/// too but for a different column set (`command`, not `ppid`) and a
+/// different match (argv adjacency, not parent-pid equality).
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(ppid: u32) -> Vec<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .unwrap_or_else(|error| panic!("spawn ps for the child-pid census: {error}"));
+    assert!(
+        output.status.success(),
+        "ps exited {} during the child-pid census: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(child_pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        if parent == ppid {
+            pids.push(child_pid);
         }
     }
     pids

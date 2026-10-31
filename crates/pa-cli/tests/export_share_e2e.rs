@@ -53,16 +53,16 @@ fn kill_worker(pid: u32) {
     }
 }
 
+/// Portable liveness (the product's own probe - Linux `/proc` state,
+/// macOS `kill(0)` + the Darwin zombie check).
 fn process_alive(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        let rest = stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest)
-            .unwrap_or_default();
-        !rest.starts_with('Z')
-    })
+    pa_daemon::lease::is_process_alive(pid).unwrap_or(false)
 }
 
+/// Teardown-only; no owned session ids tracked here to look up
+/// descriptors for instead, so a process census is the right shape,
+/// just made portable.
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -83,6 +83,40 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         };
         if parent == ppid {
             pids.push(entry_pid);
+        }
+    }
+    pids
+}
+
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` for the
+/// pid/ppid columns. NOT the same mechanism as `pty_holder_pids`'s
+/// macOS fallback (`pa-cli/tests/termios_process_exit_e2e.rs`), which
+/// shells to `lsof` for fd-ownership of one specific path - a different
+/// tool and output shape. Loud failure on a `ps` that cannot run or
+/// exits non-zero, matching the Linux arm's own loud failure.
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(ppid: u32) -> Vec<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .unwrap_or_else(|error| panic!("spawn ps for the child-pid census: {error}"));
+    assert!(
+        output.status.success(),
+        "ps exited {} during the child-pid census: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(child_pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        if parent == ppid {
+            pids.push(child_pid);
         }
     }
     pids
