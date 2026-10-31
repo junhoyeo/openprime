@@ -153,7 +153,10 @@ mod tests {
     #[tokio::test]
     async fn issue_37_unverifiable_live_predecessor_does_not_count_as_exited() {
         let observed = pa_daemon::lease::get_process_start_id(std::process::id()).unwrap();
-        let mut starts = match observed.strip_prefix("ps:").or_else(|| observed.strip_prefix("ps2:")) {
+        let mut starts = match observed
+            .strip_prefix("ps:")
+            .or_else(|| observed.strip_prefix("ps2:"))
+        {
             Some(payload) => vec![format!("ps:{payload}"), format!("ps2:{payload}")],
             None => vec![observed],
         };
@@ -162,7 +165,10 @@ mod tests {
             let identity = identity_from_hello(&json!({
                 "supervisorPid": std::process::id(), "supervisorProcessStartId": start
             }));
-            assert!(!wait_for_exit(&identity, 1).await, "reported exit for {start}");
+            assert!(
+                !wait_for_exit(&identity, 1).await,
+                "reported exit for {start}"
+            );
         }
     }
 

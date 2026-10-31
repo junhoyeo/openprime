@@ -260,9 +260,17 @@ mod tests {
     fn issue_38_identity_free_tracked_worker_is_not_signaled_or_untracked() {
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap(),
+        );
         let dir = tempfile::tempdir().unwrap();
         let descriptors = dir.path().join("daemon-workers/fixture");
         std::fs::create_dir_all(&descriptors).unwrap();
@@ -273,7 +281,8 @@ mod tests {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "workerId":"worker", "pid":child.0.id(), "supervisorSocketPath":supervisor,
             "socketPath":socket, "recoveryJournalPath":journal
-        })).unwrap();
+        }))
+        .unwrap();
         std::fs::write(&descriptor, &bytes).unwrap();
         std::fs::write(&journal, b"durable work").unwrap();
         std::fs::write(&socket, b"endpoint marker").unwrap();
