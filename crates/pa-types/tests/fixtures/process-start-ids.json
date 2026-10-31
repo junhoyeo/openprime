@@ -1,0 +1,132 @@
+[
+  {
+    "recorded": null,
+    "observed": null,
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "proc:42",
+    "observed": "proc:42",
+    "expected": "match"
+  },
+  {
+    "recorded": "proc:42",
+    "observed": "proc:43",
+    "expected": "mismatch"
+  },
+  {
+    "recorded": "proc:00042",
+    "observed": "proc:42",
+    "expected": "match"
+  },
+  {
+    "recorded": "proc:-1",
+    "observed": "proc:1",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "proc:18446744073709551616",
+    "observed": "proc:1",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Fri Oct 30 12:00:00 2026",
+    "observed": "ps2:Fri Oct 30 12:00:00 2026",
+    "expected": "match"
+  },
+  {
+    "recorded": "ps2:Fri Oct 30 12:00:00 2026",
+    "observed": "ps2:Fri Oct 30 12:00:01 2026",
+    "expected": "mismatch"
+  },
+  {
+    "recorded": "ps:Fri Oct 30 12:00:00 2026",
+    "observed": "ps2:Fri Oct 30 12:00:00 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps:Fri Oct 30 12:00:00 2026",
+    "observed": "ps:Fri Oct 30 12:00:00 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Fri Oct 30 12:00:00 2026",
+    "observed": "ps:Fri Oct 30 21:00:00 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Fri Oct 30 12:00:00 2026",
+    "observed": "ps2:Fri Oct 30 12:00:00.1 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Thu Jan  1 00:00:00 2026",
+    "observed": "ps2:Thu Jan  1 00:00:00 2026",
+    "expected": "match"
+  },
+  {
+    "recorded": "ps2:Thu Jan 1 00:00:00 2026",
+    "observed": "ps2:Thu Jan  1 00:00:00 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Mon Jan  1 00:00:00 2026",
+    "observed": "ps2:Thu Jan  1 00:00:00 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Fri Oct 30 12:00:00 2026",
+    "observed": "ps2:Fri Oct 30 12:00:00 2026 ",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "ps2:Fri Oct 30 12:00:00 2026",
+    "observed": "ps2:Fr Okt 30 12:00:00 2026",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "proc:bad",
+    "observed": "proc:bad",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "future:1",
+    "observed": "future:2",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "win:134062992000000000",
+    "observed": "win:638974224000000000",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "win:638974224000000000",
+    "observed": "win:638974224000000000",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "win:638974224000000000",
+    "observed": "win2:638974224000000000",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "win2:638974224000000000",
+    "observed": "win2:638974224000000000",
+    "expected": "match"
+  },
+  {
+    "recorded": "win2:638974224000000000",
+    "observed": "win2:638974224000000001",
+    "expected": "mismatch"
+  },
+  {
+    "recorded": "win2:0",
+    "observed": "win2:1",
+    "expected": "unverifiable"
+  },
+  {
+    "recorded": "win2:3155378976000000000",
+    "observed": "win2:638974224000000000",
+    "expected": "unverifiable"
+  }
+]

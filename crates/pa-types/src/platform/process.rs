@@ -47,7 +47,9 @@ fn ps_process_start_id(pid: u32) -> Option<String> {
         .output()
         .ok()?;
     let start_time = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!start_time.is_empty()).then(|| format!("ps:{start_time}"))
+    // `ps2:` versions the writer: a legacy `ps:` reader has no timezone
+    // provenance and must stay unverifiable forever, never a match.
+    (!start_time.is_empty()).then(|| format!("ps2:{start_time}"))
 }
 
 /// macOS: the `ps:<lstart>` identity (TS `getPsProcessStartId`) rendered
@@ -79,7 +81,9 @@ fn ps_process_start_id(pid: u32) -> Option<String> {
         )
     };
     let lstart = String::from_utf8_lossy(&buffer[..written]);
-    (written > 0).then(|| format!("ps:{lstart}"))
+    // `ps2:` versions the writer: a legacy `ps:` reader has no timezone
+    // provenance and must stay unverifiable forever, never a match.
+    (written > 0).then(|| format!("ps2:{lstart}"))
 }
 
 /// Windows: the process creation time in 100ns ticks since 1601-01-01 UTC
@@ -96,12 +100,252 @@ pub fn process_start_id(pid: u32) -> Option<String> {
     let handle = winapi::open_process(winapi::PROCESS_QUERY_LIMITED_INFORMATION, pid)?;
     let ticks = winapi::process_creation_ticks(handle);
     winapi::close_handle(handle);
-    ticks.map(|ticks| format!("win:{ticks}"))
+    // `win2:` versions the writer with the checked .NET-epoch conversion: a
+    // legacy `win:` reader (raw FILETIME ticks, ambiguous against a .NET
+    // epoch some builds also shipped) has no verifiable epoch and must
+    // stay unverifiable forever, never a match.
+    ticks.and_then(windows_start_id)
 }
 
 #[cfg(not(any(unix, windows)))]
 pub fn process_start_id(_pid: u32) -> Option<String> {
     None
+}
+
+/// Whether two start tokens prove the same or different process birth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStartIdComparison {
+    Match,
+    Mismatch,
+    Unverifiable,
+}
+
+/// A recorded process instance's state, not merely the numeric PID's liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessIdentity {
+    /// The process exited or a comparable start token proves PID reuse.
+    Gone,
+    /// The PID is live and its supported start token matches.
+    Matching,
+    /// Retain ownership and tracking; do not signal or infer exit.
+    Unknown,
+}
+
+/// Compare supported durable tokens without guessing timezone, locale, or epoch.
+///
+/// Final writers emit `ps2:` (C-locale UTC `lstart`) and `win2:` (.NET UTC
+/// ticks); historical `ps:` has no timezone provenance and historical `win:`
+/// shipped with both FILETIME and .NET epochs across builds, so both legacy
+/// prefixes are always unverifiable, even compared against themselves or
+/// against an equal-looking new-format payload. Neither whitespace nor time
+/// precision is rounded or normalized. Unsupported and malformed tokens are
+/// unverifiable, never a match and never a proof of mismatch.
+#[must_use]
+pub fn compare_process_start_ids(
+    recorded: Option<&str>,
+    observed: Option<&str>,
+) -> ProcessStartIdComparison {
+    use ProcessStartIdComparison::{Match, Mismatch, Unverifiable};
+    let (Some(recorded), Some(observed)) = (recorded, observed) else {
+        return Unverifiable;
+    };
+    let (Some((left_kind, left)), Some((right_kind, right))) =
+        (recorded.split_once(':'), observed.split_once(':'))
+    else {
+        return Unverifiable;
+    };
+    if left_kind != right_kind {
+        return Unverifiable;
+    }
+    match left_kind {
+        "proc" | "win2" => {
+            let (Some(left), Some(right)) = (decimal(left), decimal(right)) else {
+                return Unverifiable;
+            };
+            if left_kind == "win2"
+                && ![left, right]
+                    .iter()
+                    .all(|ticks| (WINDOWS_EPOCH_OFFSET..=DOTNET_MAX_TICKS).contains(ticks))
+            {
+                return Unverifiable;
+            }
+            if left == right {
+                Match
+            } else {
+                Mismatch
+            }
+        }
+        "ps2" if valid_lstart(left) && valid_lstart(right) => {
+            if left == right {
+                Match
+            } else {
+                Mismatch
+            }
+        }
+        _ => Unverifiable,
+    }
+}
+
+/// Combine independent liveness and token observations conservatively.
+/// A failed liveness probe stays unknown even when the token appears different.
+#[must_use]
+pub fn classify_process_identity(
+    alive: Option<bool>,
+    recorded: Option<&str>,
+    observed: Option<&str>,
+) -> ProcessIdentity {
+    match alive {
+        Some(false) => ProcessIdentity::Gone,
+        None => ProcessIdentity::Unknown,
+        Some(true) => match compare_process_start_ids(recorded, observed) {
+            ProcessStartIdComparison::Match => ProcessIdentity::Matching,
+            ProcessStartIdComparison::Mismatch => ProcessIdentity::Gone,
+            ProcessStartIdComparison::Unverifiable => ProcessIdentity::Unknown,
+        },
+    }
+}
+
+/// Probe a pid's liveness and current start token together and classify the
+/// result: the single call lease/revival code should use instead of
+/// combining [`is_process_alive`] and [`process_start_id`] by hand (which
+/// is easy to get wrong — see the fixed `owner_alive`/revival-veto bugs
+/// where a mismatched or unreadable observation was treated as proof of
+/// absence instead of staying unknown).
+#[must_use]
+pub fn observe_process_identity(pid: u32, recorded_start_id: Option<&str>) -> ProcessIdentity {
+    let alive = is_process_alive(pid).ok();
+    let observed = match alive {
+        Some(true) => process_start_id(pid),
+        _ => None,
+    };
+    classify_process_identity(alive, recorded_start_id, observed.as_deref())
+}
+
+fn decimal(value: &str) -> Option<u64> {
+    if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// `ps -o lstart=` under `LC_ALL=C TZ=UTC`: `strftime("%c")`'s fixed
+/// `"Www Mmm dd hh:mm:ss yyyy"` (24 bytes; a single-digit day is
+/// space-padded, never zero-padded).
+fn valid_lstart(value: &str) -> bool {
+    if !value.is_ascii() || value.len() != 24 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if [3, 7, 10, 19].iter().any(|&index| bytes[index] != b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Some(month) = months
+        .iter()
+        .position(|month| *month == &value[4..7])
+        .map(|index| index + 1)
+    else {
+        return false;
+    };
+    let Some(year) = decimal(&value[20..]).filter(|year| *year > 0) else {
+        return false;
+    };
+    let day_text = &value[8..10];
+    let Some(day) = decimal(day_text.trim_start_matches(' ')) else {
+        return false;
+    };
+    if day == 0 || (day < 10 && bytes[8] != b' ') {
+        return false;
+    }
+    let days = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 31,
+    };
+    if day > days
+        || !decimal(&value[11..13]).is_some_and(|hour| hour < 24)
+        || !decimal(&value[14..16]).is_some_and(|minute| minute < 60)
+        || !decimal(&value[17..19]).is_some_and(|second| second < 60)
+    {
+        return false;
+    }
+    // Gregorian weekday, independent of the process locale/timezone.
+    let shifted_year = year - u64::from(month < 3);
+    let offsets = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let weekday = (shifted_year + shifted_year / 4 - shifted_year / 100 + shifted_year / 400
+        + offsets[month - 1]
+        + day)
+        % 7;
+    let Ok(weekday) = usize::try_from(weekday) else {
+        return false;
+    };
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][weekday] == &value[..3]
+}
+
+/// Difference between the FILETIME (1601) and .NET (0001) epochs, in 100ns ticks.
+const WINDOWS_EPOCH_OFFSET: u64 = 504_911_232_000_000_000;
+/// `DateTime.MaxValue`: 9999-12-31T23:59:59.9999999Z.
+const DOTNET_MAX_TICKS: u64 = 3_155_378_975_999_999_999;
+
+/// Versioned .NET-epoch identity from an OS FILETIME, without overflow or rounding.
+#[cfg(any(windows, test))]
+fn windows_start_id(filetime_ticks: u64) -> Option<String> {
+    let ticks = filetime_ticks.checked_add(WINDOWS_EPOCH_OFFSET)?;
+    (ticks <= DOTNET_MAX_TICKS).then(|| format!("win2:{ticks}"))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn issue_37_supported_tokens_and_ambiguous_legacy_formats() {
+        use ProcessStartIdComparison::{Match, Mismatch, Unverifiable};
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/process-start-ids.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let left = case["recorded"].as_str();
+            let right = case["observed"].as_str();
+            let expected = match case["expected"].as_str().unwrap() {
+                "match" => Match,
+                "mismatch" => Mismatch,
+                "unverifiable" => Unverifiable,
+                value => panic!("invalid corpus verdict {value}"),
+            };
+            assert_eq!(compare_process_start_ids(left, right), expected, "{case}");
+            assert_eq!(compare_process_start_ids(right, left), expected, "reverse {case}");
+            assert_eq!(
+                classify_process_identity(None, left, right),
+                ProcessIdentity::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn issue_37_windows_epoch_conversion_is_exact_and_checked() {
+        assert_eq!(windows_start_id(0).as_deref(), Some("win2:504911232000000000"));
+        assert_eq!(
+            windows_start_id(134_062_992_000_000_000).as_deref(),
+            Some("win2:638974224000000000")
+        );
+        assert_eq!(
+            windows_start_id(DOTNET_MAX_TICKS - WINDOWS_EPOCH_OFFSET).as_deref(),
+            Some("win2:3155378975999999999")
+        );
+        assert_eq!(
+            windows_start_id(DOTNET_MAX_TICKS - WINDOWS_EPOCH_OFFSET + 1),
+            None
+        );
+        assert_eq!(windows_start_id(u64::MAX), None);
+    }
 }
 
 /// The executable a live pid runs, best-effort (`None` when the platform cannot answer). Names the
@@ -549,7 +793,7 @@ mod windows_tests {
         let Some(id) = id else {
             panic!("a live process must expose its creation-time identity");
         };
-        assert!(id.starts_with("win:") && id[4..].chars().all(|c| c.is_ascii_digit()));
+        assert!(id.starts_with("win2:") && id[5..].chars().all(|c| c.is_ascii_digit()));
         assert_eq!(process_start_id(std::process::id()), Some(id));
         assert!(is_process_alive(std::process::id()).unwrap_or(false));
     }
@@ -652,7 +896,9 @@ mod darwin_process_record_tests {
             .output()
             .ok()?;
         let lstart = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (!lstart.is_empty()).then(|| format!("ps:{lstart}"))
+        // Test-side ground truth must track the production `ps2:` prefix
+        // rename, even though it keeps calling real `ps` for the raw text.
+        (!lstart.is_empty()).then(|| format!("ps2:{lstart}"))
     }
 
     #[test]
