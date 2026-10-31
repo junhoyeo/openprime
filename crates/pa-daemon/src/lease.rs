@@ -535,6 +535,20 @@ impl SessionLease {
     }
 
     pub fn release(&self) {
+        let _ = self.release_attempt();
+    }
+
+    /// The fallible, synchronous sibling of [`release`](Self::release):
+    /// reports whether this exact call actually freed ownership, instead
+    /// of silently deferring to a later explicit `release()`/`Drop` retry.
+    /// A caller that needs to know synchronously whether a fresh lease is
+    /// actually free before handing its target off (e.g. a fork-replace
+    /// RPC deciding whether to proceed) uses this instead of `release()`.
+    pub(crate) fn try_release(&self) -> LeaseReleaseOutcome {
+        self.release_attempt()
+    }
+
+    fn release_attempt(&self) -> LeaseReleaseOutcome {
         // Stop admitting new owned mutations immediately and idempotently;
         // this is independent of whether the destructive cleanup below
         // actually runs on this call.
@@ -544,7 +558,11 @@ impl SessionLease {
             .cleanup_claimed
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return;
+            // Cleanup is already claimed: either a concurrent call is
+            // mid-drain right now, or a previous call already finished it.
+            // This exact call neither performed nor confirmed the release,
+            // so the honest answer is Deferred, not an unconfirmed Released.
+            return LeaseReleaseOutcome::Deferred;
         }
         // Fence against a concurrent append: one already past its
         // released-check must land before the lease directory is removed,
@@ -569,10 +587,11 @@ impl SessionLease {
             // The admitted mutation is still unsettled past the drain
             // bound: this attempt must not hand off or erase ownership it
             // cannot prove is safe to release. Allow a later explicit
-            // `release()` (or `Drop`) to retry the full protocol.
+            // `release()`/`try_release()` (or `Drop`) to retry the full
+            // protocol.
             self.cleanup_claimed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
+            return LeaseReleaseOutcome::Deferred;
         }
         self.write_sidecars();
         let _ = with_lease_guard(&self.directory, GuardWait::Fast, || {
@@ -583,7 +602,22 @@ impl SessionLease {
             }
             Ok(())
         });
+        LeaseReleaseOutcome::Released
     }
+}
+
+/// The outcome of [`SessionLease::try_release`]: whether this exact call
+/// actually freed ownership, or had to defer because an admitted mutation
+/// was still unsettled past the drain deadline (#37) - never silently
+/// treat a deferred release as a freed target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseReleaseOutcome {
+    /// Ownership was actually released by this call.
+    Released,
+    /// This call did not release ownership (an admitted mutation was
+    /// still unsettled, or cleanup was already claimed elsewhere). A later
+    /// `try_release`/`release`/`Drop` retries.
+    Deferred,
 }
 
 impl Drop for SessionLease {
