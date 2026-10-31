@@ -83,6 +83,35 @@ pub fn file_mode(_path: &Path) -> Option<u32> {
     None
 }
 
+/// Whether ownership metadata has the platform's private-file protection.
+/// Callers inspect with `symlink_metadata` first; this never repairs permissions.
+#[cfg(unix)]
+pub(crate) fn is_private_owner_metadata(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    metadata.uid() == nix::unistd::Uid::effective().as_raw()
+        && metadata.permissions().mode().trailing_zeros() >= 6
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_private_owner_metadata(_metadata: &std::fs::Metadata) -> bool {
+    // Inherited ACLs at creation do not prove existing-record ownership.
+    false
+}
+
+/// Fail before creating an explicit managed environment on platforms where
+/// existing-record ownership cannot be verified. Compatible read-only use
+/// needs no management authority and does not call this preflight.
+pub(crate) fn require_private_owner_metadata_support() -> std::io::Result<()> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "managed explicit kernel environments require verified record ownership on this platform; use a compatible PRIME_AGENT_KERNEL_PYTHON or an existing current explicit environment read-only",
+        ))
+    }
+}
+
 /// True when the path is an executable file (any execute bit on Unix).
 #[cfg(unix)]
 #[must_use]

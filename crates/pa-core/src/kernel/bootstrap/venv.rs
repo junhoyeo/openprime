@@ -35,11 +35,12 @@ pub(crate) use generation::{
     begin_kernel_lease_handoff, register_kernel_python_lease, GenerationLeaseGuard,
 };
 pub(super) use generation::{
-    generation_identity, generation_root, lease_for_resolver, prepare_generation_root,
-    published_candidates, reclaim_explicit_path, ExplicitBuild, ExplicitReclaim, GenerationBuild,
+    canonical_explicit_path, generation_identity, generation_root, lease_for_resolver,
+    prepare_generation_root, published_candidates, reclaim_explicit_path, ExplicitBuild,
+    ExplicitOwnership, ExplicitReclaim, GenerationBuild,
 };
 use layout::home_dir;
-pub(crate) use layout::{expand_home, resolve_writable_kernel_venv_dir};
+pub(crate) use layout::{create_explicit_parent, expand_home, resolve_writable_kernel_venv_dir};
 pub use layout::{kernel_venv_dir, kernel_venv_python};
 pub use probe::invalidate_runtime_probe_cache;
 #[cfg(test)]
