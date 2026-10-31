@@ -1002,3 +1002,69 @@ fn append_cached_bounds_an_unterminated_tail() {
         "the header and the appended row parse on their own lines; the torn row alone stays skipped:\n{text}"
     );
 }
+
+
+#[test]
+fn privacy_validation_precedes_warm_window_caches_and_refuses_torn_input() {
+    let dir=tempfile::tempdir().unwrap();
+    let path=dir.path().join("privacy-cache.jsonl");
+    let public=fixture();
+    std::fs::write(&path,&public).unwrap();
+    // Actual window construction primes live/disk v7 cache paths.
+    let first=WindowedSessionStore::open(&path).unwrap().unwrap();
+    drop(first);
+    let cached=WindowedSessionStore::open(&path).unwrap().unwrap();
+    assert!(cached.read_stats().cache_hit);
+    drop(cached);
+    let marker=pa_types::session::privacy::AdmissionPrivacy::RestrictedV1.entry(
+        pa_types::session::EntryBase { id:Some("privacy-off-branch".into()),
+            parent_id:Some("u0".into()),timestamp:Some("2026-10-30T00:00:00.000Z".into()),
+            rest:serde_json::Map::default() }).unwrap();
+    // Marker is on an old branch, not the selected compaction tail.
+    let mut rows=public.lines().map(str::to_string).collect::<Vec<_>>();
+    rows.insert(4,serde_json::to_string(&marker).unwrap());
+    let private=rows.join("\n")+"\n";
+    std::fs::write(&path,&private).unwrap();
+    assert!(WindowedSessionStore::open(&path).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(),private);
+    let torn=public+"{\"customType\":";
+    std::fs::write(&path,&torn).unwrap();
+    assert!(WindowedSessionStore::open(&path).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(),torn);
+}
+
+
+#[test]
+fn matching_legacy_v7_private_cache_cannot_bypass_full_privacy_scan() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("matching-cache.jsonl");
+    let public=fixture();std::fs::write(&path,&public).unwrap();
+    let first=WindowedSessionStore::open(&path).unwrap().unwrap();
+    let mut legacy=first.snapshot.clone();
+    assert_eq!(legacy.version,7);
+    let marker=serde_json::json!({"type":"custom","id":"off-branch-privacy",
+        "parentId":"u0","timestamp":"2026-10-30T00:00:00.000Z",
+        "customType":"admission_privacy_state","data":{"format":"openprime.session-admission-privacy",
+        "version":1,"min_queue_snapshot_version":3,"aggregate_restricted":true}}).to_string()+"\n";
+    let insertion=public.find("{\"type\":\"message\",\"id\":\"u1\"")
+        .unwrap_or_else(||public.lines().take(3).map(|line|line.len()+1).sum());
+    assert!(legacy.start>insertion as u64,"fixture must retain a later compacted window");
+    let private=format!("{}{}{}",&public[..insertion],marker,&public[insertion..]);
+    std::fs::write(&path,&private).unwrap();
+    legacy.generation=Generation::of(&std::fs::metadata(&path).unwrap());
+    legacy.start+=marker.len() as u64;
+    legacy.retained_whole_file=false;
+    // This is a true generation-matching privacy-unaware v7 snapshot, not a
+    // stale public cache invalidated by rewriting the input file.
+    let mut file=std::fs::File::open(&path).unwrap();
+    assert!(WindowedSessionStore::from_snapshot(&path,&mut file,legacy.clone(),WindowReadStats::default())
+        .unwrap().is_some(),"old snapshot receiving path must be viable");
+    for disk_only in [false,true] {
+        window_cache::save(&path,&legacy).unwrap();
+        if disk_only { window_cache::evict_live_snapshot(&path); }
+        let file=std::fs::File::open(&path).unwrap();
+        assert!(window_cache::load(&path,&file,&mut WindowReadStats::default()).is_some());
+        if disk_only { window_cache::evict_live_snapshot(&path); }
+        assert!(WindowedSessionStore::open(&path).is_err(),"matching legacy cache bypassed privacy scan");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),private);
+    }
+}
