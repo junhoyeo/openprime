@@ -1092,3 +1092,58 @@ fn listing_and_frozen_usage_agree_on_duplicate_attribution_ids() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// #42 repair/privacy-ordering regression test (required by review per the
+/// parent's explicit direction): a torn trailing fragment alone is now
+/// tolerated by the privacy scan (Step 1c) and then repaired by
+/// `SessionFile::open`'s reintroduced `repair_jsonl_damage` call - but a
+/// file that ALSO carries a genuine private marker row earlier in the
+/// file must still be refused, and refused BEFORE repair ever runs (never
+/// silently repaired into an apparently-public file). This is exactly the
+/// ordering mistake this test exists to catch if it ever regresses:
+/// privacy scan on the untouched, as-found bytes FIRST; repair only
+/// after, and only when the scan already found nothing requiring refusal.
+#[test]
+fn a_torn_tail_on_an_otherwise_private_file_refuses_before_repair_ever_runs() {
+    let dir = temp_dir();
+    let path = dir.join("private-torn.jsonl");
+    let marker = pa_types::session::privacy::AdmissionPrivacy::RestrictedV1
+        .entry(pa_types::session::EntryBase {
+            id: Some("privacy-row".into()),
+            parent_id: Some("selected-leaf".into()),
+            timestamp: Some("2026-10-30T00:00:00.000Z".into()),
+            rest: Map::default(),
+        })
+        .unwrap();
+    let mut content = format!(
+        "{}\n{}\n",
+        json!({"type":"session","version":3,"id":"private-torn","timestamp":"t","cwd":"/x"}),
+        serde_json::to_value(marker).unwrap(),
+    );
+    // The torn trailing fragment: a cut-off UTF-8 sequence, no trailing
+    // newline - exactly the shape Step 1c's category (a) tolerates for an
+    // otherwise-UNRESTRICTED file. This file is NOT unrestricted (the
+    // marker row above already makes it private), so tolerance for the
+    // torn shape specifically must not let the overall refusal slip.
+    content.push_str("{\"type\":\"message\",\"id\":\"torn\",\"message\":\"con");
+    fs::write(&path, content.as_bytes()).unwrap();
+    // One extra, genuinely non-UTF-8 byte at the very end - the same
+    // physical shape the existing torn-tail repair tests use.
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xc3]).unwrap();
+    }
+    let before = fs::read(&path).unwrap();
+    let result = SessionFile::open(&path);
+    assert!(
+        result.is_err(),
+        "a torn tail on an otherwise-private file must still refuse: {result:?}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "the refusal must land before repair ever mutates the file"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

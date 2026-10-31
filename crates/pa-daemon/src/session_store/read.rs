@@ -143,6 +143,21 @@ impl SessionFile {
             privacy.restriction.is_none(),
             "Private session open requires a capable owned admission receiver"
         );
+        // Repair crash damage (a torn tail from an unacknowledged append,
+        // or a zero-filled append) strictly AFTER the privacy scan has
+        // already assessed the untouched, as-found bytes above - never
+        // before, so repair can never run against content privacy hasn't
+        // had a chance to see yet (this ordering was lost when this
+        // lane's lease-authority refactor removed the original direct
+        // `repair_jsonl_damage` call from the create/switch call sites;
+        // reintroduced here, at the one shared choke point, rather than
+        // at each caller again). Re-open after repair since a repair that
+        // actually ran may have rewritten the file; the closed handle
+        // above is never reused past this point.
+        drop(file);
+        pa_core::session::manager::repair_jsonl_damage(path);
+        let file = fs::File::open(path)
+            .with_context(|| format!("read session file {}", path.display()))?;
         let mut lines = std::io::BufReader::new(file).lines();
         let read_context = || format!("read session file {}", path.display());
         let mut first = None;
