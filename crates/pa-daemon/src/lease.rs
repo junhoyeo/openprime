@@ -604,12 +604,36 @@ impl Drop for OwnedMutationFlight<'_> {
 
 impl SessionLease {
     pub(crate) fn acquire_target(&self, path: &Path) -> Result<std::sync::Arc<Self>> {
-        let agent_dir = self
-            .directory
+        acquire_runtime_session_lease(path, self.agent_dir()).map(std::sync::Arc::new)
+    }
+
+    /// The agent root this lease's directory lives under (derived from the
+    /// lease directory itself, the same way [`acquire_target`] always has -
+    /// not a stored field, so it can never drift from the directory).
+    fn agent_dir(&self) -> &Path {
+        self.directory
             .parent()
             .and_then(Path::parent)
-            .expect("lease directory has agent root");
-        acquire_runtime_session_lease(path, agent_dir).map(std::sync::Arc::new)
+            .expect("lease directory has agent root")
+    }
+
+    /// Re-verify this lease is still the confirmed owner, under a fresh M
+    /// acquisition (self-locking: never call this from inside an
+    /// already-held fence closure for this same canonical path - the v3
+    /// contract's "same-path transfer/reuse OUTSIDE M only" convenience).
+    /// A caller that already holds this `SessionLease` and wants to confirm
+    /// it before reusing it for a new target/import uses this instead of
+    /// re-deriving a [`RuntimeSessionAuthority`] itself.
+    ///
+    /// # Errors
+    /// Returns an error when this lease's canonical identity can no longer
+    /// be resolved, or ownership can no longer be confirmed (released,
+    /// superseded, or the on-disk owner record no longer matches this
+    /// process).
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        with_runtime_session_fence(self.agent_dir(), &self.session_path, |held| {
+            held.revalidate_lease(self)
+        })
     }
 
     /// Hold the existing append admission fence across proof, mutation and sync.
