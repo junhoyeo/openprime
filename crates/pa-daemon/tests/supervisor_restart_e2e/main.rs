@@ -133,17 +133,25 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
 }
 
 /// macOS/BSD: no `/proc`, so shell out to the host's own `ps` for the
-/// pid/ppid columns - the same `ps`-based idiom already used elsewhere
-/// in this triage (`kernel_dispose_e2e.rs::kernel_pids`,
-/// `pa-cli/tests/termios_process_exit_e2e.rs::pty_holder_pids`).
+/// pid/ppid columns. NOT the same mechanism as `pty_holder_pids`'s
+/// macOS fallback (`pa-cli/tests/termios_process_exit_e2e.rs`), which
+/// shells to `lsof` for fd-ownership of one specific path - a different
+/// tool and output shape. This full-table pid/ppid census is new code
+/// for this triage; `kernel_dispose_e2e.rs::kernel_pids` shells to `ps`
+/// too but for a different column set (`command`, not `ppid`) and a
+/// different match (argv adjacency, not parent-pid equality).
 #[cfg(not(target_os = "linux"))]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
-    let Ok(output) = std::process::Command::new("ps")
+    let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
         .output()
-    else {
-        return Vec::new();
-    };
+        .unwrap_or_else(|error| panic!("spawn ps for the child-pid census: {error}"));
+    assert!(
+        output.status.success(),
+        "ps exited {} during the child-pid census: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
