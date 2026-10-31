@@ -113,14 +113,34 @@ pub async fn wait_for_exit(identity: &UpdateProcessIdentity, budget_ms: u64) -> 
     }
 }
 
-/// Only a known-dead PID or an observed different birth identity proves exit.
+/// Only a known-dead PID or an observed different birth identity proves
+/// exit. For a pair where either side uses the versioned `kind:payload`
+/// process-start-id scheme (contains a `:`), only a provable mismatch
+/// WITHIN that scheme counts - an ambiguous/legacy-prefix/malformed
+/// comparison must never be treated as proof the predecessor's identity
+/// actually changed (#37): a live predecessor with an unverifiable
+/// identity is not an exited one. A plain opaque token on both sides
+/// (no `:` at all, not attempting that scheme) falls back to a direct
+/// inequality, which carries no such cross-format ambiguity.
 fn process_exit_observed(
     alive: Option<bool>,
     expected: Option<&str>,
     observed: Option<&str>,
 ) -> bool {
-    alive == Some(false)
-        || matches!((alive, expected, observed), (Some(true), Some(expected), Some(observed)) if expected != observed)
+    if alive == Some(false) {
+        return true;
+    }
+    let (Some(true), Some(expected), Some(observed)) = (alive, expected, observed) else {
+        return false;
+    };
+    if expected.contains(':') || observed.contains(':') {
+        matches!(
+            pa_types::platform::process::compare_process_start_ids(Some(expected), Some(observed)),
+            pa_types::platform::process::ProcessStartIdComparison::Mismatch
+        )
+    } else {
+        expected != observed
+    }
 }
 
 #[cfg(test)]
