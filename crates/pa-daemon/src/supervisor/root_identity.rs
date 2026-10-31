@@ -744,14 +744,27 @@ mod tests {
             })
             .expect("supervisor"),
         );
+        // #42 Kind-1 fix: this test's own inline descriptor needs the same
+        // identity-matching `supervisor_with_movable_worker` already carries
+        // (review-record-lifecycle-kind1-root-identity flagged this test as
+        // "same mechanism, different fixture, out of scope" - applying the
+        // identical fix here now). The delta's own `drive_delta` call below
+        // targets `sessionFile: "a.jsonl"` - `publish_verified_summary`'s
+        // ownership check runs against THAT file (not this descriptor's own,
+        // initially-fileless, `createCommand.noSession` state), so it still
+        // needs a real, fence-acquired lease via `ensure_session_leased`.
+        let pid = std::process::id();
+        let process_start_id = crate::lease::get_process_start_id(pid);
         let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
             "version": 2,
             "workerId": "w-a",
-            "pid": 0,
+            "pid": pid,
+            "processStartId": process_start_id,
             "socketPath": "/tmp/none.sock",
             "recoveryJournalPath": "/tmp/none.jsonl",
             "supervisorSocketPath": "/tmp/none.sock",
             "authenticationToken": "token-a",
+            "workerInstanceId": "i1",
             "rootActiveSessionId": "w-a",
             "createdAt": "2026-09-30T00:00:00Z",
             "updatedAt": "2026-09-30T00:00:00Z",
@@ -760,14 +773,9 @@ mod tests {
             "consecutiveFailures": 0,
         }))
         .expect("descriptor");
-        supervisor
-            .registry
-            .insert(ResidentWorker::new(
-                "w-a".to_string(),
-                descriptor,
-                dir.join("w-a.json"),
-            ))
-            .await;
+        let resident = ResidentWorker::new("w-a".to_string(), descriptor, dir.join("w-a.json"));
+        resident.note_session_ready();
+        supervisor.registry.insert(resident).await;
 
         drive_delta(&supervisor, swap_summary(&dir, "sA", "a.jsonl"), 1).await;
         let resident = supervisor.registry.get("w-a").await.expect("resident");

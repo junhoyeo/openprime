@@ -103,6 +103,7 @@ impl Supervisor {
                 anyhow::ensure!(Arc::ptr_eq(other, resident), "Registry generation changed before publication");
             }
             let mut next = descriptor.clone();
+            let mut descriptor_persisted = true;
             if is_root {
                 if let Some(file) = file {
                     let session_id = summary.get("sessionId").and_then(Value::as_str)
@@ -116,8 +117,66 @@ impl Supervisor {
                     }
                 }
                 next.lifecycle = DaemonWorkerLifecycle::Ready;
-                crate::descriptor::persist_worker(&resident.descriptor_path, &next)
-                    .context("persist final session identity before publication")?;
+                // #42: restore main's `sync_root_identity_from_roster` persist-
+                // failure fallback (root_identity.rs:188-232 on main), which
+                // this function's refactor dropped - a hard `?` here aborted
+                // the WHOLE commit (including the in-memory descriptor move)
+                // on any persist I/O failure, then `reject_failed_publication`
+                // quarantined the resident, when main's original behavior was
+                // to keep LIVE ROUTING correct while the durable record lags,
+                // marking the transition pending for the next roster write to
+                // repair. Only the descriptor-persist I/O step takes this
+                // softer path - the authority/admission/generation checks
+                // above (new in this refactor) still refuse exactly as-is;
+                // this never widens what an authority/deletion refusal does.
+                let persisted = crate::descriptor::persist_worker(&resident.descriptor_path, &next)
+                    .or_else(|error| {
+                        let retry = crate::descriptor::persist_worker(&resident.descriptor_path, &next);
+                        match retry {
+                            Ok(()) => Ok(()),
+                            Err(_retry_failed) => Err(error),
+                        }
+                    });
+                match persisted {
+                    Ok(()) => {
+                        resident.clear_identity_persist_pending();
+                        if let Err(clear_error) =
+                            crate::descriptor::clear_identity_pending(&resident.descriptor_path)
+                        {
+                            self.log_line(&format!(
+                                "the identity-pending record for worker {} did not clear after the repair (retrying on the next roster write): {clear_error:#}",
+                                resident.worker_id
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        descriptor_persisted = false;
+                        resident.mark_identity_persist_pending();
+                        if let (Some(session_id), Some(session_file)) =
+                            (next.root_session_id.as_deref(), next.session_file.as_deref())
+                        {
+                            let moved_cwd = next.create_command.rest.get("cwd")
+                                .and_then(Value::as_str).map(str::to_string);
+                            if let Err(pending_error) = crate::descriptor::write_identity_pending(
+                                &resident.descriptor_path,
+                                session_id,
+                                session_file,
+                                moved_cwd.as_deref(),
+                                &crate::util::now_iso(),
+                            ) {
+                                self.log_line(&format!(
+                                    "session identity move for {} persisted neither record nor pending side record: {pending_error:#}",
+                                    resident.worker_id
+                                ));
+                            }
+                        }
+                        self.log_line(&format!(
+                            "session identity move for {} did not persist (the pending side record carries it; repairing on the next roster write): {error:#}",
+                            resident.worker_id
+                        ));
+                        self.note_daemon_event("root_identity_persist_failed", None);
+                    }
+                }
                 *descriptor = next;
             }
             match order {
@@ -131,7 +190,12 @@ impl Supervisor {
             let superseded = if is_root {
                 let result = bindings.record(&resident.worker_id, descriptor.root_session_id.as_deref(), descriptor.session_file.as_deref());
                 workers.insert(resident.worker_id.clone(), Arc::clone(resident));
-                resident.clear_identity_persist_pending();
+                // #42: only a SUCCESSFUL descriptor persist clears the pending
+                // marker my restored fallback above may have just set - an
+                // unconditional clear here would immediately undo it.
+                if descriptor_persisted {
+                    resident.clear_identity_persist_pending();
+                }
                 resident.clear_identity_quarantine();
                 resident.note_session_ready();
                 result
