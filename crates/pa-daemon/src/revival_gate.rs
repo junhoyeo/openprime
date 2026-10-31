@@ -28,6 +28,10 @@ pub(crate) enum RevivalVeto {
     /// A live lease holds the session file: another worker process (this daemon's or another
     /// daemon's, on a shared agent dir) owns the session — one owning daemon, one owning worker.
     LiveLeaseHeld { pid: u32 },
+    /// The session file's lease owner record exists but cannot be proven live or gone (corrupt,
+    /// unreadable, or an unverifiable process-identity token): unknown must defer, never revive
+    /// (#37/#38) — a kept-by-update row is not exempt from this veto.
+    UnknownLeaseOwner,
     /// The newest `busy` record predates the freshness bound: the evidence of interrupted work is
     /// residue of an era that already ended, not a crash this boot must heal.
     StaleBusyEvidence { recorded_at: String },
@@ -47,6 +51,10 @@ impl RevivalVeto {
             RevivalVeto::LiveLeaseHeld { pid } => format!(
                 "a live worker (pid {pid}) holds its session lease; not revived (one owning daemon)"
             ),
+            RevivalVeto::UnknownLeaseOwner => {
+                "its session lease owner record is unreadable/unverifiable; not revived (unknown is never absence)"
+                    .to_string()
+            }
             RevivalVeto::StaleBusyEvidence { recorded_at } => format!(
                 "its busy evidence is stale (recorded {recorded_at}); not revived (reopens on the next client open)"
             ),
@@ -72,8 +80,17 @@ pub(crate) fn revival_veto(
         if session_is_archived(file) {
             return Some(RevivalVeto::SessionArchived);
         }
-        if let Some(owner) = crate::lease::live_lease_owner(agent_dir, file) {
-            return Some(RevivalVeto::LiveLeaseHeld { pid: owner.pid });
+        match crate::lease::lease_owner_proof(agent_dir, file) {
+            crate::lease::LeaseOwnerProof::Held(owner) => {
+                return Some(RevivalVeto::LiveLeaseHeld { pid: owner.pid });
+            }
+            // Corrupt/unreadable owner metadata must veto/defer exactly like a
+            // confirmed live owner: it is never treated as absence, for either
+            // a kept-by-update row or an ordinary boot candidate (#37/#38).
+            crate::lease::LeaseOwnerProof::Unknown => {
+                return Some(RevivalVeto::UnknownLeaseOwner);
+            }
+            crate::lease::LeaseOwnerProof::Absent | crate::lease::LeaseOwnerProof::Gone => {}
         }
     }
     if !kept_by_update {
