@@ -52,16 +52,17 @@ fn kill_worker(pid: u32) {
     }
 }
 
+/// Portable liveness (the product's own probe - Linux `/proc` state,
+/// macOS `kill(0)` + the Darwin zombie check).
 fn process_alive(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        let rest = stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest)
-            .unwrap_or_default();
-        !rest.starts_with('Z')
-    })
+    pa_daemon::lease::is_process_alive(pid).unwrap_or(false)
 }
 
+/// The live children of `ppid` - teardown-only (the `Drop` impl above),
+/// so there is no known set of owned session ids to look up descriptors
+/// for instead; a process census is the only option here, on any
+/// platform.
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -82,6 +83,33 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         };
         if parent == ppid {
             pids.push(entry_pid);
+        }
+    }
+    pids
+}
+
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` for the
+/// pid/ppid columns - the same idiom already used in
+/// `supervisor_restart_e2e/main.rs::child_pids_of`.
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(ppid: u32) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        if parent == ppid {
+            pids.push(pid);
         }
     }
     pids
