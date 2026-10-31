@@ -184,23 +184,22 @@ pub fn read_scheduled_jobs_artifact_strict(path: &Path) -> anyhow::Result<Vec<Ag
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(anyhow::Error::new(error).context(format!(
-                "read cron schedule partition {}",
-                path.display()
-            )));
+            return Err(anyhow::Error::new(error)
+                .context(format!("read cron schedule partition {}", path.display())));
         }
     };
     let parsed: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return Err(anyhow::Error::new(error).context(format!(
-                "parse cron schedule partition {}",
-                path.display()
-            )));
+            return Err(anyhow::Error::new(error)
+                .context(format!("parse cron schedule partition {}", path.display())));
         }
     };
     let Some(jobs) = parsed.get("jobs").and_then(|jobs| jobs.as_array()) else {
-        anyhow::bail!("cron schedule partition {} has no jobs array", path.display());
+        anyhow::bail!(
+            "cron schedule partition {} has no jobs array",
+            path.display()
+        );
     };
     let mut result = Vec::with_capacity(jobs.len());
     for job in jobs {

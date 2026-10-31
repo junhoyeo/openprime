@@ -237,11 +237,8 @@ pub(crate) fn cancel_scheduled_jobs_for_tree(
                 matching_ids.insert(job.id.clone());
             }
         }
-        cancelled += pa_core::cron::store::cancel_matching_ids_in_file(
-            &partition,
-            &matching_ids,
-            now,
-        )?;
+        cancelled +=
+            pa_core::cron::store::cancel_matching_ids_in_file(&partition, &matching_ids, now)?;
     }
     if !any_partition {
         return Ok(0);
