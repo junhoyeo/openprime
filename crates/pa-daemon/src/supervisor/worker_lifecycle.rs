@@ -805,8 +805,20 @@ impl Supervisor {
             }
         }
         // The per-session stop shares the terminal-stop contract: the descriptor dies only
-        // with a provably-gone process — a worker that missed the shutdown stays adoptable.
-        self.retire_worker_after_stop(resident).await;
+        // with a provably-gone process — a worker that missed the shutdown, or whose
+        // identity could not be verified either way, stays adoptable.
+        let retired = self.retire_worker_after_stop(resident).await;
+        if !retired {
+            // The durable stop-requested tombstone above already persisted (so the next
+            // boot still retries this stop and never adopts it as healthy), but the
+            // process itself could not be proven gone: this call did NOT actually stop
+            // it, so it must stay tracked and routable here, and the caller must see a
+            // failure rather than a silent success (#37/#38).
+            anyhow::bail!(
+                "session worker {} could not be confirmed stopped (survived the                  escalation, or its identity could not be verified); its process may                  still be running and remains tracked for a later retry",
+                resident.worker_id
+            );
+        }
         // A client-owned (ephemeral) worker's scheduled jobs die with the
         // registration (TS `cancelEphemeralWorkerScheduledJobs`).
         let ephemeral = resident.descriptor.lock().await.owner_client_id.is_some();
