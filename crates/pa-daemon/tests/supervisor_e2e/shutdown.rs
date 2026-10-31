@@ -7,8 +7,8 @@ use std::path::Path;
 use super::*;
 
 /// The one worker spawned for `session_id`, read from its durable
-/// descriptor (`agent_dir/daemon-workers/<socket-key>/<session_id>.json`)
-/// - the same lookup `idle_passivation_e2e.rs::worker_pid` already uses.
+/// descriptor (`agent_dir/daemon-workers/<socket-key>/<session_id>.json`),
+/// the same lookup `idle_passivation_e2e.rs::worker_pid` already uses.
 /// Reading the owned descriptor instead of walking every host process
 /// for children of the supervisor's pid is both portable (no `/proc`
 /// dependency) and a strictly more precise invariant: it names the
