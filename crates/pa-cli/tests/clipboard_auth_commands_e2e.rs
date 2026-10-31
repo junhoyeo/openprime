@@ -93,12 +93,16 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
 /// `supervisor_restart_e2e/main.rs::child_pids_of`.
 #[cfg(not(target_os = "linux"))]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
-    let Ok(output) = std::process::Command::new("ps")
+    let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
         .output()
-    else {
-        return Vec::new();
-    };
+        .unwrap_or_else(|error| panic!("spawn ps for the child-pid census: {error}"));
+    assert!(
+        output.status.success(),
+        "ps exited {} during the child-pid census: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
