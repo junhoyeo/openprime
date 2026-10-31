@@ -209,6 +209,7 @@ fn children(socket: &Path, agent_dir: &Path, script: &Path, depth: u32) -> Super
         session_file: Some(agent_dir.join("parent.jsonl").to_string_lossy().to_string()),
         thinking: None,
         child_script: Some(script.to_string_lossy().to_string()),
+        telemetry_disabled: None,
     });
     sessions.set_parent_session_name(Some("parent-name".to_string()));
     sessions

@@ -296,6 +296,7 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
         session_file: Some(parent_session_file),
         thinking: None,
         child_script: Some(child_script.to_string_lossy().to_string()),
+        telemetry_disabled: None,
     });
     let handle = children
         .spawn(RlmSpawnRequest {
@@ -616,6 +617,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
         session_file: Some(parent_session_file),
         thinking: None,
         child_script: Some(child_script.to_string_lossy().to_string()),
+        telemetry_disabled: None,
     });
     let handle = children
         .spawn(RlmSpawnRequest {
