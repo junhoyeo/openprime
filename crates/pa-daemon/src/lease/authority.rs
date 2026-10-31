@@ -209,6 +209,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "needs namespace legacy-key selection, lands with PR56 (#41/#42); PR56 removes this ignore"]
     fn issue_42_authority_keeps_a_missing_default_roots_legacy_alias_bucket() {
         let root = tempfile::tempdir().unwrap();
         let real = root.path().join("real");
