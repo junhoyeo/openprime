@@ -343,7 +343,15 @@ impl RpcSession {
             replacement.session_lease = adopted_lease;
         }
         if let Some(lease) = replacement.session_lease.as_ref() {
-            lease.revalidate().map_err(|error| format!("Replacement ownership changed: {error:#}"))?;
+            // #42 fix (RECURRENCE SWEEP, reviewer-recommended 4th fix,
+            // same day/same package): closes the narrower, bounded
+            // same-shape window between the reuse-lease decision and this
+            // post-factory-build publication point. Uses the same shared
+            // revalidate_and_check_admission() as site 3's primary fix -
+            // harmless-redundant for a freshly-acquired lease (admission
+            // was already checked moments earlier), closes the gap for
+            // the adopted-lease case.
+            lease.revalidate_and_check_admission().map_err(|error| format!("Replacement ownership changed: {error:#}"))?;
         }
         let mut handle = self.handle.write().await;
         if !Arc::ptr_eq(&handle.engine, &old_engine) {
@@ -580,4 +588,105 @@ mod same_path_reuse_tests {
         .await
         .expect("bounded rpc same-path reuse test");
     }
+
+    /// RED (pre-fix)/GREEN (post-fix) for the reviewer-identified second
+    /// window: a narrower, bounded-to-one-`replace_locked`-invocation race
+    /// between the reuse-lease decision (fixed above) and this function's
+    /// POST-factory-build publication check. A tombstone that lands while
+    /// the factory is building the replacement (not before `replace_locked`
+    /// is even called) must still be caught here, using the same shared
+    /// `revalidate_and_check_admission()`.
+    #[tokio::test]
+    async fn issue_42_rpc_replacement_publication_revalidates_a_tombstone_committed_during_the_build() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let sessions = agent_dir.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let child = sessions.join("child.jsonl");
+            let parent = sessions.join("parent.jsonl");
+            for (path, depth) in [(&parent, 0), (&child, 1)] {
+                let mut file = crate::session_store::SessionFile::create(
+                    &dir.path().to_string_lossy(), None, depth,
+                );
+                file.set_path(path.clone());
+                file.rewrite().unwrap();
+            }
+            let ledger = std::sync::Arc::new(crate::rlm_ledger::RlmSpawnLedger::new(&agent_dir, &sessions, |_| {}));
+            ledger
+                .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                    child_id: "sub-child".into(),
+                    parent: parent.to_string_lossy().into_owned(),
+                    child: child.to_string_lossy().into_owned(),
+                    depth: 1,
+                    name: "child".into(),
+                })
+                .unwrap();
+            let authority = crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap();
+            let lease = Arc::new(authority.acquire(&child).unwrap());
+
+            let handle = minimal_handle(dir.path(), &agent_dir, Some(Arc::clone(&lease))).await;
+            let writer = LineWriter::for_test();
+            let factory_cwd = dir.path().to_path_buf();
+            let factory_agent_dir = agent_dir.clone();
+            // The factory itself commits the tombstone - simulating a
+            // delete landing WHILE the replacement is being built, strictly
+            // AFTER the reuse-lease decision already passed (the ledger was
+            // still clean at that point) but BEFORE this function's later
+            // publication check runs.
+            let factory_ledger = std::sync::Arc::clone(&ledger);
+            let factory_child = child.clone();
+            let factory: RpcEngineFactory = Arc::new(move |_request: RpcEngineRequest| {
+                let cwd = factory_cwd.clone();
+                let agent_dir = factory_agent_dir.clone();
+                let ledger = std::sync::Arc::clone(&factory_ledger);
+                let child = factory_child.clone();
+                Box::pin(async move {
+                    ledger
+                        .append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User)
+                        .map_err(|error| error.to_string())?;
+                    let engine_model = test_engine_model();
+                    let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(engine_model.clone()));
+                    provider.push_text_turn("ok");
+                    let engine = pa_core::session_engine::engine::create_session(
+                        pa_core::session_engine::engine::SessionEngineConfig {
+                            cwd,
+                            agent_dir,
+                            daemonless: true,
+                            model: Some(engine_model),
+                            stream_fn: Some(provider.stream_fn()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(RpcEngineHandle {
+                        engine: Arc::new(engine),
+                        model: test_model(),
+                        api_key: None,
+                        provider_target: Arc::new(std::sync::RwLock::new(None)),
+                        bash_wake: Arc::new(tokio::sync::Notify::new()),
+                        session_lease: None,
+                    })
+                })
+            });
+            let session = RpcSession::adopt(handle, Some(factory), writer).await;
+            let before = std::fs::read(&child).unwrap();
+
+            // The ledger is still clean when this call starts - the reuse-
+            // lease decision (already fixed) correctly adopts the lease;
+            // the factory then commits the tombstone DURING the build.
+            let result = session
+                .replace_locked(RpcEngineRequest::Open { session_path: child.clone(), reuse_lease: false })
+                .await;
+            assert!(
+                result.is_err(),
+                "a tombstone committed during the replacement build must still refuse publication: {result:?}"
+            );
+            assert_eq!(std::fs::read(&child).unwrap(), before);
+        })
+        .await
+        .expect("bounded rpc mid-build tombstone test");
+    }
+
 }
