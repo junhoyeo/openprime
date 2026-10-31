@@ -79,18 +79,29 @@ fn kernel_pids() -> Vec<u32> {
     found
 }
 
-/// macOS/BSD: no `/proc`, so shell out to the host's own `ps`, the same
-/// idiom already used for this exact census in
-/// `kernel_dispose_e2e.rs::kernel_pids` and
-/// `pa-cli/tests/termios_process_exit_e2e.rs::pty_holder_pids`.
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` for a
+/// full-table pid/command census, the same idiom as
+/// `kernel_dispose_e2e.rs::kernel_pids`'s macOS arm. NOT the same
+/// mechanism as `pty_holder_pids`'s macOS fallback
+/// (`pa-cli/tests/termios_process_exit_e2e.rs`), which shells to `lsof`
+/// for fd-ownership of one specific path - a different tool and output
+/// shape, not a precedent for this full-table argv census. Loud failure
+/// on a `ps` that cannot run or exits non-zero, matching the Linux arm's
+/// own loud failure and `pty_holder_pids`'s `assert!(status.success()
+/// ...)` posture - a silent empty result would read as "no kernel
+/// survives" even if one leaked.
 #[cfg(not(target_os = "linux"))]
 fn kernel_pids() -> Vec<u32> {
-    let Ok(output) = std::process::Command::new("ps")
+    let output = std::process::Command::new("ps")
         .args(["-axww", "-o", "pid=,command="])
         .output()
-    else {
-        return Vec::new();
-    };
+        .unwrap_or_else(|error| panic!("spawn ps for the kernel-pid census: {error}"));
+    assert!(
+        output.status.success(),
+        "ps exited {} during the kernel-pid census: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut found = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let line = line.trim_start();
