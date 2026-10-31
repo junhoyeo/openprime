@@ -78,8 +78,22 @@ impl Supervisor {
             let instance = match order {
                 SummaryOrder::Pull { instance, .. } | SummaryOrder::Delta { instance, .. } => instance,
             };
-            anyhow::ensure!(descriptor.worker_instance_id.as_deref().unwrap_or("") == instance,
-                "Worker generation changed before publication");
+            // #42: a generation mismatch is a STALE frame, not a failure - the
+            // roster layer already carries this exact contract
+            // (`AgentRoster::accept_delta_sequence`'s own doc comment: "a frame
+            // from a generation the slot no longer names is stale (the answer
+            // is still success)", with its own pre-existing test
+            // `delta_sequence_gate_drops_stale_snapshots` covering precisely
+            // this). The same resident survives a generation change in place
+            // (production mutates `descriptor.worker_instance_id`, never
+            // allocates a new resident) - a hard `ensure!` here quarantines
+            // the current, live, healthy worker purely because its own
+            // prior self's frame arrived late over the network. Soft-reject
+            // like the stale-sequence check just below, not a publication
+            // failure (review-delta-push-generation-mismatch, parent-approved).
+            if descriptor.worker_instance_id.as_deref().unwrap_or("") != instance {
+                return Ok(None);
+            }
             let accepted = match order {
                 SummaryOrder::Pull { instance, sequence } => roster.pull_is_current(&resident.worker_id, instance, sequence),
                 SummaryOrder::Delta { instance, sequence } => roster.delta_is_current(&resident.worker_id, instance, sequence),
