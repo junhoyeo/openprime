@@ -656,3 +656,246 @@ mod tests {
         assert!(!lock_of(&file).exists());
     }
 }
+
+
+// --- Permanent runtime-session metadata fence (#37/#38): a single stable,
+// owner-checked coordination file, distinct from the directory-based
+// LockDir above. Never removed by lease release/reclaim.
+//
+// Stable, owner-checked carrier for permanent cross-process coordination
+// files. Closing the handle releases the OS lock. This module never
+// unlinks the file. ---
+
+use std::fs::{File, OpenOptions};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+/// One direct, empty, app-owned regular coordination file. The handle is private
+/// and never cloned or inherited by a spawned child. Callers own lock budgets.
+#[derive(Debug)]
+pub struct NativeFileFence {
+    file: File,
+    path: PathBuf,
+    identity: FileIdentity,
+    locked: bool,
+}
+
+impl NativeFileFence {
+    /// Create once or open the existing permanent file, without truncating it.
+    ///
+    /// # Errors
+    /// Refuses nonregular, linked, nonempty, foreign-owner or unverifiable files.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let (file, created) = match open_file(path, OpenMode::CreateNew) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (open_file(path, OpenMode::Existing)?, false),
+            Err(error) => return Err(error),
+        };
+        if created {
+            crate::platform::perms::restrict_open_file(&file)?;
+        }
+        let identity = file_identity(&file)?;
+        let fence = Self { file, path: path.to_path_buf(), identity, locked: false };
+        fence.verify()?;
+        Ok(fence)
+    }
+
+    /// Attempt the OS exclusive lock once. Contention is `Ok(false)`, not death.
+    ///
+    /// # Errors
+    /// Returns native lock failures, a changed entry, or recursive use of this handle.
+    pub fn try_lock(&mut self) -> io::Result<bool> {
+        if self.locked {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "coordination fence is non-reentrant"));
+        }
+        match self.file.try_lock() {
+            Ok(()) => {
+                self.locked = true;
+                self.verify()?;
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Check that the permanent pathname still names the originally opened file.
+    ///
+    /// # Errors
+    /// Refuses replacement, unlink, permission changes and unresolvable identity.
+    pub fn verify(&self) -> io::Result<()> {
+        if file_identity(&self.file)? != self.identity {
+            return Err(io::Error::other("coordination handle identity changed"));
+        }
+        let current = open_file(&self.path, OpenMode::Existing)?;
+        if file_identity(&current)? != self.identity {
+            return Err(io::Error::other("coordination file was replaced; retained without mutation"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OpenMode { CreateNew, Existing }
+
+fn open_file(path: &Path, mode: OpenMode) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(matches!(mode, OpenMode::CreateNew));
+    crate::platform::perms::set_private_mode(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse entry itself so validation can refuse it. Omitting
+        // FILE_SHARE_DELETE prevents replacement of this open file on Windows.
+        options.custom_flags(0x0020_0000).share_mode(0x0000_0003);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != 0 || metadata.nlink() != 1
+        || metadata.uid() != crate::platform::process::current_user_id()
+        || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unverifiable coordination file ownership or shape"));
+    }
+    Ok(FileIdentity { volume: metadata.dev(), file: metadata.ino() })
+}
+
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    fence_win32::file_identity(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &File) -> io::Result<FileIdentity> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "stable coordination files are unsupported"))
+}
+
+#[cfg(windows)]
+mod fence_win32 {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+    use super::FileIdentity;
+
+    type Handle = *mut c_void;
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime { low: u32, high: u32 }
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileInformation {
+        attributes: u32, creation: FileTime, access: FileTime, write: FileTime,
+        volume: u32, size_high: u32, size_low: u32, links: u32,
+        index_high: u32, index_low: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<FileInformation>() == 52
+        && std::mem::offset_of!(FileInformation, links) == 40);
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(handle: Handle, information: *mut FileInformation) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn LocalFree(memory: Handle) -> Handle;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(token: Handle, class: u32, buffer: Handle, length: u32, returned: *mut u32) -> i32;
+        fn GetSecurityInfo(handle: Handle, kind: u32, information: u32,
+            owner: *mut Handle, group: *mut Handle, dacl: *mut Handle,
+            sacl: *mut Handle, descriptor: *mut Handle) -> u32;
+        fn EqualSid(left: Handle, right: Handle) -> i32;
+        fn IsValidSid(sid: Handle) -> i32;
+    }
+    struct Token(Handle);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: OpenProcessToken returned this owned handle.
+            unsafe { CloseHandle(self.0); }
+        }
+    }
+    struct SecurityDescriptor(Handle);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocates this buffer with LocalAlloc.
+            unsafe { LocalFree(self.0); }
+        }
+    }
+
+    fn token_owner_matches(token: Handle, class: u32, owner: Handle) -> io::Result<bool> {
+        let mut length = 0;
+        // SAFETY: the null-buffer call only reports the required size.
+        unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &raw mut length); }
+        let length_usize = usize::try_from(length).map_err(io::Error::other)?;
+        if !(std::mem::size_of::<Handle>()..=65_536).contains(&length_usize) {
+            return Err(io::Error::other("process owner identity is unavailable"));
+        }
+        let mut buffer = vec![0u8; length_usize];
+        // SAFETY: buffer has exactly the capacity requested by the OS.
+        if unsafe { GetTokenInformation(token, class, buffer.as_mut_ptr().cast(), length, &raw mut length) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // TOKEN_USER and TOKEN_OWNER both begin with a SID pointer. Copy it
+        // unaligned: Vec<u8> does not promise pointer alignment.
+        let sid = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<Handle>()) };
+        // SAFETY: both SIDs are OS-owned values in live buffers for this call.
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(io::Error::other("invalid process owner identity"));
+        }
+        Ok(unsafe { EqualSid(owner, sid) } != 0)
+    }
+
+    fn owner_matches(file: &File) -> io::Result<bool> {
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SE_FILE_OBJECT=1, OWNER_SECURITY_INFORMATION=1. No ACL is changed.
+        // SAFETY: all output pointers are valid; unused outputs are null.
+        let status = unsafe { GetSecurityInfo(file.as_raw_handle(), 1, 1, &raw mut owner,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &raw mut descriptor) };
+        if status != 0 {
+            return Err(io::Error::other(format!("file owner query failed: {status}")));
+        }
+        let descriptor = SecurityDescriptor(descriptor);
+        if descriptor.0.is_null() || owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+            return Err(io::Error::other("file owner identity is unavailable"));
+        }
+        let mut raw_token = std::ptr::null_mut();
+        // SAFETY: query only this process's token; TOKEN_QUERY=8.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), 8, &raw mut raw_token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Token(raw_token);
+        // TokenUser=1; TokenOwner=4 (the current security context's default
+        // owner, which can be an enabled administrative group).
+        Ok(token_owner_matches(token.0, 1, owner)? || token_owner_matches(token.0, 4, owner)?)
+    }
+
+    pub(super) fn file_identity(file: &File) -> io::Result<FileIdentity> {
+        let mut information = FileInformation::default();
+        // SAFETY: the borrowed file handle is live; the OS fills the fixed ABI structure.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut information) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if information.attributes & (0x10 | 0x400) != 0 || information.links != 1
+            || information.size_high != 0 || information.size_low != 0 || !owner_matches(file)? {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unverifiable coordination file ownership or shape"));
+        }
+        Ok(FileIdentity { volume: u64::from(information.volume),
+            file: u64::from(information.index_high) << 32 | u64::from(information.index_low) })
+    }
+}

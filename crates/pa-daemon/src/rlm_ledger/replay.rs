@@ -74,6 +74,174 @@ fn parse_deleted_usage(
 /// version with an unknown op (forward compatibility), an error for anything
 /// else - which replay logs and skips: one bad line costs one record, never
 /// the ledger.
+struct UniqueJson;
+
+impl<'de> serde::de::Visitor<'de> for UniqueJson {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut sequence: A,
+    ) -> std::result::Result<(), A::Error> {
+        while sequence.next_element_seed(UniqueJson)?.is_some() {}
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<(), A::Error> {
+        let mut keys = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            map.next_value_seed(UniqueJson)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for UniqueJson {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+pub(super) fn validate_unique_json(line: &str) -> Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_str(line.trim());
+    serde::de::DeserializeSeed::deserialize(UniqueJson, &mut deserializer)
+        .map_err(|_| anyhow::anyhow!("RLM ledger authority JSON is malformed or ambiguous"))?;
+    deserializer
+        .end()
+        .map_err(|_| anyhow::anyhow!("RLM ledger authority JSON is malformed or ambiguous"))
+}
+
+/// One body line as an authority read classifies it.
+pub(super) enum AuthorityLine {
+    Record(LedgerRecord),
+    Meta,
+    /// Not a complete well-formed record: a write that never committed.
+    Skip(&'static str),
+}
+
+/// One required field of an authority record: its key and its type check.
+type RequiredField = (&'static str, fn(&Value) -> bool);
+
+/// The shared per-line authority rule. A record is acknowledged only after its
+/// whole line is written and synced, so a torn, non-UTF-8, non-JSON line, or
+/// one with an ABSENT required field, never committed and is skipped. A
+/// well-formed line with duplicate keys, or a required field PRESENT with the
+/// wrong type or an unknown value (op, version, reason, usage), may be a newer
+/// or ambiguous committed record and refuses. Callers apply this per line and
+/// keep reading; one bad line never ends the scan.
+pub(super) fn classify_authority_line(
+    raw: &[u8],
+    index: usize,
+    torn: bool,
+) -> Result<AuthorityLine> {
+    let line_no = index + 1;
+    if torn {
+        return Ok(AuthorityLine::Skip("torn"));
+    }
+    let Ok(line) = std::str::from_utf8(raw) else {
+        return Ok(AuthorityLine::Skip("non-UTF-8"));
+    };
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Ok(AuthorityLine::Skip("malformed"));
+    };
+    if validate_unique_json(line).is_err() {
+        bail!("ambiguous duplicate-key record on line {line_no}");
+    }
+    let Some(object) = value.as_object() else {
+        return Ok(AuthorityLine::Skip("incomplete"));
+    };
+    // An ABSENT required field means the record is incomplete and skips. A
+    // PRESENT field with the wrong type or an unknown value may come from a
+    // newer binary, so it refuses.
+    match object.get("v") {
+        None => return Ok(AuthorityLine::Skip("incomplete")),
+        Some(version) if *version != json!(1) => {
+            bail!("unsupported record version on line {line_no}")
+        }
+        Some(_) => {}
+    }
+    let op = match object.get("op") {
+        None => return Ok(AuthorityLine::Skip("incomplete")),
+        Some(Value::String(op)) => op.as_str(),
+        Some(_) => bail!("invalid operation field on line {line_no}"),
+    };
+    let required: &[RequiredField] = match op {
+        "meta" => &[("at", Value::is_string), ("sessionsDir", Value::is_string)],
+        "spawn" => &[
+            ("at", Value::is_string),
+            ("childId", Value::is_string),
+            ("parent", Value::is_string),
+            ("child", Value::is_string),
+            ("name", Value::is_string),
+            ("depth", Value::is_u64),
+        ],
+        "rename" => &[
+            ("at", Value::is_string),
+            ("childId", Value::is_string),
+            ("child", Value::is_string),
+            ("name", Value::is_string),
+        ],
+        "delete" => &[
+            ("at", Value::is_string),
+            ("childId", Value::is_string),
+            ("child", Value::is_string),
+            ("reason", Value::is_string),
+        ],
+        _ => bail!("unknown operation on line {line_no}"),
+    };
+    for (key, valid) in required {
+        match object.get(*key) {
+            None => return Ok(AuthorityLine::Skip("incomplete")),
+            Some(field) if !valid(field) => bail!("invalid {key} field on line {line_no}"),
+            Some(_) => {}
+        }
+    }
+    if op == "meta" {
+        return Ok(AuthorityLine::Meta);
+    }
+    // Every required field is present with its type. A remaining rejection is
+    // a value this reader does not know (a delete reason, a usage block, a
+    // depth range): refuse rather than drop a newer committed record.
+    match parse_ledger_line(line, index) {
+        Ok(Some(record)) => Ok(AuthorityLine::Record(record)),
+        Ok(None) => bail!("unknown operation on line {line_no}"),
+        Err(_) => bail!("unknown or invalid field value on line {line_no}"),
+    }
+}
+
+/// Parse one ledger line: `v:1` records with a known op, `None` for a known
+/// version with an unknown op (forward compatibility), an error for anything
+/// else - which replay logs and skips: one bad line costs one record, never
+/// the ledger.
 pub(super) fn parse_ledger_line(line: &str, index: usize) -> Result<Option<LedgerRecord>> {
     let line_no = index + 1;
     let record: Value = serde_json::from_str(line.trim())

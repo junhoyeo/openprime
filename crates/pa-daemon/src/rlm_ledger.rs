@@ -31,6 +31,13 @@ use crate::util::now_iso;
 
 mod replay;
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Authority: cross-lane API (#37/#38), consumed via composition.
+enum LedgerReadPolicy {
+    BestEffort,
+    Authority,
+}
+
 use replay::{
     canonicalize_dir, edge_key, file_identity, is_file, parse_ledger_line, sole_edge_by_child_id,
     DeletedBucket, LedgerRecord, LivePathResolver, ReplaySnapshot, ReplayState,
@@ -662,6 +669,18 @@ impl RlmSpawnLedger {
             .collect())
     }
 
+    /// Authority reads must not interpret unreadable or partially understood
+    /// topology as an empty tree. Keep ordinary display reads best-effort; this
+    /// uncached path propagates seeding, I/O, malformed and unknown-op errors.
+    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
+    pub(crate) fn strict_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
+        self.seed()?;
+        let state = fold_records(self.read_records_with(LedgerReadPolicy::Authority)?, |_| {
+            true
+        });
+        Ok(state.edges)
+    }
+
     /// Live edges reconciled by liveness of their recorded endpoints: a dead endpoint drops the
     /// edge; a MOVED path resolves through its durable session id first.
     ///
@@ -805,8 +824,27 @@ impl RlmSpawnLedger {
     /// ledger reads empty, and one torn or unknown line skips that
     /// record only.
     fn read_records(&self) -> Result<Vec<LedgerRecord>> {
-        let Ok(bytes) = fs::read(&self.path) else {
-            return Ok(Vec::new());
+        self.read_records_with(LedgerReadPolicy::BestEffort)
+    }
+
+    fn read_records_with(&self, policy: LedgerReadPolicy) -> Result<Vec<LedgerRecord>> {
+        if matches!(policy, LedgerReadPolicy::Authority) {
+            match fs::symlink_metadata(&self.path) {
+                Ok(metadata) if !metadata.is_file() => {
+                    bail!("authority ledger is not a regular file")
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error).context("inspect authority ledger"),
+            }
+        }
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read RLM ledger {}", self.path.display()));
+            }
         };
         if bytes.len() as u64 > RLM_LEDGER_MAX_BYTES {
             bail!(
@@ -814,8 +852,11 @@ impl RlmSpawnLedger {
                 self.path.display()
             );
         }
+        if matches!(policy, LedgerReadPolicy::Authority) {
+            return self.read_authority_records(&bytes);
+        }
         // A torn write inside a multibyte name must spoil one line, not
-        // the whole file.
+        // the whole file for ordinary display reads.
         let content = String::from_utf8_lossy(&bytes);
         let mut records = Vec::new();
         let mut lines = 0usize;
@@ -844,6 +885,80 @@ impl RlmSpawnLedger {
                         self.path.display()
                     ));
                 }
+            }
+        }
+        Ok(records)
+    }
+
+    /// Authority reads, per `replay::classify_authority_line`: torn,
+    /// non-UTF-8, non-JSON and absent-field lines never committed and are
+    /// skipped and logged by file and line number, never content.
+    /// Present-but-unknown or wrongly typed fields, unknown op or version,
+    /// and duplicate keys refuse. The header, size caps and I/O stay fatal.
+    /// This never decodes the whole file as UTF-8 (that would let a single
+    /// bad-UTF-8 line poison byte-identical neighboring lines via lossy
+    /// replacement, or hard-fail everything): it splits raw bytes and
+    /// decodes per segment instead.
+    fn read_authority_records(&self, bytes: &[u8]) -> Result<Vec<LedgerRecord>> {
+        let path = self.path.display().to_string();
+        let mut lines = bytes.split(|byte| *byte == b'\n').enumerate().peekable();
+        let terminated = bytes.is_empty() || bytes.ends_with(b"\n");
+        let header = loop {
+            let Some((_, line)) = lines.next() else {
+                bail!("authority ledger {path} has no ownership header");
+            };
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                break line;
+            }
+        };
+        let header_str = std::str::from_utf8(header).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has a malformed ownership header")
+        })?;
+        replay::validate_unique_json(header_str).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has an ambiguous ownership header")
+        })?;
+        let header: Value = serde_json::from_str(header_str).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has a malformed ownership header")
+        })?;
+        let scope = header
+            .get("sessionsDir")
+            .and_then(Value::as_str)
+            .filter(|scope| Path::new(scope).is_absolute());
+        if header.get("op").and_then(Value::as_str) != Some("meta")
+            || !scope.is_some_and(|scope| {
+                canonicalize_dir(Path::new(scope)) == self.canonical_sessions_dir
+            })
+        {
+            bail!("authority ledger {path} ownership does not match its sessions directory");
+        }
+        let mut records = Vec::new();
+        let mut count = 1usize;
+        while let Some((index, raw)) = lines.next() {
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            count += 1;
+            if count > RLM_LEDGER_MAX_RECORDS {
+                bail!(
+                    "RLM ledger {path} exceeds {RLM_LEDGER_MAX_RECORDS} records; refusing to read"
+                );
+            }
+            // The last segment without a trailing newline is a torn tail.
+            let torn = !terminated && lines.peek().is_none();
+            // One message carries both the file and the refusal reason: a
+            // plain Display of an anyhow context would otherwise hide the
+            // reason (the outer context alone, not the wrapped chain).
+            let classified = match replay::classify_authority_line(raw, index, torn) {
+                Ok(classified) => classified,
+                Err(error) => bail!("RLM ledger {path}: {error:#}"),
+            };
+            match classified {
+                replay::AuthorityLine::Record(record) => records.push(record),
+                replay::AuthorityLine::Meta => {}
+                replay::AuthorityLine::Skip(reason) => self.log(&format!(
+                    "RLM ledger {path}: skipped {reason} record on line {}",
+                    index + 1
+                )),
             }
         }
         Ok(records)
@@ -998,5 +1113,7 @@ impl RlmSpawnLedger {
     }
 }
 
+#[cfg(test)]
+mod strict_tests;
 #[cfg(test)]
 mod tests;

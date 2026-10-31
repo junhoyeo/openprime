@@ -173,12 +173,20 @@ pub(crate) async fn reap_abandoned_workers(supervisor: &Arc<Supervisor>, worker_
 /// This preflight check cannot itself bind a later numeric signal to an instance.
 /// An UNVERIFIABLE identity never signals - safe for lease retention, not for termination.
 fn identity_current(target: &ReapTarget) -> bool {
-    match &target.start_id {
-        Some(expected) => {
-            crate::lease::get_process_start_id(target.pid).as_deref() == Some(expected.as_str())
-        }
-        None => false,
-    }
+    matches!(
+        identity_verdict(target),
+        pa_types::platform::process::ProcessIdentity::Matching
+    )
+}
+
+/// The tri-state verdict for one target: confirmed exited (or pid recycled),
+/// confirmed live-and-matching, or neither provable (an unverifiable/
+/// malformed token, a missing recorded identity, or an unreadable liveness
+/// probe) - the last case must never be collapsed into either of the
+/// others (#37/#38): it is never safe to sign, and never safe to report
+/// as already gone.
+fn identity_verdict(target: &ReapTarget) -> pa_types::platform::process::ProcessIdentity {
+    pa_types::platform::process::observe_process_identity(target.pid, target.start_id.as_deref())
 }
 
 /// Stop one target on the boot reap's fast budgets.
@@ -236,12 +244,15 @@ async fn stop_target_within(
         // terminal stop keeps its tombstoned descriptor (the next boot
         // retries), never deletes it behind a false AlreadyGone.
         Err(_) => {
-            if identity_current(target)
-                && crate::lease::is_process_alive(target.pid).unwrap_or(false)
-            {
-                ReapOutcome::Survived
-            } else {
-                ReapOutcome::AlreadyGone
+            // No pidfd and no signal-capable fallback on this platform: never
+            // signal here regardless. Only a confirmed-gone verdict may
+            // report AlreadyGone; an unverifiable identity is exactly the
+            // "live process behind it is NOT gone" case above, not a reason
+            // to report it as already gone either (#37/#38).
+            match identity_verdict(target) {
+                pa_types::platform::process::ProcessIdentity::Gone => ReapOutcome::AlreadyGone,
+                pa_types::platform::process::ProcessIdentity::Matching
+                | pa_types::platform::process::ProcessIdentity::Unknown => ReapOutcome::Survived,
             }
         }
     }
@@ -255,8 +266,15 @@ async fn escalate(
     term_grace: Duration,
     kill_verify: Duration,
 ) -> ReapOutcome {
-    if !identity_current(target) || !crate::lease::is_process_alive(target.pid).unwrap_or(false) {
-        return ReapOutcome::AlreadyGone;
+    match identity_verdict(target) {
+        pa_types::platform::process::ProcessIdentity::Gone => return ReapOutcome::AlreadyGone,
+        // Neither provable: never signal (a live process behind an
+        // unverifiable identity must not be touched), and never report it
+        // as already gone either (#37/#38) - a boot log that cannot tell
+        // "gone" from "unverifiable" apart risks skipping real cleanup or
+        // dropping tracking of a possibly-still-live process.
+        pa_types::platform::process::ProcessIdentity::Unknown => return ReapOutcome::Survived,
+        pa_types::platform::process::ProcessIdentity::Matching => {}
     }
     if signal(pa_core::platform::process::Signal::Term) {
         if await_gone(target, term_grace).await {
@@ -270,12 +288,17 @@ async fn escalate(
     ReapOutcome::Survived
 }
 
-/// Poll until the identity-gated pid is gone or the budget runs out.
+/// Poll until the target is confirmed gone or the budget runs out. An
+/// unverifiable reading mid-poll (this target started out confirmed
+/// `Matching`, so this would be unusual) keeps polling rather than
+/// declaring success on ambiguity.
 async fn await_gone(target: &ReapTarget, budget: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if !identity_current(target) || !crate::lease::is_process_alive(target.pid).unwrap_or(false)
-        {
+        if matches!(
+            identity_verdict(target),
+            pa_types::platform::process::ProcessIdentity::Gone
+        ) {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -850,32 +873,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_recycled_pid_is_never_signaled() {
-        let mut child = std::process::Command::new("sleep")
+    async fn issue_38_unverifiable_process_is_never_signaled_or_reported_gone() {
+        let child = std::process::Command::new("sleep")
             .arg("300")
             .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let mut stale = target(pid);
-        stale.start_id = stale.start_id.map(|id| id + "recycled");
-        assert_eq!(stop_target(&stale).await, ReapOutcome::AlreadyGone);
-        assert!(
-            child.try_wait().expect("child alive").is_none(),
-            "the recycled identity must not have been signaled"
-        );
-        let mut unobservable = target(pid);
-        unobservable.start_id = None;
-        assert_eq!(
-            stop_target(&unobservable).await,
-            ReapOutcome::AlreadyGone,
-            "an unverifiable identity is never signaled"
-        );
-        assert!(
-            child.try_wait().expect("child alive").is_none(),
-            "the unverifiable identity must not have been signaled"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
+            .unwrap();
+        let mut guard = ReapOnDrop(Some(child));
+        let pid = guard.0.as_ref().unwrap().id();
+        let mut unverified = target(pid);
+        for start_id in [Some("unsupported:birth".to_string()), None] {
+            unverified.start_id = start_id;
+            assert_eq!(stop_target(&unverified).await, ReapOutcome::Survived);
+            assert!(guard.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        }
     }
 
     #[test]

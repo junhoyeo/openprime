@@ -195,12 +195,25 @@ pub(crate) fn kill_shell(agent_dir: &Path, id: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The KILL after a verified TERM. A leader that exited during the grace still names the group
-/// verified before the TERM: a PGID is not reused while its group has members. A leader pid
-/// that runs again under another start identity was recycled, so its group is refused.
+/// The KILL after a verified TERM. A dead leader's pid slot still answers
+/// its own exact recorded identity while it remains an unreaped zombie
+/// (the kernel keeps a zombie's stat/kinfo record, including its original
+/// start time, until something reaps it) - that continuity is what proves
+/// this exact PGID number could not have been handed to an unrelated
+/// process since this record was made, the same way a leader still
+/// running under its recorded identity would. Once the leader's pid slot
+/// has actually been vacated (fully reaped, by anything - this function
+/// does not know or care who), that continuity proof is gone: a leader
+/// that then answers nothing, or a different identity (pid reuse), can no
+/// longer be told apart from an unrelated group that later reused the
+/// same number, so the group is refused rather than killed on the
+/// strength of a TERM this call has no fresh/continuous proof was ever
+/// sent to THIS exact group (#37/#38) - never on "historical" TERM alone.
 fn kill_group(shell: &Shell) -> Result<(), String> {
-    let leader_exited = matches!(crate::lease::is_process_alive(shell.pid), Ok(false));
-    if !runs_as_registered(shell) && !leader_exited {
+    let leader_zombie_matches = !matches!(crate::lease::is_process_alive(shell.pid), Ok(true))
+        && crate::lease::get_process_start_id(shell.pid).as_deref()
+            == Some(shell.start_id.as_str());
+    if !runs_as_registered(shell) && !leader_zombie_matches {
         return if group_unverified(shell) {
             Err(
                 "Cannot verify persistent shell group ownership; no further signal sent"
@@ -316,6 +329,62 @@ mod tests {
             .spawn()
             .unwrap();
         (leader, member, id)
+    }
+
+    #[test]
+    fn issue_38_leaderless_escalation_retains_group_without_using_historical_term() {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        struct OwnedChildren(Vec<Child>);
+        impl Drop for OwnedChildren {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut leader_command = Command::new("sleep");
+        leader_command.arg("60").process_group(0);
+        let mut children = OwnedChildren(vec![leader_command.spawn().unwrap()]);
+        let pid = children.0[0].id();
+        let start = crate::lease::get_process_start_id(pid).unwrap();
+        children.0.push(
+            Command::new("sh")
+                .args(["-c", "trap '' TERM; printf 'ready\n'; read answer"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .process_group(pid as i32)
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = children.0[1].stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+        if ready.is_err() {
+            let _ = children.0[1].kill();
+            let _ = children.0[1].wait();
+        }
+        reader.join().unwrap();
+        assert_eq!(ready.unwrap().unwrap(), "ready\n");
+        let id = register(root.path(), pid, &start, "owned-fixture");
+        let record = shell_file(root.path(), &id, "json");
+        let before = std::fs::read(&record).unwrap();
+        assert!(signal_process_group(pid as i32, Signal::Term));
+        children.0[0].wait().unwrap();
+        let shell = find_shell(root.path(), &id).unwrap();
+        assert!(kill_group(&shell).is_err());
+        assert!(children.0[1].try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read(record).unwrap(), before);
+        assert_eq!(shell_rows(root.path())[0]["status"], "unverified");
     }
 
     #[test]
