@@ -1,6 +1,20 @@
 //! End-to-end fd-lifecycle audit against the real `pa-daemon` supervisor: run
 //! create/prompt/kill session cycles and sample `/proc/<pid>/fd` per cycle so any
 //! monotonically growing fd class in the supervisor is caught as a regression.
+//!
+//! Linux-only by design, not an oversight: every test here depends on the
+//! *exact* `/proc/<pid>/fd` entry set (symlink targets per open fd), which
+//! is the file's whole instrument for catching a leaked fd class. macOS has
+//! no equivalently precise primitive without shelling to `lsof -p <pid>`
+//! per sample, which has different timing, parsing, and permission
+//! characteristics that need their own design and native verification
+//! before this suite could trust them as equivalent - not a drop-in swap
+//! like the portable `pa_types::platform::process::is_process_alive` used
+//! for plain liveness elsewhere. One test below
+//! (`supervisor_raises_a_low_soft_fd_limit_to_the_hard_limit`) was already
+//! Linux-only for the same reason (`/proc/<pid>/limits`); this gate just
+//! makes that the file's whole-module default instead of a per-test
+//! exception.
 // Stack-resident futures by design; boxing for a lint tick is a perf regression.
 #![allow(clippy::large_futures)]
 // 64-bit-only targets; narrowing casts sit at bounded OS/protocol boundaries.
@@ -19,7 +33,7 @@
     clippy::struct_excessive_bools,
     clippy::struct_field_names
 )]
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
