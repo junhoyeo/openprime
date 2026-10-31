@@ -1,7 +1,12 @@
 //! Control-plane priority e2e (design R3): a supervisor booting over a sessions
 //! dir full of dead workers must keep hello/list responsive while the
 //! background recovery (capped relaunch fan-out) runs, and every queued
-//! recovery must complete. Linux-only e2e (`AF_UNIX` sockets, `kill -9` semantics).
+//! recovery must complete. `AF_UNIX` sockets and `kill -9` are portable
+//! POSIX surfaces, not actually Linux-specific; the only platform
+//! dependency this file ever had was its worker-discovery helper, which
+//! read `/proc` directly. That helper now reads each session's own
+//! durable worker descriptor instead, so `#![cfg(unix)]` is accurate:
+//! this suite runs on macOS too, not just Linux.
 #![allow(clippy::large_futures)]
 // 64-bit-only targets; the narrowing casts sit at bounded OS boundaries.
 #![allow(
@@ -74,29 +79,44 @@ fn wait_socket_ready(socket: &Path) {
     }
 }
 
-fn child_pids_of(ppid: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let entries = std::fs::read_dir("/proc").expect("read /proc");
-    for entry in entries.flatten() {
-        let Ok(entry_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+/// The worker pid for one session, read from its durable descriptor
+/// (`agent_dir/daemon-workers/<socket-key>/<session-id>.json`, same
+/// lookup `idle_passivation_e2e.rs::worker_pid` already uses). Portable,
+/// and a more precise match to what each call site below actually needs
+/// to know (THIS fixture's own sessions, not a census of whatever
+/// children the supervisor's pid happens to have) - unlike the old
+/// `/proc`-wide child_pids_of(), which also hard-panicked on macOS
+/// (`read_dir("/proc")`).
+fn worker_pid(agent_dir: &Path, session_id: &str) -> Option<u32> {
+    let instances = std::fs::read_dir(agent_dir.join("daemon-workers")).ok()?;
+    for instance in instances.flatten() {
+        let descriptor_path = instance.path().join(format!("{session_id}.json"));
+        let Ok(content) = std::fs::read_to_string(&descriptor_path) else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else {
-            continue;
-        };
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut fields = rest.split_whitespace();
-        fields.next();
-        let Ok(parent) = fields.next().unwrap_or_default().parse::<u32>() else {
-            continue;
-        };
-        if parent == ppid {
-            pids.push(entry_pid);
+        if let Ok(descriptor) = serde_json::from_str::<Value>(&content) {
+            if let Some(pid) = descriptor.get("pid").and_then(Value::as_u64) {
+                return u32::try_from(pid).ok();
+            }
         }
     }
-    pids
+    None
+}
+
+/// How many of `session_ids` currently have a live worker pid (the
+/// portable replacement for counting a supervisor's `/proc` children:
+/// a session not yet recovered still has no descriptor, or a descriptor
+/// whose last-known pid already died; a recovered session's descriptor
+/// now names the freshly adopted, live pid).
+fn live_worker_count(agent_dir: &Path, session_ids: &[String]) -> usize {
+    session_ids
+        .iter()
+        .filter(|session_id| {
+            worker_pid(agent_dir, session_id)
+                .map(|pid| pa_daemon::lease::is_process_alive(pid).unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 /// Worker ids with a registration log line at or after `since` (the log line lands
@@ -264,12 +284,14 @@ fn control_plane_stays_responsive_while_a_large_adoption_pass_recovers() {
                 .to_string(),
         );
     }
-    let supervisor_pid = daemon.child.id();
     let deadline = Instant::now() + Duration::from_mins(1);
     let worker_pids = loop {
-        let children = child_pids_of(supervisor_pid);
-        if children.len() == SESSIONS {
-            break children;
+        let pids: Vec<u32> = session_ids
+            .iter()
+            .filter_map(|session_id| worker_pid(&agent_dir, session_id))
+            .collect();
+        if pids.len() == SESSIONS {
+            break pids;
         }
         assert!(Instant::now() < deadline, "twelve workers never spawned");
         std::thread::sleep(Duration::from_millis(50));
@@ -284,7 +306,6 @@ fn control_plane_stays_responsive_while_a_large_adoption_pass_recovers() {
     let restart_before = pa_daemon::util::now_iso();
     let daemon2 = spawn_supervisor(&socket, &agent_dir);
     wait_socket_ready(&socket);
-    let restart_supervisor_pid = daemon2.child.id();
 
     // The control plane answers mid-recovery: hello within the latency bound while
     // the pass is visibly unfinished (fewer than twelve relaunched children).
@@ -297,9 +318,9 @@ fn control_plane_stays_responsive_while_a_large_adoption_pass_recovers() {
         "hello starved behind the recovery: {hello_latency:?}"
     );
     assert!(
-        child_pids_of(restart_supervisor_pid).len() < SESSIONS,
-        "the recovery finished before the first hello; the responsiveness check is vacuous (children: {:?})",
-        child_pids_of(restart_supervisor_pid)
+        live_worker_count(&agent_dir, &session_ids) < SESSIONS,
+        "the recovery finished before the first hello; the responsiveness check is vacuous (live: {})",
+        live_worker_count(&agent_dir, &session_ids)
     );
 
     // list answers mid-recovery too: it serves the registered rows instead of
