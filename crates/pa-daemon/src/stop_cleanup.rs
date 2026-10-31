@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+#[cfg(test)]
 use pa_core::cron::store::AgentCronJobStore;
 
 use crate::lease::canonical_session_path;
