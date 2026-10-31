@@ -918,7 +918,7 @@ impl RlmSpawnLedger {
             bail!("authority ledger {path} ownership does not match its sessions directory");
         }
         let mut records = Vec::new();
-        let mut count = 0usize;
+        let mut count = 1usize;
         while let Some((index, raw)) = lines.next() {
             if raw.iter().all(u8::is_ascii_whitespace) {
                 continue;
