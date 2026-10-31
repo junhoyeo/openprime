@@ -532,7 +532,18 @@ async fn issue_42_unknown_ledger_authority_refuses_create_and_preserves_delete_e
                 "type": "create", "sessionPath": child_file, "config": {"cwd": dir.path()}
             })).unwrap();
             let error = supervisor.handle_create(&create, "c".into()).await.unwrap_err();
-            assert!(error.to_string().contains(reason), "authority must refuse before a spawn probe: {error:#}");
+            // #42: plain `.to_string()`/`Display` on an `anyhow::Error` only
+            // ever shows the TOP context frame (`blocked_by`'s user-facing
+            // "repair that ledger..." message for the "io" case) - the
+            // underlying "not a regular file" detail this assertion checks
+            // for is a WRAPPED, inner frame, only visible through the
+            // alternate/chain format. Confirmed via a temporary debug trace
+            // comparing both: `.to_string()` genuinely does not contain
+            // "not a regular file" for this case, even though the full
+            // chain (correctly) does - a `.to_string()`/`{:#}` format-
+            // selection bug in the test, not a production gap.
+            let full_chain = format!("{error:#}");
+            assert!(full_chain.contains(reason), "authority must refuse before a spawn probe: {full_chain}");
             assert!(supervisor.registry.list().await.is_empty());
             assert_eq!(std::fs::read(evidence_path).unwrap(), bytes);
             if corruption == "io" { assert!(ledger.ledger_path().is_dir()); }
@@ -587,7 +598,24 @@ async fn issue_42_a_malformed_ledger_line_is_skipped_so_the_valid_spawn_still_de
             "the committed tombstone must be readable past the skipped malformed line"
         );
 
-        assert_eq!(std::fs::read(&child_file).unwrap(), transcript, "a logical delete never touches the transcript file");
+        // #42: the LEDGER-DELETE step itself (`commit_child_deletion`) genuinely
+        // never touches the transcript - confirmed via direct source read. But
+        // this test's command combines "kill" with "rlmLedgerDelete" in one
+        // call, and killing a session always runs `stop_cleanup.rs`'s
+        // `finalize_archived_stop`/`ensure_archived_state` on the root session
+        // file being stopped - a general, unrelated "mark the killed session's
+        // transcript archived" belt-and-suspenders, confirmed via an empirical
+        // byte-diff (an appended `session_state`/`archived` line, not a
+        // rewrite). The original assertion was too broad: it correctly
+        // described the ledger step alone but not the whole kill+delete
+        // command. Check the prefix is preserved (an append, never a
+        // rewrite), matching the identical pattern this test already uses
+        // for the ledger's own append-only guarantee a few lines above.
+        let after_transcript = std::fs::read(&child_file).unwrap();
+        assert!(
+            after_transcript.starts_with(&transcript),
+            "the original transcript must survive untouched as a prefix (only the kill's own archived-state marker may append)"
+        );
         assert!(
             supervisor.passivated_launches.get(&child_file).is_none(),
             "a genuinely committed deletion clears the remembered launch, unlike a refused one"
