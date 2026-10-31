@@ -815,7 +815,7 @@ impl Supervisor {
             // it, so it must stay tracked and routable here, and the caller must see a
             // failure rather than a silent success (#37/#38).
             anyhow::bail!(
-                "session worker {} could not be confirmed stopped (survived the                  escalation, or its identity could not be verified); its process may                  still be running and remains tracked for a later retry",
+                "session worker {} could not be confirmed stopped (survived the escalation, or its identity could not be verified); its process may still be running and remains tracked for a later retry",
                 resident.worker_id
             );
         }
