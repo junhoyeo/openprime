@@ -150,9 +150,11 @@ impl SupervisorChildSessionsInner {
             no_session: None,
             name: name.map(str::to_string),
             config: Some(config),
-            // RLM children never report telemetry (the depth-0 gate installs
-            // nothing); the worker's own opt-out stays process-level.
-            telemetry_disabled: None,
+            // #35/#36: the calling worker's own opt-out carries into every
+            // child it creates (rlm.spawn and the depth-0 rlm.create_session
+            // root alike) -- monotone, `identity.telemetry_disabled` is
+            // already filtered to `Some(true)`-or-`None` at its one source.
+            telemetry_disabled: identity.telemetry_disabled,
             runtime_metadata,
             lifecycle: Some(DaemonSessionLifecycle::Resident),
             env: None,
