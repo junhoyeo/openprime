@@ -160,22 +160,48 @@ pub fn read_active_orphan_processes(
     Ok(out)
 }
 
+/// Three-way reap verdict for one orphan record (#37/#38), replacing a
+/// former binary identity check that silently conflated "confirmed gone"
+/// with "cannot prove either way" — the latter must never be treated as
+/// resolved (see `reap_worker_orphan_processes`'s retry-safety tracking).
+enum OrphanIdentity {
+    /// Identity-free (legacy) record: POSIX keeps the best-effort kill.
+    Unrecorded,
+    /// The recorded identity still matches the live process.
+    Matching,
+    /// The process is confirmed exited, or a comparable start token proves
+    /// the pid was recycled: nothing to kill, and nothing to retry.
+    Gone,
+    /// Neither provable (an unverifiable/ambiguous/malformed token, or an
+    /// unreadable liveness probe): never kill, and never treat as
+    /// resolved.
+    Unverifiable,
+}
+
+fn orphan_identity(orphan: &ActiveOrphanProcess) -> OrphanIdentity {
+    let Some(recorded) = orphan.process_start_id.as_deref() else {
+        return OrphanIdentity::Unrecorded;
+    };
+    let pid = u32::try_from(orphan.pid).unwrap_or(0);
+    match pa_types::platform::process::observe_process_identity(pid, Some(recorded)) {
+        pa_types::platform::process::ProcessIdentity::Matching => OrphanIdentity::Matching,
+        pa_types::platform::process::ProcessIdentity::Gone => OrphanIdentity::Gone,
+        pa_types::platform::process::ProcessIdentity::Unknown => OrphanIdentity::Unverifiable,
+    }
+}
+
 /// True when the record's pid identity still matches the live process, so
 /// killing it cannot hit a reused pid.
 #[must_use]
 pub fn is_orphan_process_identity_current(orphan: &ActiveOrphanProcess) -> bool {
-    match &orphan.process_start_id {
-        None => false,
-        Some(recorded) => get_process_start_id(orphan.pid).as_deref() == Some(recorded.as_str()),
-    }
+    matches!(orphan_identity(orphan), OrphanIdentity::Matching)
 }
 
 fn should_reap(orphan: &ActiveOrphanProcess) -> bool {
-    match orphan.process_start_id {
-        // Identity-free records: POSIX keeps the best-effort kill.
-        None => true,
-        Some(_) => is_orphan_process_identity_current(orphan),
-    }
+    matches!(
+        orphan_identity(orphan),
+        OrphanIdentity::Unrecorded | OrphanIdentity::Matching
+    )
 }
 
 /// Kill a journaled orphan: its process group first (`bash()` children are
@@ -225,14 +251,32 @@ pub fn reap_worker_orphan_processes(path: &Path, worker_pid: i32) {
     let mut reap_failed = false;
     let mut retry_is_safe = true;
     for orphan in orphans {
-        if orphan.process_start_id.is_none() {
-            retry_is_safe = false;
-        }
-        if !should_reap(&orphan) {
-            continue;
-        }
-        if !kill_orphan_process(orphan.pid) {
-            reap_failed = true;
+        match orphan_identity(&orphan) {
+            OrphanIdentity::Unrecorded => {
+                // No identity to re-check on a later pass: a blind retry
+                // could hit a reused pid, so this one attempt is final.
+                retry_is_safe = false;
+                if !kill_orphan_process(orphan.pid) {
+                    reap_failed = true;
+                }
+            }
+            OrphanIdentity::Matching => {
+                if !kill_orphan_process(orphan.pid) {
+                    reap_failed = true;
+                }
+            }
+            // Already resolved: nothing to kill, nothing to retry.
+            OrphanIdentity::Gone => {}
+            OrphanIdentity::Unverifiable => {
+                // Cannot prove live or gone: never attempt an unsafe kill.
+                // This record is not resolved either, so treat it like a
+                // failed reap (keep the journal) rather than silently
+                // dropping tracking of a possibly-still-live child
+                // (#37/#38). Unlike the identity-free case, a later retry
+                // stays safe forever here: it will never kill without
+                // proof, so `retry_is_safe` is untouched.
+                reap_failed = true;
+            }
         }
     }
     if !reap_failed || !retry_is_safe {
