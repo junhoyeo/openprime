@@ -39,8 +39,12 @@ Do not copy or edit ownership markers to enrol an old environment.
 New managed explicit bootstrap currently requires Unix owner/permission checks.
 On platforms where existing-record ownership cannot be verified, a non-current
 explicit target is refused before creating its parent directories, environment,
-or lock metadata. On every platform, an explicit path's missing parents are
-created only once the request has passed its refusal checks.
+or lock metadata. On every platform, only two checks run before an explicit
+path's missing parents are created: the bundled runtime source must be valid,
+and, outside Unix, record ownership must be verifiable. When the parent already
+exists, the checks for a current environment, a pending build, and a stale or
+foreign target run before any directory is created. A later lock timeout or
+build failure can leave newly created parents behind.
 Existing compatible explicit environments and `PRIME_AGENT_KERNEL_PYTHON` remain
 usable read-only. Windows ACL verification and hard-link filesystem coverage are
 not established by the Unix tests; inherited ACLs are not treated as proof.

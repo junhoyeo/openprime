@@ -1407,6 +1407,7 @@ async fn issue44_enrolled_explicit_root_updates_without_mutating_the_base() {
 
 #[tokio::test]
 async fn issue44_copied_or_damaged_ownership_never_authorizes_generation_updates() {
+    use std::os::unix::fs::PermissionsExt;
     let _serial = ENV_LOCK.lock().await;
     invalidate_runtime_probe_cache();
     let root = tempfile::tempdir().unwrap();
@@ -1425,7 +1426,6 @@ async fn issue44_copied_or_damaged_ownership_never_authorizes_generation_updates
         assert_eq!(std::fs::read(&log).unwrap(), before);
     }
     std::fs::write(&ownership, &original).unwrap();
-    use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(&ownership).unwrap().permissions().mode() & 0o777, 0o600);
     std::fs::set_permissions(&ownership, std::fs::Permissions::from_mode(0o666)).unwrap();
     assert!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.is_err());
@@ -1548,119 +1548,191 @@ async fn issue44_public_entry_refusal_creates_no_explicit_parent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "manual: requires a coordinator-owned offline uv cache and ABI-2 test runtime"]
 async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
-    use pa_core::kernel::shared::{ExecuteOptions, ExecuteStatus, KernelShutdownOptions};
-    use std::time::{Duration, Instant};
-
     let _serial = ENV_LOCK.lock().await;
     invalidate_runtime_probe_cache();
-    let root = tempfile::tempdir().unwrap().keep();
-    eprintln!("issue44 real-uv evidence: {}", root.display());
-    let cache = PathBuf::from(std::env::var("PA_KERNEL_VERIFY_CACHE").expect("explicit private offline cache required"));
-    let target = PathBuf::from(std::env::var("CARGO_TARGET_DIR").expect("private Cargo target required"));
-    assert!(cache.canonicalize().unwrap().starts_with(target.canonicalize().unwrap()));
-    let contents = issue44_cache_contents(&cache);
-    std::fs::write(root.join("cache-contents.json"), serde_json::to_vec_pretty(&contents).unwrap()).unwrap();
-    let missing: Vec<_> = contents.iter().filter(|(_, found)| !**found).map(|(name, _)| name.clone()).collect();
-    assert!(missing.is_empty(), "fixture: offline cache lacks {missing:?}; not product evidence");
-    let approved = PathBuf::from(std::env::var("PA_E2E_KERNEL_PYTHON").expect("approved ABI-2 runtime required"));
-    let interpreter = approved.canonicalize().unwrap();
-    let toolchain = interpreter.parent().unwrap().parent().unwrap().to_path_buf();
-    let toolchains = root.join("python-toolchains");
-    std::fs::create_dir(&toolchains).unwrap();
-    std::os::unix::fs::symlink(&toolchain, toolchains.join(toolchain.file_name().unwrap())).unwrap();
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prime-agent-runtime");
-    let package = root.join("package");
-    let runtime_source = package.join("prime-agent-runtime");
-    copy_runtime_fixture(&source, &runtime_source);
-    let runtime_init = runtime_source.join("src/rlm/__init__.py");
-    let original_init = std::fs::read_to_string(&runtime_init).unwrap();
-    std::fs::write(&runtime_init, format!("{original_init}\nISSUE44_RUNTIME = 1\n")).unwrap();
-    let exact = root.join(format!("generation-{}-{:020}-{}", "a".repeat(20), 1, uuid::Uuid::new_v4()));
-    let skill = root.join("skill");
-    std::fs::create_dir_all(skill.join("src/issue44_skill")).unwrap();
-    let pyproject = skill.join("pyproject.toml");
-    std::fs::write(&pyproject, "[project]\nname='issue44-skill'\nversion='0.1.0'\n[build-system]\nrequires=['hatchling']\nbuild-backend='hatchling.build'\n[tool.hatch.build.targets.wheel]\npackages=['src/issue44_skill']\n").unwrap();
-    std::fs::write(skill.join("src/issue44_skill/__init__.py"), "VALUE = 44\n").unwrap();
-    let python_skill = KernelPythonSkill { name: "issue44-skill".into(), import_name: "issue44_skill".into(), package_path: skill, pyproject_path: pyproject };
-    let options = || EnsureKernelPythonOptions { python_skills: vec![python_skill.clone()], on_progress: None };
-    let _env = EnvRestore::configure(&[
-        ("PRIME_AGENT_KERNEL_PYTHON", None),
-        ("PRIME_AGENT_KERNEL_VENV", Some(exact.display().to_string())),
-        ("PI_PACKAGE_DIR", Some(package.display().to_string())),
-        ("UV_CACHE_DIR", Some(cache.display().to_string())),
-        ("UV_PYTHON_INSTALL_DIR", Some(toolchains.display().to_string())),
-        ("UV_PYTHON_PREFERENCE", Some("only-managed".into())),
-        ("UV_OFFLINE", Some("1".into())),
-        ("UV_PYTHON_DOWNLOADS", Some("never".into())),
-        ("UV_LINK_MODE", Some("copy".into())),
-    ]);
-    let generations = exact.with_file_name(format!("{}.generations", exact.file_name().unwrap().to_string_lossy()));
-    let mut managers: Vec<ReplKernelManager> = Vec::new();
-    let mut receipts: Vec<serde_json::Value> = Vec::new();
-    let mut timings: Vec<(String, f64)> = Vec::new();
-    let write_evidence = |name: &str, value: &serde_json::Value| {
-        std::fs::write(root.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    let fixture = Issue44RealUv::prepare();
+    let _env = fixture.environment();
+    let mut run = Issue44Run::default();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(480),
+        issue44_real_uv_sequence(&fixture, &mut run),
+    )
+    .await;
+    let outcome = match outcome {
+        Ok(Ok(())) => "ok".to_string(),
+        Ok(Err(error)) => format!("error: {error:#}"),
+        Err(_) => "timeout".to_string(),
     };
-    let outcome = tokio::time::timeout(Duration::from_secs(480), async {
-        let started = Instant::now();
-        let first = ensure_kernel_python(EnsureKernelPythonOptions::default()).await?;
-        timings.push(("base".into(), started.elapsed().as_secs_f64()));
-        anyhow::ensure!(first == exact.join("bin/python"), "first bootstrap must use exact base");
-        let original_marker = std::fs::read(exact.join(".bootstrap-version"))?;
-        let started = Instant::now();
-        let second = ensure_kernel_python(options()).await?;
-        timings.push(("skill-added".into(), started.elapsed().as_secs_f64()));
-        anyhow::ensure!(second != first, "a changed skill request must select a sibling generation");
-        for (python, version, skill) in [(&first, 1, false), (&second, 1, true)] {
-            let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(python.clone()), cwd: Some(root.clone()), ..Default::default() });
-            managers.push(manager.clone());
-            manager.start(KernelStartOptions::default()).await?;
-            receipts.push(issue44_observe_kernel(&manager, python, &toolchain, version, skill).await?);
-            write_evidence("receipts.json", &serde_json::Value::from(receipts.clone()));
-        }
-        let imported = managers[1].execute("import issue44_skill\nassert issue44_skill.VALUE == 44", ExecuteOptions::default()).await?;
-        anyhow::ensure!(imported.status == ExecuteStatus::Ok, "actual skill import failed");
-        std::fs::write(&runtime_init, format!("{original_init}\nISSUE44_RUNTIME = 2\n"))?;
-        let started = Instant::now();
-        let third = ensure_kernel_python(options()).await?;
-        timings.push(("runtime-updated".into(), started.elapsed().as_secs_f64()));
-        anyhow::ensure!(third != second, "runtime update must select another generation");
-        let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(third.clone()), cwd: Some(root.clone()), ..Default::default() });
-        managers.push(manager.clone());
-        manager.start(KernelStartOptions::default()).await?;
-        receipts.push(issue44_observe_kernel(&manager, &third, &toolchain, 2, true).await?);
-        write_evidence("receipts.json", &serde_json::Value::from(receipts.clone()));
-        for (index, version) in [(0, 1), (1, 1), (2, 2)] {
-            let observed = managers[index].execute(&format!("import importlib, rlm\nimportlib.reload(rlm)\nassert rlm.ISSUE44_RUNTIME == {version}"), ExecuteOptions::default()).await?;
-            anyhow::ensure!(observed.status == ExecuteStatus::Ok, "active kernel code changed: {:?}", observed.error);
-        }
-        for receipt in &receipts[..2] {
-            let path = Path::new(receipt["runtime"].as_str().unwrap_or_default());
-            anyhow::ensure!(issue44_sha256(path)? == receipt["runtime_sha256"].as_str().unwrap_or_default(), "old installed runtime file changed: {}", path.display());
-        }
-        let started = Instant::now();
-        let removed = ensure_kernel_python(EnsureKernelPythonOptions::default()).await?;
-        timings.push(("skill-removed".into(), started.elapsed().as_secs_f64()));
-        anyhow::ensure!(removed != third && removed != first, "removing a skill selects another environment");
-        let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(removed.clone()), cwd: Some(root.clone()), ..Default::default() });
-        managers.push(manager.clone());
-        manager.start(KernelStartOptions::default()).await?;
-        receipts.push(issue44_observe_kernel(&manager, &removed, &toolchain, 2, false).await?);
-        write_evidence("receipts.json", &serde_json::Value::from(receipts.clone()));
-        anyhow::ensure!(std::fs::read(exact.join(".bootstrap-version"))? == original_marker, "published base was mutated");
-        let started = Instant::now();
-        anyhow::ensure!(ensure_kernel_python(options()).await? == third, "identical request must reuse matching published generation");
-        timings.push(("reuse".into(), started.elapsed().as_secs_f64()));
-        let published = std::fs::read_dir(&generations)?
+    let (shutdown, survivors) = issue44_shutdown_and_account(&run).await;
+    fixture.write("shutdown.json", &serde_json::json!({
+        "outcome": outcome,
+        "kernels_started": run.managers.len(),
+        "shutdown": shutdown,
+        "owned_survivors": survivors,
+        "timings_seconds": run.timings,
+        "environment_bytes": run
+            .receipts
+            .iter()
+            .map(|receipt| (receipt["prefix"].clone(), issue44_tree_bytes(Path::new(receipt["prefix"].as_str().unwrap_or_default()))))
+            .collect::<Vec<_>>(),
+    }));
+    assert!(survivors.is_empty(), "owned kernel survived shutdown: {survivors:?}");
+    assert!(shutdown.iter().all(|status| status == "performed"), "owned kernel shutdown not performed: {shutdown:?}");
+    assert_eq!(outcome, "ok", "real installs, imports, and generations must agree (a timeout is a fixture failure)");
+}
+
+/// The synthetic roots, runtime copy, and skill the real-uv verifier owns.
+struct Issue44RealUv {
+    root: PathBuf,
+    cache: PathBuf,
+    toolchain: PathBuf,
+    toolchains: PathBuf,
+    package: PathBuf,
+    runtime_init: PathBuf,
+    original_init: String,
+    exact: PathBuf,
+    skill: KernelPythonSkill,
+}
+
+impl Issue44RealUv {
+    fn prepare() -> Self {
+        let root = tempfile::tempdir().unwrap().keep();
+        eprintln!("issue44 real-uv evidence: {}", root.display());
+        let cache = PathBuf::from(std::env::var("PA_KERNEL_VERIFY_CACHE").expect("explicit private offline cache required"));
+        let target = PathBuf::from(std::env::var("CARGO_TARGET_DIR").expect("private Cargo target required"));
+        assert!(cache.canonicalize().unwrap().starts_with(target.canonicalize().unwrap()));
+        let contents = issue44_cache_contents(&cache);
+        std::fs::write(root.join("cache-contents.json"), serde_json::to_vec_pretty(&contents).unwrap()).unwrap();
+        let missing: Vec<_> = contents.iter().filter(|(_, found)| !**found).map(|(name, _)| name.clone()).collect();
+        assert!(missing.is_empty(), "fixture: offline cache lacks {missing:?}; not product evidence");
+        let approved = PathBuf::from(std::env::var("PA_E2E_KERNEL_PYTHON").expect("approved ABI-2 runtime required"));
+        let interpreter = approved.canonicalize().unwrap();
+        let toolchain = interpreter.parent().unwrap().parent().unwrap().to_path_buf();
+        let toolchains = root.join("python-toolchains");
+        std::fs::create_dir(&toolchains).unwrap();
+        std::os::unix::fs::symlink(&toolchain, toolchains.join(toolchain.file_name().unwrap())).unwrap();
+        let package = root.join("package");
+        let runtime_source = package.join("prime-agent-runtime");
+        copy_runtime_fixture(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prime-agent-runtime"), &runtime_source);
+        let runtime_init = runtime_source.join("src/rlm/__init__.py");
+        let original_init = std::fs::read_to_string(&runtime_init).unwrap();
+        std::fs::write(&runtime_init, format!("{original_init}\nISSUE44_RUNTIME = 1\n")).unwrap();
+        let exact = root.join(format!("generation-{}-{:020}-{}", "a".repeat(20), 1, uuid::Uuid::new_v4()));
+        let skill_dir = root.join("skill");
+        std::fs::create_dir_all(skill_dir.join("src/issue44_skill")).unwrap();
+        let pyproject = skill_dir.join("pyproject.toml");
+        std::fs::write(&pyproject, "[project]\nname='issue44-skill'\nversion='0.1.0'\n[build-system]\nrequires=['hatchling']\nbuild-backend='hatchling.build'\n[tool.hatch.build.targets.wheel]\npackages=['src/issue44_skill']\n").unwrap();
+        std::fs::write(skill_dir.join("src/issue44_skill/__init__.py"), "VALUE = 44\n").unwrap();
+        let skill = KernelPythonSkill { name: "issue44-skill".into(), import_name: "issue44_skill".into(), package_path: skill_dir, pyproject_path: pyproject };
+        Self { root, cache, toolchain, toolchains, package, runtime_init, original_init, exact, skill }
+    }
+
+    fn environment(&self) -> EnvRestore {
+        EnvRestore::configure(&[
+            ("PRIME_AGENT_KERNEL_PYTHON", None),
+            ("PRIME_AGENT_KERNEL_VENV", Some(self.exact.display().to_string())),
+            ("PI_PACKAGE_DIR", Some(self.package.display().to_string())),
+            ("UV_CACHE_DIR", Some(self.cache.display().to_string())),
+            ("UV_PYTHON_INSTALL_DIR", Some(self.toolchains.display().to_string())),
+            ("UV_PYTHON_PREFERENCE", Some("only-managed".into())),
+            ("UV_OFFLINE", Some("1".into())),
+            ("UV_PYTHON_DOWNLOADS", Some("never".into())),
+            ("UV_LINK_MODE", Some("copy".into())),
+        ])
+    }
+
+    fn with_skill(&self) -> EnsureKernelPythonOptions {
+        EnsureKernelPythonOptions { python_skills: vec![self.skill.clone()], on_progress: None }
+    }
+
+    fn set_runtime_version(&self, version: u32) -> std::io::Result<()> {
+        std::fs::write(&self.runtime_init, format!("{}\nISSUE44_RUNTIME = {version}\n", self.original_init))
+    }
+
+    fn write(&self, name: &str, value: &serde_json::Value) {
+        std::fs::write(self.root.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    fn published_siblings(&self) -> std::io::Result<usize> {
+        let root = self.exact.with_file_name(format!("{}.generations", self.exact.file_name().unwrap().to_string_lossy()));
+        Ok(std::fs::read_dir(root)?
             .filter_map(Result::ok)
             .filter(|entry| entry.path().join(".generation-published").is_file())
-            .count();
-        anyhow::ensure!(published == 3, "expected exactly three published sibling generations, found {published}");
-        Ok::<_, anyhow::Error>(())
-    }).await;
+            .count())
+    }
+}
+
+/// The verifier's owned kernels and the evidence recorded as they start.
+#[derive(Default)]
+struct Issue44Run {
+    managers: Vec<ReplKernelManager>,
+    receipts: Vec<serde_json::Value>,
+    timings: Vec<(String, f64)>,
+}
+
+impl Issue44Run {
+    async fn ensure(&mut self, label: &str, options: EnsureKernelPythonOptions) -> anyhow::Result<PathBuf> {
+        let started = std::time::Instant::now();
+        let python = ensure_kernel_python(options).await?;
+        self.timings.push((label.to_string(), started.elapsed().as_secs_f64()));
+        Ok(python)
+    }
+
+    async fn start(&mut self, fixture: &Issue44RealUv, python: &Path, version: u32, skill: bool) -> anyhow::Result<usize> {
+        let manager = ReplKernelManager::new(KernelManagerOptions { python: Some(python.to_path_buf()), cwd: Some(fixture.root.clone()), ..Default::default() });
+        self.managers.push(manager.clone());
+        manager.start(KernelStartOptions::default()).await?;
+        self.receipts.push(issue44_observe_kernel(&manager, python, &fixture.toolchain, version, skill).await?);
+        fixture.write("receipts.json", &serde_json::Value::from(self.receipts.clone()));
+        Ok(self.managers.len() - 1)
+    }
+
+    async fn run(&self, index: usize, code: &str) -> anyhow::Result<()> {
+        let observed = self.managers[index].execute(code, pa_core::kernel::shared::ExecuteOptions::default()).await?;
+        anyhow::ensure!(observed.status == pa_core::kernel::shared::ExecuteStatus::Ok, "kernel {index} check failed: {:?}", observed.error);
+        Ok(())
+    }
+}
+
+/// Base -> skill added -> runtime updated -> skill removed -> reuse, with the
+/// older kernels kept live and re-checked after each change.
+async fn issue44_real_uv_sequence(fixture: &Issue44RealUv, run: &mut Issue44Run) -> anyhow::Result<()> {
+    let first = run.ensure("base", EnsureKernelPythonOptions::default()).await?;
+    anyhow::ensure!(first == fixture.exact.join("bin/python"), "first bootstrap must use exact base");
+    let original_marker = std::fs::read(fixture.exact.join(".bootstrap-version"))?;
+    let second = run.ensure("skill-added", fixture.with_skill()).await?;
+    anyhow::ensure!(second != first, "a changed skill request must select a sibling generation");
+    run.start(fixture, &first, 1, false).await?;
+    let skilled = run.start(fixture, &second, 1, true).await?;
+    run.run(skilled, "import issue44_skill\nassert issue44_skill.VALUE == 44").await?;
+    fixture.set_runtime_version(2)?;
+    let third = run.ensure("runtime-updated", fixture.with_skill()).await?;
+    anyhow::ensure!(third != second, "runtime update must select another generation");
+    run.start(fixture, &third, 2, true).await?;
+    for (index, version) in [(0, 1), (1, 1), (2, 2)] {
+        run.run(index, &format!("import importlib, rlm\nimportlib.reload(rlm)\nassert rlm.ISSUE44_RUNTIME == {version}")).await?;
+    }
+    for receipt in &run.receipts[..2] {
+        let path = Path::new(receipt["runtime"].as_str().unwrap_or_default());
+        anyhow::ensure!(issue44_sha256(path)? == receipt["runtime_sha256"].as_str().unwrap_or_default(), "old installed runtime file changed: {}", path.display());
+    }
+    let removed = run.ensure("skill-removed", EnsureKernelPythonOptions::default()).await?;
+    anyhow::ensure!(removed != third && removed != first, "removing a skill selects another environment");
+    run.start(fixture, &removed, 2, false).await?;
+    anyhow::ensure!(std::fs::read(fixture.exact.join(".bootstrap-version"))? == original_marker, "published base was mutated");
+    anyhow::ensure!(run.ensure("reuse", fixture.with_skill()).await? == third, "identical request must reuse matching published generation");
+    let published = fixture.published_siblings()?;
+    anyhow::ensure!(published == 3, "expected exactly three published sibling generations, found {published}");
+    Ok(())
+}
+
+/// Shut every owned kernel down, kill any that did not shut down, and list
+/// receipts whose PID and start identity still name a live process.
+async fn issue44_shutdown_and_account(run: &Issue44Run) -> (Vec<String>, Vec<serde_json::Value>) {
+    use pa_core::kernel::shared::KernelShutdownOptions;
     let mut shutdown = Vec::new();
-    for manager in &managers {
-        let status = match tokio::time::timeout(Duration::from_secs(20), manager.shutdown(KernelShutdownOptions::default())).await {
+    for manager in &run.managers {
+        let status = match tokio::time::timeout(std::time::Duration::from_secs(20), manager.shutdown(KernelShutdownOptions::default())).await {
             Ok(Ok(true)) => "performed".to_string(),
             Ok(Ok(false)) => { manager.kill(); "not-performed-then-killed".to_string() }
             Ok(Err(error)) => { manager.kill(); format!("error-then-killed: {error:#}") }
@@ -1668,7 +1740,8 @@ async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
         };
         shutdown.push(status);
     }
-    let survivors: Vec<_> = receipts
+    let survivors = run
+        .receipts
         .iter()
         .filter(|receipt| {
             let Some(pid) = receipt["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()) else {
@@ -1685,21 +1758,7 @@ async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
         })
         .cloned()
         .collect();
-    let sizes: Vec<_> = receipts
-        .iter()
-        .map(|receipt| (receipt["prefix"].clone(), issue44_tree_bytes(Path::new(receipt["prefix"].as_str().unwrap_or_default()))))
-        .collect();
-    write_evidence("shutdown.json", &serde_json::json!({
-        "outcome": outcome.as_ref().map_or_else(|_| "timeout".to_string(), |result| result.as_ref().map_or_else(|error| format!("error: {error:#}"), |_| "ok".to_string())),
-        "kernels_started": managers.len(),
-        "shutdown": shutdown,
-        "owned_survivors": survivors,
-        "timings_seconds": timings,
-        "environment_bytes": sizes,
-    }));
-    assert!(survivors.is_empty(), "owned kernel survived shutdown: {survivors:?}");
-    assert!(shutdown.iter().all(|status| status == "performed"), "owned kernel shutdown not performed: {shutdown:?}");
-    outcome.expect("bounded real-uv verifier (timeout is a fixture failure, not product evidence)").expect("real installs, imports, and generations must agree");
+    (shutdown, survivors)
 }
 
 /// One live kernel's own report: prefix, base interpreter, version, runtime
@@ -1761,7 +1820,7 @@ fn issue44_cache_contents(cache: &Path) -> Vec<(String, bool)> {
         "pandas", "numpy", "scipy", "bs4", "lxml", "pydantic",
     ];
     let archives: Vec<PathBuf> = std::fs::read_dir(cache.join("archive-v0"))
-        .map(|entries| entries.filter_map(Result::ok).map(|entry| std::fs::DirEntry::path(&entry)).collect())
+        .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).collect())
         .unwrap_or_default();
     names
         .iter()
