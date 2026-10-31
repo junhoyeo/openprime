@@ -85,15 +85,20 @@ pub(super) fn force_stop_tracked_workers(
 }
 
 /// Identity-gated stop: SIGTERM the worker (it exits keeping its resume entry),
-/// then SIGKILL if it hangs. The start-id gate defeats pid reuse.
+/// then SIGKILL if it hangs. The start-id gate defeats pid reuse. This external,
+/// best-effort `--force` path refuses a live pid with no recorded identity at
+/// all to verify against, rather than trusting liveness alone (#37/#38):
+/// unlike some lease-internal callers, nothing else here could catch a pid
+/// reuse if this signaled blind.
 pub(super) fn stop_tracked_process(pid: u32, expected_start_id: Option<&str>) -> bool {
     if !is_alive(pid) {
         return true;
     }
-    if let Some(expected) = expected_start_id {
-        if process_start_id(pid).as_deref() != Some(expected) {
-            return false;
-        }
+    let Some(expected) = expected_start_id else {
+        return false;
+    };
+    if process_start_id(pid).as_deref() != Some(expected) {
+        return false;
     }
     let _ = kill_pid(pid as i32, Signal::Term);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
@@ -103,10 +108,8 @@ pub(super) fn stop_tracked_process(pid: u32, expected_start_id: Option<&str>) ->
     if !is_alive(pid) {
         return true;
     }
-    if let Some(expected) = expected_start_id {
-        if process_start_id(pid).as_deref() != Some(expected) {
-            return false;
-        }
+    if process_start_id(pid).as_deref() != Some(expected) {
+        return false;
     }
     let _ = kill_pid(pid as i32, Signal::Kill);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -250,6 +253,35 @@ mod tests {
             socket_dir: Some(dir.join("agent").join("sockets")),
             default_socket_path: dir.join("agent").join("sockets").join("daemon.sock"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_38_identity_free_tracked_worker_is_not_signaled_or_untracked() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let descriptors = dir.path().join("daemon-workers/fixture");
+        std::fs::create_dir_all(&descriptors).unwrap();
+        let supervisor = dir.path().join("daemon.sock");
+        let socket = dir.path().join("worker.sock");
+        let journal = dir.path().join("worker.recovery.jsonl");
+        let descriptor = descriptors.join("worker.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "workerId":"worker", "pid":child.0.id(), "supervisorSocketPath":supervisor,
+            "socketPath":socket, "recoveryJournalPath":journal
+        })).unwrap();
+        std::fs::write(&descriptor, &bytes).unwrap();
+        std::fs::write(&journal, b"durable work").unwrap();
+        std::fs::write(&socket, b"endpoint marker").unwrap();
+        assert!(!force_stop_tracked_workers(&supervisor, dir.path()).is_empty());
+        assert_eq!(std::fs::read(descriptor).unwrap(), bytes);
+        assert_eq!(std::fs::read(journal).unwrap(), b"durable work");
+        assert_eq!(std::fs::read(socket).unwrap(), b"endpoint marker");
+        assert!(child.0.try_wait().unwrap().is_none());
     }
 
     #[test]

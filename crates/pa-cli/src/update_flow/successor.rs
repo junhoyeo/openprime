@@ -113,14 +113,34 @@ pub async fn wait_for_exit(identity: &UpdateProcessIdentity, budget_ms: u64) -> 
     }
 }
 
-/// Only a known-dead PID or an observed different birth identity proves exit.
+/// Only a known-dead PID or an observed different birth identity proves
+/// exit. For a pair where either side uses the versioned `kind:payload`
+/// process-start-id scheme (contains a `:`), only a provable mismatch
+/// WITHIN that scheme counts - an ambiguous/legacy-prefix/malformed
+/// comparison must never be treated as proof the predecessor's identity
+/// actually changed (#37): a live predecessor with an unverifiable
+/// identity is not an exited one. A plain opaque token on both sides
+/// (no `:` at all, not attempting that scheme) falls back to a direct
+/// inequality, which carries no such cross-format ambiguity.
 fn process_exit_observed(
     alive: Option<bool>,
     expected: Option<&str>,
     observed: Option<&str>,
 ) -> bool {
-    alive == Some(false)
-        || matches!((alive, expected, observed), (Some(true), Some(expected), Some(observed)) if expected != observed)
+    if alive == Some(false) {
+        return true;
+    }
+    let (Some(true), Some(expected), Some(observed)) = (alive, expected, observed) else {
+        return false;
+    };
+    if expected.contains(':') || observed.contains(':') {
+        matches!(
+            pa_types::platform::process::compare_process_start_ids(Some(expected), Some(observed)),
+            pa_types::platform::process::ProcessStartIdComparison::Mismatch
+        )
+    } else {
+        expected != observed
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +149,22 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn issue_37_unverifiable_live_predecessor_does_not_count_as_exited() {
+        let observed = pa_daemon::lease::get_process_start_id(std::process::id()).unwrap();
+        let mut starts = match observed.strip_prefix("ps:").or_else(|| observed.strip_prefix("ps2:")) {
+            Some(payload) => vec![format!("ps:{payload}"), format!("ps2:{payload}")],
+            None => vec![observed],
+        };
+        starts.extend(["future:opaque", "unsupported:birth", "proc:malformed"].map(str::to_string));
+        for start in &starts {
+            let identity = identity_from_hello(&json!({
+                "supervisorPid": std::process::id(), "supervisorProcessStartId": start
+            }));
+            assert!(!wait_for_exit(&identity, 1).await, "reported exit for {start}");
+        }
+    }
 
     #[test]
     fn unknown_process_probes_do_not_prove_predecessor_exit() {

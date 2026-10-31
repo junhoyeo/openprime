@@ -168,11 +168,17 @@ fn record_is_active(record: &Value) -> bool {
     else {
         return true;
     };
-    if matches!(pa_daemon::lease::is_process_alive(pid), Ok(false)) {
-        return false;
-    }
-    !matches!((record["processStartId"].as_str(), pa_daemon::lease::get_process_start_id(pid)),
-        (Some(expected), Some(observed)) if expected != observed)
+    // Only a confirmed exit (or a provable pid-reuse mismatch within the
+    // versioned kind:payload scheme) counts as inactive; an ambiguous or
+    // unverifiable identity comparison - unlike a plain string mismatch -
+    // must never let a live holder's admission be taken over (#37).
+    !matches!(
+        pa_types::platform::process::observe_process_identity(
+            pid,
+            record["processStartId"].as_str()
+        ),
+        pa_types::platform::process::ProcessIdentity::Gone
+    )
 }
 
 /// No foreign stale guard is reclaimed here. TS owns that recovery protocol;
@@ -209,6 +215,18 @@ async fn guarded<T>(directory: &Path, operation: impl FnOnce() -> Result<T>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_37_unverifiable_live_shutdown_admission_blocks_takeover() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shutdown-admission.json");
+        let owner = json!({"version":1, "token":"original", "pid":std::process::id(),
+            "processStartId":"unsupported:birth", "expiresAt":"2099-01-01T00:00:00.000Z"});
+        super::super::legacy_restart::persist(&path, &owner).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(Admission::acquire(&[directory.path().to_path_buf()]).await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
 
     #[tokio::test]
     async fn release_preserves_a_replacement_owners_token() {

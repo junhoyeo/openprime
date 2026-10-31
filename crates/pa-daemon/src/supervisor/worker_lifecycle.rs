@@ -844,8 +844,20 @@ impl Supervisor {
             }
         }
         // The per-session stop shares the terminal-stop contract: the descriptor dies only
-        // with a provably-gone process — a worker that missed the shutdown stays adoptable.
-        self.retire_worker_after_stop(resident).await;
+        // with a provably-gone process — a worker that missed the shutdown, or whose
+        // identity could not be verified either way, stays adoptable.
+        let retired = self.retire_worker_after_stop(resident).await;
+        if !retired {
+            // The durable stop-requested tombstone above already persisted (so the next
+            // boot still retries this stop and never adopts it as healthy), but the
+            // process itself could not be proven gone: this call did NOT actually stop
+            // it, so it must stay tracked and routable here, and the caller must see a
+            // failure rather than a silent success (#37/#38).
+            anyhow::bail!(
+                "session worker {} could not be confirmed stopped (survived the escalation, or its identity could not be verified); its process may still be running and remains tracked for a later retry",
+                resident.worker_id
+            );
+        }
         // A client-owned (ephemeral) worker's scheduled jobs die with the
         // registration (TS `cancelEphemeralWorkerScheduledJobs`).
         let ephemeral = resident.descriptor.lock().await.owner_client_id.is_some();
@@ -1191,6 +1203,59 @@ mod tests {
                 "liveness={alive:?}, expected={expected:?}, current={current:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn issue_38_unverifiable_stop_keeps_the_live_worker_tracked() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(Command::new("sh")
+            .args(["-c", "printf 'ready\n'; read answer"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+        if ready.is_err() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        reader.join().unwrap();
+        assert_eq!(ready.unwrap().unwrap(), "ready\n");
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = supervisor_in(dir.path());
+        let journal = supervisor.descriptor_dir.join("unverified.recovery.jsonl");
+        std::fs::write(&journal, b"durable work").unwrap();
+        let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version": 2, "workerId": "unverified", "pid": child.0.id(),
+            "processStartId": "unsupported:birth", "socketPath": dir.path().join("worker.sock"),
+            "recoveryJournalPath": journal, "supervisorSocketPath": supervisor.options.socket_path,
+            "authenticationToken": "synthetic", "rootActiveSessionId": "unverified",
+            "createdAt": "2026-10-07T00:00:00Z", "updatedAt": "2026-10-07T00:00:00Z",
+            "lifecycle": "ready", "createCommand": {}, "consecutiveFailures": 0
+        })).unwrap();
+        let path = supervisor.descriptor_dir.join("unverified.json");
+        persist_worker(&path, &descriptor).unwrap();
+        let resident = ResidentWorker::new("unverified".into(), descriptor, path.clone());
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+        assert!(supervisor.stop_worker(&resident).await.is_err());
+        assert!(supervisor.registry.get("unverified").await.is_some());
+        let persisted: DaemonWorkerDescriptor = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(persisted.stop_requested_at.is_some());
+        assert_eq!(persisted.pid, u64::from(child.0.id()));
+        assert_eq!(std::fs::read(journal).unwrap(), b"durable work");
+        assert!(child.0.try_wait().unwrap().is_none());
     }
 
     #[tokio::test]

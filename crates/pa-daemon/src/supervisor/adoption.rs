@@ -11,18 +11,68 @@ use super::{
 };
 
 /// An unobservable start identity does not prove that a live pid was recycled.
-/// Only an observed mismatch proves the descriptor's process is gone.
+/// Only an observed mismatch proves the descriptor's process is gone. For a
+/// pair where either side uses the versioned `kind:payload` process-start-id
+/// scheme (contains a `:`), only a provable mismatch WITHIN that scheme
+/// counts - an ambiguous/legacy-prefix/malformed comparison must never be
+/// treated as proof of pid reuse (#37): a live descriptor with an
+/// unverifiable identity stays adopted, not dropped. A plain opaque token
+/// on both sides (no `:` at all) keeps the direct-equality comparison the
+/// existing `recorded`/`recycled` test fixture values rely on.
 fn recorded_process_alive(
     alive: Option<bool>,
     expected: Option<&str>,
     observed: Option<&str>,
 ) -> bool {
-    alive != Some(false) && (expected.is_none() || observed.is_none() || expected == observed)
+    if alive == Some(false) {
+        return false;
+    }
+    let (Some(expected), Some(observed)) = (expected, observed) else {
+        return true;
+    };
+    if expected.contains(':') || observed.contains(':') {
+        !matches!(
+            pa_types::platform::process::compare_process_start_ids(Some(expected), Some(observed)),
+            pa_types::platform::process::ProcessStartIdComparison::Mismatch
+        )
+    } else {
+        expected == observed
+    }
 }
 
 #[cfg(test)]
 mod recorded_process_tests {
     use super::recorded_process_alive;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue_37_unverifiable_live_descriptor_is_kept_in_the_adoption_registry() {
+        use super::*;
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("agent")).unwrap();
+        let supervisor = Arc::new(Supervisor::new(super::super::SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"), agent_dir: dir.path().join("agent")
+        }).unwrap());
+        let descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_value(json!({
+            "version":2, "workerId":"legacy", "pid":child.0.id(), "processStartId":"unsupported:birth",
+            "socketPath":dir.path().join("missing.sock"), "recoveryJournalPath":dir.path().join("journal.jsonl"),
+            "supervisorSocketPath":supervisor.options.socket_path, "authenticationToken":"synthetic",
+            "rootActiveSessionId":"legacy", "createdAt":"2026-10-07T00:00:00Z", "updatedAt":"2026-10-07T00:00:00Z",
+            "lifecycle":"ready", "createCommand":{}, "consecutiveFailures":0
+        })).unwrap();
+        let path = supervisor.descriptor_dir.join("legacy.json");
+        crate::descriptor::persist_worker(&path, &descriptor).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        supervisor.adopt_persisted_worker(path.clone(), descriptor, AdoptionBoot::PlainStartup).await;
+        assert!(supervisor.registry.get("legacy").await.is_some());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
 
     #[test]
     fn unobservable_start_id_keeps_live_tombstone_owned_by_recorded_pid() {
