@@ -1675,7 +1675,7 @@ async fn issue44_public_entry_refusal_creates_no_explicit_parent() {
 }
 
 /// Explicit acceptance verifier: uses real offline uv installs and the approved
-/// read-only CPython toolchain. Run with --ignored --exact, never auto-skip.
+/// read-only `CPython` toolchain. Run with --ignored --exact, never auto-skip.
 /// It proves sequential selection, real imports, and old-kernel survival; it
 /// does not prove cross-process publication (same-key calls in one process
 /// share one in-flight bootstrap).

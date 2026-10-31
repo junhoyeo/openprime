@@ -84,12 +84,12 @@ pub fn file_mode(_path: &Path) -> Option<u32> {
 }
 
 /// Whether ownership metadata has the platform's private-file protection.
-/// Callers inspect with symlink_metadata first; this never repairs permissions.
+/// Callers inspect with `symlink_metadata` first; this never repairs permissions.
 #[cfg(unix)]
 pub(crate) fn is_private_owner_metadata(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     metadata.uid() == nix::unistd::Uid::effective().as_raw()
-        && metadata.permissions().mode() & 0o077 == 0
+        && metadata.permissions().mode().trailing_zeros() >= 6
 }
 
 #[cfg(not(unix))]
