@@ -67,6 +67,18 @@ fn fake_uv(root: &Path) -> (PathBuf, PathBuf) {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let log = root.join("uv.log");
+    // /bin/sh may materialize heredocs outside TMPDIR on macOS. Keep
+    // every fixture byte inside the owned root instead.
+    write_executable(
+        &bin.join("python-fixture"),
+        r#"#!/bin/sh
+if [ "${UV_FAIL_SKILL:-}" = "1" ] && [ "${2:-}" = "import broken_skill" ]; then exit 1; fi
+if [ "${FAKE_MISSING_DEFAULT:-}" = "1" ]; then
+  case "${2:-}" in *pandas*) exit 1 ;; esac
+fi
+exit 0
+"#,
+    );
     write_executable(
         &bin.join("uv"),
         r#"#!/bin/sh
@@ -95,15 +107,7 @@ if [ "$1" = "venv" ]; then
     cat "$UV_RELEASE_FIFO" >/dev/null
   fi
   mkdir -p "$target/bin"
-  cat > "$target/bin/python" <<'PY'
-#!/bin/sh
-if [ "${UV_FAIL_SKILL:-}" = "1" ] && [ "${2:-}" = "import broken_skill" ]; then exit 1; fi
-if [ "${FAKE_MISSING_DEFAULT:-}" = "1" ]; then
-  case "${2:-}" in *pandas*) exit 1 ;; esac
-fi
-exit 0
-PY
-  chmod +x "$target/bin/python"
+  cp "$(dirname "$0")/python-fixture" "$target/bin/python"
   exit 0
 fi
 if [ "$1" = "pip" ]; then
@@ -755,16 +759,21 @@ fn write_build_record_with_start_id(
     owner_pid: u32,
     start_id: Option<&str>,
 ) {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = std::fs::metadata(identity_of).unwrap();
+    let parent = std::fs::metadata(exact.parent().unwrap()).unwrap();
     let record = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "token": "00000000-0000-4000-8000-000000000000",
         "directory_identity": { "volume": metadata.dev(), "file": metadata.ino() },
+        "path": exact.parent().unwrap().canonicalize().unwrap().join(exact.file_name().unwrap()),
+        "parent_identity": { "volume": parent.dev(), "file": parent.ino() },
         "owner": { "pid": owner_pid, "process_start_id": start_id },
     });
-    std::fs::write(build_record_path(exact), format!("{record}\n")).unwrap();
+    let path = build_record_path(exact);
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 async fn assert_refused_untouched(exact: &Path, log: &Path) {
@@ -1047,13 +1056,15 @@ exit 0
 }
 
 #[tokio::test]
-async fn managed_optional_skill_failure_is_immutable_truthful_and_reusable() {
+async fn issue44_managed_and_explicit_optional_skill_failure_is_immutable_truthful_and_reusable() {
     let _serial = ENV_LOCK.lock().await;
+    for override_name in [None, Some("explicit-kernel-venv")] {
     invalidate_runtime_probe_cache();
     let root = tempfile::tempdir().unwrap();
     let package = runtime_fixture(root.path());
     let (bin, log) = fake_uv(root.path());
     let _env = bootstrap_env(root.path(), &bin, &package, &log);
+    let _explicit = EnvRestore::configure(&[("PRIME_AGENT_KERNEL_VENV", override_name.map(|name| root.path().join(name).display().to_string()))]);
     let first = ensure_kernel_python(EnsureKernelPythonOptions::default())
         .await
         .unwrap();
@@ -1138,6 +1149,7 @@ async fn managed_optional_skill_failure_is_immutable_truthful_and_reusable() {
         "changed requested fingerprint gets a new generation"
     );
     assert_eq!(std::fs::read_to_string(partial_sentinel).unwrap(), "yes");
+    }
 }
 
 #[tokio::test]
@@ -1275,7 +1287,7 @@ async fn exact_override_identity_swap_is_retained_and_never_accepted() {
     );
     assert!(exact.with_extension("owned-before-swap").exists());
     assert!(abandoned_siblings(&exact).is_empty());
-    assert!(!build_record_path(&exact).exists());
+    assert!(build_record_path(&exact).exists(), "unknown ownership is retained");
 }
 
 #[tokio::test]
@@ -1360,4 +1372,317 @@ async fn direct_manager_probe_uses_the_exact_kernel_environment() {
         .expect_err("probe must see interpreter-affecting kernel env overlays");
     assert!(error.to_string().contains("spawn environment"), "{error:#}");
     assert!(!spawned.exists());
+}
+
+#[tokio::test]
+async fn issue44_enrolled_explicit_root_updates_without_mutating_the_base() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+    let first = ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap();
+    let original = std::fs::read(exact.join(".bootstrap-version")).unwrap();
+    std::fs::write(package.join("prime-agent-runtime/src/rlm/repl.py"), "RUNTIME = 44\n").unwrap();
+    let (second, concurrent) = tokio::join!(
+        ensure_kernel_python(EnsureKernelPythonOptions::default()),
+        ensure_kernel_python(EnsureKernelPythonOptions::default()),
+    );
+    let second = second.expect("issue44: enrolled explicit root selects an immutable sibling");
+    assert_eq!(second, concurrent.unwrap());
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read(exact.join(".bootstrap-version")).unwrap(), original);
+    let generation = second.parent().unwrap().parent().unwrap();
+    assert_eq!(generation.parent().unwrap(), exact.with_file_name("explicit-kernel-venv.generations"));
+    assert!(generation.join(".generation-published").is_file());
+    assert!(generation.join(".leases").is_dir());
+    invalidate_runtime_probe_cache();
+    assert_eq!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap(), second);
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert_eq!(calls.lines().filter(|line| line.starts_with("venv ")).count(), 2);
+    assert_eq!(calls.lines().filter(|line| line.starts_with("pip ") && line.contains(&first.display().to_string())).count(), 1);
+}
+
+#[tokio::test]
+async fn issue44_copied_or_damaged_ownership_never_authorizes_generation_updates() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+    ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap();
+    let ownership = exact.with_file_name("explicit-kernel-venv.prime-agent-managed.json");
+    let original = std::fs::read(&ownership).expect("new explicit builds persist ownership");
+    std::fs::write(package.join("prime-agent-runtime/src/rlm/repl.py"), "RUNTIME = 44\n").unwrap();
+    let before = std::fs::read(&log).unwrap();
+    for invalid in [b"{}".to_vec(), b"not-json".to_vec()] {
+        std::fs::write(&ownership, invalid).unwrap();
+        assert!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.is_err());
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+    }
+    std::fs::write(&ownership, &original).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&ownership).unwrap().permissions().mode() & 0o777, 0o600);
+    std::fs::set_permissions(&ownership, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.is_err());
+    assert_eq!(std::fs::metadata(&ownership).unwrap().permissions().mode() & 0o777, 0o666, "no permission repair");
+    std::fs::set_permissions(&ownership, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let preserved = root.path().join("original-owner-record");
+    std::fs::rename(&ownership, &preserved).unwrap();
+    std::os::unix::fs::symlink(&preserved, &ownership).unwrap();
+    assert!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.is_err());
+    assert!(ownership.is_symlink());
+    std::fs::remove_file(&ownership).unwrap();
+    std::fs::rename(&preserved, &ownership).unwrap();
+    let displaced = root.path().join("retained-original");
+    std::fs::rename(&exact, &displaced).unwrap();
+    std::fs::create_dir(&exact).unwrap();
+    std::fs::copy(displaced.join(".bootstrap-version"), exact.join(".bootstrap-version")).unwrap();
+    std::fs::write(exact.join("foreign"), "retained").unwrap();
+    assert!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.is_err());
+    assert_eq!(std::fs::read_to_string(exact.join("foreign")).unwrap(), "retained");
+    assert_eq!(std::fs::read(&log).unwrap(), before);
+    assert_eq!(std::fs::read(&ownership).unwrap(), original);
+    assert!(!root.path().join("explicit-kernel-venv.generations").exists());
+}
+
+#[tokio::test]
+async fn issue44_current_legacy_root_is_read_only_but_not_silently_enrolled() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+    let first = ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap();
+    let ownership = exact.with_file_name("explicit-kernel-venv.prime-agent-managed.json");
+    std::fs::remove_file(&ownership).unwrap(); // represents an old published explicit environment
+    let before = std::fs::read(&log).unwrap();
+    let observed: Vec<_> = [exact.clone(), exact.join(".bootstrap-version"), first.clone()]
+        .into_iter().map(|path| {
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let bytes = path.is_file().then(|| std::fs::read(&path).unwrap());
+            (path, modified, bytes)
+        }).collect();
+    assert_eq!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap(), first);
+    for (path, modified, bytes) in observed {
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        if let Some(bytes) = bytes { assert_eq!(std::fs::read(path).unwrap(), bytes); }
+    }
+    assert!(!ownership.exists(), "current legacy paths must not be adopted");
+    std::fs::write(&ownership, "unknown-management-record").unwrap();
+    let ownership_mtime = std::fs::metadata(&ownership).unwrap().modified().unwrap();
+    assert_eq!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap(), first);
+    assert_eq!(std::fs::read_to_string(&ownership).unwrap(), "unknown-management-record");
+    assert_eq!(std::fs::metadata(&ownership).unwrap().modified().unwrap(), ownership_mtime);
+    std::fs::remove_file(&ownership).unwrap();
+    std::fs::write(package.join("prime-agent-runtime/src/rlm/repl.py"), "RUNTIME = 44\n").unwrap();
+    let error = ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap_err();
+    assert!(error.to_string().contains("new, missing PRIME_AGENT_KERNEL_VENV"), "{error:#}");
+    assert_eq!(std::fs::read(&log).unwrap(), before);
+    assert!(!root.path().join("explicit-kernel-venv.generations").exists());
+}
+
+#[tokio::test]
+async fn issue44_interrupted_validated_base_finishes_publication_before_updating() {
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+    let first = ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap();
+    let ownership = exact.with_file_name("explicit-kernel-venv.prime-agent-managed.json");
+    std::fs::remove_file(&ownership).unwrap();
+    write_build_record(&exact, &exact, dead_pid());
+    assert_eq!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap(), first);
+    assert!(ownership.is_file(), "dead validated build is published after revalidation");
+    assert!(!build_record_path(&exact).exists());
+    std::fs::write(package.join("prime-agent-runtime/src/rlm/repl.py"), "RUNTIME = 44\n").unwrap();
+    assert_ne!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap(), first);
+}
+
+/// Explicit acceptance verifier: uses real offline uv installs and the approved
+/// read-only CPython toolchain. Run with --ignored --exact, never auto-skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual: requires a coordinator-owned offline uv cache and ABI-2 test runtime"]
+async fn issue44_real_uv_keeps_two_live_kernels_on_immutable_generations() {
+    use pa_core::kernel::shared::{ExecuteOptions, ExecuteStatus, KernelShutdownOptions};
+    use sha2::Digest;
+    use std::time::Duration;
+
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap().keep();
+    eprintln!("issue44 real-uv evidence: {}", root.display());
+    let cache = PathBuf::from(std::env::var("PA_KERNEL_VERIFY_CACHE").expect("explicit private offline cache required"));
+    let target = PathBuf::from(std::env::var("CARGO_TARGET_DIR").expect("private Cargo target required"));
+    assert!(cache.canonicalize().unwrap().starts_with(target.canonicalize().unwrap()));
+    let approved = PathBuf::from(std::env::var("PA_E2E_KERNEL_PYTHON").expect("approved ABI-2 runtime required"));
+    let interpreter = approved.canonicalize().unwrap();
+    let toolchain = interpreter.parent().unwrap().parent().unwrap();
+    let toolchains = root.join("python-toolchains");
+    std::fs::create_dir(&toolchains).unwrap();
+    std::os::unix::fs::symlink(toolchain, toolchains.join(toolchain.file_name().unwrap())).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prime-agent-runtime");
+    let package = root.join("package");
+    let runtime_source = package.join("prime-agent-runtime");
+    copy_runtime_fixture(&source, &runtime_source);
+    let runtime_init = runtime_source.join("src/rlm/__init__.py");
+    let original_init = std::fs::read_to_string(&runtime_init).unwrap();
+    std::fs::write(&runtime_init, format!("{original_init}\nISSUE44_RUNTIME = 1\n")).unwrap();
+    let exact = root.join(format!("generation-{}-{:020}-{}", "a".repeat(20), 1, uuid::Uuid::new_v4()));
+    let skill = root.join("skill");
+    std::fs::create_dir_all(skill.join("src/issue44_skill")).unwrap();
+    let pyproject = skill.join("pyproject.toml");
+    std::fs::write(&pyproject, "[project]\nname='issue44-skill'\nversion='0.1.0'\n[build-system]\nrequires=['hatchling']\nbuild-backend='hatchling.build'\n[tool.hatch.build.targets.wheel]\npackages=['src/issue44_skill']\n").unwrap();
+    std::fs::write(skill.join("src/issue44_skill/__init__.py"), "VALUE = 44\n").unwrap();
+    let python_skill = KernelPythonSkill { name: "issue44-skill".into(), import_name: "issue44_skill".into(), package_path: skill, pyproject_path: pyproject };
+    let options = || EnsureKernelPythonOptions { python_skills: vec![python_skill.clone()], on_progress: None };
+    let _env = EnvRestore::configure(&[
+        ("PRIME_AGENT_KERNEL_PYTHON", None),
+        ("PRIME_AGENT_KERNEL_VENV", Some(exact.display().to_string())),
+        ("PI_PACKAGE_DIR", Some(package.display().to_string())),
+        ("UV_CACHE_DIR", Some(cache.display().to_string())),
+        ("UV_PYTHON_INSTALL_DIR", Some(toolchains.display().to_string())),
+        ("UV_OFFLINE", Some("1".into())),
+        ("UV_PYTHON_DOWNLOADS", Some("never".into())),
+        ("UV_LINK_MODE", Some("copy".into())),
+    ]);
+    let mut managers = Vec::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(240), async {
+        let first = ensure_kernel_python(EnsureKernelPythonOptions::default()).await?;
+        anyhow::ensure!(first == exact.join("bin/python"), "first bootstrap must use exact base");
+        let original_marker = std::fs::read(exact.join(".bootstrap-version"))?;
+        let first_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(first.clone()), cwd: Some(root.clone()), ..Default::default() });
+        managers.push(first_manager.clone());
+        first_manager.start(KernelStartOptions::default()).await?;
+        let (second, concurrent) = tokio::join!(ensure_kernel_python(options()), ensure_kernel_python(options()));
+        let second = second?;
+        anyhow::ensure!(second == concurrent? && second != first, "changed skill request must publish exactly one sibling");
+        let second_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(second.clone()), cwd: Some(root.clone()), ..Default::default() });
+        managers.push(second_manager.clone());
+        second_manager.start(KernelStartOptions::default()).await?;
+        let mut receipts = Vec::new();
+        let mut installed_hashes = Vec::new();
+        for (manager, python, skill_expected) in [(&first_manager, &first, false), (&second_manager, &second, true)] {
+            let expected = python.parent().unwrap().parent().unwrap();
+            let check = format!("import sys, json, importlib.util, rlm\nfrom pathlib import Path\nassert Path(sys.prefix) == Path({:?})\nassert Path(rlm.__file__).is_relative_to(Path(sys.prefix))\nassert type(rlm.RLM_RUNTIME_ABI) is int and rlm.RLM_RUNTIME_ABI == 2\nassert rlm.ISSUE44_RUNTIME == 1\nassert (importlib.util.find_spec('issue44_skill') is not None) == {}\nprint(json.dumps(dict(prefix=sys.prefix, runtime=rlm.__file__, abi=rlm.RLM_RUNTIME_ABI, code=rlm.ISSUE44_RUNTIME)))", expected.display().to_string(), if skill_expected { "True" } else { "False" });
+            let observed = manager.execute(&check, ExecuteOptions::default()).await?;
+            anyhow::ensure!(observed.status == ExecuteStatus::Ok, "real kernel check failed: {:?}", observed.error);
+            let observation: serde_json::Value = serde_json::from_str(observed.stdout.trim())?;
+            let installed = PathBuf::from(observation["runtime"].as_str().ok_or_else(|| anyhow::anyhow!("missing actual module origin"))?);
+            anyhow::ensure!(installed.starts_with(expected), "actual runtime module escaped selected environment");
+            let hash = format!("{:x}", sha2::Sha256::digest(std::fs::read(&installed)?));
+            installed_hashes.push((installed, hash));
+            let pid = manager.process_id().ok_or_else(|| anyhow::anyhow!("missing owned kernel PID"))?;
+            receipts.push(serde_json::json!({"python": python, "pid": pid, "start": pa_types::platform::process::process_start_id(u32::try_from(pid)?), "observed": observed.stdout}));
+        }
+        std::fs::write(root.join("receipts.json"), serde_json::to_vec_pretty(&receipts)?)?;
+        let imported = second_manager.execute("import issue44_skill\nassert issue44_skill.VALUE == 44", ExecuteOptions::default()).await?;
+        anyhow::ensure!(imported.status == ExecuteStatus::Ok, "actual skill import failed");
+        std::fs::write(&runtime_init, format!("{original_init}\nISSUE44_RUNTIME = 2\n"))?;
+        let third = ensure_kernel_python(options()).await?;
+        anyhow::ensure!(third != second, "runtime update must select another generation");
+        let third_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(third.clone()), cwd: Some(root.clone()), ..Default::default() });
+        managers.push(third_manager.clone());
+        third_manager.start(KernelStartOptions::default()).await?;
+        let third_pid = third_manager.process_id().ok_or_else(|| anyhow::anyhow!("missing third kernel PID"))?;
+        receipts.push(serde_json::json!({"python": third, "pid": third_pid, "start": pa_types::platform::process::process_start_id(u32::try_from(third_pid)?)}));
+        std::fs::write(root.join("receipts.json"), serde_json::to_vec_pretty(&receipts)?)?;
+        for (manager, version) in [(&first_manager, 1), (&second_manager, 1), (&third_manager, 2)] {
+            let observed = manager.execute(&format!("import importlib, rlm\nimportlib.reload(rlm)\nassert rlm.ISSUE44_RUNTIME == {version}"), ExecuteOptions::default()).await?;
+            anyhow::ensure!(observed.status == ExecuteStatus::Ok, "active kernel code changed: {:?}", observed.error);
+        }
+        for (path, before) in &installed_hashes {
+            anyhow::ensure!(format!("{:x}", sha2::Sha256::digest(std::fs::read(path)?)) == *before, "old installed runtime file changed: {}", path.display());
+        }
+        std::fs::write(root.join("installed-runtime-hashes.json"), serde_json::to_vec_pretty(&installed_hashes)?)?;
+        let removed = ensure_kernel_python(EnsureKernelPythonOptions::default()).await?;
+        anyhow::ensure!(removed != third, "removing a skill selects another environment");
+        let removed_manager = ReplKernelManager::new(KernelManagerOptions { python: Some(removed.clone()), cwd: Some(root.clone()), ..Default::default() });
+        managers.push(removed_manager.clone());
+        removed_manager.start(KernelStartOptions::default()).await?;
+        let removed_pid = removed_manager.process_id().ok_or_else(|| anyhow::anyhow!("missing removed-skill kernel PID"))?;
+        receipts.push(serde_json::json!({"python": removed, "pid": removed_pid, "start": pa_types::platform::process::process_start_id(u32::try_from(removed_pid)?)}));
+        let observed = removed_manager.execute("import importlib.util, rlm\nassert rlm.ISSUE44_RUNTIME == 2\nassert importlib.util.find_spec('issue44_skill') is None", ExecuteOptions::default()).await?;
+        anyhow::ensure!(observed.status == ExecuteStatus::Ok, "removed skill is still installed: {:?}", observed.error);
+        anyhow::ensure!(std::fs::read(exact.join(".bootstrap-version"))? == original_marker, "published base was mutated");
+        anyhow::ensure!(ensure_kernel_python(options()).await? == third, "identical request must reuse matching published generation");
+        std::fs::write(root.join("receipts.json"), serde_json::to_vec_pretty(&receipts)?)?;
+        Ok::<_, anyhow::Error>(())
+    }).await;
+    let mut shutdown_errors = Vec::new();
+    for manager in &managers {
+        match tokio::time::timeout(Duration::from_secs(20), manager.shutdown(KernelShutdownOptions::default())).await {
+            Ok(Ok(_)) => {}
+            failure => { manager.kill(); shutdown_errors.push(format!("{failure:?}")); }
+        }
+    }
+    assert!(shutdown_errors.is_empty(), "owned kernel shutdown failures: {shutdown_errors:?}");
+    outcome.expect("bounded real-uv verifier").expect("real installs, imports, and generations must agree");
+}
+
+fn copy_runtime_fixture(source: &Path, target: &Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == "__pycache__" || name == ".venv" { continue; }
+        let destination = target.join(name);
+        if entry.file_type().unwrap().is_dir() {
+            copy_runtime_fixture(&entry.path(), &destination);
+        } else if entry.path().extension().is_some_and(|extension| extension == "py" || extension == "toml") {
+            std::fs::copy(entry.path(), destination).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue44_untrusted_pending_build_never_enrols_a_current_legacy_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let exact = root.path().join("explicit-kernel-venv");
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+    ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap();
+    let ownership = exact.with_file_name("explicit-kernel-venv.prime-agent-managed.json");
+    std::fs::remove_file(&ownership).unwrap();
+    let original_version = std::fs::read(exact.join(".bootstrap-version")).unwrap();
+    let original_log = std::fs::read(&log).unwrap();
+    let leases_before = std::fs::read_dir(exact.join(".leases")).unwrap().count();
+    for (mode, binding) in [(0o666, "valid"), (0o664, "valid"), (0o644, "valid"), (0o600, "legacy"), (0o600, "wrong-parent")] {
+        write_build_record(&exact, &exact, dead_pid());
+        let pending = build_record_path(&exact);
+        if binding != "valid" {
+            let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
+            if binding == "legacy" {
+                record["version"] = serde_json::json!(2);
+                record.as_object_mut().unwrap().remove("path");
+                record.as_object_mut().unwrap().remove("parent_identity");
+            } else {
+                record["parent_identity"]["file"] = serde_json::json!(0);
+            }
+            std::fs::write(&pending, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(mode)).unwrap();
+        let before = std::fs::read(&pending).unwrap();
+        let mtime = std::fs::metadata(&pending).unwrap().modified().unwrap();
+        let _result = ensure_kernel_python(EnsureKernelPythonOptions::default()).await;
+        assert!(!ownership.exists(), "untrusted pending record must not enrol a legacy root (mode {mode:o})");
+        assert_eq!(std::fs::read(&pending).unwrap(), before);
+        assert_eq!(std::fs::metadata(&pending).unwrap().modified().unwrap(), mtime);
+        assert_eq!(std::fs::read(exact.join(".bootstrap-version")).unwrap(), original_version);
+        assert_eq!(std::fs::read_dir(exact.join(".leases")).unwrap().count(), leases_before);
+        assert_eq!(std::fs::read(&log).unwrap(), original_log);
+    }
 }

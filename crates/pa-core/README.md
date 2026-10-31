@@ -72,6 +72,17 @@ inside its async entry point; callers must offload the entire operation with
 `tokio::task::spawn_blocking` and `Handle::block_on`. Foundation plumbing
 only: nothing wires it to a user-facing cloud toggle yet.
 
+## Kernel environment ownership
+
+Kernel bootstrap owns immutable Python environments and their identity-bound local
+records. Newly built explicit `PRIME_AGENT_KERNEL_VENV` roots can resolve sibling
+generations after runtime or installed-skill changes. Existing compatible external
+roots remain exact/read-only and are never silently enrolled. Published base and
+generation leases use the same process-identity machinery; automatic recursive
+cleanup is disabled. See [kernel environments](../../docs/kernel-environments.md)
+for ownership, compatibility, recovery, and retention contracts. This adds no public
+API or dependency; update activation and rollback remain outside this crate.
+
 ## Non-goals
 No provider HTTP (pa-ai), no loop policy (pa-agent), no daemon supervision (pa-daemon), no TUI (pa-tui). No update coordination (the pa-cli coordinator owns the FSM; the update-flow seam here is the daemon-free support layer: `update::version` (semver/channel policy), `update::install` (the managed install-root layout), `update::release` (the channel manifest fetch), `update::download` (sha256-verified archive download + staging)). The package manager installs sources and resolves resource paths only. No workspace snapshot upload, transport, or remote materialization (staging and verification live here; the cloud attach surface owns the transport when it ships).
 

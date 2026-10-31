@@ -16,6 +16,8 @@ use super::{default_rlm_extra_uv_args, kernel_venv_python, BootstrapPythonSkill,
 use crate::platform::{directory_identity, DirectoryIdentity};
 
 mod explicit;
+mod explicit_owner;
+pub(in crate::kernel::bootstrap) use explicit_owner::{canonical_explicit_path, ExplicitOwnership};
 pub(in crate::kernel::bootstrap) use explicit::{
     reclaim_explicit_path, ExplicitBuild, ExplicitReclaim,
 };
@@ -432,18 +434,40 @@ fn lease_python_process(
     pid: u32,
     kind: LeaseKind,
 ) -> anyhow::Result<Option<GenerationLeaseGuard>> {
+    // An exact external interpreter remains read-only even if the user
+    // points it at a previously managed base or generation.
+    if std::env::var("PRIME_AGENT_KERNEL_PYTHON")
+        .is_ok_and(|value| !value.is_empty() && super::expand_home(&value) == python)
+    {
+        return Ok(None);
+    }
     let Some(generation) = python.parent().and_then(Path::parent) else {
         return Ok(None);
     };
-    if parse_generation_name(generation.file_name().unwrap_or_default()).is_none() {
-        return Ok(None);
-    }
     let expected = kernel_venv_python(generation);
     if expected != python {
         return Ok(None);
     }
-    require_valid_published_generation(generation)?;
-    require_direct_directory(&generation.join(LEASE_DIR))?;
+    let explicit = ExplicitOwnership::read(generation);
+    let exact_override = std::env::var("PRIME_AGENT_KERNEL_VENV").is_ok_and(|value| {
+        !value.is_empty()
+            && canonical_explicit_path(&super::expand_home(&value))
+                .is_ok_and(|path| path == generation)
+    });
+    match explicit {
+        Ok(Some(_)) => {
+            // Verified artifact type wins over spelling, including an
+            // enrolled explicit base with a generation-shaped basename.
+        }
+        Ok(None) | Err(_) if exact_override => return Ok(None),
+        Ok(None) | Err(_) => {
+            if parse_generation_name(generation.file_name().unwrap_or_default()).is_none() {
+                return Ok(None);
+            }
+            require_valid_published_generation(generation)?;
+            require_direct_directory(&generation.join(LEASE_DIR))?;
+        }
+    }
     let owner = ProcessOwner {
         pid,
         process_start_id: pa_types::platform::process::process_start_id(pid),
@@ -853,8 +877,13 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file); // Windows cannot rename an open file.
-        std::fs::rename(&temp, path)?;
+        drop(file);
+        // Atomic create-if-absent: rename would overwrite a record that
+        // appeared after the preflight check. Never replace ownership.
+        std::fs::hard_link(&temp, path)?;
+        // Publication already committed. A retained temp link is not a
+        // failed publication and must not trigger unpublished-build recovery.
+        let _ = std::fs::remove_file(&temp);
         Ok(())
     })();
     if result.is_err() {
@@ -1397,5 +1426,24 @@ mod tests {
             lease_path.exists(),
             "task cancellation cannot assert child death"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue44_enrolled_generation_shaped_base_reaches_kernel_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let exact = root.path().join(format!(
+            "{GENERATION_PREFIX}{}-{:020}-{}", identity('a'), 1, uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&exact).unwrap();
+        let build = ExplicitBuild::claim(&exact).unwrap();
+        std::fs::write(exact.join(".bootstrap-version"), "validated fixture").unwrap();
+        build.publish().unwrap();
+        let python = kernel_venv_python(&exact);
+        let handoff = begin_kernel_lease_handoff(&python).expect("explicit artifact type beats basename").unwrap();
+        let kernel = register_kernel_python_lease(&python, std::process::id()).unwrap().unwrap();
+        handoff.release();
+        kernel.release();
+        assert!(!exact.join(PUBLISHED_FILE).exists(), "base must not gain fake generation markers");
     }
 }

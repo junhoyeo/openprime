@@ -28,7 +28,8 @@ use venv::{
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
     prepare_generation_root, published_candidates, reclaim_explicit_path,
     recorded_unavailable_python_skills, resolve_writable_kernel_venv_dir, BootstrapPythonSkill,
-    ExplicitBuild, ExplicitReclaim, GenerationBuild, SUPPORTED_RLM_RUNTIME_ABI,
+    canonical_explicit_path, ExplicitBuild, ExplicitOwnership, ExplicitReclaim, GenerationBuild,
+    SUPPORTED_RLM_RUNTIME_ABI,
 };
 pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
 
@@ -253,6 +254,7 @@ async fn ensure_kernel_venv(
             &base_venv,
             &source_dir,
             &runtime_identity,
+            /*explicit_ownership*/ None,
         )
         .await
     };
@@ -270,16 +272,15 @@ fn report_recorded_unavailable_skills(options: &EnsureKernelPythonOptions, venv:
 
 fn exact_venv_stale_error(venv: &std::path::Path) -> anyhow::Error {
     anyhow!(
-        "PRIME_AGENT_KERNEL_VENV points to a non-current environment at {}. Prime Agent will not replace, relocate, or install into it while another process may use it. Stop dependent sessions and remove or move that path manually, choose a new PRIME_AGENT_KERNEL_VENV, or set PRIME_AGENT_KERNEL_PYTHON",
+        "PRIME_AGENT_KERNEL_VENV points to a non-current environment at {}. The requested runtime or Python skill set changed, or the environment failed validation. Prime Agent will not replace, relocate, or install into it without verified managed ownership. Choose a new, missing PRIME_AGENT_KERNEL_VENV path for automatic managed generations, or set PRIME_AGENT_KERNEL_PYTHON to this environment's exact interpreter if it is compatible. Existing version files do not enrol an environment; the old path is retained",
         venv.display()
     )
 }
 
-/// The explicit override is caller-owned and exact. A current path is read
-/// only. A missing path is built directly there under its lock. A non-current
-/// existing path is refused untouched, except an empty directory (removed
-/// with a non-recursive rmdir) and this product's own abandoned build (moved
-/// aside, retained); both are then built again.
+/// A current legacy override stays exact and read-only. New explicit bases
+/// are enrolled at publication; a changed request uses an owned immutable
+/// sibling generation, never installs into the published base. Unenrolled
+/// stale paths remain refused. Abandoned own builds are retained aside.
 async fn ensure_exact_kernel_venv(
     options: &EnsureKernelPythonOptions,
     python_skills: &[BootstrapPythonSkill],
@@ -287,13 +288,24 @@ async fn ensure_exact_kernel_venv(
     source_dir: &std::path::Path,
     runtime_identity: &str,
 ) -> anyhow::Result<PathBuf> {
+    let canonical = canonical_explicit_path(venv)?;
+    let venv = canonical.as_path();
+    // Ownership authorizes management, not read-only use of an explicitly
+    // chosen compatible interpreter. Keep errors until an update is needed.
+    let ownership = ExplicitOwnership::read(venv);
     let python = kernel_venv_python(venv);
     let python_str = python.to_string_lossy().to_string();
-    if kernel_ready_read_only(&python_str, venv, runtime_identity, python_skills) {
+    if !ExplicitBuild::pending(venv)
+        && kernel_ready_read_only(&python_str, venv, runtime_identity, python_skills)
+    {
+        if let Ok(Some(ownership)) = ownership {
+            ownership.lease_for_resolver(venv)?;
+        }
         report_recorded_unavailable_skills(options, venv);
         return Ok(python);
     }
 
+    crate::platform::perms::require_private_owner_metadata_support()?;
     let release_lock = acquire_bootstrap_lock(venv).await.map_err(|error| {
         anyhow!(
             "cannot create the bootstrap lock for the exact PRIME_AGENT_KERNEL_VENV at {}; choose a writable PRIME_AGENT_KERNEL_VENV or set PRIME_AGENT_KERNEL_PYTHON: {error:#}",
@@ -301,15 +313,39 @@ async fn ensure_exact_kernel_venv(
         )
     })?;
     let result = async {
+        let ownership = ExplicitOwnership::read(venv);
         if kernel_ready_read_only(&python_str, venv, runtime_identity, python_skills) {
+            if matches!(&ownership, Ok(None)) {
+                ExplicitBuild::finish_interrupted_publication(venv)?;
+            } else if ExplicitBuild::pending(venv) && ownership.is_err() {
+                return Err(anyhow!("explicit kernel build ownership is unknown; retained without publication"));
+            }
+            if let Ok(Some(ownership)) = ExplicitOwnership::read(venv) {
+                ownership.lease_for_resolver(venv)?;
+            }
             report_recorded_unavailable_skills(options, venv);
             return Ok(python);
+        }
+        if let Some(ownership) = ownership? {
+            ownership.prepare_generations(venv)?;
+            let resolved = ensure_managed_kernel_venv(
+                options, python_skills, venv, source_dir, runtime_identity, Some(&ownership),
+            ).await?;
+            ownership.verify(venv)?;
+            options.report(&format!(
+                "Using immutable kernel generation {} for configured root {}; previous environments are retained",
+                resolved.display(), venv.display()
+            ));
+            return Ok(resolved);
         }
         if let ExplicitReclaim::SetAside(aside) = reclaim_explicit_path(venv) {
             options.report(&format!(
                 "Warning: an interrupted kernel setup was moved aside and retained at {}; remove it when no longer needed",
                 aside.display()
             ));
+        }
+        if ExplicitBuild::pending(venv) {
+            return Err(exact_venv_stale_error(venv));
         }
         match std::fs::symlink_metadata(venv) {
             Ok(_) => return Err(exact_venv_stale_error(venv)),
@@ -352,7 +388,7 @@ async fn ensure_exact_kernel_venv(
         }
         bootstrap?;
         validate_built_environment(&python, venv, runtime_identity, python_skills)?;
-        build.publish();
+        build.publish()?;
         options.report("✓ ready");
         Ok(python)
     }
@@ -370,6 +406,7 @@ async fn ensure_managed_kernel_venv(
     base_venv: &std::path::Path,
     source_dir: &std::path::Path,
     runtime_identity: &str,
+    explicit_ownership: Option<&ExplicitOwnership>,
 ) -> anyhow::Result<PathBuf> {
     let legacy_python = kernel_venv_python(base_venv);
     let legacy_python_str = legacy_python.to_string_lossy().to_string();
@@ -393,6 +430,9 @@ async fn ensure_managed_kernel_venv(
         )
     })?;
     let result = async {
+        if let Some(ownership) = explicit_ownership {
+            ownership.prepare_generations(base_venv)?;
+        }
         prepare_generation_root(&root)?;
         for generation in published_candidates(&root, &identity)? {
             let python = kernel_venv_python(&generation);
@@ -402,6 +442,9 @@ async fn ensure_managed_kernel_venv(
                 // Durable before the root lock releases: pruning can never
                 // interleave between selection and resolver ownership.
                 lease_for_resolver(&generation)?;
+                if let Some(ownership) = explicit_ownership {
+                    ownership.prepare_generations(base_venv)?;
+                }
                 prepare_generation_root(&root)?;
                 return Ok(python);
             }
@@ -428,6 +471,9 @@ async fn ensure_managed_kernel_venv(
         {
             build.discard();
             return Err(error);
+        }
+        if let Some(ownership) = explicit_ownership {
+            ownership.prepare_generations(base_venv)?;
         }
         if let Err(error) = build.publish() {
             build.discard();
@@ -504,5 +550,19 @@ mod tests {
             .join("kernel-venv.generations.bootstrap.lock")
             .exists());
         drop(owner);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn issue44_unproven_platform_refuses_before_creating_explicit_target() {
+        let root = tempfile::tempdir().unwrap();
+        let venv = root.path().join("new-explicit-environment");
+        let error = ensure_exact_kernel_venv(
+            &EnsureKernelPythonOptions::default(), &[], &venv,
+            root.path(), "uninstalled-runtime",
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("verified record ownership"), "{error:#}");
+        assert!(!venv.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "no ownership or lock metadata before refusal");
     }
 }

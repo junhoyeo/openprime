@@ -36,7 +36,8 @@ pub(crate) use generation::{
 };
 pub(super) use generation::{
     generation_identity, generation_root, lease_for_resolver, prepare_generation_root,
-    published_candidates, reclaim_explicit_path, ExplicitBuild, ExplicitReclaim, GenerationBuild,
+    published_candidates, reclaim_explicit_path, canonical_explicit_path, ExplicitBuild,
+    ExplicitOwnership, ExplicitReclaim, GenerationBuild,
 };
 use layout::home_dir;
 pub(crate) use layout::{expand_home, resolve_writable_kernel_venv_dir};
