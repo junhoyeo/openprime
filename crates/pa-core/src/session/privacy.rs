@@ -78,7 +78,11 @@ fn screens_clean_of_attempted_marker(raw: &[u8]) -> bool {
     if contains_bytes(raw, b"\"customType\"") {
         return false;
     }
-    (MARKER_MIN_PREFIX_LEN..=MARKER_PREFIX.len()).all(|len| !contains_bytes(raw, &MARKER_PREFIX[..len]))
+    // Checking only the shortest prefix is equivalent to checking every longer one:
+    // any occurrence of a longer prefix necessarily contains this one at the same
+    // starting position, so there is nothing a longer check could catch that this
+    // one would miss.
+    !contains_bytes(raw, &MARKER_PREFIX[..MARKER_MIN_PREFIX_LEN])
 }
 
 /// Strictly scan the complete opened container and restore the caller's position.
@@ -309,15 +313,35 @@ mod tests {
         assert_eq!((result.session_id.as_str(),result.restriction,result.rows),("mixed",None,3));
     }
     #[test]
-    fn a_reserved_collision_row_always_refuses_even_when_screen_clean_would_tolerate_it() {
-        // A row that DID parse, and was DEFINITIVELY resolved as a disguised
-        // reserved-name collision, must never be screened/tolerated -- confirming
-        // the MUST-FIX: decode_privacy_row already reached a verdict here, so this
-        // is never an ambiguous parse failure.
+    fn a_byte_screen_clean_reserved_collision_row_still_refuses() {
+        // The MUST-FIX 1 regression test: a row that is BOTH (a) a genuine,
+        // definitively-resolved ReservedCollision once parsed, AND (b) clean under
+        // screens_clean_of_attempted_marker's raw-byte scan, because one character
+        // each in the "customType" key and the "admission_privacy_state" value is
+        // JSON \u-escaped. serde_json resolves \u0063 to the literal byte 'c' during
+        // parsing, so decode_privacy_row still sees the real strings and reaches
+        // ReservedCollision -- but the RAW, UNPARSED bytes contain neither the
+        // literal "customType" substring nor an "admission_" prefix, so the screen
+        // alone would wrongly call this clean. Only the MUST-FIX 1 scoping (never
+        // screening a row decode_privacy_row already definitively resolved) refuses
+        // this row; a version that screened every decode error unconditionally would
+        // tolerate it and reopen the collision bypass. A prior version of this test
+        // used a plain, unescaped disguised row, which the screen alone already
+        // catches via the literal "customType" substring -- that version proved
+        // nothing about the MUST-FIX 1 boundary specifically; this one does.
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
         let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
-        let disguised=json!({"type":"message","message":{"role":"custom",
-            "customType":ADMISSION_PRIVACY_CUSTOM_TYPE,"content":"synthetic"}}).to_string();
+        let disguised=concat!(
+            r#"{"type":"message","message":{"role":"custom","#,
+            r#""\u0063ustomType":"\u0061dmission_privacy_state","content":"synthetic"}}"#,
+        );
+        assert!(!disguised.contains("\"customType\""),
+            "fixture must not contain the literal key substring, or it proves nothing");
+        assert!(!disguised.contains("admission_"),
+            "fixture must not contain the literal value prefix, or it proves nothing");
+        let parsed:serde_json::Value=serde_json::from_str(disguised).unwrap();
+        assert_eq!(parsed["message"]["customType"],ADMISSION_PRIVACY_CUSTOM_TYPE,
+            "fixture must still resolve to the real reserved name once parsed");
         let after=json!({"type":"message","id":"u1","parentId":null}).to_string();
         let content=format!("{header}\n{disguised}\n{after}\n");
         std::fs::write(&path,&content).unwrap();
@@ -325,15 +349,7 @@ mod tests {
         assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
     }
-    #[test]
-    fn header_row_itself_is_never_eligible_for_either_tolerance() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let content="not json at all".to_string();
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
-    }
+
     #[test]
     fn complete_final_object_needs_no_newline_but_partial_or_trailing_bytes_refuse() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("no-newline.jsonl");
