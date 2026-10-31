@@ -99,6 +99,7 @@ use crate::types::{AgentConnectionState, SessionActionSnapshot};
 
 pub struct Worker {
     pub(crate) config: WorkerConfig,
+    pub(crate) authority: std::result::Result<crate::lease::RuntimeSessionAuthority, String>,
     /// The bind-time filesystem identity of this worker's own socket file
     /// (TS daemon-mode captures `socketIdentity` in the listen callback,
     /// daemon-mode.ts:718): the exit cleanups pass it as the unlink's
@@ -282,6 +283,13 @@ impl Worker {
     /// The wired closures panic on a poisoned session-core mutex.
     #[must_use]
     pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
+        let authority = if config.supervisor_socket_path.as_os_str().is_empty() {
+            crate::lease::RuntimeSessionAuthority::for_agent_dir(&config.agent_dir)
+        } else {
+            crate::lease::RuntimeSessionAuthority::for_supervisor(
+                &config.agent_dir, &config.supervisor_socket_path,
+            )
+        }.map_err(|error| format!("{error:#}"));
         let events = Arc::new(EventPump::new());
         let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let core = SessionCore {
@@ -733,6 +741,7 @@ impl Worker {
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
             idle_notify.clone(),
+            authority.clone(),
         );
         let exports = crate::session_export::ExportCommands::new(
             std::sync::Arc::clone(&engine),
@@ -754,9 +763,11 @@ impl Worker {
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
+            authority.clone(),
         );
         Worker {
             config,
+            authority,
             bound_socket_identity: std::sync::Mutex::new(None),
             listener_close_requested: tokio::sync::Notify::new(),
             listener_closed: tokio::sync::Notify::new(),

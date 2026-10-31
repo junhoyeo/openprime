@@ -28,8 +28,8 @@ pub struct RpcEngineHandle {
     /// settle seams fire it, and the pump listener parks on it.
     pub bash_wake: Arc<tokio::sync::Notify>,
     /// The cross-process ownership lease on the opened session file
-    /// (`None` for fresh/in-memory sessions the factory created itself).
-    pub session_lease: Option<crate::lease::SessionLease>,
+    /// (`None` only for genuinely in-memory sessions).
+    pub session_lease: Option<Arc<crate::lease::SessionLease>>,
 }
 
 /// A whole-session replacement request: a fresh session (optionally under
@@ -70,6 +70,7 @@ pub struct RpcSession {
     pending_outputs: Arc<tokio::sync::Mutex<Option<Vec<serde_json::Value>>>>,
     /// One replacement at a time: a fork racing a `switch_session` must not interleave.
     replacement: tokio::sync::Mutex<()>,
+    mutation_admission: tokio::sync::RwLock<()>,
     /// Bumped on every whole-session replacement: pumps spawned against
     /// the replaced engine retire instead of delivering.
     pump_epoch: Arc<AtomicU64>,
@@ -96,6 +97,7 @@ impl RpcSession {
             subscription: tokio::sync::Mutex::new(None),
             pending_outputs: Arc::new(tokio::sync::Mutex::new(None)),
             replacement: tokio::sync::Mutex::new(()),
+            mutation_admission: tokio::sync::RwLock::new(()),
             pump_epoch: Arc::new(AtomicU64::new(0)),
             replacing: Arc::new(AtomicBool::new(false)),
             signal_shutdown: std::sync::Arc::new(tokio_util::sync::CancellationToken::new()),
@@ -144,6 +146,13 @@ impl RpcSession {
 
     pub fn pump_generation(&self) -> u64 {
         self.pump_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn try_mutation_admission(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
+        let guard = self.mutation_admission.try_read()
+            .map_err(|_| "Session replacement is in progress; retry the command".to_string())?;
+        if self.is_replacing() { return Err("Session replacement is in progress; retry the command".to_string()); }
+        Ok(guard)
     }
 
     pub fn is_replacing(&self) -> bool {
@@ -246,6 +255,10 @@ impl RpcSession {
         // settle: a queued pump waking during the wait sees the moved epoch;
         // the in-flight gate retires a pump KICKED mid-settle.
         let _replacing = self.replacing_gate();
+        // This is an operation admission gate, not the engine/registry data
+        // mutex. Abort remains served while older mutations settle.
+        let _mutations = tokio::time::timeout(std::time::Duration::from_secs(15), self.mutation_admission.write())
+            .await.map_err(|_| "Session mutations are still settling; replacement deferred".to_string())?;
         self.pump_epoch.fetch_add(1, Ordering::SeqCst);
         // Settle the running turn BEFORE the factory opens the file: the
         // turn's final rows land in the history the replacement hydrates
@@ -265,52 +278,30 @@ impl RpcSession {
                 return Err("A signal exit is in progress".to_string());
             }
         }
-        let mut handle = tokio::select! {
-            guard = self.handle.write() => guard,
-            () = self.signal_shutdown.cancelled() => {
-                return Err("A signal exit is in progress".to_string());
-            }
+        let (old_engine, current_lease) = {
+            let handle = self.handle.read().await;
+            (Arc::clone(&handle.engine), handle.session_lease.clone())
         };
-        // A prompt or steer admitted onto the old engine inside the
-        // guard-free settle window: the re-acquired write guard blocks every
-        // new admission. Deliberate divergence from TS (open before teardown).
-        //
-        // Reopening the currently-owned file: ADOPT the current lease HERE
-        // under the write guard (no refusal path re-acquires it).
-        if let RpcEngineRequest::Open {
-            session_path,
-            reuse_lease,
-        } = &mut request
-        {
-            let canonical = crate::lease::canonical_session_path(session_path);
-            let same_path = handle
-                .session_lease
-                .as_ref()
-                .is_some_and(|lease| lease.session_path == canonical);
-            if same_path {
-                adopted_lease = handle.session_lease.take();
+        if let RpcEngineRequest::Open { session_path, reuse_lease } = &mut request {
+            let canonical = crate::lease::checked_session_path(session_path).map_err(|error| error.to_string())?;
+            if let Some(lease) = current_lease.filter(|lease| lease.session_path == canonical) {
+                lease.revalidate().map_err(|error| format!("{error:#}"))?;
+                adopted_lease = Some(lease);
                 *reuse_lease = true;
             }
         }
         // Build the replacement after the settle: a failed assembly
-        // leaves the live session serving; the adopted lease goes back
-        // onto the held handle.
+        // leaves the live session serving; its lease never left the old handle.
         let mut replacement = {
             let built = tokio::select! {
                 built = factory(request) => built,
                 () = self.signal_shutdown.cancelled() => {
-                    if adopted_lease.is_some() {
-                        handle.session_lease = adopted_lease;
-                    }
                     return Err("A signal exit is in progress".to_string());
                 }
             };
             match built {
                 Ok(replacement) => replacement,
                 Err(error) => {
-                    if adopted_lease.is_some() {
-                        handle.session_lease = adopted_lease;
-                    }
                     return Err(error);
                 }
             }
@@ -318,9 +309,9 @@ impl RpcSession {
         // The teardown aborts only now that the replacement exists; the
         // check re-samples the LIVE streaming state, catching a turn
         // admitted after the re-acquire.
-        if handle.engine.session.agent().state().await.is_streaming {
-            handle.engine.session.agent().abort();
-            handle.engine.session.agent().wait_for_idle().await;
+        if old_engine.session.agent().state().await.is_streaming {
+            old_engine.session.agent().abort();
+            old_engine.session.agent().wait_for_idle().await;
         }
         // Subscribe the replacement BEFORE publishing the handle: a prompt
         // dispatched the instant the handle lands never drops its first events.
@@ -331,15 +322,12 @@ impl RpcSession {
             subscription.unsubscribe().await;
         }
         // The teardown races the shutdown broadcast: a signal during the
-        // disposal cancels the swap; the adopted lease returns with it.
+        // disposal cancels the swap; the old handle still retains its lease.
         let disposed = tokio::select! {
-            () = handle.engine.dispose_kernel() => true,
+            () = old_engine.dispose_kernel() => true,
             () = self.signal_shutdown.cancelled() => false,
         };
         if !disposed {
-            if adopted_lease.is_some() {
-                handle.session_lease = adopted_lease;
-            }
             return Err("A signal exit is in progress".to_string());
         }
         // The adopted same-path lease rides the replacement; a fresh-open
@@ -347,12 +335,21 @@ impl RpcSession {
         if adopted_lease.is_some() {
             replacement.session_lease = adopted_lease;
         }
+        if let Some(lease) = replacement.session_lease.as_ref() {
+            lease.revalidate().map_err(|error| format!("Replacement ownership changed: {error:#}"))?;
+        }
+        let mut handle = self.handle.write().await;
+        if !Arc::ptr_eq(&handle.engine, &old_engine) {
+            return Err("Session generation changed before replacement publication".to_string());
+        }
         // The background-bash listener parks on the retired handle's wake:
         // fire it so the listener re-reads the LIVE handle (a stored
         // permit, because it may not be parked yet). Its kick against the
         // retired engine is dropped by the pump's liveness checks.
         let retired_bash_wake = Arc::clone(&handle.bash_wake);
-        *handle = replacement;
+        let retired = std::mem::replace(&mut *handle, replacement);
+        drop(handle);
+        drop(retired);
         retired_bash_wake.notify_one();
         *self.subscription.lock().await = Some(subscription);
         Ok(())

@@ -369,6 +369,24 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
     ) -> Result<SpawnedWorker> {
+        let file = resident.descriptor.lock().await.session_file.clone();
+        let _child_lifecycle = match file.as_deref() {
+            Some(file) => Some(self.child_lifecycles.lock(file).await?),
+            None => None,
+        };
+        self.relaunch_worker_under_lifecycle(resident).await
+    }
+
+    /// The caller retains the file operation gate through its registry
+    /// publication; this variant must not recursively acquire that gate.
+    pub(super) async fn relaunch_worker_under_lifecycle(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+    ) -> Result<SpawnedWorker> {
+        let file = resident.descriptor.lock().await.session_file.clone();
+        if let Some(file) = file.as_deref() {
+            self.ensure_child_not_deleted(file).await?;
+        }
         if self.is_stopping(resident) {
             return Err(anyhow!("supervisor is shutting down"));
         }
@@ -509,25 +527,40 @@ impl Supervisor {
                 ));
             }
         }
-        let mut descriptor = resident.descriptor.lock().await;
-        descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
-        // The persisted failure count stays: the give-up cap and any
-        // adoption decision read the real history, not a relaunch-blanked one.
-        let _ = persist_worker(&resident.descriptor_path, &descriptor);
-        drop(descriptor);
-        // The replayed create restored the session: routed client commands
-        // may run against this worker again.
-        resident.note_session_ready();
-        // The replacement is identity-complete and its replay answered: record the binding
-        // now — the boot registration carries no session id, so this retargets every
-        // stale client id.
-        {
-            let descriptor = resident.descriptor.lock().await;
-            self.record_session_binding(
-                &resident.worker_id,
-                descriptor.root_session_id.as_deref(),
-                descriptor.session_file.as_deref(),
-            );
+        #[cfg(test)]
+        if let Err(error) = self.lifecycle_test_hooks.checkpoint(
+            super::lifecycle_test_hooks::Phase::RecoveryReplayed, file.as_deref(),
+        ).await {
+            let stop_intent = self.persist_stop_tombstone(resident).await;
+            let mut child = child;
+            let _ = child.kill().await;
+            stop_intent?;
+            return Err(error);
+        }
+        let Some(summary) = response.data.as_ref() else {
+            resident.mark_identity_quarantined();
+            let stop_intent = self.persist_stop_tombstone(resident).await;
+            let mut child = child;
+            let _ = child.kill().await;
+            stop_intent?;
+            return Err(anyhow!("Recovered worker has no final session summary"));
+        };
+        let instance = resident.descriptor.lock().await.worker_instance_id.clone().unwrap_or_default();
+        match self.publish_verified_summary(resident, summary,
+            crate::supervisor::session_publication::SummaryOrder::Pull { instance: &instance, sequence: None }, &[]) {
+            Ok(Some(published)) => self.announce_verified_summary(&published),
+            result => {
+                resident.mark_identity_quarantined();
+                let stop_intent = self.persist_stop_tombstone(resident).await;
+                let mut child = child;
+                let _ = child.kill().await;
+                stop_intent?;
+                return Err(match result {
+                    Ok(None) => anyhow!("Recovered worker publication was superseded"),
+                    Err(error) => error.context("Recovered worker final identity refused"),
+                    Ok(Some(_)) => unreachable!("accepted publication handled above"),
+                });
+            }
         }
         Ok(child)
     }
@@ -571,6 +604,8 @@ impl Supervisor {
         };
 
         let executable = std::env::current_exe().context("resolve pa-daemon executable")?;
+        #[cfg(test)]
+        let executable = self.lifecycle_test_hooks.executable.lock().unwrap().clone().unwrap_or(executable);
         let stderr_log_path =
             crate::worker_stderr::log_path(&self.options.agent_dir, &resident.worker_id);
         let stderr_log = crate::worker_stderr::open_for_spawn(&stderr_log_path)?;

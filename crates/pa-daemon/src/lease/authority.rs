@@ -128,6 +128,10 @@ impl RuntimeSessionAuthority {
         error.downcast_ref::<DeletedSessionError>().is_some()
     }
 
+    pub(crate) fn deleted_target(error: &anyhow::Error) -> Option<&str> {
+        error.downcast_ref::<DeletedSessionError>().map(|error| error.path.as_str())
+    }
+
     /// Called only while the canonical target's common lease fence is held.
     pub(crate) fn check_admission(&self, target: &Path) -> Result<()> {
         anyhow::ensure!(!target.as_os_str().is_empty(), "Fileless session has no runtime target");
@@ -200,4 +204,77 @@ mod tests {
         assert!(reopened.acquire(&child).is_err(), "fresh authority must not select an empty bucket after root creation");
         assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), before);
     }
+    #[test]
+    fn issue_42_first_admission_refuses_partial_legacy_seed_on_every_retry() {
+        for legacy in ["deleted", "malformed"] {
+            let root = tempfile::tempdir().unwrap();
+            let agent = root.path().join("agent");
+            let sessions = agent.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let parent = sessions.join("parent.jsonl");
+            let archived = sessions.join("archived-sibling.jsonl");
+            for (path, id) in [(&parent, "parent"), (&archived, "archived-sibling")] {
+                std::fs::write(path, format!("{}\n", serde_json::json!({
+                    "type":"session", "version":3, "id":id, "timestamp":"t", "cwd":root.path(),
+                }))).unwrap();
+            }
+            let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
+            std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+            let child = agent.join("custom-storage/child.jsonl");
+            let valid = serde_json::json!({
+                "childId":"sub-valid", "sessionFile":child, "sessionName":"valid",
+                "status":"completed", "rlmDepth":1,
+            });
+            let invalid = if legacy == "deleted" {
+                serde_json::json!({
+                    "childId":"sub-deleted", "sessionFile":agent.join("custom-storage/deleted.jsonl"),
+                    "sessionName":"deleted", "status":"deleted", "rlmDepth":1,
+                }).to_string()
+            } else { "{malformed}".to_string() };
+            let bytes = format!("{valid}\n{invalid}\n");
+            std::fs::write(&registry, &bytes).unwrap();
+            let ledger_path = crate::rlm_ledger::rlm_ledger_path(&agent, &sessions);
+            let before = std::fs::read(&archived).unwrap();
+            for _ in 0..2 {
+                let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
+                assert!(authority.acquire(&archived).is_err(), "{legacy}: unknown seed must not authorize a sibling open");
+                assert!(!ledger_path.exists(), "failed seed must not publish a trusted subset");
+                assert_eq!(std::fs::read_to_string(&registry).unwrap(), bytes);
+                assert_eq!(std::fs::read(&archived).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn issue_42_valid_legacy_seed_allows_an_archived_sibling_without_losing_history() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent = sessions.join("parent.jsonl");
+        std::fs::write(&parent, format!("{}\n", serde_json::json!({
+            "type":"session", "version":3, "id":"parent", "timestamp":"t", "cwd":root.path(),
+        }))).unwrap();
+        let sibling = sessions.join("archived.jsonl");
+        let mut file = crate::session_store::SessionFile::create(root.path().to_str().unwrap(), None, 0);
+        file.set_path(sibling.clone());
+        file.append_session_state("archived");
+        file.rewrite().unwrap();
+        let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let row = serde_json::json!({
+            "childId":"sub-valid", "sessionFile":agent.join("custom-storage/child.jsonl"),
+            "sessionName":"completed-child", "status":"completed", "rlmDepth":1,
+        });
+        let bytes = format!("{row}\n");
+        std::fs::write(&registry, &bytes).unwrap();
+        let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
+        let before = std::fs::read(&sibling).unwrap();
+        let held = authority.acquire(&sibling).unwrap();
+        assert_eq!(authority.ledger.strict_edges().unwrap().len(), 1);
+        assert_eq!(std::fs::read(&sibling).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(registry).unwrap(), bytes);
+        drop(held);
+    }
+
 }

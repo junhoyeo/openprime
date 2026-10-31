@@ -93,49 +93,28 @@ impl Supervisor {
                 None,
             );
         };
-        // One per-worker critical section spans the roster write and the
-        // identity follow (the descriptor lock): no half-applied swap; the
-        // gate and the write share one roster lock, so accept order is
-        // apply order.
-        let mut changed = Vec::new();
-        let mut removed_ids = Vec::new();
-        {
-            let mut descriptor = resident.descriptor.lock().await;
-            {
-                let mut roster = self.roster.lock().unwrap();
-                if !roster.accept_delta_sequence(
-                    &resident.worker_id,
-                    worker_instance_id.as_deref().unwrap_or(""),
-                    sequence.unwrap_or(0),
-                ) {
-                    return response_success(Some(command_id), type_name, None);
-                }
-                let entry = roster.write_summary(summary.clone(), Some(&resident.worker_id), None);
-                // The worker's root slot can swap to a new durable
-                // session: the superseded row must not present as live.
-                for swapped in roster.swapped_out_root_rows(&resident.worker_id, &entry) {
-                    roster.delete(&swapped);
-                    removed_ids.push(swapped);
-                }
-                changed.push(entry);
-                for agent_id in removed {
-                    if roster.get(&agent_id).is_some() {
-                        roster.delete(&agent_id);
-                        removed_ids.push(agent_id);
-                    }
-                }
+        // A launch-owned STARTING attempt may authenticate its callback, but
+        // only its final create/recovery publication makes it route-ready.
+        if !resident.route_state().session_ready && !resident.identity_quarantined() {
+            return response_success(Some(command_id), type_name, None);
+        }
+        let order = crate::supervisor::session_publication::SummaryOrder::Delta {
+            instance: worker_instance_id.as_deref().unwrap_or(""),
+            sequence: sequence.unwrap_or(0),
+        };
+        match self.publish_verified_summary(&resident, &summary, order, &removed) {
+            Ok(Some(published)) => {
+                self.announce_verified_summary(&published);
+                response_success(Some(command_id), type_name, None)
             }
-            // The supervisor-side identity follows the write inside the
-            // same critical section; the boot quarantine lifts ONLY on a
-            // root-identity-bearing write.
-            let root_identity_bearing =
-                self.sync_root_identity_from_roster(&resident, &mut descriptor);
-            if root_identity_bearing {
-                resident.clear_identity_quarantine();
+            Ok(None) => response_success(Some(command_id), type_name, None),
+            Err(error) => {
+                if let Err(retire_error) = self.reject_failed_publication(&resident, Some(&summary), &error).await {
+                    return response_failure(Some(command_id), type_name, &format!("Publication refused; stop intent not durable: {retire_error:#}"), None);
+                }
+                response_failure(Some(command_id), type_name, &format!("{error:#}"), None)
             }
         }
-        self.push_roster_update(changed, removed_ids);
-        response_success(Some(command_id), type_name, None)
     }
 
     /// Test-support arm: production paths write through the sequence-gated
@@ -160,53 +139,28 @@ impl Supervisor {
         resident: &Arc<ResidentWorker>,
         summary: &Value,
     ) -> Option<AgentRosterEntry> {
-        let stamped_instance = summary
-            .get("workerInstanceId")
-            .and_then(serde_json::Value::as_str)
-            .filter(|stamped| !stamped.is_empty());
-        let instance = match stamped_instance {
-            Some(stamped) => stamped.to_string(),
-            None => resident
-                .descriptor
-                .lock()
-                .await
-                .worker_instance_id
-                .clone()
-                .unwrap_or_default(),
+        let instance = match summary.get("workerInstanceId").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            Some(instance) => instance.to_string(),
+            None => resident.descriptor.lock().await.worker_instance_id.clone().unwrap_or_default(),
         };
-        // The counter stamp stays an Option: ABSENT means unsequenced (a
-        // legacy summary predating the field) — an authoritative write;
-        // PRESENT-and-zero orders like any other snapshot.
-        let counter = summary
-            .get("rosterDeltaSequence")
-            .and_then(serde_json::Value::as_u64);
-        let (entry, swapped) = {
-            // The pull shares the delta path's per-worker critical
-            // section.
-            let mut descriptor = resident.descriptor.lock().await;
-            let (entry, swapped) = {
-                let mut roster = self.roster.lock().unwrap();
-                if !roster.accept_roster_pull(&resident.worker_id, &instance, counter) {
-                    return None;
-                }
-                let entry = roster.write_summary(summary.clone(), Some(&resident.worker_id), None);
-                // The pull sees the same root-slot swap: the superseded
-                // row retires, and the identity follow re-binds.
-                let swapped = roster.swapped_out_root_rows(&resident.worker_id, &entry);
-                for agent_id in &swapped {
-                    roster.delete(agent_id);
-                }
-                (entry, swapped)
-            };
-            let root_identity_bearing =
-                self.sync_root_identity_from_roster(resident, &mut descriptor);
-            if root_identity_bearing {
-                resident.clear_identity_quarantine();
+        let order = crate::supervisor::session_publication::SummaryOrder::Pull {
+            instance: &instance,
+            sequence: summary.get("rosterDeltaSequence").and_then(Value::as_u64),
+        };
+        match self.publish_verified_summary(resident, summary, order, &[]) {
+            Ok(Some(published)) => {
+                self.announce_verified_summary(&published);
+                Some(published.entry)
             }
-            (entry, swapped)
-        };
-        self.push_roster_update(vec![entry.clone()], swapped);
-        Some(entry)
+            Ok(None) => None,
+            Err(error) => {
+                if let Err(retire_error) = self.reject_failed_publication(resident, Some(summary), &error).await {
+                    self.log_line(&format!("Publication refused; stop intent not durable: {retire_error:#}"));
+                }
+                self.log_line(&format!("Session identity publication refused: {error:#}"));
+                None
+            }
+        }
     }
 
     /// Refresh one resident worker's entry from its live `get_state` (registration, adoption, and

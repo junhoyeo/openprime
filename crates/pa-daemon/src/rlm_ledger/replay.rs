@@ -70,6 +70,173 @@ fn parse_deleted_usage(
     })
 }
 
+/// Reject duplicate object keys anywhere in an authority record. Ordinary
+/// `serde_json` Value parsing keeps one duplicate, which can hide ownership data.
+#[derive(Default)]
+struct UniqueJson;
+
+impl<'de> serde::de::Visitor<'de> for UniqueJson {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut sequence: A,
+    ) -> std::result::Result<(), A::Error> {
+        while sequence.next_element_seed(UniqueJson)?.is_some() {}
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<(), A::Error> {
+        let mut keys = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            map.next_value_seed(UniqueJson)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for UniqueJson {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+pub(super) fn validate_unique_json(line: &str) -> Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_str(line.trim());
+    serde::de::DeserializeSeed::deserialize(UniqueJson, &mut deserializer)
+        .map_err(|_| anyhow::anyhow!("RLM ledger authority JSON is malformed or ambiguous"))?;
+    deserializer
+        .end()
+        .map_err(|_| anyhow::anyhow!("RLM ledger authority JSON is malformed or ambiguous"))
+}
+
+/// One body line as an authority read classifies it.
+pub(super) enum AuthorityLine {
+    Record(LedgerRecord),
+    Meta,
+    /// Not a complete well-formed record: a write that never committed.
+    Skip(&'static str),
+}
+
+/// One required field of an authority record: its key and its type check.
+type RequiredField = (&'static str, fn(&Value) -> bool);
+
+/// The shared per-line authority rule. A record is acknowledged only after its
+/// whole line is written and synced, so a torn, non-UTF-8, non-JSON line, or
+/// one with an ABSENT required field, never committed and is skipped. A
+/// well-formed line with duplicate keys, or a required field PRESENT with the
+/// wrong type or an unknown value (op, version, reason, usage), may be a newer
+/// or ambiguous committed record and refuses. Callers apply this per line and
+/// keep reading; one bad line never ends the scan.
+pub(super) fn classify_authority_line(
+    raw: &[u8],
+    index: usize,
+    torn: bool,
+) -> Result<AuthorityLine> {
+    let line_no = index + 1;
+    if torn {
+        return Ok(AuthorityLine::Skip("torn"));
+    }
+    let Ok(line) = std::str::from_utf8(raw) else {
+        return Ok(AuthorityLine::Skip("non-UTF-8"));
+    };
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Ok(AuthorityLine::Skip("malformed"));
+    };
+    if validate_unique_json(line).is_err() {
+        bail!("ambiguous duplicate-key record on line {line_no}");
+    }
+    let Some(object) = value.as_object() else {
+        return Ok(AuthorityLine::Skip("incomplete"));
+    };
+    // An ABSENT required field means the record is incomplete and skips. A
+    // PRESENT field with the wrong type or an unknown value may come from a
+    // newer binary, so it refuses.
+    match object.get("v") {
+        None => return Ok(AuthorityLine::Skip("incomplete")),
+        Some(version) if *version != json!(1) => {
+            bail!("unsupported record version on line {line_no}")
+        }
+        Some(_) => {}
+    }
+    let op = match object.get("op") {
+        None => return Ok(AuthorityLine::Skip("incomplete")),
+        Some(Value::String(op)) => op.as_str(),
+        Some(_) => bail!("invalid operation field on line {line_no}"),
+    };
+    let required: &[RequiredField] = match op {
+        "meta" => &[("at", Value::is_string), ("sessionsDir", Value::is_string)],
+        "spawn" => &[
+            ("at", Value::is_string),
+            ("childId", Value::is_string),
+            ("parent", Value::is_string),
+            ("child", Value::is_string),
+            ("name", Value::is_string),
+            ("depth", Value::is_u64),
+        ],
+        "rename" => &[
+            ("at", Value::is_string),
+            ("childId", Value::is_string),
+            ("child", Value::is_string),
+            ("name", Value::is_string),
+        ],
+        "delete" => &[
+            ("at", Value::is_string),
+            ("childId", Value::is_string),
+            ("child", Value::is_string),
+            ("reason", Value::is_string),
+        ],
+        _ => bail!("unknown operation on line {line_no}"),
+    };
+    for (key, valid) in required {
+        match object.get(*key) {
+            None => return Ok(AuthorityLine::Skip("incomplete")),
+            Some(field) if !valid(field) => bail!("invalid {key} field on line {line_no}"),
+            Some(_) => {}
+        }
+    }
+    if op == "meta" {
+        return Ok(AuthorityLine::Meta);
+    }
+    // Every required field is present with its type. A remaining rejection is
+    // a value this reader does not know (a delete reason, a usage block, a
+    // depth range): refuse rather than drop a newer committed record.
+    match parse_ledger_line(line, index) {
+        Ok(Some(record)) => Ok(AuthorityLine::Record(record)),
+        Ok(None) => bail!("unknown operation on line {line_no}"),
+        Err(_) => bail!("unknown or invalid field value on line {line_no}"),
+    }
+}
+
 /// Parse one ledger line: `v:1` records with a known op, `None` for a known
 /// version with an unknown op (forward compatibility), an error for anything
 /// else - which replay logs and skips: one bad line costs one record, never
@@ -306,9 +473,13 @@ fn artifact_session_index(agent_dir: &Path) -> ArtifactIndex {
 #[derive(Debug)]
 pub(super) struct ReplaySnapshot {
     pub(super) identity: FileIdentity,
+    /// Retain the old live object while comparing a replacement on the next read.
+    pub(super) file: std::fs::File,
     pub(super) state: Arc<ReplayState>,
 }
 
+/// Historical stat-cache key. Ledger cache hits additionally compare retained
+/// opened-file identities; these timestamps/length alone never prove an object.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(super) struct FileIdentity {
     size: u64,
@@ -318,7 +489,7 @@ pub(super) struct FileIdentity {
 }
 
 /// Resolve a path lexically (`.`/`..` folded) against the current dir.
-fn resolve_path(dir: &Path) -> PathBuf {
+pub(super) fn resolve_path(dir: &Path) -> PathBuf {
     use std::path::Component;
     let joined = if dir.is_absolute() {
         dir.to_path_buf()
@@ -340,10 +511,26 @@ fn resolve_path(dir: &Path) -> PathBuf {
     out
 }
 
-/// Canonicalize a directory: realpath when it exists, plain resolve otherwise.
+/// Preserve the shipping lexical namespace resolution, then make the missing
+/// suffix stable through existing ancestors. This names a proposed new key;
+/// protected I/O additionally requires `checked_scope` and legacy selection.
 pub(super) fn canonicalize_dir(dir: &Path) -> PathBuf {
-    let resolved = resolve_path(dir);
-    resolved.canonicalize().unwrap_or(resolved)
+    canonical_session_path(&resolve_path(dir))
+}
+
+pub(super) fn checked_scope(dir: &Path) -> std::io::Result<PathBuf> {
+    // Filesystem traversal is authoritative. A lexical `..` result may name a
+    // different root through a symlink, so it may not select a separate history.
+    let physical = crate::lease::checked_session_path(dir)?;
+    let lexical = crate::lease::checked_session_path(&resolve_path(dir))?;
+    if physical != lexical {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!(
+                "ambiguous sessions path traversal in {}; configure the sessions path without `..` after a symlink",
+                dir.display()
+            )));
+    }
+    Ok(physical)
 }
 
 /// Resolve a rename/delete record whose canonical key does not join an edge
@@ -368,10 +555,16 @@ pub(super) fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
 }
 
 fn path_identity(path: &Path) -> Option<FileIdentity> {
-    let Ok(metadata) = fs::metadata(path) else {
-        return None;
-    };
-    Some(FileIdentity {
+    let metadata = fs::metadata(path).ok()?;
+    Some(metadata_identity(&metadata))
+}
+
+pub(super) fn opened_file_stat(file: &std::fs::File) -> Result<FileIdentity> {
+    Ok(metadata_identity(&file.metadata()?))
+}
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
         size: metadata.len(),
         mtime: metadata.modified().ok(),
         #[cfg(unix)]
@@ -379,7 +572,7 @@ fn path_identity(path: &Path) -> Option<FileIdentity> {
             use std::os::unix::fs::MetadataExt;
             Some(metadata.ino())
         },
-    })
+    }
 }
 
 pub(super) fn is_file(path: &Path) -> bool {

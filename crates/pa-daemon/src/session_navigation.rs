@@ -4,6 +4,7 @@
 //! untouched); tree moves are NOT replacements — the kernel stays warm.
 
 use std::sync::{Arc, Mutex};
+use std::io::{Read as _, Seek as _, Write as _};
 
 use serde_json::{json, Value};
 
@@ -27,11 +28,16 @@ pub(crate) struct PreparedReplacement {
 pub(crate) struct SessionNavigation {
     engine: Arc<dyn SessionEngine>,
     core: Arc<Mutex<SessionCore>>,
+    authority: Result<crate::lease::RuntimeSessionAuthority, String>,
 }
 
 impl SessionNavigation {
-    pub(crate) fn new(engine: Arc<dyn SessionEngine>, core: Arc<Mutex<SessionCore>>) -> Self {
-        SessionNavigation { engine, core }
+    pub(crate) fn new(
+        engine: Arc<dyn SessionEngine>,
+        core: Arc<Mutex<SessionCore>>,
+        authority: Result<crate::lease::RuntimeSessionAuthority, String>,
+    ) -> Self {
+        SessionNavigation { engine, core, authority }
     }
 
     /// Swap the live session onto `file` (store, engine session file, rebuilt
@@ -91,6 +97,9 @@ impl SessionNavigation {
         &self,
         path: &std::path::Path,
     ) -> anyhow::Result<Option<Arc<crate::lease::SessionLease>>> {
+        anyhow::ensure!(!path.as_os_str().is_empty(), "Session target path is empty");
+        let canonical = crate::lease::checked_session_path(path)?;
+        let authority = self.authority.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
         let source = self
             .core
             .lock()
@@ -99,11 +108,12 @@ impl SessionNavigation {
             .as_ref()
             .and_then(|store| store.lease.clone());
         match source {
-            Some(source) if source.session_path == crate::lease::canonical_session_path(path) => {
+            Some(source) if source.session_path == canonical => {
+                source.revalidate()?;
                 Ok(Some(source))
             }
-            Some(source) => source.acquire_target(path).map(Some),
-            None => Ok(None),
+            Some(source) => source.acquire_target(&canonical).map(Some),
+            None => authority.acquire(&canonical).map(Arc::new).map(Some),
         }
     }
 
@@ -231,21 +241,17 @@ impl SessionNavigation {
         let lease = self
             .target_lease(&target)
             .map_err(|error| response_failure(None, "import_jsonl", &error.to_string(), None))?;
-        if std::fs::canonicalize(&target).ok() != std::fs::canonicalize(resolved).ok() {
-            if let Err(error) = std::fs::copy(resolved, &target) {
-                return Err(response_failure(
-                    None,
-                    "import_jsonl",
-                    &error.to_string(),
-                    None,
-                ));
-            }
+        let lease = lease.ok_or_else(|| response_failure(None, "import_jsonl", "Import target has no runtime ownership", None))?;
+        let current_file = self.core.lock().unwrap().store.as_ref().map(|store| store.path.clone());
+        let authority = self.authority.as_ref().map_err(|error| response_failure(None, "import_jsonl", error, None))?;
+        if let Err(error) = copy_validated_import(resolved, &target, &lease, authority, current_file.as_deref()) {
+            return Err(response_failure(None, "import_jsonl", &format!("{error:#}"), None));
         }
         self.open_replacement(
             &target.to_string_lossy(),
             cwd_override,
             "import_jsonl",
-            lease,
+            Some(lease),
         )
     }
 
@@ -265,9 +271,8 @@ impl SessionNavigation {
                 .target_lease(std::path::Path::new(path))
                 .map_err(|error| response_failure(None, command, &error.to_string(), None))?,
         };
-        if lease.is_some() {
-            pa_core::session::manager::repair_jsonl_damage(std::path::Path::new(path));
-        }
+        // SessionFile::open performs strict privacy preflight before parsing.
+        // Do not erase an ambiguous privacy carrier with pre-read repair.
         let mut file = SessionFile::open(std::path::Path::new(path))
             .map_err(|error| response_failure(None, command, &error.to_string(), None))?;
         file.lease = lease;
@@ -303,6 +308,130 @@ impl SessionNavigation {
             trace_persisted: false,
         })
     }
+}
+
+/// Stage exact validated source bytes, then create a new owned target.
+/// Existing destinations are not overwritten without complete retained privacy
+/// authority. In-place no-copy imports still validate the actual owned bytes.
+fn copy_validated_import(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    lease: &crate::lease::SessionLease,
+    authority: &crate::lease::RuntimeSessionAuthority,
+    current_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use pa_core::session::privacy::{scan_opened_container, PrivacyScanLimits};
+    let source_path = crate::lease::checked_session_path(source_path)?;
+    let target = crate::lease::checked_session_path(target_path)?;
+    anyhow::ensure!(lease.session_path == target, "Import lease does not match the target");
+    let mut source = std::fs::File::open(&source_path)?;
+    let source_scan = scan_opened_container(&mut source, PrivacyScanLimits::default())?;
+    anyhow::ensure!(source_scan.restriction.is_none(), "Private session import requires a capable owned admission receiver");
+    if target.try_exists()? {
+        // Review correction: this used to call the never-implemented
+        // `lease.with_owned_file(...)`. This is a read-only identity+scan
+        // check (no write happens here), so it needs no owned-file accessor
+        // at all -- a plain open, exactly like `source`'s own open a few
+        // lines above, is sufficient and consistent with the destination
+        // re-check further down this function.
+        let mut existing = std::fs::File::open(&target)?;
+        let same_object = pa_core::platform::opened_file_identity(&source)?
+            == pa_core::platform::opened_file_identity(&existing)?;
+        if same_object {
+            let target_scan = scan_opened_container(&mut existing, PrivacyScanLimits::default())?;
+            anyhow::ensure!(target_scan == source_scan && target_scan.restriction.is_none(),
+                "In-place import changed or requires unsupported private recovery");
+            // The alias is a read source only. The destination path and its
+            // existing target lease remain authoritative; no alias handoff.
+            return Ok(());
+        }
+    }
+    if let Some(current) = current_file.filter(|path| !path.as_os_str().is_empty()) {
+        anyhow::ensure!(crate::lease::checked_session_path(current)? != target,
+            "Cannot overwrite the currently active session during import");
+    }
+    let staged_path = target.with_extension(format!("import-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    pa_core::platform::perms::set_private_mode(&mut options);
+    let mut staged = options.open(&staged_path)?;
+    source.rewind()?;
+    std::io::copy(&mut (&mut source).take(PrivacyScanLimits::default().max_bytes + 1), &mut staged)?;
+    staged.sync_all()?;
+    let staged_scan = scan_opened_container(&mut staged, PrivacyScanLimits::default())?;
+    anyhow::ensure!(staged_scan == source_scan, "Import source changed while staging; evidence retained");
+    // A path replacement cannot redirect the copy: only this retained source
+    // supplied bytes. This check detects an already-replaced named source.
+    let named_source = std::fs::File::open(&source_path)?;
+    anyhow::ensure!(pa_core::platform::opened_file_identity(&source)?
+        == pa_core::platform::opened_file_identity(&named_source)?,
+        "Import source pathname changed; evidence retained");
+    match std::fs::symlink_metadata(&target) {
+        Ok(_) => {
+            // #41/#42-adjacent S2 fix: the destination's OWN privacy state now
+            // gates replacement, not a blanket refusal. A public-over-public
+            // import overwrite must keep working; a restricted destination
+            // keeps being refused, exactly as today.
+            let mut existing = std::fs::File::open(&target)?;
+            let existing_scan = scan_opened_container(&mut existing, PrivacyScanLimits::default())?;
+            anyhow::ensure!(existing_scan.restriction.is_none(),
+                "Replacing a private import destination requires verified retained privacy authority; destination preserved");
+            drop(existing);
+            lease.revalidate()?;
+            crate::lease::with_runtime_session_fence(authority.agent_dir(), &target, |held| {
+                held.revalidate_lease(lease)?;
+                // The informational scan above runs outside any lock. Re-open
+                // and re-scan under M immediately before the replace so a
+                // destination that turned private in between is still caught.
+                let mut fenced = std::fs::File::open(held.canonical_path())?;
+                let fenced_scan = scan_opened_container(&mut fenced, PrivacyScanLimits::default())?;
+                anyhow::ensure!(fenced_scan.restriction.is_none(),
+                    "Replacing a private import destination requires verified retained privacy authority; destination preserved");
+                drop(fenced);
+                // SessionLease pins the canonical PATH, not an inode (confirmed
+                // with process-safety): a same-directory atomic rename of the
+                // already-staged, already-validated file is the operation this
+                // model is actually safe for. A truncate-in-place of a
+                // separately opened handle would need inode-pinned ownership
+                // across the write, which this lease does not hold.
+                std::fs::rename(&staged_path, held.canonical_path())?;
+                Ok(())
+            })?;
+            lease.revalidate()?;
+            let mut replaced = std::fs::File::open(&target)?;
+            let replaced_scan = scan_opened_container(&mut replaced, PrivacyScanLimits::default())?;
+            anyhow::ensure!(replaced_scan == staged_scan,
+                "Import destination changed immediately after replacement; evidence retained");
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            lease.revalidate()?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            pa_core::platform::perms::set_private_mode(&mut options);
+            let mut destination = options.open(&target)?;
+            crate::lease::with_runtime_session_fence(authority.agent_dir(), &target, |held| {
+                held.revalidate_lease(lease)?;
+                let named = std::fs::File::open(held.canonical_path())?;
+                anyhow::ensure!(pa_core::platform::opened_file_identity(&destination)?
+                    == pa_core::platform::opened_file_identity(&named)?,
+                    "New import destination changed before first write; evidence retained");
+                Ok(())
+            })?;
+            staged.rewind()?;
+            std::io::copy(&mut staged, &mut destination)?;
+            destination.sync_all()?;
+            lease.revalidate()?;
+            let named = std::fs::File::open(&target)?;
+            anyhow::ensure!(pa_core::platform::opened_file_identity(&destination)?
+                == pa_core::platform::opened_file_identity(&named)?,
+                "Import destination pathname changed; evidence retained");
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // The staged copy remains private evidence. No cleanup is inferred from a
+    // pathname alone; a separate verified cleanup can retire this owned file.
+    Ok(())
 }
 
 /// Rebuild the engine's live context onto the moved session (the same
@@ -929,6 +1058,7 @@ mod trace_replacement_tests {
         let navigation = SessionNavigation::new(
             Arc::new(crate::engine::ScriptedEngine::default()),
             core.clone(),
+            Ok(crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap()),
         );
         assert!(navigation.prepare_new_session(&json!({})).is_err());
         let live = core.lock().unwrap();

@@ -128,8 +128,21 @@ impl SessionFile {
     pub fn open(path: &Path) -> Result<Self> {
         // Streamed line-by-line load: one line is resident at a time, so a grown session
         // never holds the raw file bytes alongside the parsed entries.
-        let file = fs::File::open(path)
+        let mut file = fs::File::open(path)
             .with_context(|| format!("read session file {}", path.display()))?;
+        // The one shared open boundary: every caller of `open`/`open_windowed`'s
+        // fallback lands here before any content is parsed or mutated. The scan
+        // reuses this same handle and restores its position, so there is no
+        // reopen and no second TOCTOU window between the check and the read.
+        let privacy = pa_core::session::privacy::scan_opened_container(
+            &mut file,
+            pa_core::session::privacy::PrivacyScanLimits::default(),
+        )
+        .with_context(|| format!("validate session privacy metadata {}", path.display()))?;
+        anyhow::ensure!(
+            privacy.restriction.is_none(),
+            "Private session open requires a capable owned admission receiver"
+        );
         let mut lines = std::io::BufReader::new(file).lines();
         let read_context = || format!("read session file {}", path.display());
         let mut first = None;
@@ -194,6 +207,18 @@ impl SessionFile {
     /// Returns an error when the windowed load fails or holds no header; a
     /// malformed retained row falls back to [`SessionFile::open`].
     pub fn open_windowed(path: &Path) -> Result<Self> {
+        // S1 v4: no separate probe/scan here anymore. Privacy's Step 1b
+        // (fix/telemetry-inheritance-privacy-types-window, ACCEPTED) moved
+        // the scan to the TOP of `WindowedSessionStore::open` itself, on the
+        // one `fs::File` handle that function already shares end-to-end for
+        // the scan, the generation certificate, the cache lookup, and the
+        // content read — closing the reopen-by-path gap entirely (no second
+        // open anywhere, not even narrowed-but-present like v3's probe was).
+        // `WindowedSessionStore::open` now refuses internally before ever
+        // returning `Some(window)`, so this reader simply trusts that
+        // refusal for the success path. The `Self::open` fallback below
+        // keeps its own internal scan, which still protects it and its
+        // other direct callers (e.g. session_navigation.rs::open_replacement).
         let Some(mut window) = pa_core::session::window::WindowedSessionStore::open(path)? else {
             return Self::open(path);
         };

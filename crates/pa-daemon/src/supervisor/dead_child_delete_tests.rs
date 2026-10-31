@@ -26,7 +26,10 @@ async fn fixture() -> Fixture {
     let child_file = sessions_dir.join("child-dead.jsonl");
     std::fs::write(
         &child_file,
-        "{\"type\":\"session\",\"version\":3,\"id\":\"child-dead\",\"timestamp\":\"t\",\"cwd\":\"/c\"}\n",
+        format!("{}\n", json!({
+            "type": "session", "version": 3, "id": "child-dead",
+            "timestamp": "t", "cwd": dir.path(), "rlmDepth": 1,
+        })),
     )
     .unwrap();
     let parent_file = sessions_dir.join("parent.jsonl");
@@ -65,8 +68,8 @@ fn child_descriptor(
         "workerId": "w-child",
         "pid": pid,
         "processStartId": start_id,
-        "socketPath": "/tmp/none.sock",
-        "recoveryJournalPath": "/tmp/none.jsonl",
+        "socketPath": supervisor.descriptor_dir.join("w-child.sock"),
+        "recoveryJournalPath": supervisor.descriptor_dir.join("w-child.recovery.jsonl"),
         "supervisorSocketPath": supervisor.options.socket_path.to_string_lossy(),
         "authenticationToken": "token",
         "rootActiveSessionId": "w-child",
@@ -85,12 +88,17 @@ fn child_descriptor(
 
 /// A pid that provably belonged to a process which has exited and been reaped.
 fn reaped_pid() -> (u32, Option<String>) {
-    let mut child = std::process::Command::new("true")
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .spawn()
-        .expect("spawn true");
+        .expect("spawn cooperative child");
     let pid = child.id();
+    // The owned pipe keeps this generation alive until its identity is read.
     let start_id = crate::lease::get_process_start_id(pid);
-    child.wait().expect("reap true");
+    drop(child.stdin.take());
+    child.wait().expect("reap cooperative child");
+    assert!(start_id.is_some(), "owned child must have a live start identity");
     (pid, start_id)
 }
 
@@ -280,4 +288,398 @@ async fn a_retried_delete_after_the_tombstone_is_gated_on_the_worker_process() {
     );
     assert!(error.contains(&format!("(pid {live_pid})")), "{error}");
     assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), ledger_before);
+}
+
+/// #42: deletion retires only the child's revival context. A restarted
+/// supervisor must refuse every create over its surviving transcript.
+#[tokio::test]
+async fn issue_42_deleted_child_record_is_retired_and_restart_create_is_refused() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+    let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
+    let launch = crate::passivated_launch::PassivatedLaunch::new(
+        &crate::descriptor::durable_create_command(&json!({
+            "sessionPath": child_file,
+            "cwd": dir.path(),
+            "rlmDepth": 1,
+        })),
+        Some(true),
+    );
+    supervisor.passivated_launches.remember(&child_file, &launch).unwrap();
+    let parent_file = supervisor.options.agent_dir.join("sessions/parent.jsonl");
+    let parent_launch = crate::passivated_launch::PassivatedLaunch::new(
+        &crate::descriptor::durable_create_command(&json!({
+            "sessionPath": parent_file, "cwd": dir.path(), "appendSystemPrompt": "parent context"
+        })), None,
+    );
+    supervisor.passivated_launches.remember(parent_file.to_str().unwrap(), &parent_launch).unwrap();
+    let (pid, start_id) = reaped_pid();
+    let (descriptor, path) = child_descriptor(&supervisor, &child_file, pid, start_id.as_deref());
+    let resident = ResidentWorker::new("w-child".to_string(), descriptor, path);
+    resident.note_session_ready();
+    supervisor.registry.insert(resident).await;
+    let response = route_delete(&supervisor).await;
+    assert_eq!(response["success"], true, "{response}");
+    assert!(ledger.edges(true).unwrap()[0].deleted.is_some());
+    assert!(std::path::Path::new(&child_file).is_file(), "the transcript stays");
+    assert!(supervisor.passivated_launches.get(&child_file).is_none(), "deleted child revival context must retire");
+    assert!(supervisor.passivated_launches.get(parent_file.to_str().unwrap()).is_some(), "parent revival context survives");
+
+    let restarted = Arc::new(Supervisor::new(SupervisorOptions {
+        socket_path: supervisor.options.socket_path.clone(),
+        agent_dir: supervisor.options.agent_dir.clone(),
+    }).unwrap());
+    // Recreate an old-format leftover from an interrupted metadata cleanup.
+    restarted.passivated_launches.remember(&child_file, &launch).unwrap();
+    restarted.pin_worker_connect_budget_for_tests(Duration::ZERO);
+    let create: DaemonCommand = serde_json::from_value(json!({
+        "type": "create", "sessionPath": child_file,
+        "config": {"cwd": dir.path()},
+    })).unwrap();
+    let error = restarted.handle_create(&create, "c".to_string()).await.unwrap_err();
+    assert!(error.to_string().contains("deleted RLM child"), "{error:#}");
+    assert!(restarted.registry.list().await.is_empty());
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let attached = subscribers::ClientSubscriptions::new("wake-client".into(), tx);
+    for kind in ["prompt", "attach", "wait_for_idle"] {
+        let command: DaemonCommand = serde_json::from_value(json!({
+            "type": kind, "activeSessionId": "child-dead", "message": "synthetic"
+        })).unwrap();
+        let (response, _) = restarted.route_client_command(
+            &command, "wake-client", &attached, "wake".into(), kind.into(), None,
+        ).await;
+        assert_eq!(response[0]["success"], false, "{response:?}");
+        assert!(response[0]["error"].as_str().unwrap().contains("deleted RLM child"), "{response:?}");
+    }
+    assert!(route_delete(&restarted).await["success"].as_bool().unwrap());
+    assert!(route_delete(&restarted).await["success"].as_bool().unwrap());
+    assert!(restarted.passivated_launches.get(&child_file).is_none());
+    assert!(restarted.registry.list().await.is_empty());
+    }).await.expect("bounded deleted-child lifecycle");
+}
+
+/// #42: a stale wake captured before delete must wait, then reread the
+/// tombstone. Polling the futures once is an explicit lock-arrival barrier.
+#[tokio::test]
+async fn issue_42_delete_and_stale_wake_serialize_on_the_transcript() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+    use std::future::Future;
+    use std::task::Poll;
+    let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
+    let gate = supervisor.child_lifecycles.lock(&child_file).await.unwrap();
+    let mut deletion = Box::pin(supervisor.tombstone_saved_rlm_child(
+        "child-dead", Some("sub-dead"), crate::rlm_ledger::RlmLedgerDeleteReason::User,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(deletion.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    assert!(ledger.edges(true).unwrap()[0].deleted.is_none(), "delete waits at the gate");
+    let create: DaemonCommand = serde_json::from_value(json!({
+        "type": "create", "sessionPath": child_file, "config": {"cwd": dir.path()}
+    })).unwrap();
+    let mut wake = Box::pin(supervisor.launch_worker(&create, None));
+    std::future::poll_fn(|cx| {
+        assert!(wake.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    assert!(supervisor.registry.list().await.is_empty(), "wake never registers across the gate");
+    drop(gate);
+    let (deleted, woken) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(deletion, wake)
+    }).await.expect("bounded lifecycle barrier");
+    deleted.unwrap();
+    let error = woken.err().expect("the stale wake is refused");
+    assert!(error.to_string().contains("deleted RLM child"), "{error:#}");
+    assert!(supervisor.registry.list().await.is_empty());
+    }).await.expect("bounded deleted-child lifecycle");
+}
+
+/// #42: if revival won the file gate, the stopped-child delete discovers
+/// and retires that resident rather than acknowledging a live deleted child.
+#[tokio::test]
+async fn issue_42_a_wake_that_won_the_gate_is_stopped_by_delete() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+    use std::future::Future;
+    use std::task::Poll;
+    let Fixture { _dir, supervisor, child_file, ledger } = fixture().await;
+    let gate = supervisor.child_lifecycles.lock(&child_file).await.unwrap();
+    let mut deletion = Box::pin(supervisor.tombstone_saved_rlm_child(
+        "child-dead", Some("sub-dead"), crate::rlm_ledger::RlmLedgerDeleteReason::User,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(deletion.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    let (pid, start_id) = reaped_pid();
+    let (descriptor, path) = child_descriptor(&supervisor, &child_file, pid, start_id.as_deref());
+    let resident = ResidentWorker::new("w-child".into(), descriptor, path);
+    resident.note_session_ready();
+    supervisor.registry.insert(resident).await;
+    drop(gate);
+    tokio::time::timeout(Duration::from_secs(5), deletion).await.unwrap().unwrap();
+    assert!(ledger.edges(true).unwrap()[0].deleted.is_some());
+    assert!(supervisor.registry.list().await.is_empty(), "raced resident cannot survive successful delete");
+    }).await.expect("bounded deleted-child lifecycle");
+}
+
+/// #42: a committed logical child delete still owns its absent transcript.
+/// Generic physical deletion may fail; that cannot authorize recreation.
+#[tokio::test]
+async fn issue_42_deleted_missing_transcript_cannot_recreate_from_a_stale_record() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+    let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
+    let launch = crate::passivated_launch::PassivatedLaunch::new(
+        &crate::descriptor::durable_create_command(&json!({
+            "sessionPath": child_file, "cwd": dir.path(), "rlmDepth": 2
+        })), None,
+    );
+    supervisor.passivated_launches.remember(&child_file, &launch).unwrap();
+    std::fs::remove_file(&child_file).unwrap();
+    let deleted = route_delete(&supervisor).await;
+    assert_eq!(deleted["success"], true, "{deleted}");
+    assert!(ledger.edges(true).unwrap()[0].deleted.is_some());
+    assert!(supervisor.passivated_launches.get(&child_file).is_none());
+    supervisor.passivated_launches.remember(&child_file, &launch).unwrap();
+    // Physical missing-file behavior is covered by the trash owner. This
+    // lane never invokes the baseline helper, which unconditionally runs trash.
+    supervisor.pin_worker_connect_budget_for_tests(Duration::ZERO);
+    let create: DaemonCommand = serde_json::from_value(json!({
+        "type": "create", "sessionPath": child_file, "config": {"cwd": dir.path()}
+    })).unwrap();
+    let error = supervisor.handle_create(&create, "c".into()).await.unwrap_err();
+    assert!(error.to_string().contains("deleted RLM child"), "{error:#}");
+    assert!(!Path::new(&child_file).exists());
+    assert!(supervisor.registry.list().await.is_empty());
+    }).await.expect("bounded deleted-child lifecycle");
+}
+
+/// #42: cleanup errors remain visible after the logical tombstone, and
+/// never authorize artifact loss or recreation from retained metadata.
+#[tokio::test]
+async fn issue_42_failed_finalization_retains_artifacts_and_blocks_revival() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+    let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
+    let launch = crate::passivated_launch::PassivatedLaunch::new(
+        &crate::descriptor::durable_create_command(&json!({
+            "sessionPath": child_file, "cwd": dir.path()
+        })), None,
+    );
+    supervisor.passivated_launches.remember(&child_file, &launch).unwrap();
+    let artifacts = crate::scheduled_jobs::session_artifact_dir(Path::new(&child_file), "child-dead").unwrap();
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let sentinel = artifacts.join("retained.txt");
+    std::fs::write(&sentinel, "owned fixture evidence").unwrap();
+    std::fs::write(&child_file, [0xff, 0xfe]).unwrap();
+    let response = route_delete(&supervisor).await;
+    assert_eq!(response["success"], false, "{response}");
+    assert!(ledger.edges(true).unwrap()[0].deleted.is_some());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"owned fixture evidence");
+    assert_eq!(std::fs::read(&child_file).unwrap(), [0xff, 0xfe]);
+    let create: DaemonCommand = serde_json::from_value(json!({
+        "type": "create", "sessionPath": child_file, "config": {"cwd": dir.path()}
+    })).unwrap();
+    supervisor.pin_worker_connect_budget_for_tests(Duration::ZERO);
+    let error = supervisor.handle_create(&create, "c".into()).await.unwrap_err();
+    assert!(error.to_string().contains("deleted RLM child"), "{error:#}");
+    }).await.expect("bounded deleted-child lifecycle");
+}
+
+/// #42: partially understood topology cannot authorize launch or deletion.
+#[tokio::test]
+async fn issue_42_unknown_ledger_authority_refuses_create_and_preserves_delete_evidence() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for (corruption, reason) in [
+            ("unknown", "unknown operation"),
+            ("malformed", "malformed"),
+            ("io", "not a regular file"),
+        ] {
+            let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
+            let launch = crate::passivated_launch::PassivatedLaunch::new(
+                &crate::descriptor::durable_create_command(&json!({
+                    "sessionPath": child_file, "cwd": dir.path()
+                })), None,
+            );
+            supervisor.passivated_launches.remember(&child_file, &launch).unwrap();
+            let mut bytes = std::fs::read(ledger.ledger_path()).unwrap();
+            let evidence_path = if corruption == "io" {
+                let backup = dir.path().join("ledger-evidence.jsonl");
+                std::fs::rename(ledger.ledger_path(), &backup).unwrap();
+                std::fs::create_dir(ledger.ledger_path()).unwrap();
+                backup
+            } else {
+                bytes.extend_from_slice(if corruption == "unknown" {
+                    b"{\"v\":1,\"op\":\"future-delete\",\"at\":\"t\"}\n"
+                } else { b"{malformed-record}\n" });
+                std::fs::write(ledger.ledger_path(), &bytes).unwrap();
+                ledger.ledger_path().to_path_buf()
+            };
+            let transcript = std::fs::read(&child_file).unwrap();
+            let deleted = route_delete(&supervisor).await;
+            assert_eq!(deleted["success"], false, "{corruption}: {deleted}");
+            assert_eq!(std::fs::read(&evidence_path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&child_file).unwrap(), transcript);
+            assert!(supervisor.passivated_launches.get(&child_file).is_some());
+            supervisor.pin_worker_connect_budget_for_tests(Duration::ZERO);
+            let create: DaemonCommand = serde_json::from_value(json!({
+                "type": "create", "sessionPath": child_file, "config": {"cwd": dir.path()}
+            })).unwrap();
+            let error = supervisor.handle_create(&create, "c".into()).await.unwrap_err();
+            assert!(error.to_string().contains(reason), "authority must refuse before a spawn probe: {error:#}");
+            assert!(supervisor.registry.list().await.is_empty());
+            assert_eq!(std::fs::read(evidence_path).unwrap(), bytes);
+            if corruption == "io" { assert!(ledger.ledger_path().is_dir()); }
+        }
+    }).await.expect("bounded deleted-child authority check");
+}
+
+/// #42 T1: only an Ok append commits a deletion. A delete line torn mid-write
+/// returns Err, the strict read skips it, and the child was never deleted:
+/// the same child id at the same path may be admitted again.
+#[tokio::test]
+async fn issue_42_a_torn_commit_child_deletion_never_committed() {
+    let Fixture { _dir, supervisor, child_file, ledger } = fixture().await;
+    let parent_file = supervisor.options.agent_dir.join("sessions/parent.jsonl");
+    crate::rlm_ledger::APPEND_WRITE_FAULT.with(|fault| fault.set(Some(12)));
+    let result = supervisor
+        .commit_child_deletion(&child_file, "sub-dead", crate::rlm_ledger::RlmLedgerDeleteReason::User, None)
+        .await;
+    crate::rlm_ledger::APPEND_WRITE_FAULT.with(|fault| fault.set(None));
+    assert!(result.is_err(), "a torn delete is not acknowledged");
+    // A fresh reader with a captured log: the torn line is skipped and
+    // logged by file and line number, never by content.
+    let logs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&logs);
+    let logged = crate::rlm_ledger::RlmSpawnLedger::new(
+        &supervisor.options.agent_dir,
+        &crate::paths::sessions_dir(&supervisor.options.agent_dir).unwrap(),
+        move |line| sink.lock().unwrap().push(line.to_string()),
+    );
+    assert_eq!(logged.strict_edges().expect("the torn line is skipped, not fatal").len(), 1);
+    {
+        let logs = logs.lock().unwrap();
+        let entry = logs.iter().find(|line| line.contains("skipped")).expect("a skipped-line log entry");
+        assert!(entry.contains(&logged.ledger_path().display().to_string()) && entry.contains("on line"), "{entry}");
+        assert!(!entry.contains("sub-dead"), "record content is never logged: {entry}");
+    }
+    let edges = ledger.strict_edges().expect("the torn line is skipped, not fatal");
+    assert_eq!(edges.len(), 1);
+    assert!(edges[0].deleted.is_none(), "the torn delete is not a tombstone");
+    assert!(std::path::Path::new(&child_file).is_file(), "no physical cleanup ran");
+    ledger
+        .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+            child_id: "sub-dead".to_string(),
+            parent: parent_file.to_string_lossy().into_owned(),
+            child: child_file.clone(),
+            depth: 1,
+            name: "dead-worker".to_string(),
+        })
+        .expect("a never-deleted child is admitted again");
+}
+
+/// #42 ordering: a failed tombstone append leaves a resident child live. It is
+/// neither quarantined nor marked for a stop, because nothing was deleted.
+#[tokio::test]
+async fn issue_42_a_failed_commit_child_deletion_leaves_the_resident_live() {
+    let Fixture { _dir, supervisor, child_file, ledger } = fixture().await;
+    let (pid, start_id) = reaped_pid();
+    let (descriptor, descriptor_path) = child_descriptor(&supervisor, &child_file, pid, start_id.as_deref());
+    let before = std::fs::read(&descriptor_path).unwrap();
+    let resident = ResidentWorker::new("w-child".to_string(), descriptor, descriptor_path.clone());
+    crate::rlm_ledger::APPEND_WRITE_FAULT.with(|fault| fault.set(Some(12)));
+    let result = supervisor
+        .commit_child_deletion(&child_file, "sub-dead", crate::rlm_ledger::RlmLedgerDeleteReason::User, Some(&resident))
+        .await;
+    crate::rlm_ledger::APPEND_WRITE_FAULT.with(|fault| fault.set(None));
+    assert!(result.is_err(), "the append failed");
+    assert!(!resident.identity_quarantined(), "no quarantine without a committed tombstone");
+    assert!(!resident.intentional_stop.load(std::sync::atomic::Ordering::SeqCst), "no stop intent");
+    assert!(resident.descriptor.lock().await.stop_requested_at.is_none());
+    assert_eq!(std::fs::read(&descriptor_path).unwrap(), before, "the persisted descriptor is unchanged");
+    assert!(ledger.strict_edges().unwrap().iter().all(|edge| edge.deleted.is_none()));
+}
+
+/// The #42 crash window: the child's tombstone committed, then the supervisor
+/// "crashed" before the resident's stop descriptor persisted. Returns the
+/// persisted descriptor path; the descriptor carries no stop intent.
+async fn crash_after_child_tombstone(fixture: &Fixture) -> std::path::PathBuf {
+    let launch = crate::passivated_launch::PassivatedLaunch::new(
+        &crate::descriptor::durable_create_command(&json!({
+            "sessionPath": fixture.child_file, "cwd": fixture._dir.path(), "rlmDepth": 1,
+        })),
+        Some(true),
+    );
+    fixture.supervisor.passivated_launches.remember(&fixture.child_file, &launch).unwrap();
+    let (pid, start_id) = reaped_pid();
+    let (descriptor, descriptor_path) =
+        child_descriptor(&fixture.supervisor, &fixture.child_file, pid, start_id.as_deref());
+    let resident = ResidentWorker::new("w-child".to_string(), descriptor, descriptor_path.clone());
+    fixture.supervisor.lifecycle_test_hooks.crash_after_tombstone.store(true, std::sync::atomic::Ordering::SeqCst);
+    let crashed = fixture
+        .supervisor
+        .commit_child_deletion(&fixture.child_file, "sub-dead", crate::rlm_ledger::RlmLedgerDeleteReason::User, Some(&resident))
+        .await;
+    assert!(format!("{:#}", crashed.unwrap_err()).contains("injected crash"));
+    assert!(fixture.ledger.strict_edges().unwrap().iter().all(|edge| edge.deleted.is_some()), "the tombstone committed");
+    let persisted: DaemonWorkerDescriptor = serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+    assert!(persisted.stop_requested_at.is_none(), "the stop never persisted");
+    descriptor_path
+}
+
+fn restarted(fixture: &Fixture) -> Arc<Supervisor> {
+    let restarted = Arc::new(Supervisor::new(SupervisorOptions {
+        socket_path: fixture.supervisor.options.socket_path.clone(),
+        agent_dir: fixture.supervisor.options.agent_dir.clone(),
+    }).unwrap());
+    restarted.pin_worker_connect_budget_for_tests(Duration::ZERO);
+    restarted
+}
+
+/// GREEN: boot adoption on a fresh supervisor finds the committed tombstone
+/// through `stop_ledger_deleted_worker` and finishes the stop. RED (adoption
+/// without that call): the descriptor has no stop intent, so the outcome is
+/// not `Stopped` and the deleted child's descriptor survives.
+#[tokio::test]
+async fn issue_42_boot_adoption_finishes_the_stop_after_a_crash_past_the_tombstone() {
+    let fixture = fixture().await;
+    let descriptor_path = crash_after_child_tombstone(&fixture).await;
+    let restarted = restarted(&fixture);
+    let mut outcomes = Vec::new();
+    for (path, descriptor) in load_descriptors(&restarted.descriptor_dir, &restarted.options.socket_path) {
+        outcomes.push(restarted.adopt_persisted_worker_for_tests(path, descriptor, AdoptionBoot::PlainStartup).await);
+    }
+    let count = |outcome| outcomes.iter().filter(|seen| **seen == outcome).count();
+    assert_eq!(count(super::adoption::AdoptionOutcome::Stopped), 1, "{outcomes:?}");
+    assert_eq!(count(super::adoption::AdoptionOutcome::Revived), 0, "{outcomes:?}");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert!(restarted.registry.get("w-child").await.is_none(), "the deleted child is not adopted");
+    assert!(!descriptor_path.exists(), "boot adoption finished the tombstoned stop");
+    assert!(restarted.passivated_launches.get(&fixture.child_file).is_none(), "its revival context retired");
+    assert!(std::path::Path::new(&fixture.child_file).is_file(), "the stop never removes the transcript");
+}
+
+/// The same crash window through self-registration on a fresh supervisor:
+/// the registrant is refused definitively and nothing is adopted.
+#[tokio::test]
+async fn issue_42_registration_after_a_crash_past_the_tombstone_is_refused() {
+    let fixture = fixture().await;
+    let descriptor_path = crash_after_child_tombstone(&fixture).await;
+    let persisted: DaemonWorkerDescriptor = serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+    let restarted = restarted(&fixture);
+    let command = DaemonCommand::WorkerRegister {
+        id: None,
+        active_session_id: "w-child".to_string(),
+        session_id: None,
+        socket_path: persisted.socket_path.clone(),
+        worker_instance_id: String::new(),
+        token: persisted.authentication_token.clone(),
+        pid: persisted.pid,
+        rest: serde_json::Map::default(),
+    };
+    let response = restarted.handle_worker_register("r-1", "worker_register", &command).await;
+    assert!(!response.success, "{response:?}");
+    let error = response.error.unwrap_or_default();
+    assert!(error.starts_with(crate::registration::UNKNOWN_SESSION_WORKER_PREFIX) && error.contains("registration refused"), "{error}");
+    assert!(restarted.registry.get("w-child").await.is_none());
+    assert!(!descriptor_path.exists(), "the refused registrant's stop finished");
+    assert!(restarted.passivated_launches.get(&fixture.child_file).is_none(), "its revival context retired");
 }

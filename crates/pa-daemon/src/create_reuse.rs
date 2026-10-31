@@ -180,6 +180,7 @@ impl Supervisor {
             return Ok(None);
         };
         let path_text = path.to_string_lossy().to_string();
+        self.ensure_child_not_deleted(&path_text).await?;
 
         // Each wait re-checks the file's residents before launching over it:
         // a settled teardown may have handed the file to a concurrent opener's

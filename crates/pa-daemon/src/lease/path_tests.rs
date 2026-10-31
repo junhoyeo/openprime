@@ -28,5 +28,8 @@ fn checked_resolver_refuses_dangling_alias_and_non_directory_component() {
     std::fs::write(&file, b"not-directory").unwrap();
     assert!(checked_session_path(&file.join("child.jsonl")).is_err());
     // The older, best-effort API remains available to unchanged lease callers.
-    assert_eq!(canonical_session_path(&file.join("child.jsonl")), file.canonicalize().unwrap().join("child.jsonl"));
+    assert_eq!(
+        canonical_session_path(&file.join("child.jsonl")),
+        file.canonicalize().unwrap().join("child.jsonl")
+    );
 }

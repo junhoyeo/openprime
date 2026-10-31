@@ -6,12 +6,16 @@
 mod accept_loop;
 mod adoption;
 mod clients;
+mod child_lifecycle;
 mod launch_budget;
+#[cfg(test)]
+mod lifecycle_test_hooks;
 mod notes;
 mod options;
 mod root_identity;
 mod routing;
 mod sessions;
+pub(crate) mod session_publication;
 mod signals_shutdown;
 pub(crate) mod subscribers;
 mod update_restart;
@@ -28,6 +32,8 @@ mod supervision;
 mod attach_window_tests;
 #[cfg(all(test, unix))]
 mod dead_child_delete_tests;
+#[cfg(test)]
+mod saved_delete_tests;
 #[cfg(test)]
 mod handshake_tests;
 #[cfg(test)]
@@ -131,6 +137,8 @@ pub struct Supervisor {
     /// mutating that env var (a set value would leak into every
     /// parallel test's launch).
     worker_connect_budget: std::sync::Mutex<Option<Duration>>,
+    #[cfg(test)]
+    lifecycle_test_hooks: lifecycle_test_hooks::LifecycleTestHooks,
     /// The durable session-binding table (the stale-active-id rebind
     /// surface): every active id the supervisor has routed stays
     /// addressable through its session's durable identity, so a client
@@ -139,6 +147,10 @@ pub struct Supervisor {
     pub(crate) session_bindings: crate::session_bindings::SessionBindingTable,
     /// Per-session-file single-flight for opens (TS `openingWorkers`): a concurrent create
     /// reuses the first one's worker instead of losing the runtime session lease.
+    pub(crate) child_lifecycles: child_lifecycle::ChildLifecycles,
+    /// How the saved-session delete removes a file. Production builds fix
+    /// it to the TS trash-then-unlink policy; test builds never reach Trash.
+    pub(crate) session_file_removal: crate::saved_session_commands::SessionFileRemoval,
     pub(crate) opening_files:
         std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The idle-passivated sessions' durable opened-with launch contexts: the
@@ -265,7 +277,11 @@ impl Supervisor {
             descriptor_dir,
             bound_socket_identity: std::sync::Mutex::new(None),
             worker_connect_budget: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            lifecycle_test_hooks: lifecycle_test_hooks::LifecycleTestHooks::default(),
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
+            child_lifecycles: child_lifecycle::ChildLifecycles::default(),
+            session_file_removal: crate::saved_session_commands::SessionFileRemoval::default(),
             opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             passivated_launches,
             telemetry: std::sync::Mutex::new(None),
@@ -372,6 +388,10 @@ impl Supervisor {
         *self.bound_socket_identity.lock().unwrap() =
             socket::socket_identity(&self.options.socket_path);
         socket::restrict_socket_path(&self.options.socket_path);
+        #[cfg(test)]
+        if let Some(ready) = self.lifecycle_test_hooks.ready.lock().unwrap().take() {
+            let _ = ready.send(());
+        }
         match crate::compaction_supervision::TerminalCompactionJournal::open(
             &self.descriptor_dir.join("compaction-supervision.jsonl"),
         ) {

@@ -588,7 +588,7 @@ fn fork_startup_selection_copies_the_source_under_a_fresh_header() {
     let (source, id) = seed_session(&session_dir, &cwd, "original question");
     let before = std::fs::read(&source).expect("read source");
 
-    let selection = fork_startup_selection(&id, &cwd, Some(&session_dir)).expect("fork startup");
+    let selection = fork_startup_selection(&id, &cwd, &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap()).expect("fork startup");
     let SessionSelection::Resume(fork) = &selection else {
         panic!("the fork opens as a resume of the forked file, got {selection:?}");
     };
@@ -636,7 +636,7 @@ fn fork_startup_selection_imports_a_global_session_into_this_cwd() {
     let (source, id) = seed_session(&session_dir, &other_project, "global question");
     let before = std::fs::read(&source).expect("read source");
 
-    let selection = fork_startup_selection(&id, &this_project, Some(&session_dir))
+    let selection = fork_startup_selection(&id, &this_project, &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap())
         .expect("a GLOBAL session is exactly what --fork is for");
     let SessionSelection::Resume(fork) = &selection else {
         panic!("the fork opens as a resume of the forked file, got {selection:?}");
@@ -668,7 +668,7 @@ fn fork_startup_selection_reports_the_ts_contracts() {
     let empty = session_dir.join("empty.jsonl");
     std::fs::write(&empty, "").expect("write empty file");
     let error =
-        fork_startup_selection(empty.to_str().expect("utf8 path"), &cwd, Some(&session_dir))
+        fork_startup_selection(empty.to_str().expect("utf8 path"), &cwd, &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap())
             .expect_err("an empty source cannot fork");
     assert!(
         error.to_string().contains(&format!(
@@ -682,7 +682,7 @@ fn fork_startup_selection_reports_the_ts_contracts() {
     // it to zero entries (the `forkFrom` contract).
     let torn = session_dir.join("torn.jsonl");
     std::fs::write(&torn, "{\"type\":\"message\"}\n").expect("write torn file");
-    let error = fork_startup_selection(torn.to_str().expect("utf8 path"), &cwd, Some(&session_dir))
+    let error = fork_startup_selection(torn.to_str().expect("utf8 path"), &cwd, &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap())
         .expect_err("a source with no readable rows cannot fork");
     assert!(
         error
@@ -702,8 +702,7 @@ fn fork_startup_selection_reports_the_ts_contracts() {
     let error = fork_startup_selection(
         headerless.to_str().expect("utf8 path"),
         &cwd,
-        Some(&session_dir),
-    )
+        &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap())
     .expect_err("a headerless source cannot fork");
     assert!(
         error
@@ -712,7 +711,7 @@ fn fork_startup_selection_reports_the_ts_contracts() {
         "unexpected error: {error:#}"
     );
 
-    let error = fork_startup_selection("does-not-exist", &cwd, Some(&session_dir))
+    let error = fork_startup_selection("does-not-exist", &cwd, &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap())
         .expect_err("an unknown selector cannot fork");
     let rendered = format!("{error:#}");
     assert!(
@@ -747,7 +746,7 @@ fn fork_startup_selection_expands_a_tilde_selector() {
     let previous_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", &home);
     let selector = format!("~/sessions/{id}.jsonl");
-    let selection = fork_startup_selection(&selector, &project, Some(&session_dir));
+    let selection = fork_startup_selection(&selector, &project, &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap());
     match previous_home {
         Some(value) => std::env::set_var("HOME", value),
         None => std::env::remove_var("HOME"),
@@ -784,8 +783,7 @@ fn fork_startup_selection_rejects_a_fifo_source_without_hanging() {
     let error = fork_startup_selection(
         fifo.to_str().expect("utf8 path"),
         &project,
-        Some(&session_dir),
-    )
+        &session_dir, &pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&dir.path().join("agent")).unwrap())
     .expect_err("a FIFO source cannot fork");
     assert!(
         error.to_string().contains(&format!(
@@ -810,9 +808,13 @@ fn build_tui_options_opens_a_fork_as_the_startup_session() {
     options.config.agent_dir = dir.path().join("agent");
     options.session.fork = Some(id);
     options.session.session_dir = Some(session_dir.clone());
+    let socket = dir.path().join("d.sock");
+    let _supervisor = pa_daemon::supervisor::Supervisor::new(pa_daemon::supervisor::SupervisorOptions {
+        socket_path: socket.clone(), agent_dir: options.config.agent_dir.clone(),
+    }).unwrap();
     let (tui, _) = build_tui_options(
         &options,
-        dir.path().join("d.sock"),
+        socket,
         std::sync::Arc::default(),
     )
     .expect("the interactive launch forks instead of refusing");
@@ -1089,4 +1091,27 @@ fn interactive_resume_restores_saved_cwd_and_project_settings_unless_overridden(
         );
         assert_eq!(tui.code_block_indent, if explicit { "  " } else { "    " });
     }
+}
+
+#[test]
+fn issue_42_interactive_fork_does_not_flush_before_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = run_options_for_continue(dir.path());
+    let socket = dir.path().join("supervisor.sock");
+    let _supervisor = pa_daemon::supervisor::Supervisor::new(pa_daemon::supervisor::SupervisorOptions {
+        socket_path: socket.clone(), agent_dir: options.config.agent_dir.clone(),
+    }).unwrap();
+    let source_dir = dir.path().join("source");
+    let (source, _) = seed_session(&source_dir, dir.path(), "synthetic source");
+    let before = std::fs::read(&source).unwrap();
+    options.session.fork = Some(source.to_string_lossy().into_owned());
+    let blocker = options.config.agent_dir.join("session-leases");
+    std::fs::write(&blocker, b"preserved blocker").unwrap();
+    let result = build_tui_options(&options, socket, std::sync::Arc::default());
+    let materialized: Vec<_> = std::fs::read_dir(options.config.agent_dir.join("sessions"))
+        .unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert!(materialized.is_empty(), "interactive preparation must own target before first flush: {materialized:?}");
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(source).unwrap(), before);
+    assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
 }

@@ -515,41 +515,40 @@ impl Supervisor {
             }
             _ => false,
         };
-        if plain_kill {
-            if let Err(error) = self.persist_stop_tombstone(&resident).await {
-                return (
-                    vec![response_line(&response_failure(
-                        Some(&command_id),
-                        &type_name,
-                        &format!("Failed to persist the session stop: {error:#}"),
-                        None,
-                    ))],
-                    false,
-                );
-            }
-            // The kill is the archive. TS revived a killed session on a later
-            // prompt with the window's revive config, so the archived session
-            // keeps its non-secret launch context for that user-driven revival,
-            // exactly like an idle passivation (no automatic path revives it).
+        let ledger_delete = match command {
+            DaemonCommand::Kill { rest, .. } => rest.get("rlmLedgerDelete")
+                .and_then(Value::as_str).and_then(crate::rlm_ledger::RlmLedgerDeleteReason::from_wire),
+            _ => None,
+        };
+        if plain_kill && ledger_delete.is_none() {
+            // Revival context must be durable BEFORE an ordinary archive's
+            // irreversible stop intent. A failed record write leaves the
+            // resident descriptor authoritative and the command retryable.
             let launch = {
                 let descriptor = resident.descriptor.lock().await;
-                descriptor.session_file.clone().map(|session_file| {
-                    (
-                        session_file,
-                        crate::passivated_launch::PassivatedLaunch::new(
-                            &descriptor.create_command,
-                            descriptor.telemetry_disabled,
-                        ),
-                    )
-                })
+                descriptor.session_file.clone().map(|session_file| (
+                    session_file,
+                    crate::passivated_launch::PassivatedLaunch::new(
+                        &descriptor.create_command, descriptor.telemetry_disabled,
+                    ),
+                ))
             };
             if let Some((session_file, launch)) = launch {
-                if let Err(error) = self.passivated_launches.remember(&session_file, &launch) {
-                    self.log_line(&format!(
-                        "session worker {} archived without a launch record (its revival falls back to the session header): {error:#}",
-                        resident.worker_id
-                    ));
+                let remembered = async {
+                    let _guard = self.child_lifecycles.lock(&session_file).await?;
+                    if !self.child_is_deleted(&session_file).await? {
+                        self.passivated_launches.remember(&session_file, &launch)?;
+                    }
+                    anyhow::Ok(())
+                }.await;
+                if let Err(error) = remembered {
+                    return (vec![response_line(&response_failure(Some(&command_id), &type_name,
+                        &format!("Archive refused before stop: revival context could not be preserved: {error:#}"), None))], false);
                 }
+            }
+            if let Err(error) = self.persist_stop_tombstone(&resident).await {
+                return (vec![response_line(&response_failure(Some(&command_id), &type_name,
+                    &format!("Failed to persist the session stop: {error:#}"), None))], false);
             }
         }
         // A delete's deletion boundary persists BEFORE the teardown: a failed tombstone is
@@ -1130,81 +1129,62 @@ impl Supervisor {
             .rlm_spawn_ledger_for(None)
             .await
             .with_context(|| "resolve the spawn ledger sessions dir".to_string())?;
-        // The child's identity: the explicit id the parent's delete carries, else
-        // the live ledger edge matching the selector.
-        let edges = ledger
-            .live_edges()
-            .with_context(|| "read the spawn ledger edges".to_string())?;
-        let (child_id, session_file) = if let Some(resolved) =
-            resolve_ledger_child(&edges, selector, child_id)
+        // Resolve identity before locking, then re-read under the same file
+        // gate used by launch/relaunch. Never guess an ambiguous child id.
+        let edges = ledger.strict_edges()?;
+        let (child_id, session_file) = resolve_ledger_child(&edges, selector, child_id)
+            .ok_or_else(|| anyhow!("stopped RLM subagent \"{selector}\" is not in the spawn ledger"))?;
+        let _child_lifecycle = self.child_lifecycles.lock(&session_file).await?;
+        let canonical = crate::lease::checked_session_path(std::path::Path::new(&session_file))?;
+        let resident = self.registry.find_by_session_file(&session_file).await;
+        self.commit_child_deletion(&session_file, &child_id, reason, resident.as_ref()).await?;
+        let record_cleanup = self.passivated_launches.forget_deleted(&session_file);
+        if let Err(error) = &record_cleanup {
+            self.log_line(&format!("deleted child launch record retained: {error:#}"));
+        }
+        // A wake that acquired the gate first has completed registration. Its
+        // worker must stop; a delete must never acknowledge a revived child.
+        if let Some(resident) = resident {
+            self.persist_stop_tombstone(&resident).await?;
+            let rest = serde_json::Map::from_iter([
+                ("rlmLedgerDelete".to_string(), serde_json::to_value(reason)?),
+                ("rlmChildId".to_string(), json!(child_id)),
+            ]);
+            self.finish_plain_kill_stop(&resident, &rest).await;
+        }
+        // An interrupted prior attempt can leave a descriptor without a
+        // resident. Unknown process identity is not proof of completed deletion.
+        for (_, descriptor) in
+            crate::descriptor::load_descriptors(&self.descriptor_dir, &self.options.socket_path)
         {
-            ledger
-                .append_delete(&resolved.0, &resolved.1, reason)
-                .with_context(|| format!("tombstone RLM subagent {}", resolved.0))?;
-            resolved
-        } else {
-            // A retry after the boundary already stands: an earlier attempt tombstoned the
-            // edge and ran its finalize, so only a still-running worker blocks the delete.
-            let tombstoned: Vec<_> = ledger
-                .edges(true)
-                .with_context(|| "read the spawn ledger edges".to_string())?
-                .into_iter()
-                .filter(|edge| edge.deleted.is_some())
-                .collect();
-            let Some((deleted_child_id, session_file)) =
-                resolve_ledger_child(&tombstoned, selector, child_id)
-            else {
-                anyhow::bail!("stopped RLM subagent \"{selector}\" is not in the spawn ledger");
-            };
-            let canonical =
-                crate::lease::canonical_session_path(std::path::Path::new(&session_file));
-            for (_, descriptor) in
-                crate::descriptor::load_descriptors(&self.descriptor_dir, &self.options.socket_path)
+            let same_session = descriptor.session_file.as_deref().is_some_and(|file| {
+                crate::lease::canonical_session_path(std::path::Path::new(file)) == canonical
+            });
+            if same_session
+                && !super::worker_lifecycle::worker_process_gone(
+                    descriptor.pid, descriptor.process_start_id.clone(),
+                ).await
             {
-                let same_session = descriptor.session_file.as_deref().is_some_and(|file| {
-                    crate::lease::canonical_session_path(std::path::Path::new(file)) == canonical
-                });
-                if same_session
-                    && !super::worker_lifecycle::worker_process_gone(
-                        descriptor.pid,
-                        descriptor.process_start_id.clone(),
-                    )
-                    .await
-                {
-                    anyhow::bail!(
-                        "deleted RLM subagent \"{selector}\": worker {} (pid {}) is still running; delete refused until it exits",
-                        descriptor.worker_id,
-                        descriptor.pid
-                    );
-                }
+                anyhow::bail!(
+                    "deleted RLM subagent \"{selector}\": worker {} (pid {}) is still running; delete refused until it exits",
+                    descriptor.worker_id, descriptor.pid
+                );
             }
-            // The first attempt may have stopped after appending its tombstone.
-            // Reuse the same finalization without writing a second boundary.
-            (deleted_child_id, session_file)
-        };
+        }
         // The stopped child's teardown mirrors the resident delete's end state: the usage
         // capture, archived state, and artifact sweep land as a live child's kill leaves them.
         let sessions_dir = crate::paths::sessions_dir(&self.options.agent_dir)
             .with_context(|| "resolve the sessions dir for the delete finalize".to_string())?;
-        // Live coverage captured AFTER the tombstone append: a wake that registered a resident
-        // between the two must be visible here (the archive/sweep skips its tree).
         let live = self.live_session_files().await;
-        if self
-            .registry
-            .find_by_session_file(&session_file)
-            .await
-            .is_some()
-        {
-            // A revival raced the delete: the tombstone stands as the durable boundary, but the
-            // revived session stays live — no archive, no artifact sweep.
-            return Ok(());
-        }
-        crate::stop_cleanup::finalize_archived_stop(
+        let (_, finalize_error) = crate::stop_cleanup::finalize_archived_stop(
             &self.options.agent_dir,
             &sessions_dir,
             std::path::Path::new(&session_file),
             &live,
         );
+        if let Some(error) = finalize_error {
+            return Err(error).context("deleted child cleanup deferred; ledger deletion remains committed");
+        }
         self.capture_deleted_child_usage(&session_file, &child_id, "rlm_delete")
             .await;
         crate::saved_session_commands::remove_session_artifacts(std::path::Path::new(
@@ -1230,7 +1210,7 @@ impl Supervisor {
             agent_id.into_iter().collect()
         };
         self.push_roster_update(changed, removed);
-        Ok(())
+        record_cleanup
     }
 }
 
@@ -1243,7 +1223,8 @@ fn reply_active_session_id(data: Option<&Value>) -> Option<String> {
 
 /// The ledger edge a delete addresses, as `(child_id, child_file)`. `rlmChildId` is the durable
 /// key; the selector is the child's LIVE id, NOT the file stem. Order: (1a) edge matching BOTH
-/// the stem and the id; (1b) the LAST edge carrying the id; (2) the stem-matching edge.
+/// the stem and the id; (1b) the sole edge carrying the id; (2) the stem-matching edge.
+/// An ambiguous id never grants deletion authority over an arbitrary sibling.
 fn resolve_ledger_child(
     edges: &[crate::rlm_ledger::RlmLedgerEdge],
     selector: &str,
@@ -1255,11 +1236,22 @@ fn resolve_ledger_child(
             .is_some_and(|name| name.to_string_lossy() == selector)
     };
     let found = match child_id {
-        Some(id) => edges
-            .iter()
-            .find(|edge| stem_matches(edge) && edge.child_id == id)
-            .or_else(|| edges.iter().rev().find(|edge| edge.child_id == id)),
-        None => edges.iter().find(|edge| stem_matches(edge)),
+        Some(id) => {
+            let matching: Vec<_> = edges.iter().filter(|edge| edge.child_id == id).collect();
+            let by_stem: Vec<_> = matching.iter().copied().filter(|edge| stem_matches(edge)).collect();
+            let candidates = if by_stem.is_empty() { &matching } else { &by_stem };
+            match candidates.as_slice() {
+                [edge] => Some(*edge),
+                [] | [_, _, ..] => None,
+            }
+        },
+        None => {
+            let matching: Vec<_> = edges.iter().filter(|edge| stem_matches(edge)).collect();
+            match matching.as_slice() {
+                [edge] => Some(*edge),
+                [] | [_, _, ..] => None,
+            }
+        },
     };
     found.map(|edge| (edge.child_id.clone(), edge.child.clone()))
 }

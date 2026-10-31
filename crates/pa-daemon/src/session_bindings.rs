@@ -43,40 +43,18 @@ impl SessionBindingTable {
         session_id: Option<&str>,
         session_file: Option<&str>,
     ) -> Option<(Vec<String>, Arc<SessionBinding>)> {
-        if active_session_id.is_empty() {
-            return None;
-        }
-        // Nothing durable to remember: a file-less worker (an in-memory
-        // session) is never a rebind source and earns no entry.
-        let session_file = session_file.filter(|file| !file.is_empty())?;
-        let binding = Arc::new(SessionBinding {
-            active_session_id: active_session_id.to_string(),
-            session_id: session_id.filter(|id| !id.is_empty()).map(str::to_string),
-            session_file: Some(canonical_binding_path(session_file)),
-        });
-        let mut by_active_id = Self::locked(&self.by_active_id);
-        let mut by_session_file = Self::locked(&self.by_session_file);
-        by_active_id.insert(active_session_id.to_string(), Arc::clone(&binding));
-        // Every id holding an older binding for this same durable session is
-        // superseded — not just the immediately previous one.
-        let file = binding.session_file.as_deref().expect("file-backed");
-        let mut superseded_ids: Vec<String> = by_active_id
-            .iter()
-            .filter(|(_, bound)| {
-                bound.session_file.as_deref() == Some(file)
-                    && bound.session_id.is_some()
-                    && bound.session_id == binding.session_id
-                    && bound.active_session_id != binding.active_session_id
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        superseded_ids.sort();
-        by_session_file.insert(file.to_string(), Arc::clone(&binding));
-        // The superseded ids keep addressing the session through the new binding.
-        for previous in &superseded_ids {
-            by_active_id.insert(previous.clone(), Arc::clone(&binding));
-        }
-        (!superseded_ids.is_empty()).then_some((superseded_ids, binding))
+        BindingWriter {
+            by_active_id: Self::locked(&self.by_active_id),
+            by_session_file: Self::locked(&self.by_session_file),
+        }.record(active_session_id, session_id, session_file)
+    }
+
+    pub(crate) fn try_writer(&self) -> std::io::Result<BindingWriter<'_>> {
+        let busy = |_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "Session bindings are changing");
+        Ok(BindingWriter {
+            by_active_id: self.by_active_id.try_lock().map_err(busy)?,
+            by_session_file: self.by_session_file.try_lock().map_err(busy)?,
+        })
     }
 
     /// The binding one active id addresses (the latest binding for its
@@ -98,6 +76,54 @@ impl SessionBindingTable {
         let mut by_session_file = Self::locked(&self.by_session_file);
         by_session_file.remove(session_file);
         by_active_id.retain(|_, bound| bound.session_file.as_deref() != Some(session_file));
+    }
+}
+
+/// The fixed-order binding slots held by a short supervisor publication.
+pub(crate) struct BindingWriter<'a> {
+    by_active_id: std::sync::MutexGuard<'a, HashMap<String, Arc<SessionBinding>>>,
+    by_session_file: std::sync::MutexGuard<'a, HashMap<String, Arc<SessionBinding>>>,
+}
+
+impl BindingWriter<'_> {
+    pub(crate) fn record(
+        &mut self,
+        active_session_id: &str,
+        session_id: Option<&str>,
+        session_file: Option<&str>,
+    ) -> Option<(Vec<String>, Arc<SessionBinding>)> {
+        if active_session_id.is_empty() {
+            return None;
+        }
+        // Nothing durable to remember: a file-less worker (an in-memory
+        // session) is never a rebind source and earns no entry.
+        let session_file = session_file.filter(|file| !file.is_empty())?;
+        let binding = Arc::new(SessionBinding {
+            active_session_id: active_session_id.to_string(),
+            session_id: session_id.filter(|id| !id.is_empty()).map(str::to_string),
+            session_file: Some(canonical_binding_path(session_file)),
+        });
+        self.by_active_id.insert(active_session_id.to_string(), Arc::clone(&binding));
+        // Every id holding an older binding for this same durable session is
+        // superseded — not just the immediately previous one.
+        let file = binding.session_file.as_deref().expect("file-backed");
+        let mut superseded_ids: Vec<String> = self.by_active_id
+            .iter()
+            .filter(|(_, bound)| {
+                bound.session_file.as_deref() == Some(file)
+                    && bound.session_id.is_some()
+                    && bound.session_id == binding.session_id
+                    && bound.active_session_id != binding.active_session_id
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        superseded_ids.sort();
+        self.by_session_file.insert(file.to_string(), Arc::clone(&binding));
+        // The superseded ids keep addressing the session through the new binding.
+        for previous in &superseded_ids {
+            self.by_active_id.insert(previous.clone(), Arc::clone(&binding));
+        }
+        (!superseded_ids.is_empty()).then_some((superseded_ids, binding))
     }
 }
 

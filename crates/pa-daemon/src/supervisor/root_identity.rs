@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use pa_types::daemon::DaemonWorkerDescriptor;
 use serde_json::Value;
-use tokio::sync::MutexGuard;
 
 use crate::registry::ResidentWorker;
 
@@ -121,142 +119,14 @@ impl Supervisor {
         });
     }
 
-    /// Follow the roster's root row for one worker's address, idempotent, under the
-    /// caller's descriptor guard: when the row names a different durable session, the
-    /// descriptor, persisted record, durable create command, and binding table all move
-    /// onto it. `false` means the write was NOT the root's own, so the quarantine stays.
-    pub(crate) fn sync_root_identity_from_roster(
-        &self,
-        resident: &Arc<ResidentWorker>,
-        descriptor: &mut MutexGuard<'_, DaemonWorkerDescriptor>,
-    ) -> bool {
-        let summary = {
-            let roster = self.roster.lock().unwrap();
-            roster
-                .by_active_session_id(&resident.worker_id)
-                .map(|entry| entry.summary.clone())
-        };
-        let Some(summary) = summary else {
-            // The roster holds no root row for this worker's address yet; the next
-            // write triggers the follow.
-            return false;
-        };
-        let (session_id, session_file) = match (
-            summary.get("sessionId").and_then(Value::as_str),
-            summary.get("sessionFile").and_then(Value::as_str),
-        ) {
-            (Some(session_id), Some(session_file))
-                if !session_id.is_empty() && !session_file.is_empty() =>
-            {
-                (session_id.to_string(), session_file.to_string())
-            }
-            // A row without a durable identity (an in-memory `no_session` session) names no
-            // file to follow, but it IS the root's own live word, so the quarantine lifts.
-            _ => return true,
-        };
-        if descriptor.root_session_id.as_deref() == Some(session_id.as_str())
-            && descriptor.session_file.as_deref() == Some(session_file.as_str())
-            && !resident.identity_persist_pending()
-        {
-            return true;
-        }
-        descriptor.root_session_id = Some(session_id.clone());
-        descriptor.session_file = Some(session_file.clone());
-        // The durable create command must reopen the moved-to session on relaunch. A
-        // worker that started `noSession` and switched onto a real file drops the in-memory
-        // flag with the path (the create refuses `noSession`+`sessionPath`).
-        descriptor.create_command.session_path = Some(session_file.clone());
-        descriptor.create_command.no_session = None;
-        // The relaunch cwd follows the moved-to session too: the replacement rebound
-        // the worker onto that transcript's own directory (or the fallback the switch
-        // selected for a missing one). Replaying the launch cwd would run the
-        // switched-in transcript in a directory that belongs to another session.
-        let moved_cwd = summary
-            .get("cwd")
-            .and_then(Value::as_str)
-            .filter(|cwd| !cwd.is_empty())
-            .map(str::to_string);
-        if let Some(cwd) = &moved_cwd {
-            descriptor
-                .create_command
-                .rest
-                .insert("cwd".to_string(), Value::from(cwd.as_str()));
-        }
-        // The durable record is the restart edge: a failed persist leaves the LIVE routing
-        // correct while the record lags — keep the transition marked pending so the next
-        // roster write repairs it.
-        let persisted = crate::descriptor::persist_worker(&resident.descriptor_path, descriptor)
-            .or_else(|error| {
-                let retry =
-                    crate::descriptor::persist_worker(&resident.descriptor_path, descriptor);
-                match retry {
-                    Ok(()) => Ok(()),
-                    Err(_retry_failed) => Err(error),
-                }
-            });
-        match persisted {
-            Ok(()) => {
-                resident.clear_identity_persist_pending();
-                // The repair landed; a failed removal leaves a stale record a later boot
-                // could roll back onto — surface it (the next repair retries).
-                if let Err(clear_error) =
-                    crate::descriptor::clear_identity_pending(&resident.descriptor_path)
-                {
-                    self.log_line(&format!(
-                        "the identity-pending record for worker {} did not clear after the repair (retrying on the next roster write): {clear_error:#}",
-                        resident.worker_id
-                    ));
-                }
-            }
-            Err(error) => {
-                resident.mark_identity_persist_pending();
-                // The durable pending: record the moved-to identity beside the descriptor so a
-                // restart applies it before any routing or relaunch (the in-memory marker dies
-                // with the process; the stale record would serve the superseded session).
-                if let Err(pending_error) = crate::descriptor::write_identity_pending(
-                    &resident.descriptor_path,
-                    &session_id,
-                    &session_file,
-                    moved_cwd.as_deref(),
-                    &crate::util::now_iso(),
-                ) {
-                    // The last resort: the side record could not land either. The boot's live
-                    // reconciliation or the death verdict remain the safety nets — surface both.
-                    self.log_line(&format!(
-                        "session identity move for {} persisted neither record nor pending side record: {pending_error:#}",
-                        resident.worker_id
-                    ));
-                }
-                self.log_line(&format!(
-                    "session identity move for {} did not persist (the pending side record carries it; repairing on the next roster write): {error:#}",
-                    resident.worker_id
-                ));
-                self.note_daemon_event("root_identity_persist_failed", None);
-            }
-        }
-        // The binding table learns the moved-to identity here (under the same guard as
-        // the move): a stale-id rebind never resolves a superseded binding.
-        self.record_session_binding(
-            &resident.worker_id,
-            Some(session_id.as_str()),
-            Some(session_file.as_str()),
-        );
-        // The durable ids never ride the log (the logging discipline); the worker's
-        // address identifies the move.
-        self.log_line(&format!(
-            "session identity moved: worker {} now serves its current session (the root-identity follow ran)",
-            resident.worker_id
-        ));
-        true
-    }
+
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use pa_types::daemon::DaemonWorkerDescriptor;
-    use serde_json::json;
+        use serde_json::json;
 
     use crate::registry::ResidentWorker;
     use crate::supervisor::Supervisor;

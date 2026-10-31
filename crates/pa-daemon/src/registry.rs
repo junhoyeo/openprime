@@ -418,6 +418,12 @@ impl SessionRegistry {
         }
     }
 
+    pub(crate) fn try_publication(&self) -> std::io::Result<tokio::sync::MutexGuard<'_, HashMap<String, Arc<ResidentWorker>>>> {
+        self.workers.try_lock().map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::WouldBlock, "Session registry is changing; publication deferred",
+        ))
+    }
+
     pub(crate) async fn insert(&self, resident: Arc<ResidentWorker>) {
         self.workers
             .lock()

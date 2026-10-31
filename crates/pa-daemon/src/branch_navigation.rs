@@ -28,6 +28,7 @@ pub(crate) struct TreeNavigation {
     engine: Arc<dyn SessionEngine>,
     core: Arc<Mutex<SessionCore>>,
     idle_notify: Arc<Notify>,
+    authority: Result<crate::lease::RuntimeSessionAuthority, String>,
     /// The live branch-summary run's abort slot; each run replaces it, like
     /// the TS `_branchSummaryAbortController`.
     abort: Mutex<Option<Arc<AbortController>>>,
@@ -38,11 +39,13 @@ impl TreeNavigation {
         engine: Arc<dyn SessionEngine>,
         core: Arc<Mutex<SessionCore>>,
         idle_notify: Arc<Notify>,
+        authority: Result<crate::lease::RuntimeSessionAuthority, String>,
     ) -> Self {
         TreeNavigation {
             engine,
             core,
             idle_notify,
+            authority,
             abort: Mutex::new(None),
         }
     }
@@ -395,12 +398,12 @@ impl TreeNavigation {
                         .trace_upload
                         .as_ref()
                         .and_then(|traces| traces.forked(&forked.path));
-                    if let Some(lease) = &store.lease {
-                        forked.lease =
-                            Some(lease.acquire_target(&forked.path).map_err(|error| {
-                                response_failure(None, "fork", &error.to_string(), None)
-                            })?);
-                    }
+                    let authority = self.authority.as_ref().map_err(|error| {
+                        response_failure(None, "fork", error, None)
+                    })?;
+                    forked.lease = Some(Arc::new(authority.acquire(&forked.path).map_err(|error| {
+                        response_failure(None, "fork", &format!("{error:#}"), None)
+                    })?));
                     if let Err(error) = forked.rewrite() {
                         return Err(response_failure(None, "fork", &error.to_string(), None));
                     }
@@ -418,12 +421,13 @@ impl TreeNavigation {
                     forked
                 } else {
                     let session_dir = store.path.parent().unwrap_or(store.path.as_path());
-                    match store.create_branched_file(leaf_id, session_dir) {
-                        Ok(forked) => forked,
-                        Err(error) => {
-                            return Err(response_failure(None, "fork", &error.to_string(), None))
-                        }
-                    }
+                    let mut forked = store.prepare_branched_file(leaf_id, session_dir)
+                        .map_err(|error| response_failure(None, "fork", &format!("{error:#}"), None))?;
+                    let authority = self.authority.as_ref().map_err(|error| response_failure(None, "fork", error, None))?;
+                    forked.lease = Some(Arc::new(authority.acquire(&forked.path)
+                        .map_err(|error| response_failure(None, "fork", &format!("{error:#}"), None))?));
+                    forked.rewrite().map_err(|error| response_failure(None, "fork", &format!("{error:#}"), None))?;
+                    forked
                 }
             }
         };
@@ -666,6 +670,7 @@ mod trace_fork_tests {
             Arc::new(crate::engine::ScriptedEngine::default()),
             core.clone(),
             Arc::new(tokio::sync::Notify::new()),
+            Ok(crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap()),
         );
         // A spare registry slot admits the fork's distinct controller at prepare
         // time; publication must keep it attached for later writes.
@@ -733,6 +738,7 @@ mod trace_fork_tests {
             Arc::new(crate::engine::ScriptedEngine::default()),
             core.clone(),
             Arc::new(tokio::sync::Notify::new()),
+            Ok(crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap()),
         );
         // At capacity the prepare-time admission is rejected (the registry
         // bound is pa-core's, covered by its bounded-admission tests); the

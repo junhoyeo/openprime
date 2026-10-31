@@ -151,14 +151,27 @@ impl Supervisor {
         // directory. Pin the file before changing the worker's process cwd so a
         // relative sessionPath still opens the same file. Explicit-cwd creates
         // retain their existing relative-path semantics.
-        let session_path = match (session_path, explicit_cwd) {
-            (Some(path), None) => Some(
-                std::path::absolute(crate::paths::expand_tilde(path)?)?
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            _ => session_path.clone(),
+        let session_path = session_path.as_deref().map(|raw| -> Result<String> {
+            anyhow::ensure!(!raw.trim().is_empty(), "Session path is empty");
+            let mut path = crate::paths::expand_tilde(raw)?;
+            if path.is_relative() {
+                if let Some(cwd) = explicit_cwd {
+                    path = crate::paths::expand_tilde(cwd)?.join(path);
+                }
+            }
+            Ok(std::path::absolute(path)?.to_string_lossy().into_owned())
+        }).transpose()?;
+        let _child_lifecycle = match session_path.as_deref() {
+            Some(file) => {
+                let guard = self.child_lifecycles.lock(file).await?;
+                self.ensure_child_not_deleted(file).await?;
+                Some(guard)
+            }
+            None => None,
         };
+        #[cfg(test)]
+        self.lifecycle_test_hooks.checkpoint(super::lifecycle_test_hooks::Phase::LaunchChecked,
+            session_path.as_deref()).await?;
         let saved_cwd = if explicit_cwd.is_none() {
             session_path
                 .as_deref()
@@ -473,7 +486,7 @@ impl Supervisor {
         }
         {
             let mut descriptor = resident.descriptor.lock().await;
-            descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
+            descriptor.lifecycle = DaemonWorkerLifecycle::Starting;
             // TS clears `launchEnv` at ready; an owned worker keeps it
             // for its recovery relaunch until ownership clears.
             if descriptor.owner_client_id.is_none() {
@@ -495,7 +508,6 @@ impl Supervisor {
                 descriptor.session_file = Some(session_file.clone());
                 // A worker hosts the session again: its own descriptor carries the
                 // launch context from here on, so a passivation record is spent.
-                self.passivated_launches.forget(&session_file);
                 // The durable create command must reopen the same session file on relaunch,
                 // or a respawned worker would create a fresh session and lose history.
                 descriptor.create_command.session_path = Some(session_file);
@@ -503,16 +515,32 @@ impl Supervisor {
             // The binding table learns the durable identity here: a create over a session
             // file another worker owned supersedes the old id, and the notification tells
             // attached clients to rebind.
-            self.record_session_binding(
-                &worker_id,
-                descriptor.root_session_id.as_deref(),
-                descriptor.session_file.as_deref(),
-            );
             persist_worker(&descriptor_path, &descriptor)?;
         }
-        // The create completed with a validated session identity: client commands may
-        // now be routed to this worker — nothing overtakes the session's create.
-        resident.note_session_ready();
+        // Only final-path M-protected publication may expose readiness/bindings.
+        let instance = resident.descriptor.lock().await.worker_instance_id.clone().unwrap_or_default();
+        let publication = self.publish_verified_summary(&resident, &create_summary,
+            crate::supervisor::session_publication::SummaryOrder::Pull { instance: &instance, sequence: None }, &[]);
+        match publication {
+            Ok(Some(published)) => self.announce_verified_summary(&published),
+            Ok(None) => {
+                resident.mark_identity_quarantined();
+                let stop_intent = self.persist_stop_tombstone(&resident).await;
+                let _ = child.kill().await;
+                stop_intent?;
+                return Err(anyhow!("Worker creation publication was superseded"));
+            }
+            Err(error) => {
+                resident.mark_identity_quarantined();
+                let stop_intent = self.persist_stop_tombstone(&resident).await;
+                let _ = child.kill().await;
+                stop_intent?;
+                return Err(error.context("Worker creation final identity refused"));
+            }
+        }
+        if let Some(file) = resident.descriptor.lock().await.session_file.clone() {
+            self.passivated_launches.forget(&file);
+        }
         let pid = child.id().unwrap_or(0);
         self.spawn_monitor(Arc::clone(&resident), Some(child), u64::from(pid), None);
         Ok((resident, create_summary))
@@ -563,13 +591,13 @@ impl Supervisor {
         let Some(child_id) = child_id else {
             anyhow::bail!("deleted RLM subagent is missing its child id");
         };
-        let ledger = self
-            .rlm_spawn_ledger_for(None)
-            .await
-            .with_context(|| "resolve the spawn ledger sessions dir".to_string())?;
-        ledger
-            .append_delete(&child_id, &session_file, reason)
-            .with_context(|| format!("tombstone RLM subagent {child_id}"))?;
+        let _child_lifecycle = self.child_lifecycles.lock(&session_file).await?;
+        self.commit_child_deletion(&session_file, &child_id, reason, Some(resident)).await?;
+        // Metadata failure must not keep a committed-deleted worker alive.
+        // Keep the foreign/unreadable record, report it, and still stop.
+        if let Err(error) = self.passivated_launches.forget_deleted(&session_file) {
+            self.log_line(&format!("deleted child launch record retained: {error:#}"));
+        }
         // The display tombstone keeps the child's identity for hydration retries;
         // best-effort because the ledger tombstone is the authority.
         let display = crate::rlm_ledger::read_rlm_subagent_display(Path::new(&session_dir));
@@ -720,8 +748,19 @@ impl Supervisor {
                 )
             })
         };
+        let _child_lifecycle = match &launch {
+            Some((file, _)) => match self.child_lifecycles.lock(file).await {
+                Ok(guard) => Some(guard),
+                Err(error) => return response_failure(Some(command_id), type_name, &format!("{error:#}"), None),
+            },
+            None => None,
+        };
         if let Some((session_file, launch)) = &launch {
-            if let Err(error) = self.passivated_launches.remember(session_file, launch) {
+            let remembered = match self.ensure_child_not_deleted(session_file).await {
+                Ok(()) => self.passivated_launches.remember(session_file, launch),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = remembered {
                 self.log_line(&format!(
                     "session worker {} passivation kept no launch record (its wake falls back to the session header): {error:#}",
                     resident.worker_id
