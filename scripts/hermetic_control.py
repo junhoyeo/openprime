@@ -33,6 +33,23 @@ class ControlDirectory:
         with self.create_file(name) as stream:
             stream.write(data)
 
+    def write_executable(self, relative, text):
+        """Create one owned executable in a fixed subdirectory, relative to the held fd."""
+        directory, _, name = relative.partition("/")
+        if (not directory or not name or "/" in name or directory in (".", "..")
+                or name in (".", "..") or "\\" in relative):
+            raise ValueError("executable path must be DIR/NAME")
+        os.mkdir(directory, 0o700, dir_fd=self.fd)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500,
+                         dir_fd=directory_fd)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(text.encode("utf-8"))
+        finally:
+            os.close(directory_fd)
+        return self.path.resolve() / directory / name
+
     def close(self):
         if self.fd is not None:
             os.close(self.fd)

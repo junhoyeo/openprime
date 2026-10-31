@@ -14,6 +14,7 @@ from unittest import mock
 
 from test_hermetic_ownership import OwnershipTest
 from test_hermetic_unknown import UnknownObservationTest
+from test_hermetic_trash import FakeTrashTest, TrashInstallTest, TrashInventoryTest, TrashProfileTest
 
 SPEC = importlib.util.spec_from_file_location("hermetic_test", Path(__file__).with_name("hermetic_test.py"))
 ht = importlib.util.module_from_spec(SPEC)

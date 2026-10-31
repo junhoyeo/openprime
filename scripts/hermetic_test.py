@@ -12,7 +12,11 @@ synthetic HOME/TMPDIR/XDG_DATA_HOME,
 and an explicit test kernel interpreter. On macOS the command also runs under a
 mandatory sandbox that denies filesystem writes outside the run root and private
 Cargo target. It permits loopback mocks except protected ports (53, 8787, 8791, 18789), and
-Unix sockets only under the run root. Direct external IP/DNS traffic is denied. Agent, session, and socket paths are
+Unix sockets only under the run root. Direct external IP/DNS traffic is denied.
+The sandbox also denies known trash executables and Apple Event file operations
+(Apple Event sends, the Apple Events, DesktopServicesHelper and FileProvider
+services, and the real ~/.Trash), and routes known `trash` CLI calls to an owned
+fake first on PATH. It does not prevent all deletion or detect every attempt. Agent, session, and socket paths are
 not forced, so tests keep their own per-test roots. After the command, it
 compares precise same-UID process identities and observed subject relationships.
 Observed owned survivors, subject-related candidates, and required tracking failures
@@ -42,6 +46,7 @@ import time
 
 from hermetic_ownership import OwnershipTracker, ReferenceProbe
 from hermetic_control import ControlDirectory, write_receipt
+import hermetic_trash
 from hermetic_processes import ProcessInventory, UnknownObservation, new_processes, reap_owned, snapshot_receipt
 
 PASS_THROUGH = ("PATH", "LANG", "LC_ALL", "TZ", "TERM", "CARGO_HOME", "RUSTUP_HOME",
@@ -96,7 +101,8 @@ def build_env(root, kernel_python, environ):
 # This fence blocks external IPs and protected ports, NOT every local service:
 # dynamic loopback mocks are supported, so an unknown local proxy remains outside
 # this guarantee. Proxy credentials/settings never enter build_env.
-def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8791, 18789)):
+def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8791, 18789),
+                    trash_rules=()):
     quote = lambda value: json.dumps(str(value))
     paths = [Path(root).resolve(), *(Path(p).resolve() for p in writable)]
     private = [real_home() / ".prime", real_home() / ".prime-rust", *map(Path, protected)]
@@ -122,6 +128,8 @@ def sandbox_profile(root, *, writable=(), protected=(), protected_ports=(8787, 8
             raise ValueError(f"invalid protected port: {port}")
         lines.append(f'(deny network-outbound (remote ip "*:{port}"))')
     lines.append('(allow process-exec (literal "/bin/ps") (with no-sandbox))')
+    # Trash rules come last: their CONTROL fake allow must be the final exec match.
+    lines.extend(trash_rules)
     return "\n".join(lines) + "\n"
 
 
@@ -207,12 +215,24 @@ def main(argv=None):
             listener.bind(("127.0.0.1", 0))
             listener.listen()
             port = listener.getsockname()[1]
+            nonce = "patrash" + os.urandom(8).hex()
+            real_trash = hermetic_trash.discover_real_trash(env["PATH"])
+            fake = hermetic_trash.install_fake(control, kernel_python, root, target)
+            env["PATH"] = f"{fake.parent}{os.pathsep}{env['PATH']}"
+            trash_rules = hermetic_trash.profile_rules(control.path, nonce, real_trash, json.dumps)
+            write_receipt(control, "trash-policy.json", {**hermetic_trash.policy_receipt(real_trash, nonce),
+                                                        "subject_path": env["PATH"], "fake": str(fake)})
             profile = sandbox_profile(root, writable=(target,), protected=(private,),
-                                      protected_ports=[*args.protect_port, port])
+                                      protected_ports=[*args.protect_port, port], trash_rules=trash_rules)
             control.write_text("isolation.sb", profile)
             profile_path = control.path / "isolation.sb"
             preflight = [kernel_python, str(Path(__file__).with_name("hermetic_preflight.py")),
-                         str(root), str(forbidden), str(private), str(port), str(control.path)]
+                         str(root), str(forbidden), str(private), str(port), str(control.path),
+                         json.dumps({"real_trash": sorted(set(real_trash) | set(real_trash.values())),
+                                     "fake": str(fake), "nonce": nonce,
+                                     "owner_trash": hermetic_trash.owner_trash(),
+                                     "services": [name for name, _ in hermetic_trash.DENIED_MACH_SERVICES],
+                                     "regex_probes": list(hermetic_trash.MACH_REGEX_PROBES)})]
             result = subprocess.run(sandboxed(preflight, profile_path), env=env,
                                     text=True, capture_output=True, timeout=20, check=False)
             write_receipt(control, "preflight.json", {"exit": result.returncode,
@@ -223,7 +243,16 @@ def main(argv=None):
                 return result.returncode or 4
             print(f"hermetic_test: OS-fence preflight {result.stdout.strip()}", file=sys.stderr)
             argv = sandboxed(argv, profile_path)
-        return run_subject(argv, env, root, target, args.timeout, control=control)
+        try:
+            return run_subject(argv, env, root, target, args.timeout, control=control)
+        finally:
+            # Evidence only: an inventory or receipt failure must never replace the
+            # subject's decision or hide an exception from run_subject.
+            try:
+                write_receipt(control, "fake-trash-inventory.json", hermetic_trash.store_inventory(root))
+            except Exception as failure:
+                print(f"hermetic_test: fake-trash inventory not recorded: {type(failure).__name__}: {failure}",
+                      file=sys.stderr)
 
 
 def read_log_tail(output):
