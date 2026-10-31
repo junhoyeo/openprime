@@ -42,16 +42,28 @@ pub fn acquire(
     std::fs::create_dir_all(&socket_dir)
         .with_context(|| format!("create {}", socket_dir.display()))?;
     let intent_path = update_intent_path(&socket_dir);
-    if let Some(existing) = read_intent(&intent_path) {
-        if is_intent_holder_alive(&existing) {
-            let join_path = existing
-                .rest
-                .get("status_path")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(|| default_status_path(&socket_dir), PathBuf::from);
-            return Ok(AcquireOutcome::Join {
-                status_path: join_path,
-            });
+    match std::fs::read_to_string(&intent_path) {
+        Ok(content) => {
+            let existing: UpdateIntent = serde_json::from_str(&content).with_context(|| {
+                format!(
+                    "Cannot verify coordinator intent ownership (unparseable record) {}",
+                    intent_path.display()
+                )
+            })?;
+            if is_intent_holder_alive(&existing) {
+                let join_path = existing
+                    .rest
+                    .get("status_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| default_status_path(&socket_dir), PathBuf::from);
+                return Ok(AcquireOutcome::Join {
+                    status_path: join_path,
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", intent_path.display()))
         }
     }
     let intent = intent_record(update_id, u64::from(std::process::id()), status_path);
@@ -86,6 +98,7 @@ pub fn hand_over(
 ) -> Result<()> {
     let socket_dir = socket_update_directory(agent_dir, socket_path);
     let intent_path = update_intent_path(&socket_dir);
+    verify_current_ownership(&intent_path)?;
     let intent = intent_record(update_id, coordinator_pid, status_path);
     write_atomically(&intent_path, &intent)
 }
@@ -99,6 +112,7 @@ pub fn release(agent_dir: &Path, socket_path: &str) -> Result<()> {
     let socket_dir = socket_update_directory(agent_dir, socket_path);
     let intent_path = update_intent_path(&socket_dir);
     if intent_path.exists() {
+        verify_current_ownership(&intent_path)?;
         std::fs::remove_file(&intent_path)
             .with_context(|| format!("remove {}", intent_path.display()))?;
     }
@@ -138,22 +152,52 @@ fn read_intent(path: &Path) -> Option<UpdateIntent> {
     serde_json::from_str(&content).ok()
 }
 
+/// Whether the recorded holder can be confirmed gone, safe for a new
+/// process to steal/release/hand off its intent record. An ambiguous or
+/// unverifiable identity comparison - unlike a provable exit, or a
+/// provable pid-reuse mismatch - must never count as proof of absence
+/// (#37): treat it the same as a confirmed-live holder (refuse/join),
+/// never the same as a confirmed-dead one.
+fn intent_holder_is_confirmed_gone(intent: &UpdateIntent) -> bool {
+    matches!(
+        pa_types::platform::process::observe_process_identity(
+            intent.pid as u32,
+            intent.process_start_id.as_deref()
+        ),
+        pa_types::platform::process::ProcessIdentity::Gone
+    )
+}
+
 fn is_intent_holder_alive(intent: &UpdateIntent) -> bool {
-    let Ok(alive) = pa_daemon::lease::is_process_alive(intent.pid as u32) else {
-        return false;
-    };
-    if !alive {
-        return false;
-    }
-    match &intent.process_start_id {
-        None => true,
-        Some(expected) => {
-            matches!(
-                pa_daemon::lease::get_process_start_id(intent.pid as u32),
-                Some(observed) if &observed == expected
-            )
-        }
-    }
+    !intent_holder_is_confirmed_gone(intent)
+}
+
+/// Before rewriting or removing the intent record, verify its on-disk
+/// holder identity can actually be confirmed as this still-live process -
+/// an unparseable record, or an ambiguous/unverifiable identity, refuses
+/// rather than let a handoff/release blindly clobber state it cannot
+/// prove it owns (#37).
+fn verify_current_ownership(intent_path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(intent_path)
+        .with_context(|| format!("read {}", intent_path.display()))?;
+    let intent: UpdateIntent = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "Cannot verify coordinator intent ownership (unparseable record) {}",
+            intent_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(
+            pa_types::platform::process::observe_process_identity(
+                intent.pid as u32,
+                intent.process_start_id.as_deref()
+            ),
+            pa_types::platform::process::ProcessIdentity::Matching
+        ),
+        "Cannot verify coordinator intent ownership; refusing to rewrite/release {}",
+        intent_path.display()
+    );
+    Ok(())
 }
 
 fn write_atomically(path: &Path, intent: &UpdateIntent) -> Result<()> {
