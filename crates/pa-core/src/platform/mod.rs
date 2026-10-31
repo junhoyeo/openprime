@@ -6,6 +6,7 @@ pub mod browser;
 mod directory_identity;
 pub mod fs;
 pub mod lock_dir;
+mod opened_file_identity;
 pub mod perms;
 pub mod process;
 pub mod shell;
@@ -13,6 +14,7 @@ pub mod shell;
 pub(crate) use directory_identity::{directory_identity, DirectoryIdentity};
 pub use fs::fsync;
 pub use lock_dir::{lock_exclusive, try_lock_exclusive, unlock_file, LockDir};
+pub use opened_file_identity::{opened_file_identity, OpenedFileIdentity};
 pub use perms::{
     file_mode, is_executable, is_readable_writable, restrict_dir, restrict_file, set_private_mode,
 };

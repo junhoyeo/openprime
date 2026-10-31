@@ -81,6 +81,18 @@ No provider HTTP (pa-ai), no loop policy (pa-agent), no daemon supervision (pa-d
 ## Depends on
 pa-types, pa-ai, pa-agent (one-way).
 
+The platform API also exposes `opened_file_identity(&File)` and its borrowed
+`OpenedFileIdentity` comparison token. Unix compares opened-file device/inode;
+Windows queries the full `FileIdInfo` volume/128-bit identifier through a
+Windows-only `windows-sys` dependency (Foundation and Storage/FileSystem only).
+Errors remain unknown identity; there is no path/size/time or narrower fallback.
+Callers retain the files through the protected operation and separately enforce
+filesystem support policy, no-follow opening, object kind, root trust and access
+control. This primitive does not certify those properties, establish privacy,
+change namespace hashes, or provide a permanent serialized identity. Native
+Windows support claims require filesystem-specific CI evidence; width unit
+vectors are not ReFS evidence.
+
 The Unix platform process API exposes `current_user_id()` for the daemon
 endpoint namespace to match the TypeScript `process.getuid()` contract on
 macOS as well as Linux. This reads the OS identity without filesystem or
