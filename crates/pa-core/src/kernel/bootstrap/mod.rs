@@ -23,13 +23,13 @@ pub(crate) use venv::{
     begin_kernel_lease_handoff, register_kernel_python_lease, GenerationLeaseGuard,
 };
 use venv::{
-    bootstrap_venv, create_explicit_parent, expand_home, generation_identity, generation_root, has_prime_agent_runtime,
-    kernel_ready, kernel_ready_read_only, kernel_runtime_ready, lease_for_resolver,
+    bootstrap_venv, canonical_explicit_path, create_explicit_parent, expand_home,
+    generation_identity, generation_root, has_prime_agent_runtime, kernel_ready,
+    kernel_ready_read_only, kernel_runtime_ready, lease_for_resolver,
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
     prepare_generation_root, published_candidates, reclaim_explicit_path,
     recorded_unavailable_python_skills, resolve_writable_kernel_venv_dir, BootstrapPythonSkill,
-    canonical_explicit_path, ExplicitBuild, ExplicitOwnership, ExplicitReclaim, GenerationBuild,
-    SUPPORTED_RLM_RUNTIME_ABI,
+    ExplicitBuild, ExplicitOwnership, ExplicitReclaim, GenerationBuild, SUPPORTED_RLM_RUNTIME_ABI,
 };
 pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
 
@@ -567,12 +567,24 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let venv = root.path().join("new-explicit-environment");
         let error = ensure_exact_kernel_venv(
-            &EnsureKernelPythonOptions::default(), &[], &venv,
-            root.path(), "uninstalled-runtime",
-        ).await.unwrap_err();
-        assert!(error.to_string().contains("verified record ownership"), "{error:#}");
+            &EnsureKernelPythonOptions::default(),
+            &[],
+            &venv,
+            root.path(),
+            "uninstalled-runtime",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("verified record ownership"),
+            "{error:#}"
+        );
         assert!(!venv.exists());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "no ownership or lock metadata before refusal");
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "no ownership or lock metadata before refusal"
+        );
     }
 
     /// Serializes the non-Unix public-entry tests that change the process env.
@@ -588,7 +600,11 @@ mod tests {
     async fn issue44_unproven_platform_public_entry_creates_no_explicit_parent() {
         let _serial = ISSUE44_ENV_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
-        let venv = root.path().join("missing").join("nested").join("kernel-venv");
+        let venv = root
+            .path()
+            .join("missing")
+            .join("nested")
+            .join("kernel-venv");
         let previous: Vec<_> = ["PRIME_AGENT_KERNEL_VENV", "PRIME_AGENT_KERNEL_PYTHON"]
             .into_iter()
             .map(|name| (name, std::env::var_os(name)))
@@ -596,7 +612,10 @@ mod tests {
         std::env::set_var("PRIME_AGENT_KERNEL_VENV", &venv);
         std::env::remove_var("PRIME_AGENT_KERNEL_PYTHON");
         let managed = ensure_kernel_python(EnsureKernelPythonOptions::default()).await;
-        std::env::set_var("PRIME_AGENT_KERNEL_PYTHON", root.path().join("missing-python.exe"));
+        std::env::set_var(
+            "PRIME_AGENT_KERNEL_PYTHON",
+            root.path().join("missing-python.exe"),
+        );
         let external = ensure_kernel_python(EnsureKernelPythonOptions::default()).await;
         for (name, value) in previous {
             match value {
@@ -605,8 +624,14 @@ mod tests {
             }
         }
         let error = managed.expect_err("unverifiable ownership refuses management");
-        assert!(format!("{error:#}").contains("verified record ownership"), "{error:#}");
-        assert!(external.is_err(), "a missing external interpreter is not accepted");
+        assert!(
+            format!("{error:#}").contains("verified record ownership"),
+            "{error:#}"
+        );
+        assert!(
+            external.is_err(),
+            "a missing external interpreter is not accepted"
+        );
         assert_eq!(
             std::fs::read_dir(root.path()).unwrap().count(),
             0,

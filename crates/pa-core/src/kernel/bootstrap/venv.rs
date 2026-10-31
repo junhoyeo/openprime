@@ -35,8 +35,8 @@ pub(crate) use generation::{
     begin_kernel_lease_handoff, register_kernel_python_lease, GenerationLeaseGuard,
 };
 pub(super) use generation::{
-    generation_identity, generation_root, lease_for_resolver, prepare_generation_root,
-    published_candidates, reclaim_explicit_path, canonical_explicit_path, ExplicitBuild,
+    canonical_explicit_path, generation_identity, generation_root, lease_for_resolver,
+    prepare_generation_root, published_candidates, reclaim_explicit_path, ExplicitBuild,
     ExplicitOwnership, ExplicitReclaim, GenerationBuild,
 };
 use layout::home_dir;

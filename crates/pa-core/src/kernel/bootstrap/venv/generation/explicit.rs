@@ -48,7 +48,8 @@ fn trusted_build_record(venv: &Path) -> RecordState<ExplicitBuildRecord> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return RecordState::Missing,
         Err(_) => return RecordState::Unknown,
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink()
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
         || !crate::platform::perms::is_private_owner_metadata(&metadata)
     {
         return RecordState::Unknown;
@@ -59,10 +60,18 @@ fn trusted_build_record(venv: &Path) -> RecordState<ExplicitBuildRecord> {
                 && uuid::Uuid::parse_str(&value.token).is_ok()
                 && super::canonical_explicit_path(venv).ok().as_ref() == value.path.as_ref()
                 && value.path.is_some()
-                && venv.parent().and_then(|parent| directory_identity(parent).ok().flatten()) == value.parent_identity
+                && venv
+                    .parent()
+                    .and_then(|parent| directory_identity(parent).ok().flatten())
+                    == value.parent_identity
                 && value.parent_identity.is_some()
-                && holds_recorded_directory(venv, &value) => RecordState::Valid { value, raw },
-        RecordState::Missing | RecordState::Unknown | RecordState::Valid { .. } => RecordState::Unknown,
+                && holds_recorded_directory(venv, &value) =>
+        {
+            RecordState::Valid { value, raw }
+        }
+        RecordState::Missing | RecordState::Unknown | RecordState::Valid { .. } => {
+            RecordState::Unknown
+        }
     }
 }
 
@@ -81,7 +90,9 @@ impl ExplicitBuild {
     /// anything else is written for it.
     pub(in crate::kernel::bootstrap) fn claim(venv: &Path) -> anyhow::Result<Self> {
         crate::platform::perms::require_private_owner_metadata_support()?;
-        let parent = venv.parent().ok_or_else(|| anyhow::anyhow!("explicit path has no parent"))?;
+        let parent = venv
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("explicit path has no parent"))?;
         let Some(parent_identity) = directory_identity(parent)? else {
             bail!("filesystem cannot prove explicit build parent identity");
         };
@@ -111,22 +122,36 @@ impl ExplicitBuild {
     /// A pending build record prevents the legacy-current fast path. Even a
     /// valid version file may belong to a still-live unpublished builder.
     pub(in crate::kernel::bootstrap) fn pending(venv: &Path) -> bool {
-        !matches!(read_record::<ExplicitBuildRecord>(&record_path(venv)), RecordState::Missing)
+        !matches!(
+            read_record::<ExplicitBuildRecord>(&record_path(venv)),
+            RecordState::Missing
+        )
     }
 
     /// Finish a dead builder's publication only after the caller validates
     /// the actual interpreter and exact requested version under the lock.
-    pub(in crate::kernel::bootstrap) fn finish_interrupted_publication(venv: &Path) -> anyhow::Result<()> {
+    pub(in crate::kernel::bootstrap) fn finish_interrupted_publication(
+        venv: &Path,
+    ) -> anyhow::Result<()> {
         let (record, raw) = match trusted_build_record(venv) {
             RecordState::Missing => return Ok(()),
             RecordState::Valid { value, raw }
                 if holder_state(&value.owner) == HolderState::Dead
-                    && holds_recorded_directory(venv, &value) => (value, raw),
+                    && holds_recorded_directory(venv, &value) =>
+            {
+                (value, raw)
+            }
             RecordState::Valid { .. } | RecordState::Unknown => {
                 bail!("explicit kernel build ownership is live or unknown; retained without publication");
             }
         };
-        Self { venv: venv.to_path_buf(), record, raw, published: false }.publish()
+        Self {
+            venv: venv.to_path_buf(),
+            record,
+            raw,
+            published: false,
+        }
+        .publish()
     }
 
     /// Whether the exact path still is the directory this attempt created.
@@ -141,7 +166,11 @@ impl ExplicitBuild {
         if !self.owns_path() {
             bail!("explicit kernel ownership changed before publication");
         }
-        super::write_process_lease(&self.venv, super::LeaseKind::Resolver, ProcessOwner::current())?;
+        super::write_process_lease(
+            &self.venv,
+            super::LeaseKind::Resolver,
+            ProcessOwner::current(),
+        )?;
         super::explicit_owner::ExplicitOwnership::publish(&self.venv, &self.record.token)?;
         self.published = true;
         remove_file_if_unchanged(&record_path(&self.venv), &self.raw);
@@ -206,9 +235,7 @@ pub(in crate::kernel::bootstrap) enum ExplicitReclaim {
 /// caller's refusal reports it.
 pub(in crate::kernel::bootstrap) fn reclaim_explicit_path(venv: &Path) -> ExplicitReclaim {
     let record = match trusted_build_record(venv) {
-        RecordState::Valid { value, raw }
-            if holder_state(&value.owner) == HolderState::Dead =>
-        {
+        RecordState::Valid { value, raw } if holder_state(&value.owner) == HolderState::Dead => {
             Some((value, raw))
         }
         _ => None,

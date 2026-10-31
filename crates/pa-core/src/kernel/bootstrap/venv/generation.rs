@@ -17,10 +17,10 @@ use crate::platform::{directory_identity, DirectoryIdentity};
 
 mod explicit;
 mod explicit_owner;
-pub(in crate::kernel::bootstrap) use explicit_owner::{canonical_explicit_path, ExplicitOwnership};
 pub(in crate::kernel::bootstrap) use explicit::{
     reclaim_explicit_path, ExplicitBuild, ExplicitReclaim,
 };
+pub(in crate::kernel::bootstrap) use explicit_owner::{canonical_explicit_path, ExplicitOwnership};
 
 const GENERATION_PREFIX: &str = "generation-";
 const PUBLISHED_FILE: &str = ".generation-published";
@@ -1433,17 +1433,27 @@ mod tests {
     fn issue44_enrolled_generation_shaped_base_reaches_kernel_handoff() {
         let root = tempfile::tempdir().unwrap();
         let exact = root.path().join(format!(
-            "{GENERATION_PREFIX}{}-{:020}-{}", identity('a'), 1, uuid::Uuid::new_v4()
+            "{GENERATION_PREFIX}{}-{:020}-{}",
+            identity('a'),
+            1,
+            uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&exact).unwrap();
         let build = ExplicitBuild::claim(&exact).unwrap();
         std::fs::write(exact.join(".bootstrap-version"), "validated fixture").unwrap();
         build.publish().unwrap();
         let python = kernel_venv_python(&exact);
-        let handoff = begin_kernel_lease_handoff(&python).expect("explicit artifact type beats basename").unwrap();
-        let kernel = register_kernel_python_lease(&python, std::process::id()).unwrap().unwrap();
+        let handoff = begin_kernel_lease_handoff(&python)
+            .expect("explicit artifact type beats basename")
+            .unwrap();
+        let kernel = register_kernel_python_lease(&python, std::process::id())
+            .unwrap()
+            .unwrap();
         handoff.release();
         kernel.release();
-        assert!(!exact.join(PUBLISHED_FILE).exists(), "base must not gain fake generation markers");
+        assert!(
+            !exact.join(PUBLISHED_FILE).exists(),
+            "base must not gain fake generation markers"
+        );
     }
 }

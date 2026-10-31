@@ -50,18 +50,28 @@ fn owner_path(venv: &Path) -> PathBuf {
 
 /// Canonicalize the parent, not the leaf: leaf symlinks must never enrol a
 /// different directory, while /tmp and /private/tmp share one lock/record.
-pub(in crate::kernel::bootstrap) fn canonical_explicit_path(venv: &Path) -> anyhow::Result<PathBuf> {
-    let parent = venv.parent().ok_or_else(|| anyhow!("explicit kernel path has no parent"))?;
-    let name = venv.file_name().ok_or_else(|| anyhow!("explicit kernel path has no final component"))?;
+pub(in crate::kernel::bootstrap) fn canonical_explicit_path(
+    venv: &Path,
+) -> anyhow::Result<PathBuf> {
+    let parent = venv
+        .parent()
+        .ok_or_else(|| anyhow!("explicit kernel path has no parent"))?;
+    let name = venv
+        .file_name()
+        .ok_or_else(|| anyhow!("explicit kernel path has no final component"))?;
     Ok(parent.canonicalize()?.join(name))
 }
 
 fn require_private_record(path: &Path) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink()
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
         || !crate::platform::perms::is_private_owner_metadata(&metadata)
     {
-        bail!("explicit kernel ownership record is not private at {}; retained without repair", path.display());
+        bail!(
+            "explicit kernel ownership record is not private at {}; retained without repair",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -69,7 +79,10 @@ fn require_private_record(path: &Path) -> anyhow::Result<()> {
 fn bootstrap_hash(venv: &Path) -> anyhow::Result<String> {
     let path = venv.join(".bootstrap-version");
     let metadata = std::fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > super::MAX_RECORD_BYTES {
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > super::MAX_RECORD_BYTES
+    {
         bail!("explicit kernel bootstrap marker is not a bounded regular file");
     }
     let bytes = std::fs::read(path)?;
@@ -84,7 +97,9 @@ impl ExplicitOwnership {
         let (record, raw) = match read_record::<OwnerRecord>(&owner_path(venv)) {
             RecordState::Missing => return Ok(None),
             RecordState::Valid { value, raw } => (value, raw),
-            RecordState::Unknown => bail!("explicit kernel ownership record is unreadable; retained without repair"),
+            RecordState::Unknown => {
+                bail!("explicit kernel ownership record is unreadable; retained without repair")
+            }
         };
         let ownership = Self { record, raw };
         ownership.verify(venv)?;
@@ -93,13 +108,17 @@ impl ExplicitOwnership {
 
     pub(super) fn publish(venv: &Path, token: &str) -> anyhow::Result<()> {
         require_direct_directory(venv)?;
-        let parent = venv.parent().ok_or_else(|| anyhow!("explicit kernel path has no parent"))?;
+        let parent = venv
+            .parent()
+            .ok_or_else(|| anyhow!("explicit kernel path has no parent"))?;
         let record = OwnerRecord {
             version: VERSION,
             token: token.to_string(),
             path: canonical_explicit_path(venv)?,
-            directory_identity: directory_identity(venv)?.ok_or_else(|| anyhow!("unknown explicit directory identity"))?,
-            parent_identity: directory_identity(parent)?.ok_or_else(|| anyhow!("unknown explicit parent identity"))?,
+            directory_identity: directory_identity(venv)?
+                .ok_or_else(|| anyhow!("unknown explicit directory identity"))?,
+            parent_identity: directory_identity(parent)?
+                .ok_or_else(|| anyhow!("unknown explicit parent identity"))?,
             bootstrap_hash: bootstrap_hash(venv)?,
         };
         let raw = write_json_new(&owner_path(venv), &record)?;
@@ -108,7 +127,9 @@ impl ExplicitOwnership {
 
     pub(in crate::kernel::bootstrap) fn verify(&self, venv: &Path) -> anyhow::Result<()> {
         require_direct_directory(venv)?;
-        let parent = venv.parent().ok_or_else(|| anyhow!("explicit kernel path has no parent"))?;
+        let parent = venv
+            .parent()
+            .ok_or_else(|| anyhow!("explicit kernel path has no parent"))?;
         require_private_record(&owner_path(venv))?;
         let unchanged = matches!(read_record::<OwnerRecord>(&owner_path(venv)), RecordState::Valid { value, raw } if value == self.record && raw == self.raw);
         if !unchanged
@@ -119,43 +140,69 @@ impl ExplicitOwnership {
             || directory_identity(parent)?.as_ref() != Some(&self.record.parent_identity)
             || bootstrap_hash(venv)? != self.record.bootstrap_hash
         {
-            bail!("explicit kernel ownership changed at {}; retained without repair", venv.display());
+            bail!(
+                "explicit kernel ownership changed at {}; retained without repair",
+                venv.display()
+            );
         }
         Ok(())
     }
 
-    pub(in crate::kernel::bootstrap) fn lease_for_resolver(&self, venv: &Path) -> anyhow::Result<()> {
+    pub(in crate::kernel::bootstrap) fn lease_for_resolver(
+        &self,
+        venv: &Path,
+    ) -> anyhow::Result<()> {
         self.verify(venv)?;
-        super::write_process_lease(venv, super::LeaseKind::Resolver, super::ProcessOwner::current())?;
+        super::write_process_lease(
+            venv,
+            super::LeaseKind::Resolver,
+            super::ProcessOwner::current(),
+        )?;
         self.verify(venv)
     }
 
     /// Called under the explicit-base bootstrap lock. A preexisting sibling
     /// root needs its own identity-bound record; a foreign directory is not adopted.
-    pub(in crate::kernel::bootstrap) fn prepare_generations(&self, venv: &Path) -> anyhow::Result<()> {
+    pub(in crate::kernel::bootstrap) fn prepare_generations(
+        &self,
+        venv: &Path,
+    ) -> anyhow::Result<()> {
         self.verify(venv)?;
         let root = generation_root(venv)?;
         match symlink_metadata_state(&root)? {
             None => {
                 std::fs::create_dir(&root)?;
                 crate::platform::perms::restrict_dir(&root)?;
-                let directory_identity = directory_identity(&root)?.ok_or_else(|| anyhow!("unknown explicit generation root identity"))?;
-                write_json_new(&root.join(ROOT_OWNER_FILE), &RootRecord {
-                    version: VERSION,
-                    owner: self.record.clone(),
-                    directory_identity,
-                })?;
+                let directory_identity = directory_identity(&root)?
+                    .ok_or_else(|| anyhow!("unknown explicit generation root identity"))?;
+                write_json_new(
+                    &root.join(ROOT_OWNER_FILE),
+                    &RootRecord {
+                        version: VERSION,
+                        owner: self.record.clone(),
+                        directory_identity,
+                    },
+                )?;
             }
             Some(_) => require_direct_directory(&root)?,
         }
         require_private_record(&root.join(ROOT_OWNER_FILE))?;
-        let RecordState::Valid { value, .. } = read_record::<RootRecord>(&root.join(ROOT_OWNER_FILE)) else {
-            bail!("explicit generation root ownership is unavailable at {}; retained without repair", root.display());
+        let RecordState::Valid { value, .. } =
+            read_record::<RootRecord>(&root.join(ROOT_OWNER_FILE))
+        else {
+            bail!(
+                "explicit generation root ownership is unavailable at {}; retained without repair",
+                root.display()
+            );
         };
-        if value.version != VERSION || value.owner != self.record
+        if value.version != VERSION
+            || value.owner != self.record
             || directory_identity(&root)?.as_ref() != Some(&value.directory_identity)
         {
-            bail!("explicit generation root ownership changed at {}; retained without repair", root.display());
+            bail!(
+                "explicit generation root ownership changed at {}; retained without repair",
+                root.display()
+            );
         }
         self.verify(venv)
     }
