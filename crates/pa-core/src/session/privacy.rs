@@ -33,13 +33,65 @@ pub struct SessionPrivacyScan {
 
 fn invalid(message: &'static str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData,message) }
 
+/// The reserved carrier's distinguishing field value, and the shortest prefix of it
+/// treated as evidence of an attempt: long enough that an accidental substring
+/// collision in unrelated content is effectively impossible, short enough that a
+/// write torn partway through this specific field value is still caught.
+const MARKER_PREFIX: &[u8] = b"admission_privacy";
+const MARKER_MIN_PREFIX_LEN: usize = 10;
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// A NON-SECURITY screen for ORDINARY, accidental corruption (a crash mid-write, bit
+/// rot, a torn append) -- not an adversarial-evasion guarantee. A local actor with
+/// write access who wants to hide or strip a marker does not need to leave a
+/// malformed trace at all: a clean delete or full rewrite defeats any content screen
+/// by construction, regardless of this function's threshold. This function only
+/// answers: "does this row, which already failed to parse, show any recognizable
+/// trace of attempting the reserved carrier?" A clean answer here licenses treating
+/// the row as ordinary, independent, benign corruption -- the same disposition the
+/// existing session loader already applies to unrelated malformed rows -- never as
+/// proof of absence of tampering.
+///
+/// Checks TWO independent signals, either one refuses:
+/// - any trace of the key name `"customType"` at all, present regardless of its
+///   value. The carrier's canonical byte order always places this key BEFORE the
+///   nested data object that carries the distinguishing value, so a left-to-right
+///   truncation can never preserve that value while losing this key -- this check
+///   alone covers every truncation shape, including one cut off before the value
+///   ever starts (ambiguous: this row could have been starting to become the
+///   carrier, or any other custom-typed row; genuinely cannot tell, so refuses);
+/// - a truncation-robust prefix match on the carrier's distinguishing field value
+///   itself, as a backstop for non-truncation corruption shapes (e.g. a corruption
+///   that specifically mangles the `"customType"` key's bytes while leaving the
+///   value elsewhere in the row intact).
+#[must_use]
+fn screens_clean_of_attempted_marker(raw: &[u8]) -> bool {
+    if contains_bytes(raw, b"\"customType\"") {
+        return false;
+    }
+    (MARKER_MIN_PREFIX_LEN..=MARKER_PREFIX.len()).all(|len| !contains_bytes(raw, &MARKER_PREFIX[..len]))
+}
+
 /// Strictly scan the complete opened container and restore the caller's position.
 /// No message/row bytes are included in diagnostics. A complete final JSON object
-/// may omit its newline; a truncated object or trailing garbage still refuses.
+/// may omit its newline; a truncated object or trailing garbage still refuses,
+/// UNLESS it is both (a) the physical end of the file (nothing durable follows,
+/// matching the append-then-fsync-before-ack contract this format's writer already
+/// gives every entry) and (b) free of any trace of an attempted reserved carrier,
+/// in which case it is treated as if the file simply ended before it -- an
+/// unacknowledged write has no effect, independent of what its partial bytes
+/// happened to look like. A malformed row that is NOT the physical end of the file
+/// is tolerated only if `screens_clean_of_attempted_marker` passes; otherwise it
+/// refuses exactly as before. The header row (first non-blank row) is never
+/// eligible for either tolerance: a session must open with a decodable header.
 ///
 /// # Errors
-/// Returns an error for malformed/duplicate/unsupported policy, incomplete input,
-/// I/O, bounds or an observed change to the opened file while scanning.
+/// Returns an error for malformed/duplicate/unsupported policy that is not covered
+/// by the two narrow tolerances above, I/O, bounds, or an observed change to the
+/// opened file while scanning.
 pub fn scan_opened_container(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacyScan> {
     let position=file.stream_position()?;
     let result=scan(file,limits);
@@ -74,7 +126,25 @@ fn scan(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacy
         }
         hash.update(&line);
         if line.iter().all(u8::is_ascii_whitespace) { continue; }
-        let (value,policy)=decode_privacy_row(&line).map_err(|_|invalid("session privacy input has malformed or conflicting metadata"))?;
+        let decoded=decode_privacy_row(&line);
+        if decoded.is_err() && rows>0 {
+            // Not the header: eligible for one of the two narrow tolerances.
+            let at_physical_end=reader.fill_buf()?.is_empty();
+            if at_physical_end && screens_clean_of_attempted_marker(&line) {
+                // Torn trailing fragment, no trace of an attempted marker: the
+                // append-then-fsync-before-ack contract means this was never
+                // acknowledged, regardless of its partial content. Stop here;
+                // everything already scanned stands as the complete result.
+                break;
+            }
+            if !at_physical_end && screens_clean_of_attempted_marker(&line) {
+                // An ordinary row's independent, benign corruption: tolerate the
+                // same way the existing loader already does, don't count it.
+                continue;
+            }
+            return Err(invalid("session privacy input has malformed or conflicting metadata"));
+        }
+        let (value,policy)=decoded.map_err(|_|invalid("session privacy input has malformed or conflicting metadata"))?;
         if rows==0 {
             if value.get("type").and_then(serde_json::Value::as_str)!=Some("session") {
                 return Err(invalid("session privacy input is missing its header"));
@@ -100,7 +170,6 @@ fn scan(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacy
     let session_id=session_id.ok_or_else(||invalid("session privacy input is empty"))?;
     Ok(SessionPrivacyScan { session_id,restriction,rows,bytes,digest:hash.finalize().into() })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +207,72 @@ mod tests {
         assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
         assert!(scan_opened_container(&mut file,PrivacyScanLimits{max_rows:1,..PrivacyScanLimits::default()}).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(),content);
+    }
+
+    #[test]
+    fn torn_trailing_fragment_with_no_marker_trace_is_tolerated() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
+        let header=json!({"type":"session","version":3,"id":"public"}).to_string();
+        let message=json!({"type":"message","id":"m1","parentId":null}).to_string();
+        let mut content=format!("{header}\n{message}\n").into_bytes();
+        // A cut-off UTF-8 continuation byte, matching a write interrupted mid-string.
+        content.extend_from_slice(b"{\"type\":\"message\",\"id\":\"torn\",\"message\":{\"role\":\"user\",\"con\xc3");
+        std::fs::write(&path,&content).unwrap();
+        let mut file=File::open(&path).unwrap();
+        let result=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
+        assert_eq!((result.session_id.as_str(),result.restriction,result.rows),("public",None,2));
+        assert_eq!(std::fs::read(&path).unwrap(),content);
+    }
+    #[test]
+    fn torn_trailing_fragment_with_a_customtype_trace_still_refuses() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
+        let header=json!({"type":"session","version":3,"id":"public"}).to_string();
+        let content=format!("{header}\n{{\"customType\":");
+        std::fs::write(&path,&content).unwrap();
+        let mut file=File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+    }
+    #[test]
+    fn mid_file_malformed_row_with_no_marker_trace_is_tolerated_and_restriction_still_folds() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
+        let marker=AdmissionPrivacy::RestrictedV1.entry(EntryBase {
+            id:Some("privacy-row".into()),parent_id:Some("u0".into()),
+            timestamp:Some("2026-10-30T00:00:00.000Z".into()),rest:Map::default(),
+        }).unwrap();
+        let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
+        let before=json!({"type":"message","id":"u0","parentId":null}).to_string();
+        let marker_row=serde_json::to_string(&marker).unwrap();
+        let after=json!({"type":"message","id":"u1","parentId":"privacy-row"}).to_string();
+        let content=format!("{header}\n{before}\nnot json\n{marker_row}\n{after}\n");
+        std::fs::write(&path,&content).unwrap();
+        let mut file=File::open(&path).unwrap();
+        let result=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
+        assert_eq!((result.session_id.as_str(),result.restriction,result.rows),
+            ("mixed",Some(AdmissionPrivacy::RestrictedV1),4));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+    }
+    #[test]
+    fn mid_file_malformed_row_with_a_marker_trace_still_refuses() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
+        let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
+        let after=json!({"type":"message","id":"u1","parentId":null}).to_string();
+        for suspicious in ["{\"customType\":\"something_else\"}", "{\"admission_priv broken}"] {
+            let content=format!("{header}\n{suspicious}\n{after}\n");
+            std::fs::write(&path,&content).unwrap();
+            let mut file=File::open(&path).unwrap();
+            assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+        }
+    }
+    #[test]
+    fn header_row_itself_is_never_eligible_for_either_tolerance() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
+        let content="not json at all".to_string();
+        std::fs::write(&path,&content).unwrap();
+        let mut file=File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
     }
     #[test]
     fn complete_final_object_needs_no_newline_but_partial_or_trailing_bytes_refuse() {
