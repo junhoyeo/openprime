@@ -12,7 +12,8 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     let socket = dir.path().join("daemon.sock");
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let daemon = spawn_daemon(&socket, &agent_dir);
+    let supervisor_pid = daemon.child.id();
     let (mut client, hello) = Client::connect(&socket);
     assert_eq!(hello["type"], "daemon_hello");
     // Differential goldens captured from the TS supervisor
@@ -30,10 +31,19 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         Some("protocol-7-schema-30-8e4b17c2a9f5".to_string())
     );
     assert!(hello["supervisorOwnerToken"].is_string());
-    assert!(hello["supervisorProcessStartId"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("proc:"));
+    // Portable identity check: compare the hello's reported id against a
+    // fresh, independent read of the live supervisor pid's own identity
+    // (`pa_types::platform::process::process_start_id`), rather than
+    // assuming the Linux-only "proc:" prefix. On macOS the product's own
+    // identity scheme returns "ps:<lstart>" instead, which the previous
+    // `starts_with("proc:")` assertion never matched.
+    assert_eq!(
+        hello["supervisorProcessStartId"]
+            .as_str()
+            .map(str::to_string),
+        pa_daemon::protocol::process_start_id(supervisor_pid),
+        "the hello's supervisorProcessStartId must match the live supervisor pid's own identity"
+    );
     assert_eq!(
         hello["serverCapabilities"],
         serde_json::json!([
