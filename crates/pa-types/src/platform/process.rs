@@ -269,16 +269,17 @@ fn valid_lstart(value: &str) -> bool {
         _ => 31,
     };
     if day > days
-        || !decimal(&value[11..13]).is_some_and(|hour| hour < 24)
-        || !decimal(&value[14..16]).is_some_and(|minute| minute < 60)
-        || !decimal(&value[17..19]).is_some_and(|second| second < 60)
+        || decimal(&value[11..13]).is_none_or(|hour| hour >= 24)
+        || decimal(&value[14..16]).is_none_or(|minute| minute >= 60)
+        || decimal(&value[17..19]).is_none_or(|second| second >= 60)
     {
         return false;
     }
     // Gregorian weekday, independent of the process locale/timezone.
     let shifted_year = year - u64::from(month < 3);
     let offsets = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    let weekday = (shifted_year + shifted_year / 4 - shifted_year / 100 + shifted_year / 400
+    let weekday = (shifted_year + shifted_year / 4 - shifted_year / 100
+        + shifted_year / 400
         + offsets[month - 1]
         + day)
         % 7;
@@ -307,10 +308,9 @@ mod identity_tests {
     #[test]
     fn issue_37_supported_tokens_and_ambiguous_legacy_formats() {
         use ProcessStartIdComparison::{Match, Mismatch, Unverifiable};
-        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../tests/fixtures/process-start-ids.json"
-        ))
-        .unwrap();
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/process-start-ids.json"))
+                .unwrap();
         for case in cases {
             let left = case["recorded"].as_str();
             let right = case["observed"].as_str();
@@ -321,7 +321,11 @@ mod identity_tests {
                 value => panic!("invalid corpus verdict {value}"),
             };
             assert_eq!(compare_process_start_ids(left, right), expected, "{case}");
-            assert_eq!(compare_process_start_ids(right, left), expected, "reverse {case}");
+            assert_eq!(
+                compare_process_start_ids(right, left),
+                expected,
+                "reverse {case}"
+            );
             assert_eq!(
                 classify_process_identity(None, left, right),
                 ProcessIdentity::Unknown
@@ -331,7 +335,10 @@ mod identity_tests {
 
     #[test]
     fn issue_37_windows_epoch_conversion_is_exact_and_checked() {
-        assert_eq!(windows_start_id(0).as_deref(), Some("win2:504911232000000000"));
+        assert_eq!(
+            windows_start_id(0).as_deref(),
+            Some("win2:504911232000000000")
+        );
         assert_eq!(
             windows_start_id(134_062_992_000_000_000).as_deref(),
             Some("win2:638974224000000000")
