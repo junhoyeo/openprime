@@ -56,6 +56,22 @@ impl WakeTelemetry {
             *telemetry_disabled = Some(true);
         }
     }
+
+    /// The wake stance for `send_message`'s saved-target revival (#35): the
+    /// SOURCE's own current opt-out, not the command's (`of_command` only
+    /// reads Attach/Reattach's own flag, which `send_message` never carries).
+    /// A passivated target woken by an opted-out sender must launch opted
+    /// out too; a resident source with no opt-out keeps the launch record's
+    /// own stance (`Inherit`, unchanged). Monotone: only a real opt-out ever
+    /// upgrades `Inherit` to `OptedOut`, never the reverse.
+    pub(crate) async fn of_source(source: Option<&Arc<ResidentWorker>>) -> Self {
+        match source {
+            Some(source) if source.descriptor.lock().await.telemetry_disabled == Some(true) => {
+                WakeTelemetry::OptedOut
+            }
+            _ => WakeTelemetry::Inherit,
+        }
+    }
 }
 
 /// Worker round-trip budget for the sender-summary read and the delivery
@@ -108,6 +124,10 @@ impl Supervisor {
                     None => None,
                 };
                 let woken_summary = wake_source.as_ref().map(|(_, summary)| summary.clone());
+                // #35: the wake must carry the SOURCE's own current opt-out,
+                // not a hardcoded Inherit -- a passivated target woken by an
+                // opted-out sender must launch opted out too.
+                let telemetry = WakeTelemetry::of_source(source.as_ref()).await;
                 match self
                     .wake_saved_target(
                         &error,
@@ -115,7 +135,7 @@ impl Supervisor {
                         wake_source
                             .as_ref()
                             .map(|(resident, summary)| (resident, summary)),
-                        WakeTelemetry::Inherit,
+                        telemetry,
                     )
                     .await
                 {
@@ -582,6 +602,13 @@ mod tests {
     }
 
     fn resident(worker_id: &str) -> Arc<ResidentWorker> {
+        resident_with_telemetry(worker_id, None)
+    }
+
+    fn resident_with_telemetry(
+        worker_id: &str,
+        telemetry_disabled: Option<bool>,
+    ) -> Arc<ResidentWorker> {
         ResidentWorker::new(
             worker_id.to_string(),
             DaemonWorkerDescriptor {
@@ -600,7 +627,7 @@ mod tests {
                 root_session_id: None,
                 session_file: Some("/sessions/some-session.jsonl".to_string()),
                 session_dir: None,
-                telemetry_disabled: None,
+                telemetry_disabled,
                 created_at: "t".to_string(),
                 updated_at: "t".to_string(),
                 lifecycle: DaemonWorkerLifecycle::Ready,
@@ -723,6 +750,32 @@ mod tests {
         }
         assert!(!ledger_edge_matches(&edge, "ki"));
         assert!(!ledger_edge_matches(&edge, "parent.jsonl"));
+    }
+
+    /// #35: a passivated/saved target woken by `send_message` must launch
+    /// opted out when the SOURCE currently is, independent of the
+    /// (nonexistent) command-level flag `of_command` alone would see.
+    #[tokio::test]
+    async fn opted_out_source_wakes_a_saved_target_opted_out() {
+        let opted_out = resident_with_telemetry("source-1", Some(true));
+        assert_eq!(
+            WakeTelemetry::of_source(Some(&opted_out)).await,
+            WakeTelemetry::OptedOut
+        );
+
+        let plain = resident_with_telemetry("source-2", None);
+        assert_eq!(
+            WakeTelemetry::of_source(Some(&plain)).await,
+            WakeTelemetry::Inherit
+        );
+
+        let explicit_off = resident_with_telemetry("source-3", Some(false));
+        assert_eq!(
+            WakeTelemetry::of_source(Some(&explicit_off)).await,
+            WakeTelemetry::Inherit
+        );
+
+        assert_eq!(WakeTelemetry::of_source(None).await, WakeTelemetry::Inherit);
     }
 
     #[tokio::test]

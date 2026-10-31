@@ -938,6 +938,11 @@ impl SessionEngine for AgentSessionEngine {
                 session_file: identity.session_file.clone(),
                 thinking: identity.thinking.clone(),
                 child_script: identity.child_script,
+                // #35/#36: carry this worker's own opt-out into every
+                // child it creates (rlm.spawn and the depth-0 rlm.create_
+                // session root alike); monotone, only a real opt-out ever
+                // propagates.
+                telemetry_disabled: self.config.telemetry_disabled.filter(|disabled| *disabled),
             };
             children.set_identity(parent);
         }
