@@ -128,14 +128,14 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+        let Some(child_pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
             continue;
         };
         let Some(parent) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
             continue;
         };
         if parent == ppid {
-            pids.push(pid);
+            pids.push(child_pid);
         }
     }
     pids
