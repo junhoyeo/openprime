@@ -77,22 +77,33 @@ fn kernel_pids() -> Vec<u32> {
     found
 }
 
-/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` the same
-/// way `pty_holder_pids`'s macOS fallback already does elsewhere in this
-/// suite (`pa-cli/tests/termios_process_exit_e2e.rs`). `-ww` disables
-/// output truncation; the kernel's own argv has no embedded spaces (a
-/// plain `python -m rlm.repl`), so splitting the rendered command on
-/// whitespace is safe for this narrow adjacency match, same risk
-/// profile `pa_types::platform::process`'s pinned-locale `ps` fallback
-/// already accepts for its own identity probe.
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` for a
+/// full-table pid/command census. This is NOT the same mechanism as
+/// `pty_holder_pids`'s macOS arm elsewhere in this suite
+/// (`pa-cli/tests/termios_process_exit_e2e.rs`): that one asks `lsof`
+/// which pids hold a specific fd/path open, a different tool solving a
+/// different problem with a different output shape. This is new code,
+/// not a swap to something already exercised. `-ww` disables output
+/// truncation; the kernel's own argv has no embedded spaces (a plain
+/// `python -m rlm.repl`), so splitting the rendered command on
+/// whitespace is safe for this narrow adjacency match. Loud failure on
+/// a `ps` that cannot run or exits non-zero, matching the Linux arm's
+/// own loud failure on an unreadable `/proc` and `pty_holder_pids`'s
+/// `assert!(status.success() ...)` posture - a silent empty result here
+/// would read as "no kernel survives" in await_kernels_gone even if one
+/// actually leaked, which is the wrong direction to fail quietly in.
 #[cfg(not(target_os = "linux"))]
 fn kernel_pids() -> Vec<u32> {
-    let Ok(output) = std::process::Command::new("ps")
+    let output = std::process::Command::new("ps")
         .args(["-axww", "-o", "pid=,command="])
         .output()
-    else {
-        return Vec::new();
-    };
+        .unwrap_or_else(|error| panic!("spawn ps for the kernel-pid census: {error}"));
+    assert!(
+        output.status.success(),
+        "ps exited {} during the kernel-pid census: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut found = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let line = line.trim_start();
