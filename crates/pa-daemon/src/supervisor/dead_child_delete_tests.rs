@@ -485,12 +485,22 @@ async fn issue_42_failed_finalization_retains_artifacts_and_blocks_revival() {
 }
 
 /// #42: partially understood topology cannot authorize launch or deletion.
+///
+/// Review correction: the original parametrization also iterated a
+/// "malformed" ledger-corruption case (a line that fails to parse as JSON
+/// at all) and expected it to refuse deletion/create the same way as
+/// "unknown" and "io". That no longer holds under the canonical,
+/// independently-reviewed Authority-read disposition (skip+log a
+/// torn/unparseable line, never bail the whole read) this lane adopted
+/// earlier in this same effort. Dropped "malformed" from this refusing
+/// test; its own, qualitatively different expected flow (the delete
+/// SUCCEEDS once the bad line is skipped) is its own test below,
+/// `issue_42_a_malformed_ledger_line_is_skipped_so_the_valid_spawn_still_deletes`.
 #[tokio::test]
 async fn issue_42_unknown_ledger_authority_refuses_create_and_preserves_delete_evidence() {
     tokio::time::timeout(Duration::from_secs(15), async {
         for (corruption, reason) in [
             ("unknown", "unknown operation"),
-            ("malformed", "malformed"),
             ("io", "not a regular file"),
         ] {
             let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
@@ -507,9 +517,7 @@ async fn issue_42_unknown_ledger_authority_refuses_create_and_preserves_delete_e
                 std::fs::create_dir(ledger.ledger_path()).unwrap();
                 backup
             } else {
-                bytes.extend_from_slice(if corruption == "unknown" {
-                    b"{\"v\":1,\"op\":\"future-delete\",\"at\":\"t\"}\n"
-                } else { b"{malformed-record}\n" });
+                bytes.extend_from_slice(b"{\"v\":1,\"op\":\"future-delete\",\"at\":\"t\"}\n");
                 std::fs::write(ledger.ledger_path(), &bytes).unwrap();
                 ledger.ledger_path().to_path_buf()
             };
@@ -529,6 +537,72 @@ async fn issue_42_unknown_ledger_authority_refuses_create_and_preserves_delete_e
             assert_eq!(std::fs::read(evidence_path).unwrap(), bytes);
             if corruption == "io" { assert!(ledger.ledger_path().is_dir()); }
         }
+    }).await.expect("bounded deleted-child authority check");
+}
+
+/// The split-out "malformed" case: a line that fails to parse as JSON at
+/// all is the SAME shape the ledger's own append-then-fsync-before-ack
+/// protocol already treats as "never committed" for Authority reads
+/// elsewhere in this effort (the earlier-resolved rlm_ledger.rs skip-vs-
+/// refuse conflict). `strict_edges()` skips it and still reads the
+/// fixture's valid "sub-dead" spawn record, so deletion authority proceeds
+/// and genuinely commits. Confirmed via direct source read (not guessed):
+/// `commit_child_deletion` only appends to the ledger and (if a resident
+/// exists) persists its descriptor - it never touches the transcript file
+/// - and its caller (`routing.rs`'s delete-by-selector path) calls
+/// `passivated_launches.forget_deleted(...)` immediately after a
+/// successful commit, so the remembered launch is cleared, not retained.
+#[tokio::test]
+async fn issue_42_a_malformed_ledger_line_is_skipped_so_the_valid_spawn_still_deletes() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let Fixture { _dir: dir, supervisor, child_file, ledger } = fixture().await;
+        let launch = crate::passivated_launch::PassivatedLaunch::new(
+            &crate::descriptor::durable_create_command(&json!({
+                "sessionPath": child_file, "cwd": dir.path()
+            })), None,
+        );
+        supervisor.passivated_launches.remember(&child_file, &launch).unwrap();
+        let mut with_malformed = std::fs::read(ledger.ledger_path()).unwrap();
+        with_malformed.extend_from_slice(b"{malformed-record}\n");
+        std::fs::write(ledger.ledger_path(), &with_malformed).unwrap();
+        let transcript = std::fs::read(&child_file).unwrap();
+
+        let deleted = route_delete(&supervisor).await;
+        assert_eq!(deleted["success"], true, "a skippable malformed line must not block a real deletion: {deleted}");
+
+        // The pre-existing bytes (the spawn record and the malformed line) are
+        // an unchanged prefix; the commit only ever appends, never rewrites.
+        let after = std::fs::read(ledger.ledger_path()).unwrap();
+        assert!(
+            after.starts_with(&with_malformed),
+            "the spawn record and the skipped malformed line must survive untouched"
+        );
+        assert!(
+            after.len() > with_malformed.len(),
+            "a real tombstone record must be appended after the skipped line"
+        );
+        let edges = ledger.strict_edges().unwrap();
+        assert!(
+            edges.iter().any(|edge| edge.child_id == "sub-dead" && edge.deleted.is_some()),
+            "the committed tombstone must be readable past the skipped malformed line"
+        );
+
+        assert_eq!(std::fs::read(&child_file).unwrap(), transcript, "a logical delete never touches the transcript file");
+        assert!(
+            supervisor.passivated_launches.get(&child_file).is_none(),
+            "a genuinely committed deletion clears the remembered launch, unlike a refused one"
+        );
+
+        supervisor.pin_worker_connect_budget_for_tests(Duration::ZERO);
+        let create: DaemonCommand = serde_json::from_value(json!({
+            "type": "create", "sessionPath": child_file, "config": {"cwd": dir.path()}
+        })).unwrap();
+        let error = supervisor.handle_create(&create, "c".into()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Cannot revive deleted RLM child"),
+            "a re-create at a now-deleted path must refuse as a revival, not a ledger-readability error: {error:#}"
+        );
+        assert!(supervisor.registry.list().await.is_empty());
     }).await.expect("bounded deleted-child authority check");
 }
 

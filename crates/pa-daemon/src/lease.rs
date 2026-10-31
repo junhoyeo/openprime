@@ -675,6 +675,28 @@ impl SessionLease {
         })
     }
 
+    /// #42 fix (RECURRENCE SWEEP, site 3 of 3): `revalidate()` alone only
+    /// proves the lease is still unreleased and identity-matched; it never
+    /// re-reads the deletion ledger. A same-path-reuse receiver that has no
+    /// ambient, already-correctly-scoped [`RuntimeSessionAuthority`] of its
+    /// own (unlike the daemon's supervised `Worker`, which already holds
+    /// one) needs both checks bundled under ONE held M. Resolves a strict,
+    /// standalone authority scope for this lease's own agent root - the
+    /// matching scope for an unsupervised caller (e.g. the CLI's direct RPC
+    /// session), not a substitute for a supervised caller's own authority.
+    ///
+    /// # Errors
+    /// Returns an error when this lease's canonical identity can no longer
+    /// be resolved, ownership can no longer be confirmed, or the deletion
+    /// ledger now names this target as deleted.
+    pub(crate) fn revalidate_and_check_admission(&self) -> Result<()> {
+        let authority = RuntimeSessionAuthority::for_agent_dir(self.agent_dir())?;
+        with_runtime_session_fence(self.agent_dir(), &self.session_path, |held| {
+            held.revalidate_lease(self)?;
+            authority.check_admission(held.canonical_path())
+        })
+    }
+
     /// Hold the existing append admission fence across proof, mutation and sync.
     /// Release retains its existing ten-second drain policy: a wedged IO call
     /// or suspended process beyond that bound is not absolute handoff safety.

@@ -126,7 +126,8 @@ impl Supervisor {
 mod tests {
     use std::sync::Arc;
 
-        use serde_json::json;
+    use pa_types::daemon::DaemonWorkerDescriptor;
+    use serde_json::json;
 
     use crate::registry::ResidentWorker;
     use crate::supervisor::Supervisor;

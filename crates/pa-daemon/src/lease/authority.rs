@@ -204,45 +204,93 @@ mod tests {
         assert!(reopened.acquire(&child).is_err(), "fresh authority must not select an empty bucket after root creation");
         assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), before);
     }
+    /// Review correction (independent reviewer, review-issue42-legacy-seed-test-or-impl):
+    /// the original parametrization also iterated a "deleted" legacy-registry row whose
+    /// target file was never created. That is NOT an unknown/ambiguous seed shape -
+    /// `RlmSpawnLedger::seed()` deliberately imports a deleted row as a tombstone pair
+    /// without ever dereferencing its target file (matching dcc/final TS; a deleted
+    /// child's transcript being absent is the ordinary, expected case, not corruption).
+    /// Only a row that genuinely fails to parse (`"malformed"`) poisons the whole
+    /// registry. Dropped the "deleted" case from this refusal test; the companion
+    /// positive case now lives in
+    /// `issue_42_valid_legacy_seed_tolerates_a_deleted_row_with_no_transcript_below`.
     #[test]
-    fn issue_42_first_admission_refuses_partial_legacy_seed_on_every_retry() {
-        for legacy in ["deleted", "malformed"] {
-            let root = tempfile::tempdir().unwrap();
-            let agent = root.path().join("agent");
-            let sessions = agent.join("sessions");
-            std::fs::create_dir_all(&sessions).unwrap();
-            let parent = sessions.join("parent.jsonl");
-            let archived = sessions.join("archived-sibling.jsonl");
-            for (path, id) in [(&parent, "parent"), (&archived, "archived-sibling")] {
-                std::fs::write(path, format!("{}\n", serde_json::json!({
-                    "type":"session", "version":3, "id":id, "timestamp":"t", "cwd":root.path(),
-                }))).unwrap();
-            }
-            let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
-            std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
-            let child = agent.join("custom-storage/child.jsonl");
-            let valid = serde_json::json!({
-                "childId":"sub-valid", "sessionFile":child, "sessionName":"valid",
-                "status":"completed", "rlmDepth":1,
-            });
-            let invalid = if legacy == "deleted" {
-                serde_json::json!({
-                    "childId":"sub-deleted", "sessionFile":agent.join("custom-storage/deleted.jsonl"),
-                    "sessionName":"deleted", "status":"deleted", "rlmDepth":1,
-                }).to_string()
-            } else { "{malformed}".to_string() };
-            let bytes = format!("{valid}\n{invalid}\n");
-            std::fs::write(&registry, &bytes).unwrap();
-            let ledger_path = crate::rlm_ledger::rlm_ledger_path(&agent, &sessions);
-            let before = std::fs::read(&archived).unwrap();
-            for _ in 0..2 {
-                let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
-                assert!(authority.acquire(&archived).is_err(), "{legacy}: unknown seed must not authorize a sibling open");
-                assert!(!ledger_path.exists(), "failed seed must not publish a trusted subset");
-                assert_eq!(std::fs::read_to_string(&registry).unwrap(), bytes);
-                assert_eq!(std::fs::read(&archived).unwrap(), before);
-            }
+    fn issue_42_first_admission_refuses_an_unparseable_legacy_seed_on_every_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent = sessions.join("parent.jsonl");
+        let archived = sessions.join("archived-sibling.jsonl");
+        for (path, id) in [(&parent, "parent"), (&archived, "archived-sibling")] {
+            std::fs::write(path, format!("{}\n", serde_json::json!({
+                "type":"session", "version":3, "id":id, "timestamp":"t", "cwd":root.path(),
+            }))).unwrap();
         }
+        let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let child = agent.join("custom-storage/child.jsonl");
+        let valid = serde_json::json!({
+            "childId":"sub-valid", "sessionFile":child, "sessionName":"valid",
+            "status":"completed", "rlmDepth":1,
+        });
+        let bytes = format!("{valid}\n{{malformed}}\n");
+        std::fs::write(&registry, &bytes).unwrap();
+        let ledger_path = crate::rlm_ledger::rlm_ledger_path(&agent, &sessions);
+        let before = std::fs::read(&archived).unwrap();
+        for _ in 0..2 {
+            let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
+            assert!(authority.acquire(&archived).is_err(), "unparseable seed must not authorize a sibling open");
+            assert!(!ledger_path.exists(), "failed seed must not publish a trusted subset");
+            assert_eq!(std::fs::read_to_string(&registry).unwrap(), bytes);
+            assert_eq!(std::fs::read(&archived).unwrap(), before);
+        }
+    }
+
+    /// The positive companion the reviewer recommended: a deleted-status legacy row
+    /// whose target transcript was never created is the ordinary, expected case
+    /// (matching `claimed_legacy_deletion_seeds_a_tombstone_beside_non_session_roots`
+    /// in rlm_ledger/tests.rs) - admission on an unrelated sibling succeeds, and the
+    /// published ledger carries the imported tombstone pair for the deleted row.
+    #[test]
+    fn issue_42_valid_legacy_seed_tolerates_a_deleted_row_with_no_transcript_below() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent = sessions.join("parent.jsonl");
+        let archived = sessions.join("archived-sibling.jsonl");
+        for (path, id) in [(&parent, "parent"), (&archived, "archived-sibling")] {
+            std::fs::write(path, format!("{}\n", serde_json::json!({
+                "type":"session", "version":3, "id":id, "timestamp":"t", "cwd":root.path(),
+            }))).unwrap();
+        }
+        let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let child = agent.join("custom-storage/child.jsonl");
+        let deleted_child = agent.join("custom-storage/deleted.jsonl");
+        let valid = serde_json::json!({
+            "childId":"sub-valid", "sessionFile":child, "sessionName":"valid",
+            "status":"completed", "rlmDepth":1,
+        });
+        let deleted = serde_json::json!({
+            "childId":"sub-deleted", "sessionFile":deleted_child, "sessionName":"deleted",
+            "status":"deleted", "rlmDepth":1,
+        });
+        let bytes = format!("{valid}\n{deleted}\n");
+        std::fs::write(&registry, &bytes).unwrap();
+        let before = std::fs::read(&archived).unwrap();
+        let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
+        let held = authority.acquire(&archived).unwrap();
+        let edges = authority.ledger.strict_edges().unwrap();
+        assert_eq!(edges.len(), 2, "both the completed child and the deleted tombstone import");
+        assert!(
+            edges.iter().any(|edge| edge.child_id == "sub-deleted" && edge.deleted.is_some()),
+            "the deleted row imports as a committed tombstone, never dereferencing its absent transcript"
+        );
+        assert_eq!(std::fs::read(&archived).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&registry).unwrap(), bytes);
+        drop(held);
     }
 
     #[test]

@@ -237,7 +237,7 @@ async fn fork_at(
         forked.rewrite().map_err(|error| format!("{error:#}"))?;
         let target = forked.path.clone();
         drop(forked);
-        match target_lease.try_release().map_err(|error| format!("{error:#}"))? {
+        match target_lease.try_release() {
             crate::lease::LeaseReleaseOutcome::Released => target,
             crate::lease::LeaseReleaseOutcome::Deferred => return Err("Fork ownership is still settling; replacement deferred".to_string()),
         }

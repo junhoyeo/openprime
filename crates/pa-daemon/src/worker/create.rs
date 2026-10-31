@@ -37,8 +37,26 @@ impl Worker {
                 let Some(lease) = lease else {
                     return response_failure(None, "create", "File-backed session has no runtime ownership", None);
                 };
-                let checked = tokio::task::spawn_blocking(move || lease.revalidate()).await
-                    .map_err(anyhow::Error::from).and_then(|result| result);
+                // #42 fix (RECURRENCE SWEEP, site 2 of 3): the idempotent
+                // re-create path reuses a lease that may have been held
+                // across an arbitrary window (a full supervisor restart or
+                // respawn, wider than a single command gap). `revalidate()`
+                // alone never re-reads the deletion ledger - a tombstone
+                // committed during that window must still be caught before
+                // this reuse is allowed, same mandate and same fence-held
+                // pairing as target_lease's fix (site 1).
+                let checked = {
+                    let authority = authority.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let target = lease.session_path.clone();
+                        crate::lease::with_runtime_session_fence(authority.agent_dir(), &target, |held| {
+                            held.revalidate_lease(&lease)?;
+                            authority.check_admission(held.canonical_path())
+                        })
+                    })
+                }
+                .await
+                .map_err(anyhow::Error::from).and_then(|result| result);
                 if let Err(error) = checked {
                     return response_failure(None, "create", &format!("Cannot reuse {}: {error:#}", path.display()), None);
                 }

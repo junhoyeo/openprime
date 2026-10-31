@@ -285,7 +285,14 @@ impl RpcSession {
         if let RpcEngineRequest::Open { session_path, reuse_lease } = &mut request {
             let canonical = crate::lease::checked_session_path(session_path).map_err(|error| error.to_string())?;
             if let Some(lease) = current_lease.filter(|lease| lease.session_path == canonical) {
-                lease.revalidate().map_err(|error| format!("{error:#}"))?;
+                // #42 fix (RECURRENCE SWEEP, site 3 of 3): this is the exact
+                // scenario the lock-contract review named verbatim ("RPC
+                // same-path replacement transfers the existing lease and
+                // sets reuse_lease"). `revalidate()` alone never re-reads
+                // the deletion ledger - a tombstone committed while this
+                // session held the lease must still be caught before this
+                // reuse is allowed.
+                lease.revalidate_and_check_admission().map_err(|error| format!("{error:#}"))?;
                 adopted_lease = Some(lease);
                 *reuse_lease = true;
             }
@@ -391,5 +398,186 @@ struct ReplacingGate<'a>(&'a AtomicBool);
 impl Drop for ReplacingGate<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// #42 RECURRENCE SWEEP (parent/coordinator priority item, 2026-11-01): a
+/// minimal harness for `replace_locked`'s `RpcEngineRequest::Open` same-
+/// path-reuse branch - the exact scenario the lock-contract review named
+/// verbatim ("RPC same-path replacement transfers the existing lease and
+/// sets reuse_lease"). Uses `LineWriter::for_test()` (a new, minimal,
+/// `#[cfg(test)]`-gated constructor added alongside this test, reviewed
+/// together as one unit) since the production constructor writes to the
+/// real stdout and is private to this crate's own module.
+#[cfg(test)]
+mod same_path_reuse_tests {
+    use super::*;
+
+    /// `RpcEngineHandle.model`'s type (`pa_types::ai::Model`, the catalog/wire shape).
+    fn test_model() -> pa_types::ai::Model {
+        pa_types::ai::Model {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "test".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: pa_types::ai::ModelCost {
+                input: 0.0.into(),
+                output: 0.0.into(),
+                cache_read: 0.0.into(),
+                cache_write: 0.0.into(),
+            },
+            context_window: 100_000,
+            max_tokens: 8_000,
+            max_tokens_explicit: false,
+            featured: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// `SessionEngineConfig.model`'s DIFFERENT type (`pa_agent::types::Model`,
+    /// the provider-runtime shape - a distinct, similarly-named type).
+    fn test_engine_model() -> pa_agent::types::Model {
+        pa_agent::types::Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            cost: pa_agent::types::UsageCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+            max_tokens_explicit: false,
+        }
+    }
+
+    async fn minimal_handle(
+        cwd: &std::path::Path,
+        agent_dir: &std::path::Path,
+        lease: Option<Arc<crate::lease::SessionLease>>,
+    ) -> RpcEngineHandle {
+        let engine_model = test_engine_model();
+        let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(engine_model.clone()));
+        provider.push_text_turn("ok");
+        let engine = pa_core::session_engine::engine::create_session(
+            pa_core::session_engine::engine::SessionEngineConfig {
+                cwd: cwd.to_path_buf(),
+                agent_dir: agent_dir.to_path_buf(),
+                daemonless: true,
+                model: Some(engine_model),
+                stream_fn: Some(provider.stream_fn()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("minimal session engine assembles");
+        RpcEngineHandle {
+            engine: Arc::new(engine),
+            model: test_model(),
+            api_key: None,
+            provider_target: Arc::new(std::sync::RwLock::new(None)),
+            bash_wake: Arc::new(tokio::sync::Notify::new()),
+            session_lease: lease,
+        }
+    }
+
+    /// RED: demonstrates the bypass under the CURRENT, unfixed code - the
+    /// same gap confirmed for `switch_session` (worker/replacement_gate_tests.rs)
+    /// and the idempotent re-create path (worker/create_collapse_tests.rs).
+    /// `lease.revalidate()` alone proves the lease is unreleased and
+    /// identity-matched; it never re-reads the deletion ledger.
+    #[tokio::test]
+    async fn issue_42_rpc_same_path_open_revalidates_a_committed_tombstone() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let sessions = agent_dir.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let child = sessions.join("child.jsonl");
+            let parent = sessions.join("parent.jsonl");
+            for (path, depth) in [(&parent, 0), (&child, 1)] {
+                let mut file = crate::session_store::SessionFile::create(
+                    &dir.path().to_string_lossy(), None, depth,
+                );
+                file.set_path(path.clone());
+                file.rewrite().unwrap();
+            }
+            let ledger = crate::rlm_ledger::RlmSpawnLedger::new(&agent_dir, &sessions, |_| {});
+            ledger
+                .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                    child_id: "sub-child".into(),
+                    parent: parent.to_string_lossy().into_owned(),
+                    child: child.to_string_lossy().into_owned(),
+                    depth: 1,
+                    name: "child".into(),
+                })
+                .unwrap();
+            let authority = crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap();
+            let lease = Arc::new(authority.acquire(&child).unwrap());
+
+            let handle = minimal_handle(dir.path(), &agent_dir, Some(Arc::clone(&lease))).await;
+            let writer = LineWriter::for_test();
+            // The factory ignores the request's specifics - `replace_locked`
+            // overwrites a fresh handle's `session_lease` with the adopted
+            // lease when the same-path branch sets `reuse_lease`, so the
+            // factory's own returned lease never matters for this scenario.
+            let factory_cwd = dir.path().to_path_buf();
+            let factory_agent_dir = agent_dir.clone();
+            let factory: RpcEngineFactory = Arc::new(move |_request: RpcEngineRequest| {
+                let cwd = factory_cwd.clone();
+                let agent_dir = factory_agent_dir.clone();
+                Box::pin(async move {
+                    let engine_model = test_engine_model();
+                    let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(engine_model.clone()));
+                    provider.push_text_turn("ok");
+                    let engine = pa_core::session_engine::engine::create_session(
+                        pa_core::session_engine::engine::SessionEngineConfig {
+                            cwd,
+                            agent_dir,
+                            daemonless: true,
+                            model: Some(engine_model),
+                            stream_fn: Some(provider.stream_fn()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(RpcEngineHandle {
+                        engine: Arc::new(engine),
+                        model: test_model(),
+                        api_key: None,
+                        provider_target: Arc::new(std::sync::RwLock::new(None)),
+                        bash_wake: Arc::new(tokio::sync::Notify::new()),
+                        session_lease: None,
+                    })
+                })
+            });
+            let session = RpcSession::adopt(handle, Some(factory), writer).await;
+
+            // An interrupted prior stop can leave this exact RPC session
+            // holding a lease the ledger now says is deleted - the same
+            // simulated scenario the other 2 RED tests use, outside the
+            // common-fence admission protocol on purpose.
+            ledger
+                .append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User)
+                .unwrap();
+            let before = std::fs::read(&child).unwrap();
+
+            let result = session
+                .replace_locked(RpcEngineRequest::Open { session_path: child.clone(), reuse_lease: false })
+                .await;
+            assert!(
+                result.is_err(),
+                "same-path RPC open must revalidate deletion authority, not just lease release/identity: {result:?}"
+            );
+            assert_eq!(std::fs::read(&child).unwrap(), before);
+        })
+        .await
+        .expect("bounded rpc same-path reuse test");
     }
 }

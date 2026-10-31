@@ -109,7 +109,22 @@ impl SessionNavigation {
             .and_then(|store| store.lease.clone());
         match source {
             Some(source) if source.session_path == canonical => {
-                source.revalidate()?;
+                // #42 fix (RECURRENCE SWEEP, site 1 of 3): `source.revalidate()`
+                // alone only proves the lease itself is still unreleased and
+                // identity-matched - it never re-reads the deletion ledger. A
+                // tombstone committed after this lease was first acquired
+                // (e.g. an interrupted prior stop's delete landing late) must
+                // still be caught here, per the lock-contract review's
+                // explicit mandate for this exact receiver: "revalidate
+                // strict authority under M as well as the still-owned,
+                // nonreleased lease." Both checks run under ONE held fence
+                // (the fence-held `revalidate_lease`, not the self-locking
+                // `revalidate()` convenience) so this never nests a second
+                // acquisition on the same canonical key.
+                crate::lease::with_runtime_session_fence(authority.agent_dir(), &canonical, |held| {
+                    held.revalidate_lease(&source)?;
+                    authority.check_admission(held.canonical_path())
+                })?;
                 Ok(Some(source))
             }
             Some(source) => source.acquire_target(&canonical).map(Some),
