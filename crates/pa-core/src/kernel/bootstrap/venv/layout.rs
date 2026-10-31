@@ -45,14 +45,13 @@ fn xdg_kernel_venv_dir() -> PathBuf {
 
 pub(crate) fn resolve_writable_kernel_venv_dir() -> anyhow::Result<PathBuf> {
     let primary = kernel_venv_dir();
-    if std::fs::create_dir_all(primary.parent().unwrap_or(Path::new("/"))).is_ok() {
+    // An explicit path is exact: its parents are created only after every
+    // refusal check passes (`create_explicit_parent`), never here.
+    if std::env::var("PRIME_AGENT_KERNEL_VENV").is_ok_and(|v| !v.is_empty()) {
         return Ok(primary);
     }
-    if std::env::var("PRIME_AGENT_KERNEL_VENV").is_ok_and(|v| !v.is_empty()) {
-        return Err(anyhow!(
-            "couldn't create kernel venv parent directories for {}",
-            primary.display()
-        ));
+    if std::fs::create_dir_all(primary.parent().unwrap_or(Path::new("/"))).is_ok() {
+        return Ok(primary);
     }
     let fallback = xdg_kernel_venv_dir();
     if std::fs::create_dir_all(fallback.parent().unwrap_or(Path::new("/"))).is_err() {
@@ -63,6 +62,17 @@ pub(crate) fn resolve_writable_kernel_venv_dir() -> anyhow::Result<PathBuf> {
         ));
     }
     Ok(fallback)
+}
+
+/// Create the missing parents of an explicit kernel path. Callers invoke this
+/// only once the request will build a new environment.
+pub(crate) fn create_explicit_parent(venv: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(venv.parent().unwrap_or(Path::new("/"))).map_err(|error| {
+        anyhow!(
+            "couldn't create kernel venv parent directories for {}: {error}",
+            venv.display()
+        )
+    })
 }
 
 /// Path of the venv's python interpreter.

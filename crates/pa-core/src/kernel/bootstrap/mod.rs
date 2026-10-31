@@ -23,7 +23,7 @@ pub(crate) use venv::{
     begin_kernel_lease_handoff, register_kernel_python_lease, GenerationLeaseGuard,
 };
 use venv::{
-    bootstrap_venv, expand_home, generation_identity, generation_root, has_prime_agent_runtime,
+    bootstrap_venv, create_explicit_parent, expand_home, generation_identity, generation_root, has_prime_agent_runtime,
     kernel_ready, kernel_ready_read_only, kernel_runtime_ready, lease_for_resolver,
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
     prepare_generation_root, published_candidates, reclaim_explicit_path,
@@ -288,6 +288,15 @@ async fn ensure_exact_kernel_venv(
     source_dir: &std::path::Path,
     runtime_identity: &str,
 ) -> anyhow::Result<PathBuf> {
+    // A missing parent means a new environment. Refuse unverifiable
+    // management before creating anything, then create the parents so the
+    // exact path can be canonicalized.
+    if venv.parent().is_some_and(|parent| {
+        matches!(std::fs::symlink_metadata(parent), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        crate::platform::perms::require_private_owner_metadata_support()?;
+        create_explicit_parent(venv)?;
+    }
     let canonical = canonical_explicit_path(venv)?;
     let venv = canonical.as_path();
     // Ownership authorizes management, not read-only use of an explicitly
