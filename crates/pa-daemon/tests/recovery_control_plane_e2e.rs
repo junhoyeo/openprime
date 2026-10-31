@@ -113,8 +113,7 @@ fn live_worker_count(agent_dir: &Path, session_ids: &[String]) -> usize {
         .iter()
         .filter(|session_id| {
             worker_pid(agent_dir, session_id)
-                .map(|pid| pa_daemon::lease::is_process_alive(pid).unwrap_or(false))
-                .unwrap_or(false)
+                .is_some_and(|pid| pa_daemon::lease::is_process_alive(pid).unwrap_or(false))
         })
         .count()
 }
