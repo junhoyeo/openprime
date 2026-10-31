@@ -929,9 +929,12 @@ impl RlmSpawnLedger {
             }
             // The last segment without a trailing newline is a torn tail.
             let torn = !terminated && lines.peek().is_none();
+            // One message carries both the file and the refusal reason: a
+            // plain Display of an anyhow context would otherwise hide the
+            // reason (the outer context alone, not the wrapped chain).
             let classified = match replay::classify_authority_line(raw, index, torn) {
                 Ok(classified) => classified,
-                Err(error) => return Err(error).with_context(|| format!("RLM ledger {path}")),
+                Err(error) => bail!("RLM ledger {path}: {error:#}"),
             };
             match classified {
                 replay::AuthorityLine::Record(record) => records.push(record),
