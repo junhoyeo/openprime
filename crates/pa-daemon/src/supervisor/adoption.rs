@@ -123,6 +123,14 @@ pub(super) enum AdoptionOutcome {
     /// The descriptor carried a durable stop tombstone: the boot re-ran
     /// the stop's finalization instead of adopting or reviving.
     Stopped,
+    /// The socket could not be reached, but the recorded process could
+    /// NOT be proven gone either (an unverifiable identity, or a liveness
+    /// probe that itself failed): tracked in the registry (quarantined
+    /// from routing) rather than left for SkippedIdle's "safe to ignore"
+    /// treatment, so a later create/open or self-registration finds it
+    /// already present instead of risking a second owner for the same
+    /// session (#37/#38).
+    Unverified,
     Failed,
 }
 
@@ -179,7 +187,14 @@ impl Supervisor {
                     let counter = match outcome {
                         AdoptionOutcome::AdoptedLive => adopted_live,
                         AdoptionOutcome::Revived => revived,
-                        AdoptionOutcome::SkippedIdle => skipped_idle,
+                        // Counted alongside SkippedIdle for telemetry only
+                        // (no new cross-crate telemetry field): both mean
+                        // "neither adopted live nor revived a new process"
+                        // from the boot pass's own counting perspective.
+                        // The real behavioral difference (tracked in the
+                        // registry, quarantined, vs. left untracked) lives
+                        // in adopt_persisted_worker itself, not here.
+                        AdoptionOutcome::SkippedIdle | AdoptionOutcome::Unverified => skipped_idle,
                         AdoptionOutcome::Stopped => stopped,
                         AdoptionOutcome::Failed => failed,
                     };
@@ -375,9 +390,26 @@ impl Supervisor {
             // so the boot reap needs the same positive owner-death evidence
             // the tombstone probes use (TS `recoverWorker` runs its orphan
             // sweep only once the recorded process identity is gone).
-            if self.recorded_worker_is_gone(&resident).await {
-                self.reap_dead_worker_orphans(&resident).await;
+            let worker_is_gone = self.recorded_worker_is_gone(&resident).await;
+            if !worker_is_gone {
+                // The recorded process cannot be proven gone - it may still
+                // be the exact same worker, just unreachable through its
+                // socket right now (a slow boot, a transient listener
+                // hiccup, an unverifiable identity). Track it rather than
+                // leaving the descriptor untracked: a later create/open or
+                // self-registration attempt must find it already present
+                // instead of risking a second owner for the same session
+                // (#37/#38). Quarantine it from routing immediately -
+                // nothing here has actually confirmed this resident is
+                // live and ready to serve.
+                resident.mark_identity_quarantined();
+                self.registry.insert(Arc::clone(&resident)).await;
+                self.log_line(&format!(
+                    "session worker {worker_id} could not be reached and its identity could not be ruled out; tracked and quarantined pending reconciliation"
+                ));
+                return AdoptionOutcome::Unverified;
             }
+            self.reap_dead_worker_orphans(&resident).await;
             let interrupted =
                 crate::journal::WorkerRecoveryJournal::read_interrupted(&journal_path);
             let kept = match &boot {
