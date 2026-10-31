@@ -11,13 +11,33 @@ use super::{
 };
 
 /// An unobservable start identity does not prove that a live pid was recycled.
-/// Only an observed mismatch proves the descriptor's process is gone.
+/// Only an observed mismatch proves the descriptor's process is gone. For a
+/// pair where either side uses the versioned `kind:payload` process-start-id
+/// scheme (contains a `:`), only a provable mismatch WITHIN that scheme
+/// counts - an ambiguous/legacy-prefix/malformed comparison must never be
+/// treated as proof of pid reuse (#37): a live descriptor with an
+/// unverifiable identity stays adopted, not dropped. A plain opaque token
+/// on both sides (no `:` at all) keeps the direct-equality comparison the
+/// existing `recorded`/`recycled` test fixture values rely on.
 fn recorded_process_alive(
     alive: Option<bool>,
     expected: Option<&str>,
     observed: Option<&str>,
 ) -> bool {
-    alive != Some(false) && (expected.is_none() || observed.is_none() || expected == observed)
+    if alive == Some(false) {
+        return false;
+    }
+    let (Some(expected), Some(observed)) = (expected, observed) else {
+        return true;
+    };
+    if expected.contains(':') || observed.contains(':') {
+        !matches!(
+            pa_types::platform::process::compare_process_start_ids(Some(expected), Some(observed)),
+            pa_types::platform::process::ProcessStartIdComparison::Mismatch
+        )
+    } else {
+        expected == observed
+    }
 }
 
 #[cfg(test)]
