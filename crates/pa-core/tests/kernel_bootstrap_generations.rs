@@ -229,7 +229,13 @@ async fn missing_explicit_kernel_venv_builds_at_the_exact_path() {
     let python = ensure_kernel_python(EnsureKernelPythonOptions::default())
         .await
         .unwrap();
-    assert_eq!(python, exact.join("bin/python"));
+    let exact_canonical = exact
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(exact.file_name().unwrap());
+    assert_eq!(python, exact_canonical.join("bin/python"));
     assert!(python.is_file());
     assert!(!root
         .path()
@@ -381,7 +387,13 @@ async fn current_explicit_symlink_is_reused_read_only_but_stale_symlink_is_refus
     let reused = ensure_kernel_python(EnsureKernelPythonOptions::default())
         .await
         .unwrap();
-    assert_eq!(reused, alias.join("bin/python"));
+    let alias_canonical = alias
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(alias.file_name().unwrap());
+    assert_eq!(reused, alias_canonical.join("bin/python"));
     assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "untouched");
     assert!(
         !probe_memo.exists(),
@@ -656,7 +668,13 @@ async fn explicit_build_dropped_mid_bootstrap_is_set_aside_and_rebuilt() {
     let python = ensure_kernel_python(EnsureKernelPythonOptions::default())
         .await
         .expect("the next session builds the exact path");
-    assert_eq!(python, exact.join("bin/python"));
+    let exact_canonical = exact
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(exact.file_name().unwrap());
+    assert_eq!(python, exact_canonical.join("bin/python"));
     assert!(!build_record_path(&exact).exists());
 }
 
@@ -716,7 +734,13 @@ fn explicit_build_killed_mid_bootstrap_is_set_aside_and_rebuilt() {
         ensure_kernel_python(EnsureKernelPythonOptions::default()).await
     });
     let python = python.expect("an abandoned own build is set aside and rebuilt");
-    assert_eq!(python, exact.join("bin/python"));
+    let exact_canonical = exact
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(exact.file_name().unwrap());
+    assert_eq!(python, exact_canonical.join("bin/python"));
     assert!(!exact.join("lib/partial-install").exists());
     let abandoned = abandoned_siblings(&exact);
     assert_eq!(abandoned.len(), 1, "{abandoned:?}");
@@ -744,7 +768,13 @@ async fn empty_explicit_dir_is_removed_without_recursion_and_rebuilt() {
     let python = ensure_kernel_python(EnsureKernelPythonOptions::default())
         .await
         .expect("an empty exact directory is rebuilt");
-    assert_eq!(python, exact.join("bin/python"));
+    let exact_canonical = exact
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(exact.file_name().unwrap());
+    assert_eq!(python, exact_canonical.join("bin/python"));
     assert!(abandoned_siblings(&exact).is_empty());
 }
 
@@ -866,10 +896,16 @@ async fn unreadable_explicit_dir_gets_the_unchanged_refusal() {
         .await
         .expect_err("an unreadable non-current path is refused");
     let message = error.to_string();
+    let exact_canonical = exact
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(exact.file_name().unwrap());
     assert!(
         message.contains(&format!(
             "PRIME_AGENT_KERNEL_VENV points to a non-current environment at {}",
-            exact.display()
+            exact_canonical.display()
         )),
         "{error:#}"
     );
@@ -1411,10 +1447,13 @@ async fn issue44_enrolled_explicit_root_updates_without_mutating_the_base() {
         original
     );
     let generation = second.parent().unwrap().parent().unwrap();
-    assert_eq!(
-        generation.parent().unwrap(),
-        exact.with_file_name("explicit-kernel-venv.generations")
-    );
+    let generations_root_canonical = exact
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("explicit-kernel-venv.generations");
+    assert_eq!(generation.parent().unwrap(), generations_root_canonical);
     assert!(generation.join(".generation-published").is_file());
     assert!(generation.join(".leases").is_dir());
     invalidate_runtime_probe_cache();
