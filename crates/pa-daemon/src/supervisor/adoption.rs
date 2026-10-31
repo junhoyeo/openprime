@@ -140,7 +140,7 @@ pub(super) enum AdoptionOutcome {
     /// The socket could not be reached, but the recorded process could
     /// NOT be proven gone either (an unverifiable identity, or a liveness
     /// probe that itself failed): tracked in the registry (quarantined
-    /// from routing) rather than left for SkippedIdle's "safe to ignore"
+    /// from routing) rather than left for `SkippedIdle`'s "safe to ignore"
     /// treatment, so a later create/open or self-registration finds it
     /// already present instead of risking a second owner for the same
     /// session (#37/#38).

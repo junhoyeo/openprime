@@ -1,6 +1,12 @@
 //! The one permanent metadata fence for a canonical runtime-session lease.
 //! No network/await/destructor that acquires a lease may run in a held closure.
 
+// Cross-lane shared API (#37/#38 M-fence + identity): consumed by sibling lanes'
+// call sites (record-lifecycle/namespace's rpc/session.rs, session_navigation.rs,
+// worker/create.rs) that land via composition, not by anything in pa-daemon's own
+// --lib/--tests on this branch alone. Remove this once those call sites are merged.
+#![allow(dead_code)]
+
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
@@ -195,7 +201,7 @@ impl HeldRuntimeSessionFence<'_> {
 
 /// Run a short synchronous ownership transaction. Resolve ledger objects and do
 /// network work before entering; use fixed-order try-locks for publication data.
-/// Never call a self-locking lease method or drop a SessionLease in this closure.
+/// Never call a self-locking lease method or drop a `SessionLease` in this closure.
 pub(crate) fn with_runtime_session_fence<T>(
     agent_dir: &Path,
     target: &Path,

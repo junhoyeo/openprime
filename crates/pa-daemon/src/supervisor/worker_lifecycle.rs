@@ -28,6 +28,10 @@ use crate::protocol::{response_failure, response_success, DaemonResponse};
 /// `process_confirmed_stopped` is what actually distinguishes a failed
 /// stop from a successful one with a residual cleanup hiccup.
 pub(super) struct RetirementOutcome {
+    // Read only in test assertions today - production code checks
+    // process_confirmed_stopped instead (the doc comment above explains why
+    // the two signals are independent); kept for test clarity, not dead.
+    #[allow(dead_code)]
     pub(super) retired: bool,
     pub(super) process_confirmed_stopped: bool,
 }

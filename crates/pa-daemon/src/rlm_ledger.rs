@@ -32,6 +32,7 @@ use crate::util::now_iso;
 mod replay;
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Authority: cross-lane API (#37/#38), consumed via composition.
 enum LedgerReadPolicy {
     BestEffort,
     Authority,
@@ -671,6 +672,7 @@ impl RlmSpawnLedger {
     /// Authority reads must not interpret unreadable or partially understood
     /// topology as an empty tree. Keep ordinary display reads best-effort; this
     /// uncached path propagates seeding, I/O, malformed and unknown-op errors.
+    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn strict_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
         self.seed()?;
         let state = fold_records(self.read_records_with(LedgerReadPolicy::Authority)?, |_| {

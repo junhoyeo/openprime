@@ -3,6 +3,12 @@
 //! Storage overrides never select a different ledger. Supervised workers use
 //! their supervisor's persisted default scope, including when initially fileless.
 
+// Cross-lane shared API (#37/#38 M-fence + identity): consumed by sibling lanes'
+// call sites (record-lifecycle/namespace's rpc/session.rs, session_navigation.rs,
+// worker/create.rs) that land via composition, not by anything in pa-daemon's own
+// --lib/--tests on this branch alone. Remove this once those call sites are merged.
+#![allow(dead_code)]
+
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -176,7 +182,7 @@ impl RuntimeSessionAuthority {
         let target = super::checked_session_path(target)?;
         match std::fs::metadata(&target) {
             Ok(metadata) => {
-                anyhow::ensure!(metadata.is_file(), "Session target is not a regular file")
+                anyhow::ensure!(metadata.is_file(), "Session target is not a regular file");
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("inspect session target"),
