@@ -50,14 +50,26 @@ mod recorded_process_tests {
         use super::*;
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap(),
+        );
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("agent")).unwrap();
-        let supervisor = Arc::new(Supervisor::new(super::super::SupervisorOptions {
-            socket_path: dir.path().join("daemon.sock"), agent_dir: dir.path().join("agent")
-        }).unwrap());
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
         let descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_value(json!({
             "version":2, "workerId":"legacy", "pid":child.0.id(), "processStartId":"unsupported:birth",
             "socketPath":dir.path().join("missing.sock"), "recoveryJournalPath":dir.path().join("journal.jsonl"),
@@ -68,7 +80,9 @@ mod recorded_process_tests {
         let path = supervisor.descriptor_dir.join("legacy.json");
         crate::descriptor::persist_worker(&path, &descriptor).unwrap();
         let before = std::fs::read(&path).unwrap();
-        supervisor.adopt_persisted_worker(path.clone(), descriptor, AdoptionBoot::PlainStartup).await;
+        supervisor
+            .adopt_persisted_worker(path.clone(), descriptor, AdoptionBoot::PlainStartup)
+            .await;
         assert!(supervisor.registry.get("legacy").await.is_some());
         assert_eq!(std::fs::read(path).unwrap(), before);
         assert!(child.0.try_wait().unwrap().is_none());

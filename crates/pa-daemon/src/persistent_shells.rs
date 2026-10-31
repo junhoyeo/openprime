@@ -211,7 +211,8 @@ pub(crate) fn kill_shell(agent_dir: &Path, id: &str) -> Result<bool, String> {
 /// sent to THIS exact group (#37/#38) - never on "historical" TERM alone.
 fn kill_group(shell: &Shell) -> Result<(), String> {
     let leader_zombie_matches = !matches!(crate::lease::is_process_alive(shell.pid), Ok(true))
-        && crate::lease::get_process_start_id(shell.pid).as_deref() == Some(shell.start_id.as_str());
+        && crate::lease::get_process_start_id(shell.pid).as_deref()
+            == Some(shell.start_id.as_str());
     if !runs_as_registered(shell) && !leader_zombie_matches {
         return if group_unverified(shell) {
             Err(
@@ -337,7 +338,10 @@ mod tests {
         struct OwnedChildren(Vec<Child>);
         impl Drop for OwnedChildren {
             fn drop(&mut self) {
-                for child in &mut self.0 { let _ = child.kill(); let _ = child.wait(); }
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
         let root = tempfile::tempdir().unwrap();
@@ -346,14 +350,22 @@ mod tests {
         let mut children = OwnedChildren(vec![leader_command.spawn().unwrap()]);
         let pid = children.0[0].id();
         let start = crate::lease::get_process_start_id(pid).unwrap();
-        children.0.push(Command::new("sh")
-            .args(["-c", "trap '' TERM; printf 'ready\n'; read answer"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).process_group(pid as i32).spawn().unwrap());
+        children.0.push(
+            Command::new("sh")
+                .args(["-c", "trap '' TERM; printf 'ready\n'; read answer"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .process_group(pid as i32)
+                .spawn()
+                .unwrap(),
+        );
         let stdout = children.0[1].stdout.take().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut line = String::new();
-            let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
             let _ = ready_tx.send(result);
         });
         let ready = ready_rx.recv_timeout(Duration::from_secs(5));

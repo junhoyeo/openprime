@@ -81,7 +81,11 @@ impl Supervisor {
             // only with a provably-gone process — the settle is not a death certificate.
             let settled = self.finalize_worker_stop(resident, None).await;
             if settled {
-                if self.retire_worker_after_stop(resident).await.process_confirmed_stopped {
+                if self
+                    .retire_worker_after_stop(resident)
+                    .await
+                    .process_confirmed_stopped
+                {
                     self.log_line(&format!(
                         "finished the tombstoned stop of session worker {}",
                         resident.worker_id
@@ -101,7 +105,11 @@ impl Supervisor {
             if resident.descriptor.lock().await.owner_client_id.is_some() {
                 self.finalize_owned_stop(resident).await;
             }
-            if self.retire_worker_after_stop(resident).await.process_confirmed_stopped {
+            if self
+                .retire_worker_after_stop(resident)
+                .await
+                .process_confirmed_stopped
+            {
                 self.log_line(&format!(
                     "finished the tombstoned per-session stop of session worker {}",
                     resident.worker_id
@@ -883,14 +891,20 @@ impl Supervisor {
                     "session worker {} survived the shutdown escalation; descriptor tombstoned for the next boot",
                     resident.worker_id
                 ));
-                RetirementOutcome { retired: false, process_confirmed_stopped: false }
+                RetirementOutcome {
+                    retired: false,
+                    process_confirmed_stopped: false,
+                }
             }
             _ if alive_unverified => {
                 self.log_line(&format!(
                     "session worker {} cannot be identity-verified; descriptor tombstoned for the next boot",
                     resident.worker_id
                 ));
-                RetirementOutcome { retired: false, process_confirmed_stopped: false }
+                RetirementOutcome {
+                    retired: false,
+                    process_confirmed_stopped: false,
+                }
             }
             _ => {
                 // The worker is provably gone, so its kernels can no longer
@@ -931,7 +945,10 @@ impl Supervisor {
                 let _ = crate::descriptor::clear_identity_pending(&resident.descriptor_path);
                 // The reaper alone owns orphan-journal removal. A read or
                 // identity-verified kill failure must preserve its retry records.
-                RetirementOutcome { retired: true, process_confirmed_stopped: true }
+                RetirementOutcome {
+                    retired: true,
+                    process_confirmed_stopped: true,
+                }
             }
         }
     }
@@ -1203,14 +1220,21 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let mut child = OwnedChild(Command::new("sh")
-            .args(["-c", "printf 'ready\n'; read answer"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut child = OwnedChild(
+            Command::new("sh")
+                .args(["-c", "printf 'ready\n'; read answer"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let stdout = child.0.stdout.take().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut line = String::new();
-            let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
             let _ = ready_tx.send(result);
         });
         let ready = ready_rx.recv_timeout(Duration::from_secs(5));
@@ -1231,14 +1255,16 @@ mod tests {
             "authenticationToken": "synthetic", "rootActiveSessionId": "unverified",
             "createdAt": "2026-10-07T00:00:00Z", "updatedAt": "2026-10-07T00:00:00Z",
             "lifecycle": "ready", "createCommand": {}, "consecutiveFailures": 0
-        })).unwrap();
+        }))
+        .unwrap();
         let path = supervisor.descriptor_dir.join("unverified.json");
         persist_worker(&path, &descriptor).unwrap();
         let resident = ResidentWorker::new("unverified".into(), descriptor, path.clone());
         supervisor.registry.insert(Arc::clone(&resident)).await;
         assert!(supervisor.stop_worker(&resident).await.is_err());
         assert!(supervisor.registry.get("unverified").await.is_some());
-        let persisted: DaemonWorkerDescriptor = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let persisted: DaemonWorkerDescriptor =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert!(persisted.stop_requested_at.is_some());
         assert_eq!(persisted.pid, u64::from(child.0.id()));
         assert_eq!(std::fs::read(journal).unwrap(), b"durable work");

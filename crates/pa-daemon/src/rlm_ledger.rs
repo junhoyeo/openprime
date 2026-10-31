@@ -673,7 +673,9 @@ impl RlmSpawnLedger {
     /// uncached path propagates seeding, I/O, malformed and unknown-op errors.
     pub(crate) fn strict_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
         self.seed()?;
-        let state = fold_records(self.read_records_with(LedgerReadPolicy::Authority)?, |_| true);
+        let state = fold_records(self.read_records_with(LedgerReadPolicy::Authority)?, |_| {
+            true
+        });
         Ok(state.edges)
     }
 
@@ -826,7 +828,9 @@ impl RlmSpawnLedger {
     fn read_records_with(&self, policy: LedgerReadPolicy) -> Result<Vec<LedgerRecord>> {
         if matches!(policy, LedgerReadPolicy::Authority) {
             match fs::symlink_metadata(&self.path) {
-                Ok(metadata) if !metadata.is_file() => bail!("authority ledger is not a regular file"),
+                Ok(metadata) if !metadata.is_file() => {
+                    bail!("authority ledger is not a regular file")
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(error) => return Err(error).context("inspect authority ledger"),
@@ -836,7 +840,8 @@ impl RlmSpawnLedger {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
-                return Err(error).with_context(|| format!("read RLM ledger {}", self.path.display()));
+                return Err(error)
+                    .with_context(|| format!("read RLM ledger {}", self.path.display()));
             }
         };
         if bytes.len() as u64 > RLM_LEDGER_MAX_BYTES {
@@ -904,16 +909,23 @@ impl RlmSpawnLedger {
                 break line;
             }
         };
-        let header_str = std::str::from_utf8(header)
-            .map_err(|_| anyhow::anyhow!("authority ledger {path} has a malformed ownership header"))?;
-        replay::validate_unique_json(header_str)
-            .map_err(|_| anyhow::anyhow!("authority ledger {path} has an ambiguous ownership header"))?;
-        let header: Value = serde_json::from_str(header_str)
-            .map_err(|_| anyhow::anyhow!("authority ledger {path} has a malformed ownership header"))?;
-        let scope = header.get("sessionsDir").and_then(Value::as_str)
+        let header_str = std::str::from_utf8(header).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has a malformed ownership header")
+        })?;
+        replay::validate_unique_json(header_str).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has an ambiguous ownership header")
+        })?;
+        let header: Value = serde_json::from_str(header_str).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has a malformed ownership header")
+        })?;
+        let scope = header
+            .get("sessionsDir")
+            .and_then(Value::as_str)
             .filter(|scope| Path::new(scope).is_absolute());
         if header.get("op").and_then(Value::as_str) != Some("meta")
-            || !scope.is_some_and(|scope| canonicalize_dir(Path::new(scope)) == self.canonical_sessions_dir)
+            || !scope.is_some_and(|scope| {
+                canonicalize_dir(Path::new(scope)) == self.canonical_sessions_dir
+            })
         {
             bail!("authority ledger {path} ownership does not match its sessions directory");
         }
@@ -925,7 +937,9 @@ impl RlmSpawnLedger {
             }
             count += 1;
             if count > RLM_LEDGER_MAX_RECORDS {
-                bail!("RLM ledger {path} exceeds {RLM_LEDGER_MAX_RECORDS} records; refusing to read");
+                bail!(
+                    "RLM ledger {path} exceeds {RLM_LEDGER_MAX_RECORDS} records; refusing to read"
+                );
             }
             // The last segment without a trailing newline is a torn tail.
             let torn = !terminated && lines.peek().is_none();
@@ -947,7 +961,6 @@ impl RlmSpawnLedger {
         }
         Ok(records)
     }
-
 
     /// One durable append; the first record in a fresh file is the meta
     /// header (the same line `seed` publishes).
@@ -1099,6 +1112,6 @@ impl RlmSpawnLedger {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod strict_tests;
+#[cfg(test)]
+mod tests;

@@ -21,7 +21,9 @@ fn fixture() -> (tempfile::TempDir, RlmSpawnLedger, RlmSpawnInput) {
 #[test]
 fn strict_authority_reads_include_deleted_edges() {
     let (_temp, ledger, input) = fixture();
-    ledger.append_delete(&input.child_id, &input.child, RlmLedgerDeleteReason::User).unwrap();
+    ledger
+        .append_delete(&input.child_id, &input.child, RlmLedgerDeleteReason::User)
+        .unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     let edges = ledger.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
@@ -39,9 +41,15 @@ fn strict_authority_reads_include_deleted_edges() {
 #[test]
 fn a_malformed_record_line_is_skipped_not_refused_on_authority_reads() {
     let (_temp, ledger, input) = fixture();
-    OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap()
-        .write_all(b"{malformed-record}
-").unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(
+            b"{malformed-record}
+",
+        )
+        .unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     let edges = ledger.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
@@ -55,7 +63,14 @@ fn a_malformed_record_line_is_skipped_not_refused_on_authority_reads() {
 fn unknown_operation_is_not_known_empty_authority() {
     let (_temp, ledger, _) = fixture();
     let future = json!({"v":1, "op":"future-operation", "at":"2026-01-01T00:00:00Z"});
-    writeln!(OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap(), "{future}").unwrap();
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(ledger.ledger_path())
+            .unwrap(),
+        "{future}"
+    )
+    .unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     assert!(ledger.strict_edges().is_err());
     assert_eq!(ledger.edges(false).unwrap().len(), 1);
@@ -93,12 +108,19 @@ fn a_genuinely_missing_ledger_without_legacy_history_remains_empty() {
 fn a_torn_final_delete_is_skipped_not_refused() {
     let (_temp, ledger, input) = fixture();
     let row = json!({"v":1,"op":"delete","at":"2026-01-01T00:00:00Z","childId":input.child_id,"child":input.child,"reason":"user"});
-    OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap()
-        .write_all(row.to_string().as_bytes()).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(row.to_string().as_bytes())
+        .unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     let edges = ledger.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].deleted, None, "an unacknowledged delete is not a tombstone");
+    assert_eq!(
+        edges[0].deleted, None,
+        "an unacknowledged delete is not a tombstone"
+    );
     assert_eq!(fs::read(ledger.ledger_path()).unwrap(), bytes);
 }
 
@@ -108,8 +130,12 @@ fn a_torn_final_delete_is_skipped_not_refused() {
 #[test]
 fn an_invalid_utf8_line_is_skipped_never_lossily_read() {
     let (_temp, ledger, input) = fixture();
-    OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap()
-        .write_all(b"{\"v\":1,\"op\":\"delete\",\"at\":\"t\",\"childId\":\"\xff\"}\n").unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(b"{\"v\":1,\"op\":\"delete\",\"at\":\"t\",\"childId\":\"\xff\"}\n")
+        .unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     let edges = ledger.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
@@ -130,10 +156,18 @@ fn a_well_formed_duplicate_key_record_refuses_authority() {
         id = serde_json::to_string(&input.child_id).unwrap(),
         child = serde_json::to_string(&input.child).unwrap(),
     );
-    OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap()
-        .write_all(line.as_bytes()).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(line.as_bytes())
+        .unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
-    assert!(ledger.strict_edges().unwrap_err().to_string().contains("duplicate-key"));
+    assert!(ledger
+        .strict_edges()
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate-key"));
     assert_eq!(fs::read(ledger.ledger_path()).unwrap(), bytes);
 }
 
@@ -144,8 +178,19 @@ fn a_well_formed_duplicate_key_record_refuses_authority() {
 fn a_well_formed_newer_version_record_refuses_authority() {
     let (_temp, ledger, input) = fixture();
     let row = json!({"v":2,"op":"delete","at":"t","childId":input.child_id,"child":input.child,"reason":"user"});
-    writeln!(OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap(), "{row}").unwrap();
-    assert!(ledger.strict_edges().unwrap_err().to_string().contains("unsupported record version"));
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(ledger.ledger_path())
+            .unwrap(),
+        "{row}"
+    )
+    .unwrap();
+    assert!(ledger
+        .strict_edges()
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported record version"));
 }
 
 /// A present-but-wrongly-typed required field may be a newer/ambiguous
@@ -154,13 +199,32 @@ fn a_well_formed_newer_version_record_refuses_authority() {
 #[test]
 fn a_required_field_with_the_wrong_type_refuses_but_an_absent_one_skips() {
     let (_temp, ledger, input) = fixture();
-    let wrong = json!({"v":1,"op":"delete","at":"t","childId":7,"child":input.child,"reason":"user"});
-    writeln!(OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap(), "{wrong}").unwrap();
-    assert!(ledger.strict_edges().unwrap_err().to_string().contains("invalid childId field"));
+    let wrong =
+        json!({"v":1,"op":"delete","at":"t","childId":7,"child":input.child,"reason":"user"});
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(ledger.ledger_path())
+            .unwrap(),
+        "{wrong}"
+    )
+    .unwrap();
+    assert!(ledger
+        .strict_edges()
+        .unwrap_err()
+        .to_string()
+        .contains("invalid childId field"));
 
     let (_temp2, ledger2, input2) = fixture();
     let absent = json!({"v":1,"op":"delete","at":"t","child":input2.child,"reason":"user"});
-    writeln!(OpenOptions::new().append(true).open(ledger2.ledger_path()).unwrap(), "{absent}").unwrap();
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(ledger2.ledger_path())
+            .unwrap(),
+        "{absent}"
+    )
+    .unwrap();
     let edges = ledger2.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].deleted, None);
@@ -175,14 +239,25 @@ fn a_dangling_ledger_entry_is_not_genuine_absence() {
     std::os::unix::fs::symlink(temp.path().join("missing-history"), ledger.ledger_path()).unwrap();
     assert!(ledger.strict_edges().is_err());
     assert!(backup.is_file());
-    assert!(ledger.ledger_path().symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(ledger
+        .ledger_path()
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 #[test]
 fn missing_or_conflicting_ownership_header_cannot_authorize_mutation() {
     let (_temp, ledger, _) = fixture();
-    for contents in [String::new(), format!("{}
-", json!({"v":1,"op":"meta","at":"t","sessionsDir":ledger.canonical_sessions_dir.with_file_name("unrelated-sessions")}))] {
+    for contents in [
+        String::new(),
+        format!(
+            "{}
+",
+            json!({"v":1,"op":"meta","at":"t","sessionsDir":ledger.canonical_sessions_dir.with_file_name("unrelated-sessions")})
+        ),
+    ] {
         fs::write(ledger.ledger_path(), &contents).unwrap();
         assert!(ledger.strict_edges().is_err());
         assert_eq!(fs::read_to_string(ledger.ledger_path()).unwrap(), contents);
