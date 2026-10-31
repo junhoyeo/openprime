@@ -48,7 +48,14 @@ fn kernel_python() -> Option<PathBuf> {
     None
 }
 
-/// Every live `python -m rlm.repl` pid on the box (ambient kernels are part of the baseline).
+/// Every live `python -m rlm.repl` pid on the box (ambient kernels are part
+/// of the baseline). There is no owned on-disk record of a session's
+/// kernel pid reachable from this test (unlike the worker pid, which has
+/// a durable descriptor) - the kernel is a grandchild the worker spawns
+/// directly, with no wire field or descriptor exposing its pid. A
+/// command-line process census is therefore the only way to find it, on
+/// every platform.
+#[cfg(target_os = "linux")]
 fn kernel_pids() -> Vec<u32> {
     let mut found = Vec::new();
     let entries = std::fs::read_dir("/proc").unwrap_or_else(|e| panic!("read /proc: {e}"));
@@ -62,6 +69,40 @@ fn kernel_pids() -> Vec<u32> {
         // The kernel is spawned as `python -m rlm.repl` (NUL-separated argv): the adjacent
         // pair avoids matching an unrelated process that merely mentions the module.
         let args: Vec<&str> = cmdline.split('\0').collect();
+        if args.windows(2).any(|window| window == ["-m", "rlm.repl"]) {
+            found.push(pid);
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps` the same
+/// way `pty_holder_pids`'s macOS fallback already does elsewhere in this
+/// suite (`pa-cli/tests/termios_process_exit_e2e.rs`). `-ww` disables
+/// output truncation; the kernel's own argv has no embedded spaces (a
+/// plain `python -m rlm.repl`), so splitting the rendered command on
+/// whitespace is safe for this narrow adjacency match, same risk
+/// profile `pa_types::platform::process`'s pinned-locale `ps` fallback
+/// already accepts for its own identity probe.
+#[cfg(not(target_os = "linux"))]
+fn kernel_pids() -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid_text, command)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        let args: Vec<&str> = command.split_whitespace().collect();
         if args.windows(2).any(|window| window == ["-m", "rlm.repl"]) {
             found.push(pid);
         }
