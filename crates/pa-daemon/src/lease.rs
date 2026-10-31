@@ -232,7 +232,12 @@ fn classify_owner(directory: &Path) -> LeaseOwnerProof {
             LeaseOwnerProof::Held(LiveLeaseOwner {
                 pid: owner.pid,
                 active_session_id: owner.active_session_id.filter(|id| !id.is_empty()),
-                process_start_id: owner.process_start_id.clone(),
+                // Reachable only when owner.process_start_id was Some (the
+                // Matching verdict just above requires it) - see the
+                // struct field's own doc comment.
+                process_start_id: owner.process_start_id.clone().expect(
+                    "a Matching identity verdict guarantees a recorded process_start_id"
+                ),
             })
         }
     }
@@ -716,7 +721,14 @@ pub struct LiveLeaseOwner {
     /// later (rather than re-reading the owner file) use this, not a
     /// fresh `get_process_start_id` call, which answers the pid's
     /// *current* identity, not the one this lease was published under.
-    pub process_start_id: Option<String>,
+    /// Never optional: `Held` itself (classify_owner's only production
+    /// construction site) is reachable only via a confirmed `Matching`
+    /// verdict, which `compare_process_start_ids` can only reach when both
+    /// the recorded and observed identities are `Some` - so a `Held` value
+    /// always carries a known start id by construction, and a looser
+    /// `Option<String>` here would only invite dead code or a future
+    /// construction-site bug the type system should catch instead.
+    pub process_start_id: String,
 }
 
 /// Whether a live process holds the session file's runtime lease: read
