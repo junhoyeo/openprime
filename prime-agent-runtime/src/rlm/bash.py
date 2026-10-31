@@ -1191,7 +1191,7 @@ class PersistentBashHandle(BashHandle):
         self._rc_path = _persistent_file(home, shell_id, "rc")
         self._done = threading.Event()
         self._result: BashResult | None = None
-        self._completion_error: OSError | ValueError | None = None
+        self._completion_error: OSError | ValueError | RuntimeError | None = None
         self._callbacks: list[Callable[[], None]] = []
         self._reap_callback: Callable[[], None] | None = None
         self._result_consumed = False
@@ -1246,9 +1246,15 @@ class PersistentBashHandle(BashHandle):
         # A dead leader's group can still contain the shell's children. A live
         # recycled pid instead names a stranger's group and must not be signalled.
         with self._kill_lock:
-            reaped = _reap_persistent_group(
-                self._pid, self._start_id, leader_exit_witnessed=self._proc is not None or running
-            )
+            try:
+                reaped = _reap_persistent_group(self._pid, self._start_id)
+            except RuntimeError as error:
+                # Neither killed nor resolved: keep the record (and the
+                # error) for whoever is awaiting/polling this handle,
+                # instead of silently dropping tracking of an unverifiable
+                # group (#37/#38).
+                self._completion_error = error
+                reaped = False
             self._reaped = True
         try:
             cast("_OutputFile", self._buffer).keep()
@@ -1541,13 +1547,31 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+_SUPPORTED_START_ID_KINDS = frozenset({"proc", "ps", "ps2", "win", "win2"})
+
+
+def _start_id_kind(value: str) -> str | None:
+    kind, sep, _ = value.partition(":")
+    return kind if sep else None
+
+
 def _shell_identity(pid: int, start_id: str) -> bool | None:
     """True while pid still names the recorded shell, False once it is provably
-    gone (dead, or recycled under a new start identity), None when unprovable."""
+    gone (dead, or recycled under a new start identity within a kind this
+    reader recognizes), None when unprovable - including when either side's
+    identity uses a kind this reader does not recognize at all (a future or
+    unsupported format must never be treated as a proof of exit/mismatch,
+    only as unverifiable) (#37/#38)."""
     if not _pid_alive(pid):
         return False
     current = _process_start_id(pid)
-    return None if current is None else current == start_id
+    if current is None:
+        return None
+    if _start_id_kind(start_id) not in _SUPPORTED_START_ID_KINDS or (
+        _start_id_kind(current) not in _SUPPORTED_START_ID_KINDS
+    ):
+        return None
+    return current == start_id
 
 
 def _spawn_persistent(command: str, yield_after: float | None) -> PersistentBashHandle:
@@ -1631,24 +1655,30 @@ def _rehydrate_persistent_shells() -> None:
             _remove_shell_files(home, record["id"])
 
 
-def _reap_persistent_group(pid: int, start_id: str, leader_exit_witnessed: bool = False) -> bool:
+def _reap_persistent_group(pid: int, start_id: str) -> bool:
     """Reap stragglers without ever signalling a live recycled or unverified pid."""
     # Existence is distinct from liveness: a recycled zombie can still own an
     # unrelated group. It must pass the same start-identity check as a live pid.
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        if leader_exit_witnessed:
-            return _signal_group(pid, signal.SIGKILL)
-        # A durable record can outlive its original group. An extant group
-        # without the recorded leader may be a reused PGID: retain it, do not kill.
+        # The leader's pid slot is actually gone (not merely unreaped): no
+        # historical fact - that a caller once witnessed this exact leader
+        # exit, or sent it a signal earlier - proves the pgid number has not
+        # since been handed to an unrelated process. A durable record can
+        # outlive its original group; an extant group under this now-
+        # leaderless number may be this shell's own members, or it may be a
+        # reused PGID entirely - neither is provable from here (#37/#38:
+        # never kill on a historical TERM/exit, only continuous proof).
         try:
             os.killpg(pid, 0)
         except ProcessLookupError:
-            return True
+            return True  # genuinely nothing left; fully resolved
         except OSError:
-            return False
-        return False
+            return False  # transient probe failure; no kill attempted, safe to retry later
+        raise RuntimeError(
+            f"unverifiable group cleanup: leader pid {pid} is gone but its process group still has members"
+        )
     except PermissionError:
         pass
     current = _process_start_id(pid)
@@ -1692,7 +1722,11 @@ def _process_start_id(pid: int) -> str | None:
                 timeout=5,
                 env=_helper_env(),
             ).stdout.strip()
-            return f"win:{out}" if out.isdigit() else None
+            # `win2:` versions the writer (this value is already .NET UTC
+            # ticks, same epoch as the Rust `win2:` writer); a legacy
+            # `win:` reader has no verifiable epoch and must stay
+            # unverifiable forever, never a match.
+            return f"win2:{out}" if out.isdigit() else None
         except (OSError, subprocess.SubprocessError):
             return None
     try:
@@ -1718,7 +1752,9 @@ def _process_start_id(pid: int) -> str | None:
             timeout=5,
             env={**os.environ, "LC_ALL": "C", "LC_TIME": "C", "LANG": "C", "TZ": "UTC"},
         ).stdout.strip()
-        return f"ps:{out}" if out else None
+        # `ps2:` versions the writer: a legacy `ps:` reader has no timezone
+        # provenance and must stay unverifiable forever, never a match.
+        return f"ps2:{out}" if out else None
     except (OSError, subprocess.SubprocessError):
         return None
 

@@ -258,7 +258,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             for record in records:
                 self.assertEqual(record["ownerPid"], os.getpid())
                 self.assertEqual(record["kernelPid"], os.getpid())
-            self.assertTrue(records[0]["processStartId"].startswith(("proc:", "ps:")))
+            self.assertTrue(records[0]["processStartId"].startswith(("proc:", "ps2:")))
 
     async def test_await_returns_when_shell_backgrounds_child(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -519,7 +519,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 with mock.patch.object(
                     bash_module.subprocess, "run", return_value=completed
                 ) as run:
-                    self.assertEqual(bash_module._process_start_id(1234), "win:638000000000000000")
+                    self.assertEqual(bash_module._process_start_id(1234), "win2:638000000000000000")
         argv = run.call_args.args[0]
         self.assertEqual(
             argv[0],
@@ -1237,7 +1237,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             with mock.patch("builtins.open", side_effect=OSError):
                 with mock.patch.object(bash_module.subprocess, "run", return_value=completed) as run:
                     self.assertEqual(
-                        bash_module._process_start_id(1234), "ps:Mon Jan  1 00:00:00 2026"
+                        bash_module._process_start_id(1234), "ps2:Mon Jan  1 00:00:00 2026"
                     )
         self.assertEqual(run.call_args.args[0][0], "/bin/ps")
 
