@@ -565,4 +565,43 @@ mod tests {
         assert!(!venv.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "no ownership or lock metadata before refusal");
     }
+
+    /// Serializes the non-Unix public-entry tests that change the process env.
+    #[cfg(not(unix))]
+    static ISSUE44_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// #44: on a platform that cannot verify record ownership, the public
+    /// entry refuses a new nested explicit path without creating its
+    /// parents, target, lock, or sidecar. An external interpreter override
+    /// is read-only and writes nothing either.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn issue44_unproven_platform_public_entry_creates_no_explicit_parent() {
+        let _serial = ISSUE44_ENV_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let venv = root.path().join("missing").join("nested").join("kernel-venv");
+        let previous: Vec<_> = ["PRIME_AGENT_KERNEL_VENV", "PRIME_AGENT_KERNEL_PYTHON"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("PRIME_AGENT_KERNEL_VENV", &venv);
+        std::env::remove_var("PRIME_AGENT_KERNEL_PYTHON");
+        let managed = ensure_kernel_python(EnsureKernelPythonOptions::default()).await;
+        std::env::set_var("PRIME_AGENT_KERNEL_PYTHON", root.path().join("missing-python.exe"));
+        let external = ensure_kernel_python(EnsureKernelPythonOptions::default()).await;
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let error = managed.expect_err("unverifiable ownership refuses management");
+        assert!(format!("{error:#}").contains("verified record ownership"), "{error:#}");
+        assert!(external.is_err(), "a missing external interpreter is not accepted");
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "no parent, target, lock, or sidecar before refusal"
+        );
+    }
 }

@@ -1508,6 +1508,38 @@ async fn issue44_interrupted_validated_base_finishes_publication_before_updating
     assert_ne!(ensure_kernel_python(EnsureKernelPythonOptions::default()).await.unwrap(), first);
 }
 
+/// #44: a public-entry refusal must not create the explicit path's missing
+/// parents. An unreadable runtime source fails validation after layout
+/// resolution, so the parents must still be absent afterwards.
+#[tokio::test]
+async fn issue44_public_entry_refusal_creates_no_explicit_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = ENV_LOCK.lock().await;
+    invalidate_runtime_probe_cache();
+    let root = tempfile::tempdir().unwrap();
+    let package = runtime_fixture(root.path());
+    let (bin, log) = fake_uv(root.path());
+    let unreadable = package.join("prime-agent-runtime/src/rlm/unreadable.py");
+    std::fs::write(&unreadable, "VALUE = 1\n").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read(&unreadable).is_ok();
+    let exact = root.path().join("missing/nested/explicit-kernel-venv");
+    let _env = explicit_env(&bin, &package, &log, &exact, None);
+    let result = ensure_kernel_python(EnsureKernelPythonOptions::default()).await;
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!readable, "fixture must make runtime validation fail");
+    let error = result.expect_err("an unreadable runtime source is refused");
+    assert!(
+        error.to_string().contains("Failed to set up the Python kernel runtime"),
+        "{error:#}"
+    );
+    assert!(
+        !root.path().join("missing").exists(),
+        "refusal created explicit parent directories"
+    );
+    assert!(!log.exists(), "a refused setup must not start uv");
+}
+
 /// Explicit acceptance verifier: uses real offline uv installs and the approved
 /// read-only CPython toolchain. Run with --ignored --exact, never auto-skip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
