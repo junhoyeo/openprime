@@ -168,11 +168,17 @@ fn record_is_active(record: &Value) -> bool {
     else {
         return true;
     };
-    if matches!(pa_daemon::lease::is_process_alive(pid), Ok(false)) {
-        return false;
-    }
-    !matches!((record["processStartId"].as_str(), pa_daemon::lease::get_process_start_id(pid)),
-        (Some(expected), Some(observed)) if expected != observed)
+    // Only a confirmed exit (or a provable pid-reuse mismatch within the
+    // versioned kind:payload scheme) counts as inactive; an ambiguous or
+    // unverifiable identity comparison - unlike a plain string mismatch -
+    // must never let a live holder's admission be taken over (#37).
+    !matches!(
+        pa_types::platform::process::observe_process_identity(
+            pid,
+            record["processStartId"].as_str()
+        ),
+        pa_types::platform::process::ProcessIdentity::Gone
+    )
 }
 
 /// No foreign stale guard is reclaimed here. TS owns that recovery protocol;
