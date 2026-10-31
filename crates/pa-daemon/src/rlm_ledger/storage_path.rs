@@ -39,6 +39,18 @@ pub(super) fn same_open_file(left: &File, right: &File) -> Result<bool> {
     Ok(left_identity == right_identity)
 }
 
+/// A ledger-held namespace lock is typically held only for the duration of
+/// one short, local file read/write - not across an M-fenced network wait.
+/// Two DIFFERENT M-fenced targets under the SAME agent/sessions scope (e.g.
+/// two concurrent session switches to different files) legitimately both
+/// need this namespace lock in quick succession; without a bounded retry
+/// here, the loser of a pure-timing race would fail an otherwise-valid
+/// operation outright (#42: confirmed via `concurrent_replacements_never_
+/// interleave_their_critical_sections` - 2 concurrent switches, each its
+/// own M fence, both needing this shared namespace lock in turn).
+const ACQUIRE_RETRY_ATTEMPTS: u32 = 20;
+const ACQUIRE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl StorageGuard {
     pub(super) fn acquire(agent_dir: &Path, sessions_dir: &Path) -> Result<Self> {
         let directory = agent_dir.join("rlm-ledger-locks");
@@ -64,20 +76,31 @@ impl StorageGuard {
         validate_opened_metadata(&lock.metadata()?)?;
         // Capability failure is Unknown even for an otherwise empty namespace.
         let _ = pa_core::platform::opened_file_identity(&lock)?;
-        if let Err(error) = pa_core::platform::try_lock_exclusive(&lock) {
-            if matches!(
-                error
-                    .get_ref()
-                    .and_then(|source| source.downcast_ref::<std::fs::TryLockError>()),
-                Some(std::fs::TryLockError::WouldBlock)
-            ) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "RLM ledger scope is busy; retry this operation (no append was acknowledged)",
-                )
-                .into());
+        let mut attempt = 0;
+        loop {
+            match pa_core::platform::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(error) => {
+                    let would_block = matches!(
+                        error
+                            .get_ref()
+                            .and_then(|source| source.downcast_ref::<std::fs::TryLockError>()),
+                        Some(std::fs::TryLockError::WouldBlock)
+                    );
+                    if !would_block {
+                        return Err(error).context("RLM ledger scope could not be locked");
+                    }
+                    attempt += 1;
+                    if attempt >= ACQUIRE_RETRY_ATTEMPTS {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "RLM ledger scope is busy; retry this operation (no append was acknowledged)",
+                        )
+                        .into());
+                    }
+                    std::thread::sleep(ACQUIRE_RETRY_INTERVAL);
+                }
             }
-            return Err(error).context("RLM ledger scope could not be locked");
         }
         // Under the held namespace lock no live seed owns a scratch: a seed
         // holds this guard from create_new through hard_link and cleanup.
