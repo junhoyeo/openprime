@@ -55,6 +55,11 @@ fn kernel_python() -> Option<PathBuf> {
 
 /// Every live `python -m rlm.repl` pid on the box (ambient kernels from
 /// other sessions are part of the baseline the diffs below remove).
+/// There is no owned on-disk record of a session's kernel pid reachable
+/// from this test (the kernel is a worker grandchild with no wire field
+/// or descriptor naming it), so a command-line process census is the
+/// only way to find it, on any platform.
+#[cfg(target_os = "linux")]
 fn kernel_pids() -> Vec<u32> {
     let mut found = Vec::new();
     let entries = std::fs::read_dir("/proc").unwrap_or_else(|e| panic!("read /proc: {e}"));
@@ -66,6 +71,36 @@ fn kernel_pids() -> Vec<u32> {
             continue;
         };
         let args: Vec<&str> = cmdline.split('\0').collect();
+        if args.windows(2).any(|window| window == ["-m", "rlm.repl"]) {
+            found.push(pid);
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// macOS/BSD: no `/proc`, so shell out to the host's own `ps`, the same
+/// idiom already used for this exact census in
+/// `kernel_dispose_e2e.rs::kernel_pids` and
+/// `pa-cli/tests/termios_process_exit_e2e.rs::pty_holder_pids`.
+#[cfg(not(target_os = "linux"))]
+fn kernel_pids() -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid_text, command)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        let args: Vec<&str> = command.split_whitespace().collect();
         if args.windows(2).any(|window| window == ["-m", "rlm.repl"]) {
             found.push(pid);
         }
