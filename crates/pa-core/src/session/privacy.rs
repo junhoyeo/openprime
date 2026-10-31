@@ -337,13 +337,22 @@ mod tests {
         );
         assert!(!disguised.contains("\"customType\""),
             "fixture must not contain the literal key substring, or it proves nothing");
-        assert!(!disguised.contains("admission_"),
-            "fixture must not contain the literal value prefix, or it proves nothing");
+        assert!(!contains_bytes(disguised.as_bytes(),&MARKER_PREFIX[..MARKER_MIN_PREFIX_LEN]),
+            "fixture must not contain the literal value prefix the production threshold actually checks, or it proves nothing");
         let parsed:serde_json::Value=serde_json::from_str(disguised).unwrap();
         assert_eq!(parsed["message"]["customType"],ADMISSION_PRIVACY_CUSTOM_TYPE,
             "fixture must still resolve to the real reserved name once parsed");
         let after=json!({"type":"message","id":"u1","parentId":null}).to_string();
         let content=format!("{header}\n{disguised}\n{after}\n");
+        std::fs::write(&path,&content).unwrap();
+        let mut file=File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+    }
+    #[test]
+    fn header_row_itself_is_never_eligible_for_either_tolerance() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
+        let content="not json at all".to_string();
         std::fs::write(&path,&content).unwrap();
         let mut file=File::open(&path).unwrap();
         assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
