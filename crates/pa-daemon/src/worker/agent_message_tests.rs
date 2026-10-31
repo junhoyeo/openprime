@@ -452,13 +452,34 @@ async fn assert_clear_queue_bounces(restore_queue: bool) {
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("supervisor.sock");
     let (sends, _server) = crate::worker::tests::fake_supervisor(&socket);
+    let agent_dir = dir.join("agent");
+    // #42: `Worker::new` resolves `RuntimeSessionAuthority::for_supervisor` at
+    // construction whenever a supervisor socket is set - it reads a REAL,
+    // persisted `supervisor-config` file (normally written by `Supervisor::new`
+    // itself; confirmed via `supervisor.rs:255`'s own `persist_supervisor_
+    // config` call). This fixture's `fake_supervisor` is a bare socket
+    // listener, not a real `Supervisor`, so the config was never written -
+    // "inspect supervisor authority ...: No such file or directory". Write it
+    // directly, matching the established test-only precedent
+    // (`usage_emit_tests.rs`).
+    let descriptor_dir = crate::descriptor::descriptor_dir(&agent_dir, &socket);
+    std::fs::create_dir_all(&descriptor_dir).unwrap();
+    crate::descriptor::persist_supervisor_config(
+        &descriptor_dir.join(crate::descriptor::SUPERVISOR_CONFIG_FILE_NAME),
+        &crate::descriptor::PersistedSupervisorConfig {
+            version: 1,
+            socket_path: socket.to_string_lossy().to_string(),
+            default_session_dir: Some(dir.to_string_lossy().to_string()),
+        },
+    )
+    .unwrap();
     let config = WorkerConfig {
         socket_path: dir.join("worker.sock"),
         supervisor_socket_path: socket,
         token: "token".to_string(),
         worker_instance_id: String::new(),
         active_session_id: "target-session".to_string(),
-        agent_dir: dir.join("agent"),
+        agent_dir,
         recovery_journal_path: dir.join("recovery.jsonl"),
         telemetry_disabled: None,
         script: Some(json!({ "responses": ["ack"] })),
