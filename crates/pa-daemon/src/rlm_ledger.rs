@@ -846,24 +846,7 @@ impl RlmSpawnLedger {
             );
         }
         if matches!(policy, LedgerReadPolicy::Authority) {
-            if std::str::from_utf8(&bytes).is_err() {
-                bail!("cleanup topology contains invalid UTF-8");
-            }
-            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-                bail!("cleanup topology has an unterminated record");
-            }
-            let header = bytes.split(|byte| *byte == b'\n')
-                .find(|line| !line.iter().all(u8::is_ascii_whitespace))
-                .ok_or_else(|| anyhow::anyhow!("authority ledger has no ownership header"))?;
-            let header: Value = serde_json::from_slice(header)
-                .map_err(|_| anyhow::anyhow!("authority ledger has a malformed ownership header"))?;
-            let scope = header.get("sessionsDir").and_then(Value::as_str)
-                .filter(|scope| Path::new(scope).is_absolute());
-            if header.get("op").and_then(Value::as_str) != Some("meta")
-                || !scope.is_some_and(|scope| canonicalize_dir(Path::new(scope)) == self.canonical_sessions_dir)
-            {
-                bail!("authority ledger ownership does not match its sessions directory");
-            }
+            return self.read_authority_records(&bytes);
         }
         // A torn write inside a multibyte name must spoil one line, not
         // the whole file for ordinary display reads.
@@ -884,22 +867,12 @@ impl RlmSpawnLedger {
             match parse_ledger_line(line, index) {
                 Ok(Some(record)) => records.push(record),
                 Ok(None) => {
-                    if matches!(policy, LedgerReadPolicy::Authority) {
-                        let value: Value = serde_json::from_str(line)?;
-                        if value.get("op").and_then(Value::as_str) != Some("meta") {
-                            bail!("cleanup topology contains an unknown operation on line {}", index + 1);
-                        }
-                        continue;
-                    }
                     self.log(&format!(
                         "RLM ledger: skipped record with unknown op on line {}",
                         index + 1
                     ));
                 }
                 Err(error) => {
-                    if matches!(policy, LedgerReadPolicy::Authority) {
-                        return Err(error).context("cleanup topology is malformed; refusing partial tree");
-                    }
                     self.log(&format!(
                         "RLM ledger {}: skipped {error:#}",
                         self.path.display()
@@ -909,6 +882,69 @@ impl RlmSpawnLedger {
         }
         Ok(records)
     }
+
+    /// Authority reads, per `replay::classify_authority_line`: torn,
+    /// non-UTF-8, non-JSON and absent-field lines never committed and are
+    /// skipped and logged by file and line number, never content.
+    /// Present-but-unknown or wrongly typed fields, unknown op or version,
+    /// and duplicate keys refuse. The header, size caps and I/O stay fatal.
+    /// This never decodes the whole file as UTF-8 (that would let a single
+    /// bad-UTF-8 line poison byte-identical neighboring lines via lossy
+    /// replacement, or hard-fail everything): it splits raw bytes and
+    /// decodes per segment instead.
+    fn read_authority_records(&self, bytes: &[u8]) -> Result<Vec<LedgerRecord>> {
+        let path = self.path.display().to_string();
+        let mut lines = bytes.split(|byte| *byte == b'\n').enumerate().peekable();
+        let terminated = bytes.is_empty() || bytes.ends_with(b"\n");
+        let header = loop {
+            let Some((_, line)) = lines.next() else {
+                bail!("authority ledger {path} has no ownership header");
+            };
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                break line;
+            }
+        };
+        let header_str = std::str::from_utf8(header)
+            .map_err(|_| anyhow::anyhow!("authority ledger {path} has a malformed ownership header"))?;
+        replay::validate_unique_json(header_str)
+            .map_err(|_| anyhow::anyhow!("authority ledger {path} has an ambiguous ownership header"))?;
+        let header: Value = serde_json::from_str(header_str)
+            .map_err(|_| anyhow::anyhow!("authority ledger {path} has a malformed ownership header"))?;
+        let scope = header.get("sessionsDir").and_then(Value::as_str)
+            .filter(|scope| Path::new(scope).is_absolute());
+        if header.get("op").and_then(Value::as_str) != Some("meta")
+            || !scope.is_some_and(|scope| canonicalize_dir(Path::new(scope)) == self.canonical_sessions_dir)
+        {
+            bail!("authority ledger {path} ownership does not match its sessions directory");
+        }
+        let mut records = Vec::new();
+        let mut count = 0usize;
+        while let Some((index, raw)) = lines.next() {
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            count += 1;
+            if count > RLM_LEDGER_MAX_RECORDS {
+                bail!("RLM ledger {path} exceeds {RLM_LEDGER_MAX_RECORDS} records; refusing to read");
+            }
+            // The last segment without a trailing newline is a torn tail.
+            let torn = !terminated && lines.peek().is_none();
+            let classified = match replay::classify_authority_line(raw, index, torn) {
+                Ok(classified) => classified,
+                Err(error) => return Err(error).with_context(|| format!("RLM ledger {path}")),
+            };
+            match classified {
+                replay::AuthorityLine::Record(record) => records.push(record),
+                replay::AuthorityLine::Meta => {}
+                replay::AuthorityLine::Skip(reason) => self.log(&format!(
+                    "RLM ledger {path}: skipped {reason} record on line {}",
+                    index + 1
+                )),
+            }
+        }
+        Ok(records)
+    }
+
 
     /// One durable append; the first record in a fresh file is the meta
     /// header (the same line `seed` publishes).
