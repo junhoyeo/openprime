@@ -242,7 +242,10 @@ async fn missing_explicit_kernel_venv_builds_at_the_exact_path() {
         .join("explicit-kernel-venv.generations")
         .exists());
     let invocations = std::fs::read_to_string(log).unwrap();
-    assert!(invocations.contains(&format!("venv {} --python 3.11 --seed", exact.display())));
+    assert!(invocations.contains(&format!(
+        "venv {} --python 3.11 --seed",
+        exact_canonical.display()
+    )));
     assert!(!invocations.contains("--clear"));
     assert!(!invocations.contains("--force"));
 }
