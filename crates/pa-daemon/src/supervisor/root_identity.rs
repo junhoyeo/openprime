@@ -135,6 +135,15 @@ mod tests {
 
     /// A supervisor with one registered resident whose address matches its
     /// roster row, carrying a persisted root identity the deltas can move.
+    /// #42 Kind-1 fix: `descriptor.pid`/`process_start_id`/`worker_instance_id`
+    /// are set to match what a REAL `authority.acquire()` call (made later,
+    /// per-delta, by `ensure_session_leased` below, against the delta's OWN
+    /// `sessionFile` - never this descriptor's initial one) will actually
+    /// publish as the owner/generation. A bare `pid: 0` (the original setup)
+    /// can never match a real acquiring process's identity, so every later
+    /// root-targeted publication correctly refused. Every test's original
+    /// assertions/intent are unchanged; only the identity fields this new
+    /// model's checks compare against are set to match THIS TEST PROCESS.
     async fn supervisor_with_movable_worker(dir: &std::path::Path) -> Arc<Supervisor> {
         let supervisor = Arc::new(
             Supervisor::new(crate::supervisor::SupervisorOptions {
@@ -143,14 +152,18 @@ mod tests {
             })
             .expect("supervisor"),
         );
+        let pid = std::process::id();
+        let process_start_id = crate::lease::get_process_start_id(pid);
         let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
             "version": 2,
             "workerId": "w-a",
-            "pid": 0,
+            "pid": pid,
+            "processStartId": process_start_id,
             "socketPath": "/tmp/none.sock",
             "recoveryJournalPath": "/tmp/none.jsonl",
             "supervisorSocketPath": "/tmp/none.sock",
             "authenticationToken": "token-a",
+            "workerInstanceId": "i1",
             "rootActiveSessionId": "w-a",
             "rootSessionId": "s0",
             "sessionFile": dir.join("s0.jsonl").to_string_lossy(),
@@ -164,6 +177,73 @@ mod tests {
         let resident = ResidentWorker::new("w-a".to_string(), descriptor, dir.join("w-a.json"));
         supervisor.registry.insert(resident).await;
         supervisor
+    }
+
+    /// #42 Kind-1 fix: `publish_verified_summary`'s M-fence ownership check
+    /// targets the DELTA's own `summary.sessionFile` (confirmed via
+    /// `with_runtime_session_fence(authority.agent_dir(), Path::new(file), ...)`
+    /// in `session_publication.rs`), never a resident's session file at setup
+    /// time - so every root-targeted delta this test suite drives needs a
+    /// REAL, fence-acquired lease on that exact file before the delta is
+    /// sent, or the is_root ownership check sees `Absent` and refuses.
+    ///
+    /// Tolerates being called more than once for the SAME file within one
+    /// test (several tests swap back onto a session they already visited,
+    /// e.g. `successive_swaps_land_the_identity_on_the_final_row`'s second
+    /// `"a.jsonl"` delta): a fresh `acquire()` on a file this same process
+    /// already holds fails with `SessionAlreadyActiveError` (the lease is
+    /// intentionally never released - see below); that specific, provably-
+    /// self-held case is treated as already-satisfied, not an error.
+    ///
+    /// The owner record's `active_session_id` is read from the process-wide
+    /// `SESSION_LEASE_OWNER_ID_ENV` var by `acquire()` internally; set here
+    /// for the narrow span of the call only, under the crate's shared
+    /// `test_support::TELEMETRY_ENV_MUTEX` (already used by 2 other test
+    /// modules for exactly this "serialize process-env mutation across
+    /// concurrent test threads" purpose, despite its telemetry-flavored
+    /// name - its own doc comment: "one lock across the crate's test
+    /// modules"). The owner record is fully durable the moment `acquire()`
+    /// returns, so the env var and the lock are released immediately after.
+    async fn ensure_session_leased(supervisor: &Arc<Supervisor>, summary: &serde_json::Value) {
+        let Some(file) = summary.get("sessionFile").and_then(serde_json::Value::as_str).filter(|f| !f.is_empty()) else {
+            return;
+        };
+        let active = summary.get("activeSessionId").or_else(|| summary.get("id"))
+            .and_then(serde_json::Value::as_str).unwrap_or_default();
+        let session_path = std::path::PathBuf::from(file);
+        if !session_path.exists() {
+            let mut sf = crate::session_store::SessionFile::create(
+                &session_path.parent().unwrap().to_string_lossy(), None, 0,
+            );
+            sf.set_path(session_path.clone());
+            sf.rewrite().unwrap();
+        }
+        let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
+            &supervisor.options.agent_dir, &supervisor.options.socket_path,
+        )
+        .expect("supervisor authority resolves");
+        let outcome = {
+            let _env_lock = crate::test_support::TELEMETRY_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os(crate::lease::SESSION_LEASE_OWNER_ID_ENV);
+            std::env::set_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV, active);
+            let acquired = authority.acquire(&session_path);
+            match previous {
+                Some(value) => std::env::set_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV, value),
+                None => std::env::remove_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV),
+            }
+            acquired
+        };
+        match outcome {
+            Ok(lease) => std::mem::forget(lease),
+            Err(error) => {
+                let already_mine = error
+                    .downcast_ref::<crate::lease::SessionAlreadyActiveError>()
+                    .is_some_and(|held| held.holder_pid == Some(std::process::id()));
+                assert!(already_mine, "the session file leases for real: {error:#}");
+            }
+        }
     }
 
     fn swap_summary(dir: &std::path::Path, session: &str, file: &str) -> serde_json::Value {
@@ -189,6 +269,7 @@ mod tests {
     /// Drive one accepted roster delta for the worker (a sequenced
     /// generation, the real handler path).
     async fn drive_delta(supervisor: &Arc<Supervisor>, summary: serde_json::Value, sequence: u64) {
+        ensure_session_leased(supervisor, &summary).await;
         let response = supervisor
             .handle_worker_roster_delta(
                 "d",
