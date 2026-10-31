@@ -175,6 +175,7 @@ mod tests {
         }))
         .expect("descriptor");
         let resident = ResidentWorker::new("w-a".to_string(), descriptor, dir.join("w-a.json"));
+        resident.note_session_ready();
         supervisor.registry.insert(resident).await;
         supervisor
     }
