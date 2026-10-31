@@ -109,8 +109,7 @@ fn a_torn_final_delete_is_skipped_not_refused() {
 fn an_invalid_utf8_line_is_skipped_never_lossily_read() {
     let (_temp, ledger, input) = fixture();
     OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap()
-        .write_all(b"{"v":1,"op":"delete","at":"t","childId":"ÿ"}
-").unwrap();
+        .write_all(b"{\"v\":1,\"op\":\"delete\",\"at\":\"t\",\"childId\":\"\xff\"}\n").unwrap();
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     let edges = ledger.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
@@ -127,8 +126,7 @@ fn an_invalid_utf8_line_is_skipped_never_lossily_read() {
 fn a_well_formed_duplicate_key_record_refuses_authority() {
     let (_temp, ledger, input) = fixture();
     let line = format!(
-        "{{"v":1,"op":"delete","at":"t","childId":{id},"childId":"other","child":{child},"reason":"user"}}
-",
+        "{{\"v\":1,\"op\":\"delete\",\"at\":\"t\",\"childId\":{id},\"childId\":\"other\",\"child\":{child},\"reason\":\"user\"}}\n",
         id = serde_json::to_string(&input.child_id).unwrap(),
         child = serde_json::to_string(&input.child).unwrap(),
     );
