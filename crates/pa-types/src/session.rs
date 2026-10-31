@@ -3,6 +3,8 @@
 //! [`FileEntry`] entry. Entry timestamps are ISO-8601 strings; message timestamps are Unix
 //! milliseconds.
 
+pub mod privacy;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
