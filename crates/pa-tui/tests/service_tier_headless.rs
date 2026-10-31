@@ -139,10 +139,7 @@ impl MockSupervisor {
         write_json(&mut writer, &hello);
 
         let mut line = String::new();
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
             if remaining.is_zero() {
                 break;
             }
