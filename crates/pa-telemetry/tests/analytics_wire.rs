@@ -59,7 +59,9 @@ async fn batch_posts_the_exact_ts_request() {
     let outcome = sink.send_batch(INSTALL_ID, events.clone()).await;
     assert_eq!(outcome, SinkOutcome::Sent);
 
-    let request = rx.recv().expect("stub captured request");
+    let request = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stub captured request");
     assert!(request
         .request_line
         .starts_with("POST /api/v1/agent-analytics/events "));
@@ -93,7 +95,9 @@ async fn the_client_batches_through_the_sink() {
     client.track("agent command used", properties("command_name", "resume"));
     client.flush().await.unwrap();
 
-    let request = rx.recv().expect("one request for both events");
+    let request = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("one request for both events");
     assert_eq!(request.body["installation_id"], INSTALL_ID);
     let events = request.body["events"].as_array().unwrap();
     assert_eq!(events.len(), 2);
@@ -122,7 +126,13 @@ async fn failures_drop_the_batch() {
             .await,
         SinkOutcome::Dropped
     );
-    assert_eq!(rx.iter().take(2).count(), 2);
+    let captured = (0..2)
+        .map(|_| {
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("stub captured failed request")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(captured.len(), 2);
 }
 
 #[tokio::test]
