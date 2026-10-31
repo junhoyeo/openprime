@@ -195,12 +195,24 @@ pub(crate) fn kill_shell(agent_dir: &Path, id: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The KILL after a verified TERM. A leader that exited during the grace still names the group
-/// verified before the TERM: a PGID is not reused while its group has members. A leader pid
-/// that runs again under another start identity was recycled, so its group is refused.
+/// The KILL after a verified TERM. A dead leader's pid slot still answers
+/// its own exact recorded identity while it remains an unreaped zombie
+/// (the kernel keeps a zombie's stat/kinfo record, including its original
+/// start time, until something reaps it) - that continuity is what proves
+/// this exact PGID number could not have been handed to an unrelated
+/// process since this record was made, the same way a leader still
+/// running under its recorded identity would. Once the leader's pid slot
+/// has actually been vacated (fully reaped, by anything - this function
+/// does not know or care who), that continuity proof is gone: a leader
+/// that then answers nothing, or a different identity (pid reuse), can no
+/// longer be told apart from an unrelated group that later reused the
+/// same number, so the group is refused rather than killed on the
+/// strength of a TERM this call has no fresh/continuous proof was ever
+/// sent to THIS exact group (#37/#38) - never on "historical" TERM alone.
 fn kill_group(shell: &Shell) -> Result<(), String> {
-    let leader_exited = matches!(crate::lease::is_process_alive(shell.pid), Ok(false));
-    if !runs_as_registered(shell) && !leader_exited {
+    let leader_zombie_matches = !matches!(crate::lease::is_process_alive(shell.pid), Ok(true))
+        && crate::lease::get_process_start_id(shell.pid).as_deref() == Some(shell.start_id.as_str());
+    if !runs_as_registered(shell) && !leader_zombie_matches {
         return if group_unverified(shell) {
             Err(
                 "Cannot verify persistent shell group ownership; no further signal sent"
