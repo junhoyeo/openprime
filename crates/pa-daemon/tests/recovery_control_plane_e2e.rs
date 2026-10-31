@@ -85,7 +85,7 @@ fn wait_socket_ready(socket: &Path) {
 /// and a more precise match to what each call site below actually needs
 /// to know (THIS fixture's own sessions, not a census of whatever
 /// children the supervisor's pid happens to have) - unlike the old
-/// `/proc`-wide child_pids_of(), which also hard-panicked on macOS
+/// `/proc`-wide `child_pids_of()`, which also hard-panicked on macOS
 /// (`read_dir("/proc")`).
 fn worker_pid(agent_dir: &Path, session_id: &str) -> Option<u32> {
     let instances = std::fs::read_dir(agent_dir.join("daemon-workers")).ok()?;

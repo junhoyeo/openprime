@@ -90,8 +90,8 @@ fn kernel_pids() -> Vec<u32> {
 /// a `ps` that cannot run or exits non-zero, matching the Linux arm's
 /// own loud failure on an unreadable `/proc` and `pty_holder_pids`'s
 /// `assert!(status.success() ...)` posture - a silent empty result here
-/// would read as "no kernel survives" in await_kernels_gone even if one
-/// actually leaked, which is the wrong direction to fail quietly in.
+/// would read as "no kernel survives" in `await_kernels_gone` even if
+/// one actually leaked, which is the wrong direction to fail quietly in.
 #[cfg(not(target_os = "linux"))]
 fn kernel_pids() -> Vec<u32> {
     let output = std::process::Command::new("ps")
