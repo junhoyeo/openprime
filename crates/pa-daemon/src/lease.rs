@@ -222,25 +222,38 @@ fn classify_owner(directory: &Path) -> LeaseOwnerProof {
         Ok(None) => return LeaseOwnerProof::Absent,
         Err(_) => return LeaseOwnerProof::Unknown,
     };
-    match pa_types::platform::process::observe_process_identity(
-        owner.pid,
-        owner.process_start_id.as_deref(),
-    ) {
-        pa_types::platform::process::ProcessIdentity::Gone => LeaseOwnerProof::Gone,
-        pa_types::platform::process::ProcessIdentity::Unknown => LeaseOwnerProof::Unknown,
-        pa_types::platform::process::ProcessIdentity::Matching => {
-            LeaseOwnerProof::Held(LiveLeaseOwner {
-                pid: owner.pid,
-                active_session_id: owner.active_session_id.filter(|id| !id.is_empty()),
-                // Reachable only when owner.process_start_id was Some (the
-                // Matching verdict just above requires it) - see the
-                // struct field's own doc comment.
-                process_start_id: owner.process_start_id.clone().expect(
-                    "a Matching identity verdict guarantees a recorded process_start_id"
-                ),
-            })
-        }
+    let alive = match pa_types::platform::process::is_process_alive(owner.pid) {
+        Ok(alive) => alive,
+        Err(_) => return LeaseOwnerProof::Unknown,
+    };
+    if !alive {
+        return LeaseOwnerProof::Gone;
     }
+    // The pid is confirmed alive. A provable mismatch (both sides a
+    // comparable format that actually differs) proves this pid number was
+    // recycled, so the owner THIS RECORD describes is gone even though the
+    // number is live. An unverifiable comparison - an ambiguous/legacy
+    // format, a malformed payload, or simply no recorded identity at all -
+    // cannot prove either way, but a live pid with SOME recorded identity
+    // is still a holder worth reporting (#37/#38: this is a weaker,
+    // display-oriented claim than "confirmed the same process" - the
+    // reclaim/revival decisions elsewhere (owner_alive/lease_reclaimable)
+    // use the full tri-state directly and are unaffected by this).
+    let Some(recorded) = owner.process_start_id.as_deref() else {
+        return LeaseOwnerProof::Unknown;
+    };
+    let observed = pa_types::platform::process::process_start_id(owner.pid);
+    if matches!(
+        pa_types::platform::process::compare_process_start_ids(Some(recorded), observed.as_deref()),
+        pa_types::platform::process::ProcessStartIdComparison::Mismatch
+    ) {
+        return LeaseOwnerProof::Gone;
+    }
+    LeaseOwnerProof::Held(LiveLeaseOwner {
+        pid: owner.pid,
+        active_session_id: owner.active_session_id.filter(|id| !id.is_empty()),
+        process_start_id: recorded.to_string(),
+    })
 }
 
 /// Whether the recorded owner is live, unknown, or gone, for a lease
@@ -920,13 +933,22 @@ pub(crate) fn reclaim_dead_owner_leases(agent_dir: &Path) -> usize {
             if reclaimed.unwrap_or(false) {
                 removed += 1;
             }
+        } else if name.contains(".lock.stale-")
+            && fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none())
+            && fs::remove_dir(&path).is_ok()
+        {
+            // An EMPTY `.lock.stale-*` quarantine directory is exactly what
+            // `reclaim_stale` leaves behind on the rare race where its own
+            // rename succeeded but its own synchronous remove_dir_all did
+            // not complete (a crash or kill in that narrow window) - safe
+            // to finish sweeping, since an empty directory cannot carry any
+            // retained state. A NON-EMPTY one has no such provenance (it
+            // may be an unrelated/adversarial name, not evidence of a dead
+            // owner) and a bare name match alone is never an ownership
+            // certificate for it (#37) - only emptiness, which this checks
+            // directly, not the name.
+            removed += 1;
         }
-        // A `.lock.stale-*` quarantine directory is never swept here by its
-        // name alone: `reclaim_stale` already removes the one it just
-        // renamed, synchronously, in the same call. A survivor found by a
-        // later directory scan has no verifiable provenance — it may be an
-        // unrelated/adversarial name, not evidence of a dead owner — and a
-        // bare name match is not an ownership certificate (#37).
     }
     removed
 }
@@ -1089,7 +1111,7 @@ mod tests {
         let start = get_process_start_id(std::process::id());
         assert!(start.is_some());
         let id = start.unwrap();
-        assert!(id.starts_with("proc:") || id.starts_with("ps:"));
+        assert!(id.starts_with("proc:") || id.starts_with("ps2:"));
         assert!(get_process_start_id(0).is_none());
     }
 
