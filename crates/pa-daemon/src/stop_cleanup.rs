@@ -76,8 +76,11 @@ fn strict_session_identity(path: &Path) -> Result<PathBuf> {
 /// The ledger's parent→child map: non-deleted edges keyed by canonical parent path.
 ///
 /// Uses the ledger's authority-grade `strict_edges()`, not the lenient `edges(false)`:
-/// this map drives cleanup/cancellation decisions, which must refuse on a torn or
-/// unreadable ledger line rather than silently reading a truncated topology as complete.
+/// this map drives cleanup/cancellation decisions, which must refuse on a well-formed
+/// but unrecognized record (an unknown op or version, a duplicate key), or an I/O or
+/// cap error - never on a torn, non-JSON, or non-UTF-8 line, which the authority reader
+/// skips and logs instead (per `replay::classify_authority_line`'s established rule).
+/// Silently reading a truncated topology as complete is exactly what this must avoid.
 fn children_by_parent(
     agent_dir: &Path,
     sessions_dir: &Path,
