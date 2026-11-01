@@ -135,7 +135,6 @@ impl RuntimeSessionAuthority {
 
     /// Cleanup proof for one already-committed child deletion, called under M.
     /// This is not admission permission or authorization to discard private data.
-    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn check_committed_deletion(&self, target: &Path, child_id: &str) -> Result<()> {
         anyhow::ensure!(
             !child_id.is_empty() && !target.as_os_str().is_empty(),
