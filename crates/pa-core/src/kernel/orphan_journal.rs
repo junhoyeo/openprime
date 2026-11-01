@@ -321,11 +321,13 @@ mod tests {
 
     #[test]
     fn process_start_id_reads_the_platform_ladder() {
-        // Linux answers from /proc (`proc:`); macOS/BSD answer
-        // `ps:<lstart>` - the same ladder TS `getProcessStartId` walks.
+        // Linux answers from /proc (`proc:`); macOS/BSD answer the
+        // versioned `ps2:<lstart>` (#37/#38: the legacy unversioned `ps:`
+        // is a read-compat alias for old records, never a fresh write) -
+        // the same ladder TS `getProcessStartId` walks.
         let id = get_process_start_id(std::process::id() as i32);
         let id = id.expect("own pid must be readable");
-        assert!(id.starts_with("proc:") || id.starts_with("ps:"));
+        assert!(id.starts_with("proc:") || id.starts_with("ps2:"));
     }
 
     #[test]
