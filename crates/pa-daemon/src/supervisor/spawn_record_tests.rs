@@ -116,7 +116,8 @@ async fn a_known_resident_registration_writes_nothing_to_disk() {
     // mismatch: TEST BUG, not an implementation gap).
     let descriptor = resident.descriptor.lock().await;
     assert_eq!(
-        descriptor.lifecycle, DaemonWorkerLifecycle::Starting,
+        descriptor.lifecycle,
+        DaemonWorkerLifecycle::Starting,
         "registration alone never establishes readiness"
     );
     assert_eq!(

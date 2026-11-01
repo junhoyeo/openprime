@@ -516,8 +516,10 @@ impl Supervisor {
             _ => false,
         };
         let ledger_delete = match command {
-            DaemonCommand::Kill { rest, .. } => rest.get("rlmLedgerDelete")
-                .and_then(Value::as_str).and_then(crate::rlm_ledger::RlmLedgerDeleteReason::from_wire),
+            DaemonCommand::Kill { rest, .. } => rest
+                .get("rlmLedgerDelete")
+                .and_then(Value::as_str)
+                .and_then(crate::rlm_ledger::RlmLedgerDeleteReason::from_wire),
             _ => None,
         };
         if plain_kill && ledger_delete.is_none() {
@@ -526,12 +528,15 @@ impl Supervisor {
             // resident descriptor authoritative and the command retryable.
             let launch = {
                 let descriptor = resident.descriptor.lock().await;
-                descriptor.session_file.clone().map(|session_file| (
-                    session_file,
-                    crate::passivated_launch::PassivatedLaunch::new(
-                        &descriptor.create_command, descriptor.telemetry_disabled,
-                    ),
-                ))
+                descriptor.session_file.clone().map(|session_file| {
+                    (
+                        session_file,
+                        crate::passivated_launch::PassivatedLaunch::new(
+                            &descriptor.create_command,
+                            descriptor.telemetry_disabled,
+                        ),
+                    )
+                })
             };
             if let Some((session_file, launch)) = launch {
                 let remembered = async {
@@ -540,15 +545,23 @@ impl Supervisor {
                         self.passivated_launches.remember(&session_file, &launch)?;
                     }
                     anyhow::Ok(())
-                }.await;
+                }
+                .await;
                 if let Err(error) = remembered {
                     return (vec![response_line(&response_failure(Some(&command_id), &type_name,
                         &format!("Archive refused before stop: revival context could not be preserved: {error:#}"), None))], false);
                 }
             }
             if let Err(error) = self.persist_stop_tombstone(&resident).await {
-                return (vec![response_line(&response_failure(Some(&command_id), &type_name,
-                    &format!("Failed to persist the session stop: {error:#}"), None))], false);
+                return (
+                    vec![response_line(&response_failure(
+                        Some(&command_id),
+                        &type_name,
+                        &format!("Failed to persist the session stop: {error:#}"),
+                        None,
+                    ))],
+                    false,
+                );
             }
         }
         // A delete's deletion boundary persists BEFORE the teardown: a failed tombstone is
@@ -1133,11 +1146,14 @@ impl Supervisor {
         // gate used by launch/relaunch. Never guess an ambiguous child id.
         let edges = ledger.strict_edges()?;
         let (child_id, session_file) = resolve_ledger_child(&edges, selector, child_id)
-            .ok_or_else(|| anyhow!("stopped RLM subagent \"{selector}\" is not in the spawn ledger"))?;
+            .ok_or_else(|| {
+                anyhow!("stopped RLM subagent \"{selector}\" is not in the spawn ledger")
+            })?;
         let _child_lifecycle = self.child_lifecycles.lock(&session_file).await?;
         let canonical = crate::lease::checked_session_path(std::path::Path::new(&session_file))?;
         let resident = self.registry.find_by_session_file(&session_file).await;
-        self.commit_child_deletion(&session_file, &child_id, reason, resident.as_ref()).await?;
+        self.commit_child_deletion(&session_file, &child_id, reason, resident.as_ref())
+            .await?;
         let record_cleanup = self.passivated_launches.forget_deleted(&session_file);
         if let Err(error) = &record_cleanup {
             self.log_line(&format!("deleted child launch record retained: {error:#}"));
@@ -1162,8 +1178,10 @@ impl Supervisor {
             });
             if same_session
                 && !super::worker_lifecycle::worker_process_gone(
-                    descriptor.pid, descriptor.process_start_id.clone(),
-                ).await
+                    descriptor.pid,
+                    descriptor.process_start_id.clone(),
+                )
+                .await
             {
                 anyhow::bail!(
                     "deleted RLM subagent \"{selector}\": worker {} (pid {}) is still running; delete refused until it exits",
@@ -1183,7 +1201,8 @@ impl Supervisor {
             &live,
         );
         if let Some(error) = finalize_error {
-            return Err(error).context("deleted child cleanup deferred; ledger deletion remains committed");
+            return Err(error)
+                .context("deleted child cleanup deferred; ledger deletion remains committed");
         }
         self.capture_deleted_child_usage(&session_file, &child_id, "rlm_delete")
             .await;
@@ -1235,23 +1254,28 @@ fn resolve_ledger_child(
             .file_stem()
             .is_some_and(|name| name.to_string_lossy() == selector)
     };
-    let found = match child_id {
-        Some(id) => {
-            let matching: Vec<_> = edges.iter().filter(|edge| edge.child_id == id).collect();
-            let by_stem: Vec<_> = matching.iter().copied().filter(|edge| stem_matches(edge)).collect();
-            let candidates = if by_stem.is_empty() { &matching } else { &by_stem };
-            match candidates.as_slice() {
-                [edge] => Some(*edge),
-                [] | [_, _, ..] => None,
-            }
-        },
-        None => {
-            let matching: Vec<_> = edges.iter().filter(|edge| stem_matches(edge)).collect();
-            match matching.as_slice() {
-                [edge] => Some(*edge),
-                [] | [_, _, ..] => None,
-            }
-        },
+    let found = if let Some(id) = child_id {
+        let matching: Vec<_> = edges.iter().filter(|edge| edge.child_id == id).collect();
+        let by_stem: Vec<_> = matching
+            .iter()
+            .copied()
+            .filter(|edge| stem_matches(edge))
+            .collect();
+        let candidates = if by_stem.is_empty() {
+            &matching
+        } else {
+            &by_stem
+        };
+        match candidates.as_slice() {
+            [edge] => Some(*edge),
+            [] | [_, _, ..] => None,
+        }
+    } else {
+        let matching: Vec<_> = edges.iter().filter(|edge| stem_matches(edge)).collect();
+        match matching.as_slice() {
+            [edge] => Some(*edge),
+            [] | [_, _, ..] => None,
+        }
     };
     found.map(|edge| (edge.child_id.clone(), edge.child.clone()))
 }

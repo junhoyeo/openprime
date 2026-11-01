@@ -224,7 +224,9 @@ mod tests {
             "processStartId":"unsupported:birth", "expiresAt":"2099-01-01T00:00:00.000Z"});
         super::super::legacy_restart::persist(&path, &owner).unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert!(Admission::acquire(&[directory.path().to_path_buf()]).await.is_err());
+        assert!(Admission::acquire(&[directory.path().to_path_buf()])
+            .await
+            .is_err());
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
 

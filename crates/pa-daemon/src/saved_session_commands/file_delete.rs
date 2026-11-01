@@ -11,7 +11,10 @@ use super::remove_session_artifacts;
 /// proof of absence: an installed script can have a missing interpreter.
 fn trash_program() -> std::io::Result<Option<PathBuf>> {
     let search = std::env::var_os("PATH").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is unset; cannot establish whether trash is installed")
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "PATH is unset; cannot establish whether trash is installed",
+        )
     })?;
     for directory in std::env::split_paths(&search) {
         let candidate = directory.join(if cfg!(windows) { "trash.exe" } else { "trash" });
@@ -33,7 +36,9 @@ pub(crate) fn delete_session_file_after_file_removed(
 ) -> Value {
     let program = match trash_program() {
         Ok(program) => program,
-        Err(error) => return json!({"ok": false, "error": format!("Could not locate trash: {error}; no files were removed")}),
+        Err(error) => {
+            return json!({"ok": false, "error": format!("Could not locate trash: {error}; no files were removed")})
+        }
     };
     delete_with_program(path, after_file_removed, program.as_deref())
 }
@@ -52,16 +57,26 @@ fn delete_with_program(
     };
     match std::fs::symlink_metadata(&absolute) {
         Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {}
-        Ok(_) => return json!({"ok": false, "error": "Session path is not a file or symlink; nothing was removed"}),
-        Err(error) => return json!({"ok": false, "error": format!("Session was not removed: {error}")}),
+        Ok(_) => {
+            return json!({"ok": false, "error": "Session path is not a file or symlink; nothing was removed"})
+        }
+        Err(error) => {
+            return json!({"ok": false, "error": format!("Session was not removed: {error}")})
+        }
     }
     let method = if let Some(program) = program {
         let output = match Command::new(program).arg(&absolute).output() {
             Ok(output) => output,
-            Err(error) => return json!({"ok": false, "error": format!("Could not run installed trash: {error}; permanent deletion was not attempted")}),
+            Err(error) => {
+                return json!({"ok": false, "error": format!("Could not run installed trash: {error}; permanent deletion was not attempted")})
+            }
         };
         if !output.status.success() {
-            let hint: String = String::from_utf8_lossy(&output.stderr).trim().chars().take(200).collect();
+            let hint: String = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(200)
+                .collect();
             return json!({"ok": false, "error": format!("trash failed ({}): {hint}; permanent deletion was not attempted", output.status)});
         }
         "trash"
@@ -79,8 +94,12 @@ fn delete_with_program(
             remove_session_artifacts(path);
             json!({"ok": true, "method": method})
         }
-        Ok(_) => json!({"ok": false, "error": "Removal did not remove the session entry; artifacts were retained"}),
-        Err(error) => json!({"ok": false, "error": format!("Could not verify session removal: {error}; artifacts were retained")}),
+        Ok(_) => {
+            json!({"ok": false, "error": "Removal did not remove the session entry; artifacts were retained"})
+        }
+        Err(error) => {
+            json!({"ok": false, "error": format!("Could not verify session removal: {error}; artifacts were retained")})
+        }
     }
 }
 

@@ -11,7 +11,8 @@ use super::state::{
     write_jobs_state,
 };
 use super::{
-    AgentCronDispatchRecord, AgentCronJobStore, CronJobsState, SESSION_SCHEDULED_JOBS_FILENAME,
+    iso_from_millis, AgentCronDispatchRecord, AgentCronJobStore, CronJobsState,
+    SESSION_SCHEDULED_JOBS_FILENAME,
 };
 use crate::cron::AgentCronJob;
 
@@ -163,6 +164,143 @@ impl AgentCronJobStore {
 #[must_use]
 pub fn read_scheduled_jobs_artifact(path: &Path) -> Vec<AgentCronJob> {
     read_jobs_state(path).jobs
+}
+
+/// Read one scheduled-jobs artifact file's job rows, refusing instead of
+/// silently dropping on a read failure, unparseable JSON, or any job row
+/// that fails to deserialize. A missing file (no partition registered yet)
+/// reads as no jobs - the one case this treats the same as the lenient
+/// [`read_scheduled_jobs_artifact`]. Used by the stop/delete cancellation
+/// path, which must not treat corrupt or malformed state as empty success;
+/// every other caller keeps using the lenient read unchanged.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read, its content
+/// is not a JSON object with a `jobs` array, or any job row fails to
+/// deserialize.
+pub fn read_scheduled_jobs_artifact_strict(path: &Path) -> anyhow::Result<Vec<AgentCronJob>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("read cron schedule partition {}", path.display())));
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("parse cron schedule partition {}", path.display())));
+        }
+    };
+    let Some(jobs) = parsed.get("jobs").and_then(|jobs| jobs.as_array()) else {
+        anyhow::bail!(
+            "cron schedule partition {} has no jobs array",
+            path.display()
+        );
+    };
+    let mut result = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        match serde_json::from_value::<AgentCronJob>(job.clone()) {
+            Ok(job) => result.push(job),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("malformed job row in {}", path.display())));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Cancel the given job ids (if still active/paused) within ONE partition file
+/// directly, bypassing the store's registration model entirely. The store
+/// registers at most one directory per session id, so it cannot represent two
+/// simultaneously-registered partitions for one session (for example a raw
+/// and a canonical spelling of an aliased path) - callers that already know,
+/// by their own identity resolution, exactly which job ids in which file
+/// belong together use this instead, one file at a time, so the raw and
+/// canonical partitions cancel independently without merging.
+///
+/// # Errors
+///
+/// Returns an error when the file's state lock cannot be acquired or the
+/// write fails.
+pub fn cancel_matching_ids_in_file<S: std::hash::BuildHasher>(
+    path: &Path,
+    ids: &std::collections::HashSet<String, S>,
+    now: u64,
+) -> anyhow::Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let now_iso = iso_from_millis(now);
+    let paths = [path.to_path_buf()];
+    with_state_locks(&paths, || -> anyhow::Result<usize> {
+        // A typed round-trip (CronJobsState/AgentCronJob) would silently drop any
+        // unrecognized field on every rewrite - neither struct captures unknown
+        // keys. Mutate the raw Value tree in place instead, so every other field
+        // (dispatches, future/unknown per-job and top-level fields) survives
+        // byte-identical; only the matched jobs' status/nextRunAt/updatedAt change.
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("read cron schedule partition {}", path.display())));
+            }
+        };
+        let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("parse cron schedule partition {}", path.display())));
+            }
+        };
+        let Some(jobs) = value.get_mut("jobs").and_then(|jobs| jobs.as_array_mut()) else {
+            return Ok(0);
+        };
+        let mut cancelled = 0usize;
+        for job in jobs.iter_mut() {
+            let matches_id = job
+                .get("id")
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| ids.contains(id));
+            if !matches_id {
+                continue;
+            }
+            if job.get("status").and_then(|status| status.as_str()) == Some("cancelled") {
+                continue;
+            }
+            let Some(object) = job.as_object_mut() else {
+                continue;
+            };
+            object.insert(
+                "status".to_string(),
+                serde_json::Value::String("cancelled".to_string()),
+            );
+            object.remove("nextRunAt");
+            object.insert(
+                "updatedAt".to_string(),
+                serde_json::Value::String(now_iso.clone()),
+            );
+            cancelled += 1;
+        }
+        if cancelled > 0 {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let serialized = serde_json::to_string_pretty(&value)?;
+            crate::settings::storage::atomic_write_with(
+                path,
+                &format!("{serialized}\n"),
+                crate::settings::storage::AtomicWriteOptions { fsync: true },
+            )?;
+        }
+        Ok(cancelled)
+    })
+    .ok_or_else(|| anyhow::anyhow!("cron jobs state lock not acquired; skipped"))?
 }
 
 #[cfg(test)]

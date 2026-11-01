@@ -1223,7 +1223,15 @@ class PersistentBashHandle(BashHandle):
     def _force_kill(self) -> None:
         with self._kill_lock:
             if not self._reaped:
-                _reap_persistent_group(self._pid, self._start_id)
+                try:
+                    _reap_persistent_group(self._pid, self._start_id)
+                except RuntimeError:
+                    # Unverifiable group cleanup (#37/#38): never signalled.
+                    # _watch's own later guarded call (same _kill_lock)
+                    # still runs and records the final state - this is
+                    # just the explicit-kill grace timer's own attempt,
+                    # not the authoritative one.
+                    pass
 
     def _watch(self, running: bool) -> None:
         # running=False: the shell finished while no kernel ran; its pid may
@@ -1651,8 +1659,17 @@ def _rehydrate_persistent_shells() -> None:
                 record["command"], record["id"], record["pid"], record["startId"], record["startedAt"],
                 home, None, identity,
             )
-        elif _reap_persistent_group(record["pid"], record["startId"]):
-            _remove_shell_files(home, record["id"])
+        else:
+            try:
+                if _reap_persistent_group(record["pid"], record["startId"]):
+                    _remove_shell_files(home, record["id"])
+            except RuntimeError:
+                # Unverifiable group cleanup (#37/#38): never signalled, and
+                # this record's files stay untouched - but this must not
+                # abort the loop, or every OTHER record enumerated after
+                # this one would be silently skipped and never rehydrated
+                # this boot.
+                pass
 
 
 def _reap_persistent_group(pid: int, start_id: str) -> bool:

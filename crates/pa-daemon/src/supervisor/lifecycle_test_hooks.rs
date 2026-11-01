@@ -6,7 +6,10 @@ use std::sync::Mutex;
 use tokio::sync::oneshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Phase { LaunchChecked, RecoveryReplayed }
+pub(super) enum Phase {
+    LaunchChecked,
+    RecoveryReplayed,
+}
 
 struct Barrier {
     phase: Phase,
@@ -26,26 +29,52 @@ pub(super) struct LifecycleTestHooks {
 }
 
 impl LifecycleTestHooks {
-    pub(super) fn pause(&self, phase: Phase, path: &Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    // Test-only synchronization primitive for a planned crash-mid-tombstone
+    // scenario (pairs with `crash_after_tombstone` above) - no current test
+    // calls it yet; kept as ready-to-use infrastructure, not dead.
+    #[allow(dead_code)]
+    pub(super) fn pause(
+        &self,
+        phase: Phase,
+        path: &Path,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, wait) = oneshot::channel();
         let (resume, release) = oneshot::channel();
         let previous = self.barrier.lock().unwrap().replace(Barrier {
-            phase, path: crate::lease::canonical_session_path(path), reached, resume: release,
+            phase,
+            path: crate::lease::canonical_session_path(path),
+            reached,
+            resume: release,
         });
-        assert!(previous.is_none(), "one owned lifecycle barrier per supervisor");
+        assert!(
+            previous.is_none(),
+            "one owned lifecycle barrier per supervisor"
+        );
         (wait, resume)
     }
 
     pub(super) async fn checkpoint(&self, phase: Phase, path: Option<&str>) -> anyhow::Result<()> {
         let barrier = {
             let mut slot = self.barrier.lock().unwrap();
-            let matches = slot.as_ref().is_some_and(|barrier| barrier.phase == phase
-                && path.is_some_and(|path| crate::lease::canonical_session_path(Path::new(path)) == barrier.path));
-            if matches { slot.take() } else { None }
+            let matches = slot.as_ref().is_some_and(|barrier| {
+                barrier.phase == phase
+                    && path.is_some_and(|path| {
+                        crate::lease::canonical_session_path(Path::new(path)) == barrier.path
+                    })
+            });
+            if matches {
+                slot.take()
+            } else {
+                None
+            }
         };
         if let Some(barrier) = barrier {
-            barrier.reached.send(()).map_err(|_| anyhow::anyhow!("lifecycle observer disappeared"))?;
-            tokio::time::timeout(std::time::Duration::from_secs(15), barrier.resume).await
+            barrier
+                .reached
+                .send(())
+                .map_err(|()| anyhow::anyhow!("lifecycle observer disappeared"))?;
+            tokio::time::timeout(std::time::Duration::from_secs(15), barrier.resume)
+                .await
                 .map_err(|_| anyhow::anyhow!("lifecycle barrier release timed out"))?
                 .map_err(|_| anyhow::anyhow!("lifecycle barrier owner dropped"))?;
         }

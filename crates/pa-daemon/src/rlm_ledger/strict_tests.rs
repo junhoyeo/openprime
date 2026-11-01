@@ -30,7 +30,7 @@ fn logged_fixture() -> (
     let sink = Arc::clone(&logs);
     let agent = temp.path().join("agent");
     let ledger = RlmSpawnLedger::new(&agent, &agent.join("sessions"), move |line| {
-        sink.lock().unwrap().push(line.to_string())
+        sink.lock().unwrap().push(line.to_string());
     });
     (temp, ledger, input, logs)
 }
@@ -81,6 +81,31 @@ fn a_malformed_record_line_is_skipped_and_logged_on_authority_reads() {
     assert_eq!(ledger.edges(false).unwrap().len(), 1);
     assert_eq!(fs::read(ledger.ledger_path()).unwrap(), bytes);
     assert_skip_logged(&logs, &ledger, "secret");
+}
+
+/// A malformed (non-JSON) line never committed, per
+/// `replay::classify_authority_line` - it is skipped and logged, not a
+/// reason to refuse the whole tree (#37/#38: one ordinary crash must not
+/// permanently block every future authority read in this scope).
+#[test]
+fn a_malformed_record_line_is_skipped_not_refused_on_authority_reads() {
+    let (_temp, ledger, input) = fixture();
+    OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(
+            b"{malformed-record}
+",
+        )
+        .unwrap();
+    let bytes = fs::read(ledger.ledger_path()).unwrap();
+    let edges = ledger.strict_edges().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].child_id, input.child_id);
+    assert_eq!(edges[0].deleted, None);
+    assert_eq!(ledger.edges(false).unwrap().len(), 1);
+    assert_eq!(fs::read(ledger.ledger_path()).unwrap(), bytes);
 }
 
 #[test]
@@ -146,9 +171,35 @@ fn a_torn_final_delete_never_committed_and_is_skipped() {
     assert_skip_logged(&logs, &ledger, &input.child_id);
 }
 
+/// An unterminated (torn) final line never committed - it is skipped, not
+/// a reason to refuse the whole tree, and earlier valid records are still
+/// read (#37/#38).
+#[test]
+fn a_torn_final_delete_is_skipped_not_refused() {
+    let (_temp, ledger, input) = fixture();
+    let row = json!({"v":1,"op":"delete","at":"2026-01-01T00:00:00Z","childId":input.child_id,"child":input.child,"reason":"user"});
+    OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(row.to_string().as_bytes())
+        .unwrap();
+    let bytes = fs::read(ledger.ledger_path()).unwrap();
+    let edges = ledger.strict_edges().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(
+        edges[0].deleted, None,
+        "an unacknowledged delete is not a tombstone"
+    );
+    assert_eq!(fs::read(ledger.ledger_path()).unwrap(), bytes);
+}
+
+/// A non-UTF-8 line never committed and is skipped, never lossily decoded
+/// into authority (which could otherwise replace invalid bytes and read a
+/// forged/garbled identity as real) (#37/#38).
 #[test]
 fn an_invalid_utf8_line_is_skipped_never_lossily_read() {
-    let (_temp, ledger, _, logs) = logged_fixture();
+    let (_temp, ledger, input, logs) = logged_fixture();
     OpenOptions::new()
         .append(true)
         .open(ledger.ledger_path())
@@ -158,6 +209,7 @@ fn an_invalid_utf8_line_is_skipped_never_lossily_read() {
     let bytes = fs::read(ledger.ledger_path()).unwrap();
     let edges = ledger.strict_edges().unwrap();
     assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].child_id, input.child_id);
     assert_eq!(edges[0].deleted, None);
     assert_eq!(ledger.edges(false).unwrap().len(), 1);
     assert_eq!(fs::read(ledger.ledger_path()).unwrap(), bytes);
@@ -204,6 +256,38 @@ fn a_well_formed_newer_version_record_refuses_authority() {
         .unwrap_err()
         .to_string()
         .contains("unsupported record version"));
+}
+
+#[test]
+fn a_required_field_with_the_wrong_type_refuses_but_an_absent_one_skips() {
+    let (_temp, ledger, input) = fixture();
+    let wrong =
+        json!({"v":1,"op":"delete","at":"t","childId":7,"child":input.child,"reason":"user"});
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(ledger.ledger_path())
+            .unwrap(),
+        "{wrong}"
+    )
+    .unwrap();
+    assert!(ledger
+        .strict_edges()
+        .unwrap_err()
+        .to_string()
+        .contains("invalid childId field"));
+    let (_temp, ledger, input, logs) = logged_fixture();
+    let absent = json!({"v":1,"op":"delete","at":"t","child":input.child,"reason":"user"});
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(ledger.ledger_path())
+            .unwrap(),
+        "{absent}"
+    )
+    .unwrap();
+    assert_eq!(ledger.strict_edges().unwrap()[0].deleted, None);
+    assert_skip_logged(&logs, &ledger, "\"reason\"");
 }
 
 #[cfg(unix)]
@@ -277,38 +361,6 @@ fn a_delete_with_an_invalid_usage_block_refuses_authority() {
         .unwrap_err()
         .to_string()
         .contains("unknown or invalid field value"));
-}
-
-#[test]
-fn a_required_field_with_the_wrong_type_refuses_but_an_absent_one_skips() {
-    let (_temp, ledger, input) = fixture();
-    let wrong =
-        json!({"v":1,"op":"delete","at":"t","childId":7,"child":input.child,"reason":"user"});
-    writeln!(
-        OpenOptions::new()
-            .append(true)
-            .open(ledger.ledger_path())
-            .unwrap(),
-        "{wrong}"
-    )
-    .unwrap();
-    assert!(ledger
-        .strict_edges()
-        .unwrap_err()
-        .to_string()
-        .contains("invalid childId field"));
-    let (_temp, ledger, input, logs) = logged_fixture();
-    let absent = json!({"v":1,"op":"delete","at":"t","child":input.child,"reason":"user"});
-    writeln!(
-        OpenOptions::new()
-            .append(true)
-            .open(ledger.ledger_path())
-            .unwrap(),
-        "{absent}"
-    )
-    .unwrap();
-    assert_eq!(ledger.strict_edges().unwrap()[0].deleted, None);
-    assert_skip_logged(&logs, &ledger, "\"reason\"");
 }
 
 /// T1: a delete whose write fails after a prefix returns the error, so no

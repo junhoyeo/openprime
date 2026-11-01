@@ -299,6 +299,9 @@ pub struct AgentSessionEngine {
     /// The resolved faux model, registered once per engine so scripts span
     /// turns. Verification harness only; never set by the product.
     faux_model: std::sync::OnceLock<Model>,
+    /// Private API registration: a delayed request cannot resolve another
+    /// engine's script, even after a failed test releases its global test lock.
+    faux_provider: std::sync::OnceLock<model::ScriptedFauxProvider>,
     /// One compact-and-retry attempt per context overflow.
     pub(crate) overflow_recovery: std::sync::Mutex<OverflowRecovery>,
     /// The image-model route armed for the dispatched episode, re-applied at

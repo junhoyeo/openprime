@@ -109,8 +109,16 @@ impl Supervisor {
             }
             Ok(None) => response_success(Some(command_id), type_name, None),
             Err(error) => {
-                if let Err(retire_error) = self.reject_failed_publication(&resident, Some(&summary), &error).await {
-                    return response_failure(Some(command_id), type_name, &format!("Publication refused; stop intent not durable: {retire_error:#}"), None);
+                if let Err(retire_error) = self
+                    .reject_failed_publication(&resident, Some(&summary), &error)
+                    .await
+                {
+                    return response_failure(
+                        Some(command_id),
+                        type_name,
+                        &format!("Publication refused; stop intent not durable: {retire_error:#}"),
+                        None,
+                    );
                 }
                 response_failure(Some(command_id), type_name, &format!("{error:#}"), None)
             }
@@ -139,9 +147,19 @@ impl Supervisor {
         resident: &Arc<ResidentWorker>,
         summary: &Value,
     ) -> Option<AgentRosterEntry> {
-        let instance = match summary.get("workerInstanceId").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        let instance = match summary
+            .get("workerInstanceId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             Some(instance) => instance.to_string(),
-            None => resident.descriptor.lock().await.worker_instance_id.clone().unwrap_or_default(),
+            None => resident
+                .descriptor
+                .lock()
+                .await
+                .worker_instance_id
+                .clone()
+                .unwrap_or_default(),
         };
         let order = crate::supervisor::session_publication::SummaryOrder::Pull {
             instance: &instance,
@@ -154,8 +172,13 @@ impl Supervisor {
             }
             Ok(None) => None,
             Err(error) => {
-                if let Err(retire_error) = self.reject_failed_publication(resident, Some(summary), &error).await {
-                    self.log_line(&format!("Publication refused; stop intent not durable: {retire_error:#}"));
+                if let Err(retire_error) = self
+                    .reject_failed_publication(resident, Some(summary), &error)
+                    .await
+                {
+                    self.log_line(&format!(
+                        "Publication refused; stop intent not durable: {retire_error:#}"
+                    ));
                 }
                 self.log_line(&format!("Session identity publication refused: {error:#}"));
                 None

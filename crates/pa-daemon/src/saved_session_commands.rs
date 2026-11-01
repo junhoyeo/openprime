@@ -120,6 +120,9 @@ pub(crate) enum SessionFileRemoval {
     Fail,
 }
 
+// Not derivable: the default VARIES by build config (test vs production) -
+// a #[derive(Default)] + #[default] attribute cannot express that split.
+#[allow(clippy::derivable_impls)]
 impl Default for SessionFileRemoval {
     fn default() -> Self {
         #[cfg(test)]
@@ -145,8 +148,20 @@ pub(crate) fn delete_session_file_with(
 ) -> Value {
     match removal {
         SessionFileRemoval::TrashThenUnlink => {
-            // Hermetic deny guard: a unit test must never reach the user's Trash.
-            assert!(!cfg!(test), "tests must never invoke the real trash tool; use SessionFileRemoval::Unlink");
+            // Hermetic deny guard: a unit test must never reach the user's
+            // Trash - a RUNTIME check deliberately, not a const block: this
+            // must only fire if this branch is actually reached during a
+            // test build, never unconditionally at compile time (a const
+            // block evaluates immediately regardless of whether
+            // TrashThenUnlink is ever matched, which would make every test
+            // build fail to compile at all, not just refuse this branch).
+            #[allow(clippy::assertions_on_constants)]
+            {
+                assert!(
+                    !cfg!(test),
+                    "tests must never invoke the real trash tool; use SessionFileRemoval::Unlink"
+                );
+            }
             delete_session_file_after_file_removed(path, after_file_removed)
         }
         #[cfg(test)]
@@ -159,7 +174,9 @@ pub(crate) fn delete_session_file_with(
             Err(error) => json!({ "ok": false, "error": error.to_string() }),
         },
         #[cfg(test)]
-        SessionFileRemoval::Fail => json!({ "ok": false, "error": "injected physical removal failure" }),
+        SessionFileRemoval::Fail => {
+            json!({ "ok": false, "error": "injected physical removal failure" })
+        }
     }
 }
 
@@ -289,21 +306,32 @@ pub(crate) fn commit_saved_session_tombstone(
         return Ok(SavedTombstone::default());
     };
     let ledger = std::sync::Arc::clone(authority.ledger());
-    crate::lease::with_runtime_session_fence(authority.agent_dir(), Path::new(canonical_path), |held| {
-        ledger.strict_edges()?;
-        match held.inspect_ownership()? {
-            crate::lease::RuntimeLeaseOwnership::Absent | crate::lease::RuntimeLeaseOwnership::Stale => {}
-            crate::lease::RuntimeLeaseOwnership::Unknown => {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                    "Runtime ownership is unknown; deletion deferred").into());
+    crate::lease::with_runtime_session_fence(
+        authority.agent_dir(),
+        Path::new(canonical_path),
+        |held| {
+            ledger.strict_edges()?;
+            match held.inspect_ownership()? {
+                crate::lease::RuntimeLeaseOwnership::Absent
+                | crate::lease::RuntimeLeaseOwnership::Stale => {}
+                crate::lease::RuntimeLeaseOwnership::Unknown => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Runtime ownership is unknown; deletion deferred",
+                    )
+                    .into());
+                }
+                crate::lease::RuntimeLeaseOwnership::Held(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Another runtime owns this session; deletion deferred",
+                    )
+                    .into());
+                }
             }
-            crate::lease::RuntimeLeaseOwnership::Held(_) => {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                    "Another runtime owns this session; deletion deferred").into());
-            }
-        }
-        append_saved_session_tombstone(&ledger, capture)
-    })
+            append_saved_session_tombstone(&ledger, capture)
+        },
+    )
 }
 
 /// The saved delete's answer when the tombstone committed but the physical
@@ -647,8 +675,17 @@ impl Supervisor {
         };
         let _child_lifecycle = match self.child_lifecycles.lock(session_path).await {
             Ok(guard) => guard,
-            Err(error) => return (vec![response_line(&response_failure(Some(command_id), type_name,
-                &format!("Session delete could not acquire lifecycle ownership: {error:#}"), None))], false),
+            Err(error) => {
+                return (
+                    vec![response_line(&response_failure(
+                        Some(command_id),
+                        type_name,
+                        &format!("Session delete could not acquire lifecycle ownership: {error:#}"),
+                        None,
+                    ))],
+                    false,
+                )
+            }
         };
         let canonical = canonical_session_path(Path::new(session_path))
             .to_string_lossy()
@@ -712,9 +749,17 @@ impl Supervisor {
                 {
                     self.session_bindings.forget_file(&canonical);
                     if let Err(error) = self.passivated_launches.forget_deleted(session_path) {
-                        self.log_line(&format!("deleted session launch record retained: {error:#}"));
-                        response = response_failure(Some(command_id), type_name,
-                            &format!("Session deleted, but launch record cleanup failed: {error:#}"), None);
+                        self.log_line(&format!(
+                            "deleted session launch record retained: {error:#}"
+                        ));
+                        response = response_failure(
+                            Some(command_id),
+                            type_name,
+                            &format!(
+                                "Session deleted, but launch record cleanup failed: {error:#}"
+                            ),
+                            None,
+                        );
                     }
                 }
                 return (vec![response_line(&response)], false);
@@ -752,7 +797,9 @@ impl Supervisor {
                     vec![response_line(&response_failure(
                         Some(command_id),
                         type_name,
-                        &format!("Session delete was not committed; nothing was removed: {error:#}"),
+                        &format!(
+                            "Session delete was not committed; nothing was removed: {error:#}"
+                        ),
                         None,
                     ))],
                     false,
@@ -763,7 +810,8 @@ impl Supervisor {
             self.note_deleted_child_usage_captured("saved_delete", committed.captured);
         }
         let logical = committed.edges > 0;
-        let result = delete_session_file_with(Path::new(session_path), &|_| {}, self.session_file_removal);
+        let result =
+            delete_session_file_with(Path::new(session_path), &|_| {}, self.session_file_removal);
         let removed = result.get("ok").and_then(Value::as_bool) == Some(true);
         if removed {
             // A deleted session file can carry passive scheduled rows: the catalog must rescan.
@@ -792,16 +840,27 @@ impl Supervisor {
             };
             self.push_roster_update(changed, removed_ids);
             if let Err(error) = self.passivated_launches.forget_deleted(session_path) {
-                self.log_line(&format!("deleted session launch record retained: {error:#}"));
-                return (vec![response_line(&response_failure(Some(command_id), type_name,
-                    &format!("Session deleted, but launch record cleanup failed: {error:#}"), None))], false);
+                self.log_line(&format!(
+                    "deleted session launch record retained: {error:#}"
+                ));
+                return (
+                    vec![response_line(&response_failure(
+                        Some(command_id),
+                        type_name,
+                        &format!("Session deleted, but launch record cleanup failed: {error:#}"),
+                        None,
+                    ))],
+                    false,
+                );
             }
         }
         let result = if !removed && logical {
             // Committed tombstone, failed physical removal: the child is
             // deleted (no revival) and the transcript is retained for a retry.
             if let Err(error) = self.passivated_launches.forget_deleted(session_path) {
-                self.log_line(&format!("deleted session launch record retained: {error:#}"));
+                self.log_line(&format!(
+                    "deleted session launch record retained: {error:#}"
+                ));
             }
             partial_saved_delete_result(result)
         } else {

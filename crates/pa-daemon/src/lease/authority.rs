@@ -32,7 +32,8 @@ pub struct RuntimeSessionAuthority {
 
 impl fmt::Debug for RuntimeSessionAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("RuntimeSessionAuthority")
+        formatter
+            .debug_struct("RuntimeSessionAuthority")
             .field("agent_dir", &self.agent_dir)
             .field("sessions_dir", &self.sessions_dir)
             .finish_non_exhaustive()
@@ -60,26 +61,43 @@ impl RuntimeSessionAuthority {
     /// # Errors
     /// Returns an error when the configuration or its identities cannot be verified.
     pub fn for_supervisor(agent_dir: &Path, socket: &Path) -> Result<Self> {
-        anyhow::ensure!(!socket.as_os_str().is_empty() && socket.is_absolute(),
-            "supervised session authority requires an absolute supervisor socket");
+        anyhow::ensure!(
+            !socket.as_os_str().is_empty() && socket.is_absolute(),
+            "supervised session authority requires an absolute supervisor socket"
+        );
         let agent_dir = super::checked_session_path(agent_dir)?;
-        let path = crate::descriptor::descriptor_dir(&agent_dir, socket)
-            .join(SUPERVISOR_CONFIG_FILE_NAME);
+        let path =
+            crate::descriptor::descriptor_dir(&agent_dir, socket).join(SUPERVISOR_CONFIG_FILE_NAME);
         let metadata = std::fs::symlink_metadata(&path)
             .with_context(|| format!("inspect supervisor authority {}", path.display()))?;
-        anyhow::ensure!(metadata.file_type().is_file(), "supervisor authority is not a regular file");
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "supervisor authority is not a regular file"
+        );
         let mut bytes = Vec::new();
-        std::fs::File::open(&path)?.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-        anyhow::ensure!(bytes.len() as u64 <= MAX_CONFIG_BYTES, "supervisor authority configuration is oversized");
-        let config: PersistedSupervisorConfig = serde_json::from_slice(&bytes)
-            .context("invalid supervisor authority configuration")?;
-        anyhow::ensure!(config.version == 1 && Path::new(&config.socket_path).is_absolute()
-            && super::checked_session_path(Path::new(&config.socket_path))?
-                == super::checked_session_path(socket)?,
-            "supervisor authority does not match the selected socket");
-        let configured = config.default_session_dir.as_deref()
+        std::fs::File::open(&path)?
+            .take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_CONFIG_BYTES,
+            "supervisor authority configuration is oversized"
+        );
+        let config: PersistedSupervisorConfig =
+            serde_json::from_slice(&bytes).context("invalid supervisor authority configuration")?;
+        anyhow::ensure!(
+            config.version == 1
+                && Path::new(&config.socket_path).is_absolute()
+                && super::checked_session_path(Path::new(&config.socket_path))?
+                    == super::checked_session_path(socket)?,
+            "supervisor authority does not match the selected socket"
+        );
+        let configured = config
+            .default_session_dir
+            .as_deref()
             .filter(|path| Path::new(path).is_absolute())
-            .ok_or_else(|| anyhow::anyhow!("supervisor authority has no absolute default sessions directory"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("supervisor authority has no absolute default sessions directory")
+            })?;
         let sessions_dir = PathBuf::from(configured);
         super::checked_session_path(&sessions_dir)?;
         Ok(Self::resolved(agent_dir, sessions_dir))
@@ -87,14 +105,22 @@ impl RuntimeSessionAuthority {
 
     fn resolved(agent_dir: PathBuf, sessions_dir: PathBuf) -> Self {
         let ledger = Arc::new(RlmSpawnLedger::new(&agent_dir, &sessions_dir, |_| {}));
-        Self { agent_dir, sessions_dir, ledger }
+        Self {
+            agent_dir,
+            sessions_dir,
+            ledger,
+        }
     }
 
     /// The configured agent root. It is independent of transcript storage.
     #[must_use]
-    pub(crate) fn agent_dir(&self) -> &Path { &self.agent_dir }
+    pub(crate) fn agent_dir(&self) -> &Path {
+        &self.agent_dir
+    }
 
-    pub(crate) fn ledger(&self) -> &Arc<RlmSpawnLedger> { &self.ledger }
+    pub(crate) fn ledger(&self) -> &Arc<RlmSpawnLedger> {
+        &self.ledger
+    }
 
     /// Acquire checked runtime ownership before the target is opened or written.
     ///
@@ -109,18 +135,32 @@ impl RuntimeSessionAuthority {
 
     /// Cleanup proof for one already-committed child deletion, called under M.
     /// This is not admission permission or authorization to discard private data.
+    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn check_committed_deletion(&self, target: &Path, child_id: &str) -> Result<()> {
-        anyhow::ensure!(!child_id.is_empty() && !target.as_os_str().is_empty(), "Deleted child identity is incomplete");
+        anyhow::ensure!(
+            !child_id.is_empty() && !target.as_os_str().is_empty(),
+            "Deleted child identity is incomplete"
+        );
         let target = super::checked_session_path(target)?;
         let mut matches = Vec::new();
         for edge in self.ledger.strict_edges()? {
-            anyhow::ensure!(Path::new(&edge.child).is_absolute(), "Deletion authority contains a non-absolute child identity");
-            if super::checked_session_path(Path::new(&edge.child))? == target { matches.push(edge); }
+            anyhow::ensure!(
+                Path::new(&edge.child).is_absolute(),
+                "Deletion authority contains a non-absolute child identity"
+            );
+            if super::checked_session_path(Path::new(&edge.child))? == target {
+                matches.push(edge);
+            }
         }
-        anyhow::ensure!(matches.len() == 1, "Committed child deletion is missing or ambiguous");
+        anyhow::ensure!(
+            matches.len() == 1,
+            "Committed child deletion is missing or ambiguous"
+        );
         let edge = &matches[0];
-        anyhow::ensure!(edge.child_id == child_id && edge.deleted.is_some(),
-            "Exact child deletion is not committed in this authority scope");
+        anyhow::ensure!(
+            edge.child_id == child_id && edge.deleted.is_some(),
+            "Exact child deletion is not committed in this authority scope"
+        );
         Ok(())
     }
 
@@ -129,24 +169,36 @@ impl RuntimeSessionAuthority {
     }
 
     pub(crate) fn deleted_target(error: &anyhow::Error) -> Option<&str> {
-        error.downcast_ref::<DeletedSessionError>().map(|error| error.path.as_str())
+        error
+            .downcast_ref::<DeletedSessionError>()
+            .map(|error| error.path.as_str())
     }
 
     /// Called only while the canonical target's common lease fence is held.
     pub(crate) fn check_admission(&self, target: &Path) -> Result<()> {
-        anyhow::ensure!(!target.as_os_str().is_empty(), "Fileless session has no runtime target");
+        anyhow::ensure!(
+            !target.as_os_str().is_empty(),
+            "Fileless session has no runtime target"
+        );
         let target = super::checked_session_path(target)?;
         match std::fs::metadata(&target) {
-            Ok(metadata) => anyhow::ensure!(metadata.is_file(), "Session target is not a regular file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(metadata) => {
+                anyhow::ensure!(metadata.is_file(), "Session target is not a regular file");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("inspect session target"),
         }
         for edge in self.ledger.strict_edges()? {
-            anyhow::ensure!(Path::new(&edge.child).is_absolute(),
-                "session authority contains a non-absolute child identity");
+            anyhow::ensure!(
+                Path::new(&edge.child).is_absolute(),
+                "session authority contains a non-absolute child identity"
+            );
             let child = super::checked_session_path(Path::new(&edge.child))?;
             if edge.deleted.is_some() && child == target {
-                return Err(DeletedSessionError { path: target.display().to_string() }.into());
+                return Err(DeletedSessionError {
+                    path: target.display().to_string(),
+                }
+                .into());
             }
         }
         Ok(())
@@ -169,160 +221,73 @@ mod tests {
         let socket = root.path().join("supervisor.sock");
         crate::descriptor::persist_supervisor_config(
             &crate::descriptor::descriptor_dir(&agent, &socket).join(SUPERVISOR_CONFIG_FILE_NAME),
-            &PersistedSupervisorConfig { version: 1, socket_path: socket.to_string_lossy().into_owned(),
-                default_session_dir: Some(default_sessions.to_string_lossy().into_owned()) },
-        ).unwrap();
+            &PersistedSupervisorConfig {
+                version: 1,
+                socket_path: socket.to_string_lossy().into_owned(),
+                default_session_dir: Some(default_sessions.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
         let storage = root.path().join("custom-storage");
         std::fs::create_dir(&storage).unwrap();
         let child = storage.join("child.jsonl");
         let parent = storage.join("parent.jsonl");
         for path in [&child, &parent] {
-            std::fs::write(path, format!("{}\n", serde_json::json!({
-                "type": "session", "version": 3,
-                "id": path.file_stem().unwrap().to_string_lossy(),
-                "timestamp": "t", "cwd": root.path(),
-            }))).unwrap();
+            std::fs::write(
+                path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "session", "version": 3,
+                        "id": path.file_stem().unwrap().to_string_lossy(),
+                        "timestamp": "t", "cwd": root.path(),
+                    })
+                ),
+            )
+            .unwrap();
         }
         let ledger = RlmSpawnLedger::new(&agent, &default_sessions, |_| {});
-        ledger.append_spawn(&crate::rlm_ledger::RlmSpawnInput {
-            child_id: "sub-child".into(), parent: parent.to_string_lossy().into_owned(),
-            child: child.to_string_lossy().into_owned(), depth: 1, name: "child".into(),
-        }).unwrap();
-        ledger.append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User).unwrap();
+        ledger
+            .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "sub-child".into(),
+                parent: parent.to_string_lossy().into_owned(),
+                child: child.to_string_lossy().into_owned(),
+                depth: 1,
+                name: "child".into(),
+            })
+            .unwrap();
+        ledger
+            .append_delete(
+                "sub-child",
+                child.to_str().unwrap(),
+                crate::rlm_ledger::RlmLedgerDeleteReason::User,
+            )
+            .unwrap();
         let before = std::fs::read(ledger.ledger_path()).unwrap();
-        assert!(!default_sessions.exists(), "custom storage must leave the default root missing");
+        assert!(
+            !default_sessions.exists(),
+            "custom storage must leave the default root missing"
+        );
         let authority = RuntimeSessionAuthority::for_supervisor(&agent, &socket).unwrap();
         assert_eq!(authority.ledger.ledger_path(), ledger.ledger_path());
-        assert!(authority.acquire(&child).is_err(), "the real acquire cannot shed the legacy tombstone");
+        assert!(
+            authority.acquire(&child).is_err(),
+            "the real acquire cannot shed the legacy tombstone"
+        );
         assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), before);
         // Namespace continuity is also required after the formerly missing root
         // appears. This remains a real regression until legacy-key selection
         // composes; raw caller spelling alone is not a complete fix.
         std::fs::create_dir_all(&default_sessions).unwrap();
-        assert!(authority.acquire(&child).is_err(), "captured authority must retain or refuse its namespace");
+        assert!(
+            authority.acquire(&child).is_err(),
+            "captured authority must retain or refuse its namespace"
+        );
         let reopened = RuntimeSessionAuthority::for_supervisor(&agent, &socket).unwrap();
-        assert!(reopened.acquire(&child).is_err(), "fresh authority must not select an empty bucket after root creation");
+        assert!(
+            reopened.acquire(&child).is_err(),
+            "fresh authority must not select an empty bucket after root creation"
+        );
         assert_eq!(std::fs::read(ledger.ledger_path()).unwrap(), before);
     }
-    /// Review correction (independent reviewer, review-issue42-legacy-seed-test-or-impl):
-    /// the original parametrization also iterated a "deleted" legacy-registry row whose
-    /// target file was never created. That is NOT an unknown/ambiguous seed shape -
-    /// `RlmSpawnLedger::seed()` deliberately imports a deleted row as a tombstone pair
-    /// without ever dereferencing its target file (matching dcc/final TS; a deleted
-    /// child's transcript being absent is the ordinary, expected case, not corruption).
-    /// Only a row that genuinely fails to parse (`"malformed"`) poisons the whole
-    /// registry. Dropped the "deleted" case from this refusal test; the companion
-    /// positive case now lives in
-    /// `issue_42_valid_legacy_seed_tolerates_a_deleted_row_with_no_transcript_below`.
-    #[test]
-    fn issue_42_first_admission_refuses_an_unparseable_legacy_seed_on_every_retry() {
-        let root = tempfile::tempdir().unwrap();
-        let agent = root.path().join("agent");
-        let sessions = agent.join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let parent = sessions.join("parent.jsonl");
-        let archived = sessions.join("archived-sibling.jsonl");
-        for (path, id) in [(&parent, "parent"), (&archived, "archived-sibling")] {
-            std::fs::write(path, format!("{}\n", serde_json::json!({
-                "type":"session", "version":3, "id":id, "timestamp":"t", "cwd":root.path(),
-            }))).unwrap();
-        }
-        let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
-        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
-        let child = agent.join("custom-storage/child.jsonl");
-        let valid = serde_json::json!({
-            "childId":"sub-valid", "sessionFile":child, "sessionName":"valid",
-            "status":"completed", "rlmDepth":1,
-        });
-        let bytes = format!("{valid}\n{{malformed}}\n");
-        std::fs::write(&registry, &bytes).unwrap();
-        let ledger_path = crate::rlm_ledger::rlm_ledger_path(&agent, &sessions);
-        let before = std::fs::read(&archived).unwrap();
-        for _ in 0..2 {
-            let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
-            assert!(authority.acquire(&archived).is_err(), "unparseable seed must not authorize a sibling open");
-            assert!(!ledger_path.exists(), "failed seed must not publish a trusted subset");
-            assert_eq!(std::fs::read_to_string(&registry).unwrap(), bytes);
-            assert_eq!(std::fs::read(&archived).unwrap(), before);
-        }
-    }
-
-    /// The positive companion the reviewer recommended: a deleted-status legacy row
-    /// whose target transcript was never created is the ordinary, expected case
-    /// (matching `claimed_legacy_deletion_seeds_a_tombstone_beside_non_session_roots`
-    /// in rlm_ledger/tests.rs) - admission on an unrelated sibling succeeds, and the
-    /// published ledger carries the imported tombstone pair for the deleted row.
-    #[test]
-    fn issue_42_valid_legacy_seed_tolerates_a_deleted_row_with_no_transcript_below() {
-        let root = tempfile::tempdir().unwrap();
-        let agent = root.path().join("agent");
-        let sessions = agent.join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let parent = sessions.join("parent.jsonl");
-        let archived = sessions.join("archived-sibling.jsonl");
-        for (path, id) in [(&parent, "parent"), (&archived, "archived-sibling")] {
-            std::fs::write(path, format!("{}\n", serde_json::json!({
-                "type":"session", "version":3, "id":id, "timestamp":"t", "cwd":root.path(),
-            }))).unwrap();
-        }
-        let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
-        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
-        let child = agent.join("custom-storage/child.jsonl");
-        let deleted_child = agent.join("custom-storage/deleted.jsonl");
-        let valid = serde_json::json!({
-            "childId":"sub-valid", "sessionFile":child, "sessionName":"valid",
-            "status":"completed", "rlmDepth":1,
-        });
-        let deleted = serde_json::json!({
-            "childId":"sub-deleted", "sessionFile":deleted_child, "sessionName":"deleted",
-            "status":"deleted", "rlmDepth":1,
-        });
-        let bytes = format!("{valid}\n{deleted}\n");
-        std::fs::write(&registry, &bytes).unwrap();
-        let before = std::fs::read(&archived).unwrap();
-        let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
-        let held = authority.acquire(&archived).unwrap();
-        let edges = authority.ledger.strict_edges().unwrap();
-        assert_eq!(edges.len(), 2, "both the completed child and the deleted tombstone import");
-        assert!(
-            edges.iter().any(|edge| edge.child_id == "sub-deleted" && edge.deleted.is_some()),
-            "the deleted row imports as a committed tombstone, never dereferencing its absent transcript"
-        );
-        assert_eq!(std::fs::read(&archived).unwrap(), before);
-        assert_eq!(std::fs::read_to_string(&registry).unwrap(), bytes);
-        drop(held);
-    }
-
-    #[test]
-    fn issue_42_valid_legacy_seed_allows_an_archived_sibling_without_losing_history() {
-        let root = tempfile::tempdir().unwrap();
-        let agent = root.path().join("agent");
-        let sessions = agent.join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let parent = sessions.join("parent.jsonl");
-        std::fs::write(&parent, format!("{}\n", serde_json::json!({
-            "type":"session", "version":3, "id":"parent", "timestamp":"t", "cwd":root.path(),
-        }))).unwrap();
-        let sibling = sessions.join("archived.jsonl");
-        let mut file = crate::session_store::SessionFile::create(root.path().to_str().unwrap(), None, 0);
-        file.set_path(sibling.clone());
-        file.append_session_state("archived");
-        file.rewrite().unwrap();
-        let registry = agent.join("session-artifacts/parent/rlm-subagents.jsonl");
-        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
-        let row = serde_json::json!({
-            "childId":"sub-valid", "sessionFile":agent.join("custom-storage/child.jsonl"),
-            "sessionName":"completed-child", "status":"completed", "rlmDepth":1,
-        });
-        let bytes = format!("{row}\n");
-        std::fs::write(&registry, &bytes).unwrap();
-        let authority = RuntimeSessionAuthority::for_agent_dir(&agent).unwrap();
-        let before = std::fs::read(&sibling).unwrap();
-        let held = authority.acquire(&sibling).unwrap();
-        assert_eq!(authority.ledger.strict_edges().unwrap().len(), 1);
-        assert_eq!(std::fs::read(&sibling).unwrap(), before);
-        assert_eq!(std::fs::read_to_string(registry).unwrap(), bytes);
-        drop(held);
-    }
-
 }

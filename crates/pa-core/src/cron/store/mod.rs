@@ -16,7 +16,9 @@ mod rlm_heartbeat;
 mod session_artifacts;
 mod state;
 
-pub use session_artifacts::read_scheduled_jobs_artifact;
+pub use session_artifacts::{
+    cancel_matching_ids_in_file, read_scheduled_jobs_artifact, read_scheduled_jobs_artifact_strict,
+};
 
 pub const SESSION_SCHEDULED_JOBS_FILENAME: &str = "scheduled-jobs.json";
 

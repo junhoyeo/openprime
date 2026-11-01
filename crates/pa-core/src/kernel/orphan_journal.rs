@@ -293,15 +293,26 @@ mod tests {
     fn issue_37_unknown_orphan_identity_retains_the_live_child_and_journal() {
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap(),
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orphans.jsonl");
-        let bytes = format!("{}\n", json!({
-            "version": 1, "pid": child.0.id(), "ownerPid": std::process::id(),
-            "active": true, "recordedAt": iso8601_now(), "processStartId": "unsupported:birth"
-        }));
+        let bytes = format!(
+            "{}\n",
+            json!({
+                "version": 1, "pid": child.0.id(), "ownerPid": std::process::id(),
+                "active": true, "recordedAt": iso8601_now(), "processStartId": "unsupported:birth"
+            })
+        );
         std::fs::write(&path, &bytes).unwrap();
         reap_worker_orphan_processes(&path, std::process::id() as i32);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);

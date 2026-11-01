@@ -528,9 +528,14 @@ impl Supervisor {
             }
         }
         #[cfg(test)]
-        if let Err(error) = self.lifecycle_test_hooks.checkpoint(
-            super::lifecycle_test_hooks::Phase::RecoveryReplayed, file.as_deref(),
-        ).await {
+        if let Err(error) = self
+            .lifecycle_test_hooks
+            .checkpoint(
+                super::lifecycle_test_hooks::Phase::RecoveryReplayed,
+                file.as_deref(),
+            )
+            .await
+        {
             let stop_intent = self.persist_stop_tombstone(resident).await;
             let mut child = child;
             let _ = child.kill().await;
@@ -545,9 +550,22 @@ impl Supervisor {
             stop_intent?;
             return Err(anyhow!("Recovered worker has no final session summary"));
         };
-        let instance = resident.descriptor.lock().await.worker_instance_id.clone().unwrap_or_default();
-        match self.publish_verified_summary(resident, summary,
-            crate::supervisor::session_publication::SummaryOrder::Pull { instance: &instance, sequence: None }, &[]) {
+        let instance = resident
+            .descriptor
+            .lock()
+            .await
+            .worker_instance_id
+            .clone()
+            .unwrap_or_default();
+        match self.publish_verified_summary(
+            resident,
+            summary,
+            crate::supervisor::session_publication::SummaryOrder::Pull {
+                instance: &instance,
+                sequence: None,
+            },
+            &[],
+        ) {
             Ok(Some(published)) => self.announce_verified_summary(&published),
             result => {
                 resident.mark_identity_quarantined();
@@ -605,7 +623,13 @@ impl Supervisor {
 
         let executable = std::env::current_exe().context("resolve pa-daemon executable")?;
         #[cfg(test)]
-        let executable = self.lifecycle_test_hooks.executable.lock().unwrap().clone().unwrap_or(executable);
+        let executable = self
+            .lifecycle_test_hooks
+            .executable
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(executable);
         let stderr_log_path =
             crate::worker_stderr::log_path(&self.options.agent_dir, &resident.worker_id);
         let stderr_log = crate::worker_stderr::open_for_spawn(&stderr_log_path)?;

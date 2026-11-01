@@ -234,7 +234,11 @@ impl SessionFile {
 
     /// Prepare a branch without materializing its target. Runtime callers must
     /// acquire target ownership before the first rewrite.
-    pub(crate) fn prepare_branched_file(&self, leaf_id: &str, session_dir: &Path) -> Result<SessionFile> {
+    pub(crate) fn prepare_branched_file(
+        &self,
+        leaf_id: &str,
+        session_dir: &Path,
+    ) -> Result<SessionFile> {
         let path = self
             .branch_path_entries(leaf_id)
             .ok_or_else(|| anyhow!("Entry {leaf_id} not found"))?;

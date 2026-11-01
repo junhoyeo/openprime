@@ -506,19 +506,16 @@ fn unknown_or_symlinked_seed_scratch_still_refuses_and_is_not_moved() {
         fs::create_dir_all(&sessions).unwrap();
         let proposed = rlm_ledger_path(&agent, &sessions);
         fs::create_dir_all(proposed.parent().unwrap()).unwrap();
-        let entry = match case {
-            "unknown-name" => {
-                let path = proposed.with_extension("seed-abc");
-                fs::write(&path, b"unknown").unwrap();
-                path
-            }
-            _ => {
-                let target = temp.path().join("elsewhere");
-                fs::write(&target, b"outside").unwrap();
-                let path = proposed.with_extension("seed-1-1");
-                std::os::unix::fs::symlink(&target, &path).unwrap();
-                path
-            }
+        let entry = if case == "unknown-name" {
+            let path = proposed.with_extension("seed-abc");
+            fs::write(&path, b"unknown").unwrap();
+            path
+        } else {
+            let target = temp.path().join("elsewhere");
+            fs::write(&target, b"outside").unwrap();
+            let path = proposed.with_extension("seed-1-1");
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            path
         };
         let ledger = RlmSpawnLedger::new(&agent, &sessions, |_| {});
         let error = ledger.strict_edges().unwrap_err().to_string();
@@ -684,6 +681,7 @@ fn plain_parent_component_without_symlink_preserves_existing_hash() {
 #[test]
 #[ignore = "requires PA_NAMESPACE_VAR_FIXTURE from the coordinator-owned literal /var alias fixture"]
 fn literal_var_fixture_missing_root_then_created_converges() {
+    use std::os::unix::fs::MetadataExt;
     let manifest = std::env::var_os("PA_NAMESPACE_VAR_FIXTURE")
         .expect("selected literal /var fixture test requires PA_NAMESPACE_VAR_FIXTURE");
     let fixture: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
@@ -702,7 +700,6 @@ fn literal_var_fixture_missing_root_then_created_converges() {
         fs::read_dir(&target).unwrap().next().is_none(),
         "literal /var fixture target must be fresh and empty"
     );
-    use std::os::unix::fs::MetadataExt;
     let alias_metadata = fs::symlink_metadata(&alias).unwrap();
     let target_metadata = fs::metadata(&target).unwrap();
     let observed = json!({
@@ -1051,7 +1048,7 @@ fn malformed_selected_history_keeps_display_policy_without_foreign_candidates() 
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&logs);
     let ledger = RlmSpawnLedger::new(&agent, &sessions, move |line| {
-        sink.lock().unwrap().push(line.to_string())
+        sink.lock().unwrap().push(line.to_string());
     });
     ledger
         .append_spawn(&RlmSpawnInput {

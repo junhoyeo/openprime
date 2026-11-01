@@ -118,8 +118,6 @@ impl Supervisor {
             }
         });
     }
-
-
 }
 
 #[cfg(test)]
@@ -186,7 +184,7 @@ mod tests {
     /// in `session_publication.rs`), never a resident's session file at setup
     /// time - so every root-targeted delta this test suite drives needs a
     /// REAL, fence-acquired lease on that exact file before the delta is
-    /// sent, or the is_root ownership check sees `Absent` and refuses.
+    /// sent, or the `is_root` ownership check sees `Absent` and refuses.
     ///
     /// Tolerates being called more than once for the SAME file within one
     /// test (several tests swap back onto a session they already visited,
@@ -205,22 +203,36 @@ mod tests {
     /// name - its own doc comment: "one lock across the crate's test
     /// modules"). The owner record is fully durable the moment `acquire()`
     /// returns, so the env var and the lock are released immediately after.
+    // Kept async for caller consistency (every call site already
+    // `.await`s it); its body happens to be synchronous today, not a
+    // reason to churn callers for a style-only clippy preference.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn ensure_session_leased(supervisor: &Arc<Supervisor>, summary: &serde_json::Value) {
-        let Some(file) = summary.get("sessionFile").and_then(serde_json::Value::as_str).filter(|f| !f.is_empty()) else {
+        let Some(file) = summary
+            .get("sessionFile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|f| !f.is_empty())
+        else {
             return;
         };
-        let active = summary.get("activeSessionId").or_else(|| summary.get("id"))
-            .and_then(serde_json::Value::as_str).unwrap_or_default();
+        let active = summary
+            .get("activeSessionId")
+            .or_else(|| summary.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         let session_path = std::path::PathBuf::from(file);
         if !session_path.exists() {
             let mut sf = crate::session_store::SessionFile::create(
-                &session_path.parent().unwrap().to_string_lossy(), None, 0,
+                &session_path.parent().unwrap().to_string_lossy(),
+                None,
+                0,
             );
             sf.set_path(session_path.clone());
             sf.rewrite().unwrap();
         }
         let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
-            &supervisor.options.agent_dir, &supervisor.options.socket_path,
+            &supervisor.options.agent_dir,
+            &supervisor.options.socket_path,
         )
         .expect("supervisor authority resolves");
         let outcome = {

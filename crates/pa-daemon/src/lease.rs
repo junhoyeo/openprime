@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 mod authority;
 mod fence;
 
-pub(crate) use authority::RuntimeSessionAuthority;
+pub use authority::RuntimeSessionAuthority;
 pub(crate) use fence::{with_runtime_session_fence, HeldRuntimeSessionFence};
 
 pub const SESSION_LEASES_ENABLED_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
@@ -222,9 +222,8 @@ fn classify_owner(directory: &Path) -> LeaseOwnerProof {
         Ok(None) => return LeaseOwnerProof::Absent,
         Err(_) => return LeaseOwnerProof::Unknown,
     };
-    let alive = match pa_types::platform::process::is_process_alive(owner.pid) {
-        Ok(alive) => alive,
-        Err(_) => return LeaseOwnerProof::Unknown,
+    let Ok(alive) = pa_types::platform::process::is_process_alive(owner.pid) else {
+        return LeaseOwnerProof::Unknown;
     };
     if !alive {
         return LeaseOwnerProof::Gone;
@@ -298,7 +297,9 @@ pub(crate) enum RuntimeLeaseOwnership {
 
 /// Called only while the canonical target's M fence is held
 /// ([`HeldRuntimeSessionFence::inspect_ownership`]).
-fn inspect_runtime_ownership_at(target: &fence::RuntimeSessionTarget) -> Result<RuntimeLeaseOwnership> {
+fn inspect_runtime_ownership_at(
+    target: &fence::RuntimeSessionTarget,
+) -> Result<RuntimeLeaseOwnership> {
     Ok(match classify_owner(&target.directory) {
         LeaseOwnerProof::Absent => RuntimeLeaseOwnership::Absent,
         LeaseOwnerProof::Gone => RuntimeLeaseOwnership::Stale,
@@ -335,7 +336,10 @@ fn publish_runtime_owner(
 /// Called only while the canonical target's M fence is held
 /// ([`HeldRuntimeSessionFence::revalidate_lease`]): strict identity/path
 /// checks against the on-disk owner record, no recursive owner acquisition.
-fn revalidate_owned_lease(target: &fence::RuntimeSessionTarget, lease: &SessionLease) -> Result<()> {
+fn revalidate_owned_lease(
+    target: &fence::RuntimeSessionTarget,
+    lease: &SessionLease,
+) -> Result<()> {
     anyhow::ensure!(
         !lease.released.load(std::sync::atomic::Ordering::SeqCst),
         "runtime session lease was already released"
@@ -562,7 +566,7 @@ impl SessionLease {
     /// A caller that needs to know synchronously whether a fresh lease is
     /// actually free before handing its target off (e.g. a fork-replace
     /// RPC deciding whether to proceed) uses this instead of `release()`.
-    pub(crate) fn try_release(&self) -> LeaseReleaseOutcome {
+    pub fn try_release(&self) -> LeaseReleaseOutcome {
         self.release_attempt()
     }
 
@@ -629,7 +633,7 @@ impl SessionLease {
 /// was still unsettled past the drain deadline (#37) - never silently
 /// treat a deferred release as a freed target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LeaseReleaseOutcome {
+pub enum LeaseReleaseOutcome {
     /// Ownership was actually released by this call.
     Released,
     /// This call did not release ownership (an admitted mutation was
@@ -756,7 +760,7 @@ pub struct LiveLeaseOwner {
     /// later (rather than re-reading the owner file) use this, not a
     /// fresh `get_process_start_id` call, which answers the pid's
     /// *current* identity, not the one this lease was published under.
-    /// Never optional: `Held` itself (classify_owner's only production
+    /// Never optional: `Held` itself (`classify_owner`'s only production
     /// construction site) is reachable only via a confirmed `Matching`
     /// verdict, which `compare_process_start_ids` can only reach when both
     /// the recorded and observed identities are `Some` - so a `Held` value
@@ -1009,12 +1013,18 @@ mod tests {
         }
         impl FinishMutation {
             fn finish(&mut self) -> std::thread::Result<Result<()>> {
-                if let Some(signal) = self.signal.take() { let _ = signal.send(()); }
-                self.writer.take().map_or(Ok(Ok(())), std::thread::JoinHandle::join)
+                if let Some(signal) = self.signal.take() {
+                    let _ = signal.send(());
+                }
+                self.writer
+                    .take()
+                    .map_or(Ok(Ok(())), std::thread::JoinHandle::join)
             }
         }
         impl Drop for FinishMutation {
-            fn drop(&mut self) { let _ = self.finish(); }
+            fn drop(&mut self) {
+                let _ = self.finish();
+            }
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("held.jsonl");
@@ -1026,13 +1036,25 @@ mod tests {
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
         let writing_lease = std::sync::Arc::clone(&lease);
         let writing_path = path.clone();
-        let writer = std::thread::spawn(move || writing_lease.with_owned_mutation(&writing_path, || {
-            started_tx.send(()).map_err(|error| anyhow!("mutation admission: {error}"))?;
-            finish_rx.recv_timeout(Duration::from_secs(30)).map_err(|error| anyhow!("mutation completion: {error}"))?;
-            fs::OpenOptions::new().append(true).open(&writing_path)?.write_all(b"settled\n")?;
-            Ok(())
-        }));
-        let mut finish = FinishMutation { signal: Some(finish_tx), writer: Some(writer) };
+        let writer = std::thread::spawn(move || {
+            writing_lease.with_owned_mutation(&writing_path, || {
+                started_tx
+                    .send(())
+                    .map_err(|error| anyhow!("mutation admission: {error}"))?;
+                finish_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(|error| anyhow!("mutation completion: {error}"))?;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&writing_path)?
+                    .write_all(b"settled\n")?;
+                Ok(())
+            })
+        });
+        let mut finish = FinishMutation {
+            signal: Some(finish_tx),
+            writer: Some(writer),
+        };
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // The existing ten-second release deadline expires while the admitted
         // writer is held by a concrete barrier, not a readiness sleep.
@@ -1062,11 +1084,16 @@ mod tests {
     #[test]
     fn issue_37_ownerless_quarantine_is_not_deleted_from_its_name() {
         let dir = tempfile::tempdir().unwrap();
-        let quarantine = dir.path().join("session-leases/unknown.lock.stale-123-token");
+        let quarantine = dir
+            .path()
+            .join("session-leases/unknown.lock.stale-123-token");
         fs::create_dir_all(&quarantine).unwrap();
         fs::write(quarantine.join("retained"), b"unknown ownership").unwrap();
         assert_eq!(reclaim_dead_owner_leases(dir.path()), 0);
-        assert_eq!(fs::read(quarantine.join("retained")).unwrap(), b"unknown ownership");
+        assert_eq!(
+            fs::read(quarantine.join("retained")).unwrap(),
+            b"unknown ownership"
+        );
     }
 
     #[cfg(unix)]
@@ -1081,14 +1108,21 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let mut child = OwnedChild(Command::new("sh")
-            .args(["-c", "printf 'ready\n'; read answer"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut child = OwnedChild(
+            Command::new("sh")
+                .args(["-c", "printf 'ready\n'; read answer"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let stdout = child.0.stdout.take().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut line = String::new();
-            let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
             let _ = ready_tx.send(result);
         });
         let ready = ready_rx.recv_timeout(Duration::from_secs(5));
@@ -1104,24 +1138,38 @@ mod tests {
         let directory = lease_directory(dir.path(), &path);
         fs::create_dir_all(&directory).unwrap();
         let observed = get_process_start_id(child.0.id()).unwrap();
-        let mut starts = match observed.strip_prefix("ps:").or_else(|| observed.strip_prefix("ps2:")) {
+        let mut starts = match observed
+            .strip_prefix("ps:")
+            .or_else(|| observed.strip_prefix("ps2:"))
+        {
             Some(payload) => vec![format!("ps:{payload}"), format!("ps2:{payload}")],
             None => vec![observed],
         };
-        starts.extend(["future:opaque", "unsupported:identity", "proc:malformed"].map(str::to_string));
+        starts.extend(
+            ["future:opaque", "unsupported:identity", "proc:malformed"].map(str::to_string),
+        );
         for start in &starts {
             let owner = LeaseOwner {
-                version: 1, token: "original-holder".into(), pid: child.0.id(),
-                process_start_id: Some(start.clone()), active_session_id: Some("legacy".into()),
+                version: 1,
+                token: "original-holder".into(),
+                pid: child.0.id(),
+                process_start_id: Some(start.clone()),
+                active_session_id: Some("legacy".into()),
                 session_path: canonical_session_path(&path).to_string_lossy().into_owned(),
                 created_at: crate::util::now_iso(),
             };
             let bytes = serde_json::to_vec(&owner).unwrap();
             fs::write(directory.join("owner.json"), &bytes).unwrap();
-            assert!(acquire_runtime_session_lease(&path, dir.path()).is_err(), "stole {start}");
+            assert!(
+                acquire_runtime_session_lease(&path, dir.path()).is_err(),
+                "stole {start}"
+            );
             assert_eq!(reclaim_dead_owner_leases(dir.path()), 0);
             assert_eq!(fs::read(directory.join("owner.json")).unwrap(), bytes);
-            assert_eq!(live_lease_owner(dir.path(), &path).unwrap().pid, child.0.id());
+            assert_eq!(
+                live_lease_owner(dir.path(), &path).unwrap().pid,
+                child.0.id()
+            );
             assert!(child.0.try_wait().unwrap().is_none());
         }
     }

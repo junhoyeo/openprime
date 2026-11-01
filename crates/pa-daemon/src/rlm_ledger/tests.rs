@@ -1740,9 +1740,7 @@ fn a_failed_legacy_seed_publication_leaves_no_ledger_and_retries_once() {
         (1, 0)
     );
     // Under the namespace guard the dead scratch is moved aside, never deleted.
-    let retained = fs::read_dir(dir.join("rlm-ledger-retained"))
-        .map(|entries| entries.count())
-        .unwrap_or(0);
+    let retained = fs::read_dir(dir.join("rlm-ledger-retained")).map_or(0, Iterator::count);
     assert!(
         scratch_count() + retained >= 1,
         "the dead attempt's scratch is retained"
@@ -1862,16 +1860,13 @@ fn retained_seed_directory_must_be_private() {
         let dir = temp_dir(&format!("seed-retained-{case}"));
         legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
         let retained = dir.join("rlm-ledger-retained");
-        match case {
-            "symlink" => {
-                let target = dir.join("elsewhere");
-                fs::create_dir(&target).unwrap();
-                std::os::unix::fs::symlink(&target, &retained).unwrap();
-            }
-            _ => {
-                fs::create_dir(&retained).unwrap();
-                fs::set_permissions(&retained, fs::Permissions::from_mode(0o777)).unwrap();
-            }
+        if case == "symlink" {
+            let target = dir.join("elsewhere");
+            fs::create_dir(&target).unwrap();
+            std::os::unix::fs::symlink(&target, &retained).unwrap();
+        } else {
+            fs::create_dir(&retained).unwrap();
+            fs::set_permissions(&retained, fs::Permissions::from_mode(0o777)).unwrap();
         }
         let ledger = ledger_for(&dir);
         SEED_PUBLISH_FAULT.with(|fault| fault.set(true));

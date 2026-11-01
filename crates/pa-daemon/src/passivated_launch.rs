@@ -143,7 +143,10 @@ impl PassivatedLaunches {
         session_file: &str,
         launch: &PassivatedLaunch,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(Path::new(session_file).is_absolute(), "launch record requires an absolute session path");
+        anyhow::ensure!(
+            Path::new(session_file).is_absolute(),
+            "launch record requires an absolute session path"
+        );
         let canonical = crate::lease::canonical_session_path(Path::new(session_file));
         if let Some(recorded) = launch.create_command.session_path.as_deref() {
             anyhow::ensure!(
@@ -156,7 +159,8 @@ impl PassivatedLaunches {
         crate::paths::ensure_dir(&self.dir)?;
         let mut stored = PassivatedLaunch::new(&launch.create_command, launch.telemetry_disabled);
         stored.create_command.session_path = Some(canonical.to_string_lossy().into_owned());
-        stored.session_id = pa_core::session::manager::read_session_header(&canonical).map(|header| header.id);
+        stored.session_id =
+            pa_core::session::manager::read_session_header(&canonical).map(|header| header.id);
         let content = serde_json::to_string_pretty(&stored)?;
         crate::descriptor::write_file_atomic(&self.record_path(session_file), &content)
     }
@@ -178,8 +182,8 @@ impl PassivatedLaunches {
     pub(crate) fn forget_deleted(&self, session_file: &str) -> anyhow::Result<()> {
         if self.get_checked(session_file)?.is_some() {
             match std::fs::remove_file(self.record_path(session_file)) {
-                Ok(()) => {},
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -187,24 +191,47 @@ impl PassivatedLaunches {
     }
 
     /// A wake must distinguish genuine absence from unreadable or foreign context.
-    pub(crate) fn get_checked(&self, session_file: &str) -> anyhow::Result<Option<PassivatedLaunch>> {
-        anyhow::ensure!(Path::new(session_file).is_absolute(), "launch record requires an absolute session path");
+    pub(crate) fn get_checked(
+        &self,
+        session_file: &str,
+    ) -> anyhow::Result<Option<PassivatedLaunch>> {
+        anyhow::ensure!(
+            Path::new(session_file).is_absolute(),
+            "launch record requires an absolute session path"
+        );
         let path = self.record_path(session_file);
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => anyhow::ensure!(metadata.file_type().is_file(), "launch record is not a regular file: {}", path.display()),
+            Ok(metadata) => anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "launch record is not a regular file: {}",
+                path.display()
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         }
         let launch: PassivatedLaunch = serde_json::from_str(&std::fs::read_to_string(path)?)?;
         let canonical = crate::lease::canonical_session_path(Path::new(session_file));
-        anyhow::ensure!(launch.create_command.session_path.as_deref().is_some_and(|recorded| {
-            Path::new(recorded).is_absolute()
-                && crate::lease::canonical_session_path(Path::new(recorded)) == canonical
-        }), "launch record belongs to a different session");
+        anyhow::ensure!(
+            launch
+                .create_command
+                .session_path
+                .as_deref()
+                .is_some_and(|recorded| {
+                    Path::new(recorded).is_absolute()
+                        && crate::lease::canonical_session_path(Path::new(recorded)) == canonical
+                }),
+            "launch record belongs to a different session"
+        );
         if let Some(expected) = launch.session_id.as_deref() {
             match pa_core::session::manager::read_session_header(&canonical) {
-                Some(header) => anyhow::ensure!(header.id == expected, "launch record session identity changed"),
-                None => anyhow::ensure!(!canonical.try_exists()?, "launch record session identity cannot be verified"),
+                Some(header) => anyhow::ensure!(
+                    header.id == expected,
+                    "launch record session identity changed"
+                ),
+                None => anyhow::ensure!(
+                    !canonical.try_exists()?,
+                    "launch record session identity cannot be verified"
+                ),
             }
         }
         Ok(Some(launch))
@@ -277,7 +304,10 @@ mod tests {
         let restarted = PassivatedLaunches::new(records);
         let spelled = dir.path().join(".").join("session.jsonl");
         assert_eq!(
-            restarted.get(&spelled.to_string_lossy()).unwrap().wake_create("/wake.jsonl", 0, None),
+            restarted
+                .get(&spelled.to_string_lossy())
+                .unwrap()
+                .wake_create("/wake.jsonl", 0, None),
             launch.wake_create("/wake.jsonl", 0, None),
         );
         restarted.forget(&session_file.to_string_lossy());
@@ -298,10 +328,13 @@ mod tests {
         let path = records.record_path(file.to_str().unwrap());
         std::fs::write(&path, old.to_string()).unwrap();
         let legacy = records.get(file.to_str().unwrap()).unwrap();
-        let wake = serde_json::to_value(legacy.wake_create(file.to_str().unwrap(), 1, None)).unwrap();
+        let wake =
+            serde_json::to_value(legacy.wake_create(file.to_str().unwrap(), 1, None)).unwrap();
         assert!(!wake.to_string().contains("synthetic-secret"));
         records.remember(file.to_str().unwrap(), &legacy).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("synthetic-secret"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("synthetic-secret"));
         for recorded in [json!(other), json!("../child.jsonl"), Value::Null] {
             let mut foreign = old.clone();
             foreign["createCommand"]["sessionPath"] = recorded;
@@ -319,5 +352,4 @@ mod tests {
         assert!(records.forget_deleted(file.to_str().unwrap()).is_err());
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
-
 }

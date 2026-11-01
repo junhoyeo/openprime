@@ -32,8 +32,13 @@ impl ChildLifecycles {
         };
         tokio::time::timeout(std::time::Duration::from_secs(1), gate.lock_owned())
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                format!("Session lifecycle operation is still pending: {file}")).into())
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("Session lifecycle operation is still pending: {file}"),
+                )
+                .into()
+            })
     }
 }
 
@@ -63,7 +68,9 @@ impl Supervisor {
         resident: &Arc<crate::registry::ResidentWorker>,
     ) -> Result<bool> {
         let file = resident.descriptor.lock().await.session_file.clone();
-        let Some(file) = file else { return Ok(false); };
+        let Some(file) = file else {
+            return Ok(false);
+        };
         if !self.child_is_deleted(&file).await? {
             return Ok(false);
         }
@@ -77,6 +84,10 @@ impl Supervisor {
     /// The first logical delete commits under the same process-shared fence
     /// that every checked runtime acquisition uses. Registry presence is not
     /// runtime ownership; an unrelated or unknown holder always refuses.
+    // Kept async for caller consistency (5 call sites across production and
+    // tests already `.await` it); its body happens to be synchronous today,
+    // not a reason to churn every caller for a style-only clippy preference.
+    #[allow(clippy::unused_async_trait_impl, clippy::unused_async)]
     pub(super) async fn commit_child_deletion(
         self: &Arc<Self>,
         file: &str,
@@ -85,7 +96,8 @@ impl Supervisor {
         resident: Option<&Arc<crate::registry::ResidentWorker>>,
     ) -> Result<()> {
         let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
-            &self.options.agent_dir, &self.options.socket_path,
+            &self.options.agent_dir,
+            &self.options.socket_path,
         )?;
         let ledger = Arc::clone(authority.ledger());
         crate::lease::with_runtime_session_fence(authority.agent_dir(), Path::new(file), |held| {
@@ -93,35 +105,62 @@ impl Supervisor {
             let mut matching = Vec::new();
             for edge in ledger.strict_edges()? {
                 let path = crate::lease::checked_session_path(Path::new(&edge.child))?;
-                if edge.child_id == child_id && path == target { matching.push(edge); }
+                if edge.child_id == child_id && path == target {
+                    matching.push(edge);
+                }
             }
-            anyhow::ensure!(matching.len() == 1, "RLM child identity is missing or ambiguous in the spawn ledger");
+            anyhow::ensure!(
+                matching.len() == 1,
+                "RLM child identity is missing or ambiguous in the spawn ledger"
+            );
             let edge = matching.pop().expect("one verified edge");
             let ownership = held.inspect_ownership()?;
-            let mut descriptor = resident.map(|resident| resident.descriptor.try_lock()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                    "Worker identity is changing; delete deferred"))).transpose()?;
+            let mut descriptor = resident
+                .map(|resident| {
+                    resident.descriptor.try_lock().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "Worker identity is changing; delete deferred",
+                        )
+                    })
+                })
+                .transpose()?;
             if let Some(descriptor) = descriptor.as_ref() {
-                let file = descriptor.session_file.as_deref()
+                let file = descriptor
+                    .session_file
+                    .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("Worker has no file identity"))?;
-                anyhow::ensure!(crate::lease::checked_session_path(Path::new(file))? == target,
-                    "Worker identity changed before deletion");
+                anyhow::ensure!(
+                    crate::lease::checked_session_path(Path::new(file))? == target,
+                    "Worker identity changed before deletion"
+                );
             }
             match ownership {
-                crate::lease::RuntimeLeaseOwnership::Absent | crate::lease::RuntimeLeaseOwnership::Stale => {},
+                crate::lease::RuntimeLeaseOwnership::Absent
+                | crate::lease::RuntimeLeaseOwnership::Stale => {}
                 crate::lease::RuntimeLeaseOwnership::Unknown => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                        "Runtime ownership is unknown; deletion deferred").into());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Runtime ownership is unknown; deletion deferred",
+                    )
+                    .into());
                 }
                 crate::lease::RuntimeLeaseOwnership::Held(owner) => {
                     let Some(descriptor) = descriptor.as_ref() else {
-                        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
-                            "Another runtime owns this child; deletion deferred").into());
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "Another runtime owns this child; deletion deferred",
+                        )
+                        .into());
                     };
-                    anyhow::ensure!(descriptor.pid == u64::from(owner.pid)
-                        && descriptor.process_start_id.as_deref() == Some(owner.process_start_id.as_str())
-                        && owner.active_session_id.as_deref() == Some(descriptor.root_active_session_id.as_str()),
-                        "Runtime ownership does not match the authenticated child worker");
+                    anyhow::ensure!(
+                        descriptor.pid == u64::from(owner.pid)
+                            && descriptor.process_start_id.as_deref()
+                                == Some(owner.process_start_id.as_str())
+                            && owner.active_session_id.as_deref()
+                                == Some(descriptor.root_active_session_id.as_str()),
+                        "Runtime ownership does not match the authenticated child worker"
+                    );
                 }
             }
             // #42: the logical deletion commits first. Only an Ok append
@@ -131,20 +170,27 @@ impl Supervisor {
                 ledger.append_delete(child_id, file, reason)?;
             }
             #[cfg(test)]
-            if self.lifecycle_test_hooks.crash_after_tombstone.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .lifecycle_test_hooks
+                .crash_after_tombstone
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 bail!("injected crash after the tombstone commit");
             }
             if let (Some(resident), Some(descriptor)) = (resident, descriptor.as_mut()) {
                 let mut stopped = (**descriptor).clone();
-                stopped.stop_requested_at.get_or_insert_with(crate::util::now_iso);
+                stopped
+                    .stop_requested_at
+                    .get_or_insert_with(crate::util::now_iso);
                 stopped.archive_on_stop = Some(true);
                 crate::descriptor::persist_worker(&resident.descriptor_path, &stopped)?;
                 **descriptor = stopped;
                 resident.mark_identity_quarantined();
-                resident.intentional_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                resident
+                    .intentional_stop
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(())
         })
     }
-
 }

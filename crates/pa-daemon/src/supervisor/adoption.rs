@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use super::{
     anyhow, json, load_descriptors, response_failure, response_success, socket,
-    worker_connect_deadline, Context, DaemonCommand, DaemonResponse, DaemonWorkerLifecycle,
-    Duration, Ordering, Path, PathBuf, ResidentWorker, Result, Supervisor, Value,
-    WorkerRegistration,
+    worker_connect_deadline, Context, DaemonCommand, DaemonResponse, Duration, Ordering, Path,
+    PathBuf, ResidentWorker, Result, Supervisor, Value, WorkerRegistration,
 };
 
 /// An unobservable start identity does not prove that a live pid was recycled.
@@ -50,14 +49,26 @@ mod recorded_process_tests {
         use super::*;
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = OwnedChild(std::process::Command::new("sleep").arg("300").spawn().unwrap());
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap(),
+        );
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("agent")).unwrap();
-        let supervisor = Arc::new(Supervisor::new(super::super::SupervisorOptions {
-            socket_path: dir.path().join("daemon.sock"), agent_dir: dir.path().join("agent")
-        }).unwrap());
+        let supervisor = Arc::new(
+            Supervisor::new(super::super::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
         let descriptor: crate::descriptor::WorkerDescriptor = serde_json::from_value(json!({
             "version":2, "workerId":"legacy", "pid":child.0.id(), "processStartId":"unsupported:birth",
             "socketPath":dir.path().join("missing.sock"), "recoveryJournalPath":dir.path().join("journal.jsonl"),
@@ -68,7 +79,9 @@ mod recorded_process_tests {
         let path = supervisor.descriptor_dir.join("legacy.json");
         crate::descriptor::persist_worker(&path, &descriptor).unwrap();
         let before = std::fs::read(&path).unwrap();
-        supervisor.adopt_persisted_worker(path.clone(), descriptor, AdoptionBoot::PlainStartup).await;
+        supervisor
+            .adopt_persisted_worker(path.clone(), descriptor, AdoptionBoot::PlainStartup)
+            .await;
         assert!(supervisor.registry.get("legacy").await.is_some());
         assert_eq!(std::fs::read(path).unwrap(), before);
         assert!(child.0.try_wait().unwrap().is_none());
@@ -126,7 +139,7 @@ pub(super) enum AdoptionOutcome {
     /// The socket could not be reached, but the recorded process could
     /// NOT be proven gone either (an unverifiable identity, or a liveness
     /// probe that itself failed): tracked in the registry (quarantined
-    /// from routing) rather than left for SkippedIdle's "safe to ignore"
+    /// from routing) rather than left for `SkippedIdle`'s "safe to ignore"
     /// treatment, so a later create/open or self-registration finds it
     /// already present instead of risking a second owner for the same
     /// session (#37/#38).
@@ -344,7 +357,7 @@ impl Supervisor {
         };
         match self.stop_ledger_deleted_worker(&resident).await {
             Ok(true) => return AdoptionOutcome::Stopped,
-            Ok(false) => {},
+            Ok(false) => {}
             Err(error) => {
                 self.log_line(&format!("could not verify worker {worker_id}: {error:#}"));
                 return AdoptionOutcome::Failed;
@@ -572,28 +585,47 @@ impl Supervisor {
             if token.as_str() != descriptor.authentication_token {
                 return fail("Session worker authentication failed");
             }
-            (descriptor.session_file.clone(), descriptor.stop_requested_at.is_some())
+            (
+                descriptor.session_file.clone(),
+                descriptor.stop_requested_at.is_some(),
+            )
         };
         if stopping {
             resident.mark_identity_quarantined();
             resident.note_retired();
-            return fail(&crate::registration::tombstoned_registration_refusal(active_session_id));
+            return fail(&crate::registration::tombstoned_registration_refusal(
+                active_session_id,
+            ));
         }
         if let Some(file) = file {
             let authority = match crate::lease::RuntimeSessionAuthority::for_supervisor(
-                &self.options.agent_dir, &self.options.socket_path,
+                &self.options.agent_dir,
+                &self.options.socket_path,
             ) {
                 Ok(authority) => authority,
                 Err(error) => return fail(&format!("{error:#}")),
             };
-            let checked = crate::lease::with_runtime_session_fence(authority.agent_dir(), Path::new(&file), |held| {
-                authority.check_admission(held.canonical_path())
-            });
+            let checked = crate::lease::with_runtime_session_fence(
+                authority.agent_dir(),
+                Path::new(&file),
+                |held| authority.check_admission(held.canonical_path()),
+            );
             if let Err(error) = checked {
-                match self.reject_failed_publication(&resident, None, &error).await {
-                    Ok(true) => return fail(&crate::registration::tombstoned_registration_refusal(active_session_id)),
+                match self
+                    .reject_failed_publication(&resident, None, &error)
+                    .await
+                {
+                    Ok(true) => {
+                        return fail(&crate::registration::tombstoned_registration_refusal(
+                            active_session_id,
+                        ))
+                    }
                     Ok(false) => return fail(&format!("{error:#}")),
-                    Err(persist_error) => return fail(&format!("Registration quarantined; stop intent not durable: {persist_error:#}")),
+                    Err(persist_error) => {
+                        return fail(&format!(
+                            "Registration quarantined; stop intent not durable: {persist_error:#}"
+                        ))
+                    }
                 }
             }
         }
@@ -701,7 +733,9 @@ impl Supervisor {
             self.refresh_roster_entry(&resident).await;
         }
         if resident.descriptor.lock().await.stop_requested_at.is_some() {
-            return fail(&crate::registration::tombstoned_registration_refusal(active_session_id));
+            return fail(&crate::registration::tombstoned_registration_refusal(
+                active_session_id,
+            ));
         }
         // A worker that registers after the boot seed publishes its passive ledger family in
         // the background: TS reseeds on the worker's first roster snapshot, and this port's
@@ -786,9 +820,11 @@ impl Supervisor {
             None => None,
         };
         if self.stop_ledger_deleted_worker(&resident).await? {
-            return Err(anyhow!(crate::registration::tombstoned_registration_refusal(
-                &registration.active_session_id
-            )));
+            return Err(anyhow!(
+                crate::registration::tombstoned_registration_refusal(
+                    &registration.active_session_id
+                )
+            ));
         }
         // A tombstoned identity is mid-stop (TS `adoptOrRecoverWorker`'s stopRequestedAt
         // branch): adoption finishes the stop and never adopts the worker as healthy.

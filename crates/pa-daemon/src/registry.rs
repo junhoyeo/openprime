@@ -292,6 +292,11 @@ impl ResidentWorker {
         self.publish_route_state(|state| state.retired = true);
     }
 
+    // Read only in test assertions today - production code checks
+    // mark/clear_identity_persist_pending's own write side instead; kept
+    // for test clarity (verifying the pending flag actually flipped), not
+    // dead.
+    #[allow(dead_code)]
     pub(crate) fn identity_persist_pending(&self) -> bool {
         self.identity_persist_pending
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -418,10 +423,15 @@ impl SessionRegistry {
         }
     }
 
-    pub(crate) fn try_publication(&self) -> std::io::Result<tokio::sync::MutexGuard<'_, HashMap<String, Arc<ResidentWorker>>>> {
-        self.workers.try_lock().map_err(|_| std::io::Error::new(
-            std::io::ErrorKind::WouldBlock, "Session registry is changing; publication deferred",
-        ))
+    pub(crate) fn try_publication(
+        &self,
+    ) -> std::io::Result<tokio::sync::MutexGuard<'_, HashMap<String, Arc<ResidentWorker>>>> {
+        self.workers.try_lock().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Session registry is changing; publication deferred",
+            )
+        })
     }
 
     pub(crate) async fn insert(&self, resident: Arc<ResidentWorker>) {

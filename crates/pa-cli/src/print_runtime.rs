@@ -137,8 +137,10 @@ fn daemon_acp_create(
                 let authority = pa_daemon::lease::RuntimeSessionAuthority::for_supervisor(
                     &config.agent_dir,
                     &crate::interactive_mode::resolve_socket_path(options.daemon_socket.as_deref()),
-                ).map_err(|error| format!("{error:#}"))?;
-                let target = materialize_startup_fork(&source, &config.cwd, &session_dir, &authority)?;
+                )
+                .map_err(|error| format!("{error:#}"))?;
+                let target =
+                    materialize_startup_fork(&source, &config.cwd, &session_dir, &authority)?;
                 (config.cwd.clone(), Some(target))
             }
             HeadlessSession::Open(path) => (
@@ -303,12 +305,13 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
                         }
                     };
                     // The fresh session's file is leased BEFORE the replacement can write it.
-                    let lease = authority.acquire(
-                        manager
-                            .get_session_file()
-                            .expect("a fresh session knows its file"),
-                    )
-                    .map_err(|error| format!("{error:#}"))?;
+                    let lease = authority
+                        .acquire(
+                            manager
+                                .get_session_file()
+                                .expect("a fresh session knows its file"),
+                        )
+                        .map_err(|error| format!("{error:#}"))?;
                     (manager, Some(lease))
                 }
                 pa_daemon::rpc::session::RpcEngineRequest::Open {
@@ -358,7 +361,8 @@ pub(crate) fn runtime_session_authority(
             &crate::interactive_mode::resolve_socket_path(Some(socket)),
         ),
         None => pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&options.config.agent_dir),
-    }.map_err(|error| format!("Could not resolve session authority: {error:#}"))
+    }
+    .map_err(|error| format!("Could not resolve session authority: {error:#}"))
 }
 
 fn replacement_session_dir(options: &RunOptions) -> std::path::PathBuf {
@@ -1299,7 +1303,9 @@ fn build_session_manager_with_lease(
     match select_headless_session(options)? {
         HeadlessSession::Fork(source) => {
             let manager = pa_core::session::manager::SessionManager::prepare_fork_from(
-                &source, &cwd, &session_dir,
+                &source,
+                &cwd,
+                &session_dir,
             )?;
             let (mut manager, lease) = lease_fresh_manager(manager, &authority)?;
             manager.flush_now().map_err(|error| error.to_string())?;
@@ -1323,10 +1329,13 @@ fn fresh_session_with_lease(
     cwd: &std::path::Path,
     session_dir: &std::path::Path,
     authority: &pa_daemon::lease::RuntimeSessionAuthority,
-) -> Result<(
-    pa_core::session::manager::SessionManager,
-    pa_daemon::lease::SessionLease,
-), String> {
+) -> Result<
+    (
+        pa_core::session::manager::SessionManager,
+        pa_daemon::lease::SessionLease,
+    ),
+    String,
+> {
     let manager = pa_core::session::manager::SessionManager::persisted(cwd, session_dir);
     lease_fresh_manager(manager, authority)
 }
@@ -1336,13 +1345,18 @@ fn fresh_session_with_lease(
 fn lease_fresh_manager(
     manager: pa_core::session::manager::SessionManager,
     authority: &pa_daemon::lease::RuntimeSessionAuthority,
-) -> Result<(
-    pa_core::session::manager::SessionManager,
-    pa_daemon::lease::SessionLease,
-), String> {
-    let path = manager.get_session_file()
+) -> Result<
+    (
+        pa_core::session::manager::SessionManager,
+        pa_daemon::lease::SessionLease,
+    ),
+    String,
+> {
+    let path = manager
+        .get_session_file()
         .ok_or_else(|| "A file-backed session has no target path".to_string())?;
-    let lease = authority.acquire(path)
+    let lease = authority
+        .acquire(path)
         .map_err(|error| format!("Could not lease the fresh session file: {error:#}"))?;
     Ok((manager, lease))
 }
@@ -1356,15 +1370,20 @@ pub(crate) fn materialize_startup_fork(
     session_dir: &std::path::Path,
     authority: &pa_daemon::lease::RuntimeSessionAuthority,
 ) -> Result<std::path::PathBuf, String> {
-    let prepared = pa_core::session::manager::SessionManager::prepare_fork_from(source, cwd, session_dir)?;
+    let prepared =
+        pa_core::session::manager::SessionManager::prepare_fork_from(source, cwd, session_dir)?;
     let (mut manager, lease) = lease_fresh_manager(prepared, authority)?;
     manager.flush_now().map_err(|error| error.to_string())?;
-    let target = manager.get_session_file()
-        .ok_or_else(|| "Prepared fork has no target path".to_string())?.to_path_buf();
+    let target = manager
+        .get_session_file()
+        .ok_or_else(|| "Prepared fork has no target path".to_string())?
+        .to_path_buf();
     drop(manager);
-    match lease.try_release().map_err(|error| format!("Fork ownership could not settle: {error:#}"))? {
+    match lease.try_release() {
         pa_daemon::lease::LeaseReleaseOutcome::Released => Ok(target),
-        pa_daemon::lease::LeaseReleaseOutcome::Deferred => Err("Fork ownership is still settling; handoff deferred".to_string()),
+        pa_daemon::lease::LeaseReleaseOutcome::Deferred => {
+            Err("Fork ownership is still settling; handoff deferred".to_string())
+        }
     }
 }
 
@@ -2133,13 +2152,21 @@ mod tests {
         crate::mode::RunOptions {
             app_mode: crate::mode::AppMode::Print,
             config: crate::mode::RuntimeConfig {
-                cwd: root.to_path_buf(), agent_dir: root.join("agent"),
+                cwd: root.to_path_buf(),
+                agent_dir: root.join("agent"),
                 ..Default::default()
             },
             session: crate::mode::SessionOptions::default(),
-            messages: Vec::new(), file_args: Vec::new(), daemon_socket: None,
-            list_models: None, initial_message: None, initial_images: Vec::new(),
-            verbose: false, offline: true, agents_view_requested: false, attach_agent: None,
+            messages: Vec::new(),
+            file_args: Vec::new(),
+            daemon_socket: None,
+            list_models: None,
+            initial_message: None,
+            initial_images: Vec::new(),
+            verbose: false,
+            offline: true,
+            agents_view_requested: false,
+            attach_agent: None,
         }
     }
 
@@ -2151,7 +2178,10 @@ mod tests {
         let blocker = options.config.agent_dir.join("session-leases");
         std::fs::write(&blocker, b"preserved blocker").unwrap();
         let result = super::build_session_manager_with_lease(&options);
-        assert!(result.is_err(), "a file-backed engine must not receive an unleased manager");
+        assert!(
+            result.is_err(),
+            "a file-backed engine must not receive an unleased manager"
+        );
         assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
     }
 
@@ -2160,7 +2190,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut options = lifecycle_options(dir.path());
         let mut source = pa_core::session::manager::SessionManager::persisted(
-            dir.path(), &dir.path().join("source"),
+            dir.path(),
+            &dir.path().join("source"),
         );
         source.flush_now().unwrap();
         let source_path = source.get_session_file().unwrap().to_path_buf();
@@ -2171,8 +2202,13 @@ mod tests {
         std::fs::write(&blocker, b"preserved blocker").unwrap();
         let result = super::build_session_manager_with_lease(&options);
         let materialized: Vec<_> = std::fs::read_dir(options.config.agent_dir.join("sessions"))
-            .unwrap().map(|entry| entry.unwrap().path()).collect();
-        assert!(materialized.is_empty(), "no target may be flushed before acquisition succeeds: {materialized:?}");
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            materialized.is_empty(),
+            "no target may be flushed before acquisition succeeds: {materialized:?}"
+        );
         assert!(result.is_err());
         assert_eq!(std::fs::read(source_path).unwrap(), before);
         assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
@@ -2184,10 +2220,16 @@ mod tests {
         let options = lifecycle_options(dir.path());
         let (manager, held) = super::build_session_manager_with_lease(&options).unwrap();
         let target = manager.get_session_file().unwrap();
-        assert!(pa_daemon::lease::acquire_runtime_session_lease(target, &options.config.agent_dir).is_err(),
-            "the runtime must own the configured agent root, not a global fallback root");
+        assert!(
+            pa_daemon::lease::acquire_runtime_session_lease(target, &options.config.agent_dir)
+                .is_err(),
+            "the runtime must own the configured agent root, not a global fallback root"
+        );
         drop(held);
-        drop(pa_daemon::lease::acquire_runtime_session_lease(target, &options.config.agent_dir).unwrap());
+        drop(
+            pa_daemon::lease::acquire_runtime_session_lease(target, &options.config.agent_dir)
+                .unwrap(),
+        );
     }
 
     #[test]
@@ -2197,10 +2239,16 @@ mod tests {
         options.app_mode = crate::mode::AppMode::Acp;
         let socket = dir.path().join("supervisor.sock");
         options.daemon_socket = Some(socket.to_string_lossy().into_owned());
-        let _supervisor = pa_daemon::supervisor::Supervisor::new(pa_daemon::supervisor::SupervisorOptions {
-            socket_path: socket, agent_dir: options.config.agent_dir.clone(),
-        }).unwrap();
-        let mut source = pa_core::session::manager::SessionManager::persisted(dir.path(), &dir.path().join("source"));
+        let _supervisor =
+            pa_daemon::supervisor::Supervisor::new(pa_daemon::supervisor::SupervisorOptions {
+                socket_path: socket,
+                agent_dir: options.config.agent_dir.clone(),
+            })
+            .unwrap();
+        let mut source = pa_core::session::manager::SessionManager::persisted(
+            dir.path(),
+            &dir.path().join("source"),
+        );
         source.flush_now().unwrap();
         let source_path = source.get_session_file().unwrap().to_path_buf();
         let before = std::fs::read(&source_path).unwrap();
@@ -2209,13 +2257,17 @@ mod tests {
         std::fs::write(&blocker, b"preserved blocker").unwrap();
         let result = super::daemon_acp_create(&options);
         let materialized: Vec<_> = std::fs::read_dir(options.config.agent_dir.join("sessions"))
-            .unwrap().map(|entry| entry.unwrap().path()).collect();
-        assert!(materialized.is_empty(), "ACP must own the target before first flush: {materialized:?}");
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            materialized.is_empty(),
+            "ACP must own the target before first flush: {materialized:?}"
+        );
         assert!(result.is_err());
         assert_eq!(std::fs::read(source_path).unwrap(), before);
         assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
     }
-
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@
 
 mod accept_loop;
 mod adoption;
-mod clients;
 mod child_lifecycle;
+mod clients;
 mod launch_budget;
 #[cfg(test)]
 mod lifecycle_test_hooks;
@@ -14,8 +14,8 @@ mod notes;
 mod options;
 mod root_identity;
 mod routing;
-mod sessions;
 pub(crate) mod session_publication;
+mod sessions;
 mod signals_shutdown;
 pub(crate) mod subscribers;
 mod update_restart;
@@ -33,9 +33,9 @@ mod attach_window_tests;
 #[cfg(all(test, unix))]
 mod dead_child_delete_tests;
 #[cfg(test)]
-mod saved_delete_tests;
-#[cfg(test)]
 mod handshake_tests;
+#[cfg(test)]
+mod saved_delete_tests;
 #[cfg(test)]
 mod spawn_record_tests;
 #[cfg(test)]

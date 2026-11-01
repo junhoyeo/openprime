@@ -608,13 +608,9 @@ async fn dispose_child(child: &Arc<InlineChild>) {
         let lease = current.session_lease.lock().await.take();
         if let Some(lease) = lease {
             match lease.try_release() {
-                Ok(pa_daemon::lease::LeaseReleaseOutcome::Released) => {},
-                Ok(pa_daemon::lease::LeaseReleaseOutcome::Deferred) => {
+                pa_daemon::lease::LeaseReleaseOutcome::Released => {}
+                pa_daemon::lease::LeaseReleaseOutcome::Deferred => {
                     eprintln!("inline child ownership is still settling; lease retained");
-                    *current.session_lease.lock().await = Some(lease);
-                }
-                Err(error) => {
-                    eprintln!("inline child ownership could not settle; lease retained: {error:#}");
                     *current.session_lease.lock().await = Some(lease);
                 }
             }
@@ -786,8 +782,13 @@ impl RlmSubagentHost for InlineHost {
                 )
             };
             let child_lease = match child_manager.get_session_file() {
-                Some(path) => Some(recipe.authority.as_ref()
-                    .map_err(|error| anyhow::anyhow!("{error}"))?.acquire(path)?),
+                Some(path) => Some(
+                    recipe
+                        .authority
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("{error}"))?
+                        .acquire(path)?,
+                ),
                 None => None,
             };
             child_manager

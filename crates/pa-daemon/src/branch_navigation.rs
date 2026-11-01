@@ -398,12 +398,13 @@ impl TreeNavigation {
                         .trace_upload
                         .as_ref()
                         .and_then(|traces| traces.forked(&forked.path));
-                    let authority = self.authority.as_ref().map_err(|error| {
-                        response_failure(None, "fork", error, None)
-                    })?;
-                    forked.lease = Some(Arc::new(authority.acquire(&forked.path).map_err(|error| {
-                        response_failure(None, "fork", &format!("{error:#}"), None)
-                    })?));
+                    let authority = self
+                        .authority
+                        .as_ref()
+                        .map_err(|error| response_failure(None, "fork", error, None))?;
+                    forked.lease = Some(Arc::new(authority.acquire(&forked.path).map_err(
+                        |error| response_failure(None, "fork", &format!("{error:#}"), None),
+                    )?));
                     if let Err(error) = forked.rewrite() {
                         return Err(response_failure(None, "fork", &error.to_string(), None));
                     }
@@ -421,12 +422,22 @@ impl TreeNavigation {
                     forked
                 } else {
                     let session_dir = store.path.parent().unwrap_or(store.path.as_path());
-                    let mut forked = store.prepare_branched_file(leaf_id, session_dir)
-                        .map_err(|error| response_failure(None, "fork", &format!("{error:#}"), None))?;
-                    let authority = self.authority.as_ref().map_err(|error| response_failure(None, "fork", error, None))?;
-                    forked.lease = Some(Arc::new(authority.acquire(&forked.path)
-                        .map_err(|error| response_failure(None, "fork", &format!("{error:#}"), None))?));
-                    forked.rewrite().map_err(|error| response_failure(None, "fork", &format!("{error:#}"), None))?;
+                    let mut forked =
+                        store
+                            .prepare_branched_file(leaf_id, session_dir)
+                            .map_err(|error| {
+                                response_failure(None, "fork", &format!("{error:#}"), None)
+                            })?;
+                    let authority = self
+                        .authority
+                        .as_ref()
+                        .map_err(|error| response_failure(None, "fork", error, None))?;
+                    forked.lease = Some(Arc::new(authority.acquire(&forked.path).map_err(
+                        |error| response_failure(None, "fork", &format!("{error:#}"), None),
+                    )?));
+                    forked.rewrite().map_err(|error| {
+                        response_failure(None, "fork", &format!("{error:#}"), None)
+                    })?;
                     forked
                 }
             }

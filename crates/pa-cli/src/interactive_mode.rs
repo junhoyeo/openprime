@@ -428,11 +428,14 @@ fn build_tui_options(
     let mut session = match &options.session.fork {
         Some(selector) => {
             let authority = pa_daemon::lease::RuntimeSessionAuthority::for_supervisor(
-                &config.agent_dir, &socket_path,
+                &config.agent_dir,
+                &socket_path,
             )?;
-            let storage = session_dir.as_deref().ok_or_else(|| anyhow!("Fork storage directory is unavailable"))?;
+            let storage = session_dir
+                .as_deref()
+                .ok_or_else(|| anyhow!("Fork storage directory is unavailable"))?;
             fork_startup_selection(selector, &config.cwd, storage, &authority)?
-        },
+        }
         None => session_selection(&options.session, session_dir.as_deref()),
     };
     // A plain resume follows the saved project. Resolve its file before

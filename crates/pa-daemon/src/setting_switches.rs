@@ -1309,7 +1309,8 @@ mod tests {
         // directory) without disturbing the read side.
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.join("agent"), std::fs::Permissions::from_mode(0o555)).unwrap();
+            std::fs::set_permissions(dir.join("agent"), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
         }
         let response = worker
             .dispatch(

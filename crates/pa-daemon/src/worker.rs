@@ -287,9 +287,11 @@ impl Worker {
             crate::lease::RuntimeSessionAuthority::for_agent_dir(&config.agent_dir)
         } else {
             crate::lease::RuntimeSessionAuthority::for_supervisor(
-                &config.agent_dir, &config.supervisor_socket_path,
+                &config.agent_dir,
+                &config.supervisor_socket_path,
             )
-        }.map_err(|error| format!("{error:#}"));
+        }
+        .map_err(|error| format!("{error:#}"));
         let events = Arc::new(EventPump::new());
         let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let core = SessionCore {

@@ -148,10 +148,16 @@ impl RpcSession {
         self.pump_epoch.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn try_mutation_admission(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
-        let guard = self.mutation_admission.try_read()
+    pub(crate) fn try_mutation_admission(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
+        let guard = self
+            .mutation_admission
+            .try_read()
             .map_err(|_| "Session replacement is in progress; retry the command".to_string())?;
-        if self.is_replacing() { return Err("Session replacement is in progress; retry the command".to_string()); }
+        if self.is_replacing() {
+            return Err("Session replacement is in progress; retry the command".to_string());
+        }
         Ok(guard)
     }
 
@@ -257,8 +263,12 @@ impl RpcSession {
         let _replacing = self.replacing_gate();
         // This is an operation admission gate, not the engine/registry data
         // mutex. Abort remains served while older mutations settle.
-        let _mutations = tokio::time::timeout(std::time::Duration::from_secs(15), self.mutation_admission.write())
-            .await.map_err(|_| "Session mutations are still settling; replacement deferred".to_string())?;
+        let _mutations = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.mutation_admission.write(),
+        )
+        .await
+        .map_err(|_| "Session mutations are still settling; replacement deferred".to_string())?;
         self.pump_epoch.fetch_add(1, Ordering::SeqCst);
         // Settle the running turn BEFORE the factory opens the file: the
         // turn's final rows land in the history the replacement hydrates
@@ -282,8 +292,13 @@ impl RpcSession {
             let handle = self.handle.read().await;
             (Arc::clone(&handle.engine), handle.session_lease.clone())
         };
-        if let RpcEngineRequest::Open { session_path, reuse_lease } = &mut request {
-            let canonical = crate::lease::checked_session_path(session_path).map_err(|error| error.to_string())?;
+        if let RpcEngineRequest::Open {
+            session_path,
+            reuse_lease,
+        } = &mut request
+        {
+            let canonical = crate::lease::checked_session_path(session_path)
+                .map_err(|error| error.to_string())?;
             if let Some(lease) = current_lease.filter(|lease| lease.session_path == canonical) {
                 // #42 fix (RECURRENCE SWEEP, site 3 of 3): this is the exact
                 // scenario the lock-contract review named verbatim ("RPC
@@ -292,7 +307,9 @@ impl RpcSession {
                 // the deletion ledger - a tombstone committed while this
                 // session held the lease must still be caught before this
                 // reuse is allowed.
-                lease.revalidate_and_check_admission().map_err(|error| format!("{error:#}"))?;
+                lease
+                    .revalidate_and_check_admission()
+                    .map_err(|error| format!("{error:#}"))?;
                 adopted_lease = Some(lease);
                 *reuse_lease = true;
             }
@@ -351,7 +368,9 @@ impl RpcSession {
             // harmless-redundant for a freshly-acquired lease (admission
             // was already checked moments earlier), closes the gap for
             // the adopted-lease case.
-            lease.revalidate_and_check_admission().map_err(|error| format!("Replacement ownership changed: {error:#}"))?;
+            lease
+                .revalidate_and_check_admission()
+                .map_err(|error| format!("Replacement ownership changed: {error:#}"))?;
         }
         let mut handle = self.handle.write().await;
         if !Arc::ptr_eq(&handle.engine, &old_engine) {
@@ -413,7 +432,7 @@ impl Drop for ReplacingGate<'_> {
 /// minimal harness for `replace_locked`'s `RpcEngineRequest::Open` same-
 /// path-reuse branch - the exact scenario the lock-contract review named
 /// verbatim ("RPC same-path replacement transfers the existing lease and
-/// sets reuse_lease"). Uses `LineWriter::for_test()` (a new, minimal,
+/// sets `reuse_lease`"). Uses `LineWriter::for_test()` (a new, minimal,
 /// `#[cfg(test)]`-gated constructor added alongside this test, reviewed
 /// together as one unit) since the production constructor writes to the
 /// real stdout and is private to this crate's own module.
@@ -470,7 +489,9 @@ mod same_path_reuse_tests {
         lease: Option<Arc<crate::lease::SessionLease>>,
     ) -> RpcEngineHandle {
         let engine_model = test_engine_model();
-        let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(engine_model.clone()));
+        let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(
+            engine_model.clone(),
+        ));
         provider.push_text_turn("ok");
         let engine = pa_core::session_engine::engine::create_session(
             pa_core::session_engine::engine::SessionEngineConfig {
@@ -495,8 +516,8 @@ mod same_path_reuse_tests {
     }
 
     /// RED: demonstrates the bypass under the CURRENT, unfixed code - the
-    /// same gap confirmed for `switch_session` (worker/replacement_gate_tests.rs)
-    /// and the idempotent re-create path (worker/create_collapse_tests.rs).
+    /// same gap confirmed for `switch_session` (`worker/replacement_gate_tests.rs`)
+    /// and the idempotent re-create path (`worker/create_collapse_tests.rs`).
     /// `lease.revalidate()` alone proves the lease is unreleased and
     /// identity-matched; it never re-reads the deletion ledger.
     #[tokio::test]
@@ -597,7 +618,8 @@ mod same_path_reuse_tests {
     /// is even called) must still be caught here, using the same shared
     /// `revalidate_and_check_admission()`.
     #[tokio::test]
-    async fn issue_42_rpc_replacement_publication_revalidates_a_tombstone_committed_during_the_build() {
+    async fn issue_42_rpc_replacement_publication_revalidates_a_tombstone_committed_during_the_build(
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let dir = tempfile::tempdir().unwrap();
             let agent_dir = dir.path().join("agent");
@@ -688,5 +710,4 @@ mod same_path_reuse_tests {
         .await
         .expect("bounded rpc mid-build tombstone test");
     }
-
 }

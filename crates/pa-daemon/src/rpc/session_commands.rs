@@ -208,30 +208,42 @@ async fn fork_at(
     }
     let forked_path = {
         let handle = state.session.handle().await;
-        let source_lease = handle.session_lease.clone()
+        let source_lease = handle
+            .session_lease
+            .clone()
             .ok_or_else(|| "Persisted RPC session has no runtime ownership".to_string())?;
         let persistence = handle.engine.session.shared_persistence();
         let manager = persistence.lock().await;
-        let session_file = manager.get_session_file()
-            .ok_or_else(|| "Persisted session is missing a session file".to_string())?.to_path_buf();
+        let session_file = manager
+            .get_session_file()
+            .ok_or_else(|| "Persisted session is missing a session file".to_string())?
+            .to_path_buf();
         let session_dir = manager.get_session_dir().to_path_buf();
         let source_cwd = manager.get_cwd().display().to_string();
         drop(manager);
         drop(handle);
-        source_lease.revalidate().map_err(|error| format!("{error:#}"))?;
+        source_lease
+            .revalidate()
+            .map_err(|error| format!("{error:#}"))?;
         let store = crate::session_store::SessionFile::open(&session_file)
             .map_err(|error| format!("{error:#}"))?;
         let mut forked = if let Some(leaf) = target_leaf.as_deref() {
-            store.prepare_branched_file(leaf, &session_dir)
+            store
+                .prepare_branched_file(leaf, &session_dir)
                 .map_err(|error| format!("{error:#}"))?
         } else {
             let mut forked = crate::session_store::SessionFile::create(
-                &source_cwd, session_file.to_str(), store.rlm_depth().unwrap_or(0),
+                &source_cwd,
+                session_file.to_str(),
+                store.rlm_depth().unwrap_or(0),
             );
-            forked.set_path(session_dir.join(crate::session_store::session_file_name(forked.session_id())));
+            forked.set_path(
+                session_dir.join(crate::session_store::session_file_name(forked.session_id())),
+            );
             forked
         };
-        let target_lease = source_lease.acquire_target(&forked.path)
+        let target_lease = source_lease
+            .acquire_target(&forked.path)
             .map_err(|error| format!("{error:#}"))?;
         forked.lease = Some(Arc::clone(&target_lease));
         forked.rewrite().map_err(|error| format!("{error:#}"))?;
@@ -239,7 +251,9 @@ async fn fork_at(
         drop(forked);
         match target_lease.try_release() {
             crate::lease::LeaseReleaseOutcome::Released => target,
-            crate::lease::LeaseReleaseOutcome::Deferred => return Err("Fork ownership is still settling; replacement deferred".to_string()),
+            crate::lease::LeaseReleaseOutcome::Deferred => {
+                return Err("Fork ownership is still settling; replacement deferred".to_string())
+            }
         }
     };
     let outcome = state

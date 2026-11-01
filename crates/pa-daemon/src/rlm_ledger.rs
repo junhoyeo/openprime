@@ -1063,11 +1063,15 @@ impl RlmSpawnLedger {
         Ok(records)
     }
 
-    /// Authority reads, per `replay::classify_authority_line`: torn, non-UTF-8,
-    /// non-JSON and absent-field lines never committed and are skipped and
-    /// logged by file and line number, never content. Present-but-unknown or
-    /// wrongly typed fields, unknown op or version and duplicate keys refuse.
-    /// The header, caps and I/O stay fatal.
+    /// Authority reads, per `replay::classify_authority_line`: torn,
+    /// non-UTF-8, non-JSON and absent-field lines never committed and are
+    /// skipped and logged by file and line number, never content.
+    /// Present-but-unknown or wrongly typed fields, unknown op or version,
+    /// and duplicate keys refuse. The header, size caps and I/O stay fatal.
+    /// This never decodes the whole file as UTF-8 (that would let a single
+    /// bad-UTF-8 line poison byte-identical neighboring lines via lossy
+    /// replacement, or hard-fail everything): it splits raw bytes and
+    /// decodes per segment instead.
     fn read_authority_records(&self, bytes: &[u8]) -> Result<Vec<LedgerRecord>> {
         let path = self.ledger_path().display().to_string();
         let mut lines = bytes.split(|byte| *byte == b'\n').enumerate().peekable();
@@ -1080,11 +1084,13 @@ impl RlmSpawnLedger {
                 break line;
             }
         };
-        let header = std::str::from_utf8(header).map_err(|_| {
+        let header_str = std::str::from_utf8(header).map_err(|_| {
             anyhow::anyhow!("authority ledger {path} has a malformed ownership header")
         })?;
-        replay::validate_unique_json(header)?;
-        let header: Value = serde_json::from_str(header).map_err(|_| {
+        replay::validate_unique_json(header_str).map_err(|_| {
+            anyhow::anyhow!("authority ledger {path} has an ambiguous ownership header")
+        })?;
+        let header: Value = serde_json::from_str(header_str).map_err(|_| {
             anyhow::anyhow!("authority ledger {path} has a malformed ownership header")
         })?;
         let scope = header
@@ -1112,8 +1118,9 @@ impl RlmSpawnLedger {
             }
             // The last segment without a trailing newline is a torn tail.
             let torn = !terminated && lines.peek().is_none();
-            // One message carries both the file and the refusal reason; plain
-            // Display of an anyhow context would otherwise hide the reason.
+            // One message carries both the file and the refusal reason: a
+            // plain Display of an anyhow context would otherwise hide the
+            // reason (the outer context alone, not the wrapped chain).
             let classified = match replay::classify_authority_line(raw, index, torn) {
                 Ok(classified) => classified,
                 Err(error) => bail!("RLM ledger {path}: {error:#}"),

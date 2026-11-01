@@ -76,9 +76,17 @@ impl AgentRoster {
         })
     }
 
-    pub(crate) fn pull_is_current(&self, worker_id: &str, instance: &str, counter: Option<u64>) -> bool {
-        counter.is_none_or(|counter| self.delta_watermarks.get(worker_id)
-            .is_none_or(|slot| slot.instance == instance && counter >= slot.watermark))
+    pub(crate) fn pull_is_current(
+        &self,
+        worker_id: &str,
+        instance: &str,
+        counter: Option<u64>,
+    ) -> bool {
+        counter.is_none_or(|counter| {
+            self.delta_watermarks
+                .get(worker_id)
+                .is_none_or(|slot| slot.instance == instance && counter >= slot.watermark)
+        })
     }
 
     /// The stale-delta gate for one worker's `worker_roster_delta`: a sequence at or below

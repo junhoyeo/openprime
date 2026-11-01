@@ -301,7 +301,7 @@ mod tests {
     /// leased` below, against the delta's own `sessionFile`) will actually
     /// publish as the owner/generation. Mirrors `root_identity.rs`'s
     /// identically-shaped fix (review-record-lifecycle-kind1-root-identity,
-    /// ACCEPTed) - duplicated here rather than shared across files for now;
+    /// `ACCEPTed`) - duplicated here rather than shared across files for now;
     /// worth consolidating into a shared test-support helper as a follow-up
     /// if a 3rd module needs the identical pattern.
     async fn supervisor_with_stale_identity(dir: &std::path::Path) -> Arc<Supervisor> {
@@ -347,26 +347,43 @@ mod tests {
 
     /// #42 Kind-1 fix: same pattern as `root_identity.rs`'s
     /// `ensure_session_leased` (review-record-lifecycle-kind1-root-identity,
-    /// ACCEPTed) - `publish_verified_summary`'s is_root ownership check
+    /// `ACCEPTed`) - `publish_verified_summary`'s `is_root` ownership check
     /// targets the DELTA's own `summary.sessionFile`, never a resident's
     /// session file at setup time, so a root-targeted delta needs a real,
     /// fence-acquired lease on that exact file before it is sent.
-    async fn ensure_delta_session_leased(supervisor: &Arc<Supervisor>, summary: &serde_json::Value) {
-        let Some(file) = summary.get("sessionFile").and_then(serde_json::Value::as_str).filter(|f| !f.is_empty()) else {
+    // Kept async for caller consistency (every call site already
+    // `.await`s it); its body happens to be synchronous today, not a
+    // reason to churn callers for a style-only clippy preference.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn ensure_delta_session_leased(
+        supervisor: &Arc<Supervisor>,
+        summary: &serde_json::Value,
+    ) {
+        let Some(file) = summary
+            .get("sessionFile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|f| !f.is_empty())
+        else {
             return;
         };
-        let active = summary.get("activeSessionId").or_else(|| summary.get("id"))
-            .and_then(serde_json::Value::as_str).unwrap_or_default();
+        let active = summary
+            .get("activeSessionId")
+            .or_else(|| summary.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         let session_path = std::path::PathBuf::from(file);
         if !session_path.exists() {
             let mut sf = crate::session_store::SessionFile::create(
-                &session_path.parent().unwrap().to_string_lossy(), None, 0,
+                &session_path.parent().unwrap().to_string_lossy(),
+                None,
+                0,
             );
             sf.set_path(session_path.clone());
             sf.rewrite().unwrap();
         }
         let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
-            &supervisor.options.agent_dir, &supervisor.options.socket_path,
+            &supervisor.options.agent_dir,
+            &supervisor.options.socket_path,
         )
         .expect("supervisor authority resolves");
         let outcome = {

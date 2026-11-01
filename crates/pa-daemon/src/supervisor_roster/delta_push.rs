@@ -176,11 +176,7 @@ async fn worker_roster_delta_drops_stale_sequences() {
     // counter (the worker has pushed nothing yet): it starts the
     // slot and applies — the create path's first authoritative
     // write.
-    let resident = supervisor
-        .registry
-        .get("s1")
-        .await
-        .expect("resident");
+    let resident = supervisor.registry.get("s1").await.expect("resident");
     let mut fresh_pull = summary("off");
     fresh_pull["rosterDeltaSequence"] = serde_json::json!(0);
     fresh_pull["workerInstanceId"] = serde_json::json!("i1");

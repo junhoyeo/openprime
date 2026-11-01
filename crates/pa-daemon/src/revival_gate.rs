@@ -312,9 +312,17 @@ mod tests {
         let file = session_file(Some("active"));
         let agent_dir = agent_dir();
         let _lease = crate::lease::acquire_runtime_session_lease(&file, &agent_dir).unwrap();
-        let lease_dir = std::fs::read_dir(agent_dir.join("session-leases")).unwrap()
-            .map(Result::unwrap).find(|entry| entry.path().extension().is_some_and(|extension| extension == "lock"))
-            .unwrap().path();
+        let lease_dir = std::fs::read_dir(agent_dir.join("session-leases"))
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+            })
+            .unwrap()
+            .path();
         let owner = lease_dir.join("owner.json");
         let corrupt = b"{truncated owner";
         std::fs::write(&owner, corrupt).unwrap();

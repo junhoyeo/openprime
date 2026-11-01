@@ -345,7 +345,7 @@ async fn a_resume_is_append_only_and_never_deletes_rows() {
 /// only calls `lease.revalidate()` before allowing reuse - the SAME gap
 /// confirmed for `switch_session`'s same-path reuse
 /// (`issue_42_same_path_switch_revalidates_a_committed_tombstone`,
-/// worker/replacement_gate_tests.rs). `revalidate()` proves the lease is
+/// `worker/replacement_gate_tests.rs`). `revalidate()` proves the lease is
 /// still unreleased and identity-matched; it never re-reads the deletion
 /// ledger. A tombstone committed while the worker holds this lease (e.g.
 /// across a supervisor restart/respawn, an even wider window than a single

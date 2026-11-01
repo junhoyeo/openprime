@@ -17,7 +17,11 @@ pub struct PrivacyScanLimits {
 }
 impl Default for PrivacyScanLimits {
     fn default() -> Self {
-        Self { max_bytes:256*1024*1024, max_row_bytes:8*1024*1024, max_rows:1_000_000 }
+        Self {
+            max_bytes: 256 * 1024 * 1024,
+            max_row_bytes: 8 * 1024 * 1024,
+            max_rows: 1_000_000,
+        }
     }
 }
 
@@ -28,10 +32,12 @@ pub struct SessionPrivacyScan {
     pub restriction: Option<AdmissionPrivacy>,
     pub rows: usize,
     pub bytes: u64,
-    pub digest: [u8;32],
+    pub digest: [u8; 32],
 }
 
-fn invalid(message: &'static str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData,message) }
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
 
 /// The reserved carrier's distinguishing field value, and the shortest prefix of it
 /// treated as evidence of an attempt. The two failure directions of this threshold
@@ -48,7 +54,10 @@ const MARKER_PREFIX: &[u8] = b"admission_privacy";
 const MARKER_MIN_PREFIX_LEN: usize = 6;
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// A NON-SECURITY screen for ORDINARY, accidental corruption (a crash mid-write, bit
@@ -72,6 +81,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 ///   any custom-typed row including this one, so it refuses;
 /// - a truncation-robust, short prefix match on the carrier's distinguishing field
 ///   value itself, independently of the key check above.
+///
 /// Either signal alone refuses; both absent tolerates.
 #[must_use]
 fn screens_clean_of_attempted_marker(raw: &[u8]) -> bool {
@@ -102,41 +112,55 @@ fn screens_clean_of_attempted_marker(raw: &[u8]) -> bool {
 /// Returns an error for malformed/duplicate/unsupported policy that is not covered
 /// by the two narrow tolerances above, I/O, bounds, or an observed change to the
 /// opened file while scanning.
-pub fn scan_opened_container(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacyScan> {
-    let position=file.stream_position()?;
-    let result=scan(file,limits);
-    let restored=file.seek(SeekFrom::Start(position));
-    match (result,restored) {
-        (Ok(result),Ok(_))=>Ok(result),
-        (Err(error),_)|(_,Err(error))=>Err(error),
+pub fn scan_opened_container(
+    file: &mut File,
+    limits: PrivacyScanLimits,
+) -> io::Result<SessionPrivacyScan> {
+    let position = file.stream_position()?;
+    let result = scan(file, limits);
+    let restored = file.seek(SeekFrom::Start(position));
+    match (result, restored) {
+        (Ok(result), Ok(_)) => Ok(result),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
 
 fn scan(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacyScan> {
-    let before=file.metadata()?;
-    if !before.is_file() { return Err(invalid("session privacy input is not a regular file")); }
-    if before.len()>limits.max_bytes { return Err(invalid("session privacy scan exceeds byte limit")); }
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(invalid("session privacy input is not a regular file"));
+    }
+    if before.len() > limits.max_bytes {
+        return Err(invalid("session privacy scan exceeds byte limit"));
+    }
     file.seek(SeekFrom::Start(0))?;
-    let mut reader=BufReader::new(&mut *file);
-    let mut line=Vec::new();
-    let mut rows=0;
-    let mut bytes=0_u64;
-    let mut session_id=None;
-    let mut restriction=None;
-    let mut ids=HashSet::new();
-    let mut hash=Sha256::new();
+    let mut reader = BufReader::new(&mut *file);
+    let mut line = Vec::new();
+    let mut rows = 0;
+    let mut bytes = 0_u64;
+    let mut session_id = None;
+    let mut restriction = None;
+    let mut ids = HashSet::new();
+    let mut hash = Sha256::new();
     loop {
         line.clear();
-        let read=(&mut reader).take(limits.max_row_bytes.saturating_add(1) as u64)
-            .read_until(b'\n',&mut line)?;
-        if read==0 { break; }
-        bytes=bytes.checked_add(read as u64).ok_or_else(||invalid("session privacy scan byte overflow"))?;
-        if read>limits.max_row_bytes || bytes>limits.max_bytes || rows>=limits.max_rows {
+        let read = (&mut reader)
+            .take(limits.max_row_bytes.saturating_add(1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| invalid("session privacy scan byte overflow"))?;
+        if read > limits.max_row_bytes || bytes > limits.max_bytes || rows >= limits.max_rows {
             return Err(invalid("session privacy scan exceeds configured limit"));
         }
         hash.update(&line);
-        if line.iter().all(u8::is_ascii_whitespace) { continue; }
-        let decoded=decode_privacy_row(&line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let decoded = decode_privacy_row(&line);
         // MUST stay scoped to the two AMBIGUOUS decode failures only: the row could
         // not even be parsed into a JSON object at all, so decode_privacy_row never
         // reached a verdict about its content. InvalidEnvelope/InvalidPolicy/
@@ -145,9 +169,11 @@ fn scan(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacy
         // or tolerated, regardless of position or content, or a row deliberately
         // shaped to fail validation (e.g. a disguised non-"custom"-typed collision
         // row) would read as "a different type entirely" and slip through.
-        let ambiguous_parse_failure=matches!(decoded,
-            Err(PrivacyRowError::InvalidJson|PrivacyRowError::NotObject));
-        if decoded.is_err() && rows>0 && ambiguous_parse_failure {
+        let ambiguous_parse_failure = matches!(
+            decoded,
+            Err(PrivacyRowError::InvalidJson | PrivacyRowError::NotObject)
+        );
+        if decoded.is_err() && rows > 0 && ambiguous_parse_failure {
             // Not the header, and genuinely unparseable (not a resolved rejection):
             // eligible for one of the two narrow tolerances.
             if screens_clean_of_attempted_marker(&line) {
@@ -167,122 +193,185 @@ fn scan(file: &mut File, limits: PrivacyScanLimits) -> io::Result<SessionPrivacy
                 // same way the existing loader already does, don't count it.
                 continue;
             }
-            return Err(invalid("session privacy input has malformed or conflicting metadata"));
+            return Err(invalid(
+                "session privacy input has malformed or conflicting metadata",
+            ));
         }
-        let (value,policy)=decoded.map_err(|_|invalid("session privacy input has malformed or conflicting metadata"))?;
-        if rows==0 {
-            if value.get("type").and_then(serde_json::Value::as_str)!=Some("session") {
+        let (value, policy) = decoded
+            .map_err(|_| invalid("session privacy input has malformed or conflicting metadata"))?;
+        if rows == 0 {
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
                 return Err(invalid("session privacy input is missing its header"));
             }
-            let id=value.get("id").and_then(serde_json::Value::as_str)
-                .filter(|id|!id.is_empty()&&!id.contains('\0'))
-                .ok_or_else(||invalid("session privacy header identity is invalid"))?;
-            session_id=Some(id.to_string());
-        } else if value.get("type").and_then(serde_json::Value::as_str)==Some("session") {
+            let id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty() && !id.contains('\0'))
+                .ok_or_else(|| invalid("session privacy header identity is invalid"))?;
+            session_id = Some(id.to_string());
+        } else if value.get("type").and_then(serde_json::Value::as_str) == Some("session") {
             return Err(invalid("session privacy input has multiple headers"));
         }
-        if let Some(id)=value.get("id").and_then(serde_json::Value::as_str) {
-            if !ids.insert(id.to_string()) { return Err(invalid("session privacy input has duplicate entry identities")); }
+        if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+            if !ids.insert(id.to_string()) {
+                return Err(invalid(
+                    "session privacy input has duplicate entry identities",
+                ));
+            }
         }
-        if policy.is_some() { restriction=policy; }
-        rows+=1;
+        if policy.is_some() {
+            restriction = policy;
+        }
+        rows += 1;
     }
     drop(reader);
-    let after=file.metadata()?;
-    if before.len()!=after.len() || before.modified()?!=after.modified()? || bytes!=after.len() {
+    let after = file.metadata()?;
+    if before.len() != after.len()
+        || before.modified()? != after.modified()?
+        || bytes != after.len()
+    {
         return Err(invalid("session privacy input changed during validation"));
     }
-    let session_id=session_id.ok_or_else(||invalid("session privacy input is empty"))?;
-    Ok(SessionPrivacyScan { session_id,restriction,rows,bytes,digest:hash.finalize().into() })
+    let session_id = session_id.ok_or_else(|| invalid("session privacy input is empty"))?;
+    Ok(SessionPrivacyScan {
+        session_id,
+        restriction,
+        rows,
+        bytes,
+        digest: hash.finalize().into(),
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pa_types::session::{EntryBase,FileEntry};
     use pa_types::session::privacy::ADMISSION_PRIVACY_CUSTOM_TYPE;
-    use serde_json::{json,Map};
+    use pa_types::session::{EntryBase, FileEntry};
+    use serde_json::{json, Map};
     fn rows() -> Vec<serde_json::Value> {
-        let marker=AdmissionPrivacy::RestrictedV1.entry(EntryBase {
-            id:Some("off-branch-marker".into()),parent_id:Some("old-leaf".into()),
-            timestamp:Some("2026-10-30T00:00:00.000Z".into()),rest:Map::default(),
-        }).unwrap();
-        assert!(matches!(marker,FileEntry::Custom{..}));
-        vec![json!({"type":"session","version":3,"id":"synthetic-session"}),
+        let marker = AdmissionPrivacy::RestrictedV1
+            .entry(EntryBase {
+                id: Some("off-branch-marker".into()),
+                parent_id: Some("old-leaf".into()),
+                timestamp: Some("2026-10-30T00:00:00.000Z".into()),
+                rest: Map::default(),
+            })
+            .unwrap();
+        assert!(matches!(marker, FileEntry::Custom { .. }));
+        vec![
+            json!({"type":"session","version":3,"id":"synthetic-session"}),
             json!({"type":"message","id":"old-leaf","parentId":null}),
             serde_json::to_value(marker).unwrap(),
-            json!({"type":"message","id":"selected-leaf","parentId":null})]
+            json!({"type":"message","id":"selected-leaf","parentId":null}),
+        ]
     }
     #[test]
     fn actual_serialized_off_branch_carrier_is_folded_from_entire_file() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let content=rows().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")+"\n";
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();file.seek(SeekFrom::Start(7)).unwrap();
-        let result=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
-        assert_eq!((result.session_id.as_str(),result.restriction,result.rows),
-            ("synthetic-session",Some(AdmissionPrivacy::RestrictedV1),4));
-        assert_eq!(file.stream_position().unwrap(),7);
-        assert_eq!(std::fs::read_to_string(path).unwrap(),content);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let content = rows()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+        let result = scan_opened_container(&mut file, PrivacyScanLimits::default()).unwrap();
+        assert_eq!(
+            (result.session_id.as_str(), result.restriction, result.rows),
+            ("synthetic-session", Some(AdmissionPrivacy::RestrictedV1), 4)
+        );
+        assert_eq!(file.stream_position().unwrap(), 7);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
     }
     #[test]
     fn incomplete_or_capped_input_is_refused_without_repair() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let content=rows().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")+"\n{\"customType\":";
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-        assert!(scan_opened_container(&mut file,PrivacyScanLimits{max_rows:1,..PrivacyScanLimits::default()}).is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(),content);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let content = rows()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n{\"customType\":";
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file, PrivacyScanLimits::default()).is_err());
+        assert!(scan_opened_container(
+            &mut file,
+            PrivacyScanLimits {
+                max_rows: 1,
+                ..PrivacyScanLimits::default()
+            }
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
     }
 
     #[test]
     fn torn_trailing_fragment_with_no_marker_trace_is_tolerated() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let header=json!({"type":"session","version":3,"id":"public"}).to_string();
-        let message=json!({"type":"message","id":"m1","parentId":null}).to_string();
-        let mut content=format!("{header}\n{message}\n").into_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = json!({"type":"session","version":3,"id":"public"}).to_string();
+        let message = json!({"type":"message","id":"m1","parentId":null}).to_string();
+        let mut content = format!("{header}\n{message}\n").into_bytes();
         // A cut-off UTF-8 continuation byte, matching a write interrupted mid-string.
-        content.extend_from_slice(b"{\"type\":\"message\",\"id\":\"torn\",\"message\":{\"role\":\"user\",\"con\xc3");
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        let result=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
-        assert_eq!((result.session_id.as_str(),result.restriction,result.rows),("public",None,2));
-        assert_eq!(std::fs::read(&path).unwrap(),content);
+        content.extend_from_slice(
+            b"{\"type\":\"message\",\"id\":\"torn\",\"message\":{\"role\":\"user\",\"con\xc3",
+        );
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let result = scan_opened_container(&mut file, PrivacyScanLimits::default()).unwrap();
+        assert_eq!(
+            (result.session_id.as_str(), result.restriction, result.rows),
+            ("public", None, 2)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content);
     }
     #[test]
     fn torn_trailing_fragment_with_a_customtype_trace_still_refuses() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let header=json!({"type":"session","version":3,"id":"public"}).to_string();
-        let content=format!("{header}\n{{\"customType\":");
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = json!({"type":"session","version":3,"id":"public"}).to_string();
+        let content = format!("{header}\n{{\"customType\":");
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file, PrivacyScanLimits::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
     #[test]
     fn mid_file_malformed_row_with_no_marker_trace_is_tolerated_and_restriction_still_folds() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let marker=AdmissionPrivacy::RestrictedV1.entry(EntryBase {
-            id:Some("privacy-row".into()),parent_id:Some("u0".into()),
-            timestamp:Some("2026-10-30T00:00:00.000Z".into()),rest:Map::default(),
-        }).unwrap();
-        let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
-        let before=json!({"type":"message","id":"u0","parentId":null}).to_string();
-        let marker_row=serde_json::to_string(&marker).unwrap();
-        let after=json!({"type":"message","id":"u1","parentId":"privacy-row"}).to_string();
-        let content=format!("{header}\n{before}\nnot json\n{marker_row}\n{after}\n");
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        let result=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
-        assert_eq!((result.session_id.as_str(),result.restriction,result.rows),
-            ("mixed",Some(AdmissionPrivacy::RestrictedV1),4));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let marker = AdmissionPrivacy::RestrictedV1
+            .entry(EntryBase {
+                id: Some("privacy-row".into()),
+                parent_id: Some("u0".into()),
+                timestamp: Some("2026-10-30T00:00:00.000Z".into()),
+                rest: Map::default(),
+            })
+            .unwrap();
+        let header = json!({"type":"session","version":3,"id":"mixed"}).to_string();
+        let before = json!({"type":"message","id":"u0","parentId":null}).to_string();
+        let marker_row = serde_json::to_string(&marker).unwrap();
+        let after = json!({"type":"message","id":"u1","parentId":"privacy-row"}).to_string();
+        let content = format!("{header}\n{before}\nnot json\n{marker_row}\n{after}\n");
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let result = scan_opened_container(&mut file, PrivacyScanLimits::default()).unwrap();
+        assert_eq!(
+            (result.session_id.as_str(), result.restriction, result.rows),
+            ("mixed", Some(AdmissionPrivacy::RestrictedV1), 4)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
     #[test]
     fn mid_file_malformed_row_with_a_marker_trace_still_refuses() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
-        let after=json!({"type":"message","id":"u1","parentId":null}).to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = json!({"type":"session","version":3,"id":"mixed"}).to_string();
+        let after = json!({"type":"message","id":"u1","parentId":null}).to_string();
         // Both payloads below are genuinely unparseable (InvalidJson), not merely
         // schema-rejected -- a syntactically valid object with an unrelated
         // customType value (which decode_privacy_row already resolves to Ok(None),
@@ -291,26 +380,30 @@ mod tests {
             "{\"customType\":\"admission_privacy_state\", broken}",
             "{\"admission_priv broken}",
         ] {
-            let content=format!("{header}\n{suspicious}\n{after}\n");
-            std::fs::write(&path,&content).unwrap();
-            let mut file=File::open(&path).unwrap();
-            assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+            let content = format!("{header}\n{suspicious}\n{after}\n");
+            std::fs::write(&path, &content).unwrap();
+            let mut file = File::open(&path).unwrap();
+            assert!(scan_opened_container(&mut file, PrivacyScanLimits::default()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
         }
     }
     #[test]
     fn a_syntactically_valid_row_with_an_unrelated_customtype_never_reaches_the_screen() {
         // decode_privacy_row resolves this definitively (Ok, no restriction) --
         // confirms the screen path is never even entered for a row that parses.
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
-        let ordinary=json!({"customType":"something_else"}).to_string();
-        let after=json!({"type":"message","id":"u1","parentId":null}).to_string();
-        let content=format!("{header}\n{ordinary}\n{after}\n");
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        let result=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
-        assert_eq!((result.session_id.as_str(),result.restriction,result.rows),("mixed",None,3));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = json!({"type":"session","version":3,"id":"mixed"}).to_string();
+        let ordinary = json!({"customType":"something_else"}).to_string();
+        let after = json!({"type":"message","id":"u1","parentId":null}).to_string();
+        let content = format!("{header}\n{ordinary}\n{after}\n");
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let result = scan_opened_container(&mut file, PrivacyScanLimits::default()).unwrap();
+        assert_eq!(
+            (result.session_id.as_str(), result.restriction, result.rows),
+            ("mixed", None, 3)
+        );
     }
     #[test]
     fn a_byte_screen_clean_reserved_collision_row_still_refuses() {
@@ -329,50 +422,64 @@ mod tests {
         // used a plain, unescaped disguised row, which the screen alone already
         // catches via the literal "customType" substring -- that version proved
         // nothing about the MUST-FIX 1 boundary specifically; this one does.
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let header=json!({"type":"session","version":3,"id":"mixed"}).to_string();
-        let disguised=concat!(
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = json!({"type":"session","version":3,"id":"mixed"}).to_string();
+        let disguised = concat!(
             r#"{"type":"message","message":{"role":"custom","#,
             r#""\u0063ustomType":"\u0061dmission_privacy_state","content":"synthetic"}}"#,
         );
-        assert!(!disguised.contains("\"customType\""),
-            "fixture must not contain the literal key substring, or it proves nothing");
+        assert!(
+            !disguised.contains("\"customType\""),
+            "fixture must not contain the literal key substring, or it proves nothing"
+        );
         assert!(!contains_bytes(disguised.as_bytes(),&MARKER_PREFIX[..MARKER_MIN_PREFIX_LEN]),
             "fixture must not contain the literal value prefix the production threshold actually checks, or it proves nothing");
-        let parsed:serde_json::Value=serde_json::from_str(disguised).unwrap();
-        assert_eq!(parsed["message"]["customType"],ADMISSION_PRIVACY_CUSTOM_TYPE,
-            "fixture must still resolve to the real reserved name once parsed");
-        let after=json!({"type":"message","id":"u1","parentId":null}).to_string();
-        let content=format!("{header}\n{disguised}\n{after}\n");
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+        let parsed: serde_json::Value = serde_json::from_str(disguised).unwrap();
+        assert_eq!(
+            parsed["message"]["customType"], ADMISSION_PRIVACY_CUSTOM_TYPE,
+            "fixture must still resolve to the real reserved name once parsed"
+        );
+        let after = json!({"type":"message","id":"u1","parentId":null}).to_string();
+        let content = format!("{header}\n{disguised}\n{after}\n");
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file, PrivacyScanLimits::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
     #[test]
     fn header_row_itself_is_never_eligible_for_either_tolerance() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("session.jsonl");
-        let content="not json at all".to_string();
-        std::fs::write(&path,&content).unwrap();
-        let mut file=File::open(&path).unwrap();
-        assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),content);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let content = "not json at all".to_string();
+        std::fs::write(&path, &content).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(scan_opened_container(&mut file, PrivacyScanLimits::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
 
     #[test]
     fn complete_final_object_needs_no_newline_but_partial_or_trailing_bytes_refuse() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("no-newline.jsonl");
-        let public=serde_json::json!({"type":"session","version":3,"id":"public"}).to_string();
-        std::fs::write(&path,&public).unwrap();
-        let mut file=File::open(&path).unwrap();
-        let scan=scan_opened_container(&mut file,PrivacyScanLimits::default()).unwrap();
-        assert_eq!((scan.session_id.as_str(),scan.restriction),("public",None));
-        for suffix in [" trailing", "\n{\"customType\":", "\n{\"type\":\"custom\",\"customType\":\"admission_privacy_state\""] {
-            let invalid=public.clone()+suffix;std::fs::write(&path,&invalid).unwrap();
-            let mut file=File::open(&path).unwrap();
-            assert!(scan_opened_container(&mut file,PrivacyScanLimits::default()).is_err());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(),invalid);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-newline.jsonl");
+        let public = serde_json::json!({"type":"session","version":3,"id":"public"}).to_string();
+        std::fs::write(&path, &public).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let scan = scan_opened_container(&mut file, PrivacyScanLimits::default()).unwrap();
+        assert_eq!(
+            (scan.session_id.as_str(), scan.restriction),
+            ("public", None)
+        );
+        for suffix in [
+            " trailing",
+            "\n{\"customType\":",
+            "\n{\"type\":\"custom\",\"customType\":\"admission_privacy_state\"",
+        ] {
+            let invalid = public.clone() + suffix;
+            std::fs::write(&path, &invalid).unwrap();
+            let mut file = File::open(&path).unwrap();
+            assert!(scan_opened_container(&mut file, PrivacyScanLimits::default()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
         }
     }
-
 }

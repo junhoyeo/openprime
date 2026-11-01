@@ -7,9 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use pa_core::cron::store::{AgentCronJobStore, CancelJobsFilter};
+#[cfg(test)]
+use pa_core::cron::store::AgentCronJobStore;
 
 use crate::lease::canonical_session_path;
 use crate::registry::ResidentWorker;
@@ -21,19 +22,65 @@ use crate::supervisor::Supervisor;
 /// One tree member of a stopped root: its durable session id and file.
 struct TreeMember {
     session_id: String,
+    /// The canonical (filesystem-resolved) identity: used for live-coverage and
+    /// job-ownership matching.
     session_file: PathBuf,
+    /// The spelling as discovered (the root's own argument, or the ledger's
+    /// recorded child path), before canonicalization. A session's scheduled-
+    /// jobs partition may have been registered under either spelling, and
+    /// `session_artifact_dir`'s lexical (non-canonicalizing) computation only
+    /// finds the one it is given - both are tried at cancellation time.
+    raw_session_file: PathBuf,
+}
+
+/// A deferred-not-failed outcome: the caller should retry later rather than treat
+/// this as a terminal refusal. Carries `std::io::ErrorKind::WouldBlock` so callers
+/// (and tests) can distinguish "try again" (live coverage, an unreadable
+/// descendant that might just be mid-write) from an ordinary refusal.
+fn deferred(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        reason.to_string(),
+    ))
+}
+
+/// Like `canonical_session_path`, but refuses instead of silently falling back to
+/// treating a dangling symlink along the path as an ordinary not-yet-created one.
+/// An existing symlink that itself resolves fine (its target exists) is NOT
+/// dangling; only a component whose own resolution fails is. The genuinely
+/// not-yet-created case (nothing exists at any level) is unchanged and still
+/// resolves via `canonical_session_path`'s nearest-existing-ancestor fallback.
+fn strict_session_identity(path: &Path) -> Result<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    let mut cursor = path;
+    loop {
+        if let Ok(metadata) = std::fs::symlink_metadata(cursor) {
+            if metadata.file_type().is_symlink() && cursor.canonicalize().is_err() {
+                return Err(deferred(format!(
+                    "cannot resolve a broken symlink along {}: {}",
+                    path.display(),
+                    cursor.display()
+                )));
+            }
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    Ok(canonical_session_path(path))
 }
 
 /// The ledger's parent→child map: non-deleted edges keyed by canonical parent path.
 fn children_by_parent(
     agent_dir: &Path,
     sessions_dir: &Path,
-) -> HashMap<String, Vec<(String, PathBuf)>> {
+) -> Result<HashMap<String, Vec<(String, PathBuf)>>> {
     let ledger = RlmSpawnLedger::new(agent_dir, sessions_dir, |_| {});
     let mut map: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-    let Ok(edges) = ledger.edges(false) else {
-        return map;
-    };
+    let edges = ledger.edges(false)?;
     for edge in edges {
         let child = PathBuf::from(&edge.child);
         let parent = canonical_session_path(Path::new(&edge.parent));
@@ -41,16 +88,23 @@ fn children_by_parent(
             .or_default()
             .push((edge.child_id.clone(), child));
     }
-    map
+    Ok(map)
 }
 
 /// The stopped root's session tree: the root file plus every descendant the ledger
 /// reaches from it (the ledger is the only topology store).
+///
+/// # Errors
+///
+/// Returns a deferred error when a descendant's session metadata cannot be read
+/// (it may be mid-write, or genuinely unreadable) rather than silently omitting
+/// it: an omitted live descendant would hide live coverage, and an omitted
+/// scheduled-jobs partition would let that descendant's jobs survive.
 fn session_tree(
     agent_dir: &Path,
     sessions_dir: &Path,
     root_session_file: &Path,
-) -> Vec<TreeMember> {
+) -> Result<Vec<TreeMember>> {
     let mut members = Vec::new();
     let root = canonical_session_path(root_session_file);
     let root_id = read_session_info(&root).map_or_else(
@@ -62,13 +116,14 @@ fn session_tree(
         |info| info.id,
     );
     if root_id.is_empty() {
-        return members;
+        return Ok(members);
     }
     members.push(TreeMember {
         session_id: root_id,
         session_file: root.clone(),
+        raw_session_file: root_session_file.to_path_buf(),
     });
-    let by_parent = children_by_parent(agent_dir, sessions_dir);
+    let by_parent = children_by_parent(agent_dir, sessions_dir)?;
     let mut queue = vec![root.to_string_lossy().to_string()];
     let mut visited: HashSet<String> = queue.iter().cloned().collect();
     while let Some(parent) = queue.pop() {
@@ -80,16 +135,20 @@ fn session_tree(
             }
             visited.insert(child_key.clone());
             let Some(info) = read_session_info(&child) else {
-                continue;
+                return Err(deferred(format!(
+                    "descendant session metadata unreadable: {}",
+                    child.display()
+                )));
             };
             members.push(TreeMember {
                 session_id: info.id,
                 session_file: child.clone(),
+                raw_session_file: child_file,
             });
             queue.push(child_key);
         }
     }
-    members
+    Ok(members)
 }
 
 /// Cancel the stopped session tree's scheduled jobs: a member cancels by session file.
@@ -101,7 +160,7 @@ pub(crate) fn cancel_scheduled_jobs_for_tree(
     root_session_file: &Path,
     live_files: &HashSet<String>,
 ) -> Result<usize> {
-    let members = session_tree(agent_dir, sessions_dir, root_session_file);
+    let members = session_tree(agent_dir, sessions_dir, root_session_file)?;
     if members.iter().any(|member| {
         live_files.contains(
             &canonical_session_path(&member.session_file)
@@ -109,39 +168,81 @@ pub(crate) fn cancel_scheduled_jobs_for_tree(
                 .to_string(),
         )
     }) {
-        return Ok(0);
+        return Err(deferred(
+            "a live worker still owns a member of this session tree",
+        ));
     }
-    let store = AgentCronJobStore::for_session_artifacts();
-    let mut registered = false;
+    // `session_artifact_dir` is lexical (two `.parent()` calls, no canonicalization),
+    // and the store registers at most one directory per session id, so it cannot
+    // represent a raw and a canonical partition for one session at the same time.
+    // Collect every candidate partition FILE directly instead, then cancel
+    // file-by-file: this also sidesteps the store's own `cancel_jobs_for_session`,
+    // whose lexical matcher can conflate two different jobs whose paths happen to
+    // collapse to the same string. Three spellings per member: its canonical
+    // identity, the spelling it was actually discovered with (the root's own
+    // argument, or the ledger's recorded child path), and that same canonical
+    // identity re-expressed through `sessions_dir`'s own (possibly aliased)
+    // spelling - the third one recovers a partition created through the alias
+    // even when THIS call's entry argument happened to use the canonical form.
+    let canonical_sessions_dir = canonical_session_path(sessions_dir);
+    let mut candidate_files: HashSet<PathBuf> = HashSet::new();
     for member in &members {
-        let Some(dir) = session_artifact_dir(&member.session_file, &member.session_id) else {
-            continue;
-        };
-        if !dir
-            .join(pa_core::cron::store::SESSION_SCHEDULED_JOBS_FILENAME)
-            .is_file()
-        {
+        let mut spellings: Vec<&Path> = vec![&member.session_file, &member.raw_session_file];
+        let aliased = member
+            .session_file
+            .strip_prefix(&canonical_sessions_dir)
+            .ok()
+            .map(|relative| sessions_dir.join(relative));
+        if let Some(aliased) = &aliased {
+            spellings.push(aliased);
+        }
+        for session_file in spellings {
+            let Some(dir) = session_artifact_dir(session_file, &member.session_id) else {
+                continue;
+            };
+            candidate_files.insert(dir.join(pa_core::cron::store::SESSION_SCHEDULED_JOBS_FILENAME));
+        }
+    }
+    let member_paths: HashSet<PathBuf> = members
+        .iter()
+        .map(|member| canonical_session_path(&member.session_file))
+        .collect();
+    let mut any_partition = false;
+    let mut cancelled = 0usize;
+    let now = crate::util::now_ms();
+    for partition in candidate_files {
+        if !partition.is_file() {
             continue;
         }
-        store.register_session_artifact(&member.session_id, &dir);
-        registered = true;
+        any_partition = true;
+        // Refuse rather than silently treat corrupt/malformed state as empty: the
+        // store's ordinary read tolerates exactly that, which is right for display
+        // but wrong for this authority path.
+        let jobs = pa_core::cron::store::read_scheduled_jobs_artifact_strict(&partition)
+            .with_context(|| format!("cron schedule partition {}", partition.display()))?;
+        let mut matching_ids: HashSet<String> = HashSet::new();
+        for job in &jobs {
+            if !matches!(
+                job.status,
+                pa_core::cron::JobStatus::Active | pa_core::cron::JobStatus::Paused
+            ) {
+                continue;
+            }
+            // A job whose identity cannot be resolved (a dangling symlink along its
+            // path) refuses rather than being silently assumed to belong to someone
+            // else's tree. Never widen this to a session-id OR match: a stale binding
+            // must not cancel a different transcript merely because a copied job
+            // reused its id.
+            let resolved = strict_session_identity(Path::new(&job.session_file))?;
+            if member_paths.contains(&resolved) {
+                matching_ids.insert(job.id.clone());
+            }
+        }
+        cancelled +=
+            pa_core::cron::store::cancel_matching_ids_in_file(&partition, &matching_ids, now)?;
     }
-    if !registered {
+    if !any_partition {
         return Ok(0);
-    }
-    let now = crate::util::now_ms();
-    let mut cancelled = 0;
-    for member in &members {
-        cancelled += store
-            .cancel_jobs_for_session(
-                &CancelJobsFilter {
-                    active_session_id: None,
-                    session_id: None,
-                    session_file: Some(member.session_file.to_string_lossy().to_string()),
-                },
-                now,
-            )?
-            .len();
     }
     Ok(cancelled)
 }
@@ -180,22 +281,14 @@ pub(crate) fn finalize_archived_stop(
         Ok(count) => (count, None),
         Err(error) => (0, Some(error)),
     };
-    // A live worker covering the tree owns its stores again — including the session
-    // file's state — so the belt skips covered trees like the cancel does.
-    let covered = session_tree(agent_dir, sessions_dir, root_session_file)
-        .iter()
-        .any(|member| {
-            live_files.contains(
-                &canonical_session_path(&member.session_file)
-                    .to_string_lossy()
-                    .to_string(),
-            )
-        });
-    if covered {
-        return (cancelled, cancel_error);
+    // Any cancellation refusal or deferral (live coverage, an unreadable descendant,
+    // corrupt/malformed schedule state, an unresolved job identity) blocks the
+    // archive belt too: the tree is not settled, so the root must not be mutated.
+    if let Some(error) = cancel_error {
+        return (cancelled, Some(error));
     }
     let archive_error = ensure_archived_state(root_session_file).err();
-    (cancelled, cancel_error.or(archive_error))
+    (cancelled, archive_error)
 }
 
 /// The kill route's deleted-child finalize (the `rlmLedgerDelete` marker):
@@ -388,9 +481,15 @@ impl Supervisor {
                     "rlm_delete",
                 )
                 .await;
-                crate::saved_session_commands::remove_session_artifacts(Path::new(
-                    &root_session_file,
-                ));
+                // An unsettled finalize (live coverage, an unreadable descendant, corrupt
+                // or malformed schedule state) must retain every artifact for the retry -
+                // the capture already ran (it is read-only and best-effort), but the sweep
+                // itself must not run until cancellation/archival actually completed.
+                if settled {
+                    crate::saved_session_commands::remove_session_artifacts(Path::new(
+                        &root_session_file,
+                    ));
+                }
             }
             None => {
                 // The adoption finalize (an interrupted stop re-runs here): a crash
@@ -399,9 +498,11 @@ impl Supervisor {
                 if let Some(child_id) = self.tombstoned_child_at(&root_session_file).await {
                     self.capture_deleted_child_usage(&root_session_file, &child_id, "adoption")
                         .await;
-                    crate::saved_session_commands::remove_session_artifacts(Path::new(
-                        &root_session_file,
-                    ));
+                    if settled {
+                        crate::saved_session_commands::remove_session_artifacts(Path::new(
+                            &root_session_file,
+                        ));
+                    }
                 }
             }
         }
@@ -494,6 +595,9 @@ impl Supervisor {
 }
 
 #[cfg(test)]
+mod path_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_store::{session_file_name, SessionFile};
@@ -506,7 +610,7 @@ mod tests {
         dir
     }
 
-    fn write_session(dir: &Path, name: Option<&str>) -> (String, PathBuf) {
+    pub(super) fn write_session(dir: &Path, name: Option<&str>) -> (String, PathBuf) {
         let mut session = SessionFile::create("/work", None, 0);
         if let Some(name) = name {
             session.append_session_info(name);
@@ -523,7 +627,7 @@ mod tests {
         (session.session_id().to_string(), path)
     }
 
-    fn write_job(session_file: &Path, session_id: &str, job_id: &str) {
+    pub(super) fn write_job(session_file: &Path, session_id: &str, job_id: &str) {
         let dir = session_artifact_dir(session_file, session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let jobs = serde_json::json!([{
@@ -550,7 +654,7 @@ mod tests {
         .unwrap();
     }
 
-    fn read_job(session_file: &Path, session_id: &str) -> AgentCronJob {
+    pub(super) fn read_job(session_file: &Path, session_id: &str) -> AgentCronJob {
         let dir = session_artifact_dir(session_file, session_id).unwrap();
         let raw: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("scheduled-jobs.json")).unwrap(),

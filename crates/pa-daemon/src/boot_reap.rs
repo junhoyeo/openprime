@@ -874,7 +874,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_38_unverifiable_process_is_never_signaled_or_reported_gone() {
-        let child = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
         let mut guard = ReapOnDrop(Some(child));
         let pid = guard.0.as_ref().unwrap().id();
         let mut unverified = target(pid);

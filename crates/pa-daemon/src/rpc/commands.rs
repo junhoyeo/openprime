@@ -210,7 +210,10 @@ pub async fn handle_command(state: &Arc<RpcState>, command: protocol::RpcCommand
     let id = command.id.clone();
     let payload = command.payload.clone();
     let name = command.command.as_str();
-    let _mutation = if matches!(name, "abort" | "abort_retry" | "new_session" | "switch_session" | "fork" | "clone") {
+    let _mutation = if matches!(
+        name,
+        "abort" | "abort_retry" | "new_session" | "switch_session" | "fork" | "clone"
+    ) {
         None
     } else {
         match state.session.try_mutation_admission() {
