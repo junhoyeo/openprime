@@ -39,11 +39,6 @@ fn mutex_path(directory: &Path) -> Result<PathBuf> {
     Ok(directory.with_extension("fence"))
 }
 
-#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
-pub(super) fn held_on_this_thread(directory: &Path) -> bool {
-    mutex_path(directory).is_ok_and(|path| HELD.with(|held| held.borrow().contains(&path)))
-}
-
 /// The existing common mutation entry: the native file is permanent and is
 /// never removed by release/reclaim. A legacy bare guard has no verifiable
 /// holder; retain/refuse it rather than using age as an ownership certificate.
@@ -167,11 +162,6 @@ impl HeldRuntimeSessionFence<'_> {
     pub(crate) fn canonical_path(&self) -> &Path {
         &self.target.canonical
     }
-    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
-    pub(crate) fn agent_dir(&self) -> &Path {
-        &self.target.agent_dir
-    }
-
     pub(crate) fn inspect_ownership(&self) -> Result<RuntimeLeaseOwnership> {
         self.target.revalidate()?;
         super::inspect_runtime_ownership_at(self.target)
