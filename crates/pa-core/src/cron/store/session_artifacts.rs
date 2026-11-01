@@ -195,11 +195,27 @@ pub fn read_scheduled_jobs_artifact_strict(path: &Path) -> anyhow::Result<Vec<Ag
                 .context(format!("parse cron schedule partition {}", path.display())));
         }
     };
-    let Some(jobs) = parsed.get("jobs").and_then(|jobs| jobs.as_array()) else {
+    // A well-formed JSON object with no `jobs` key yet (a freshly-initialized
+    // `{}` partition, the same pattern a missing file produces) is not
+    // corruption - treat it as no jobs, same as the missing-file case above.
+    // A non-object top level, or a `jobs` key present with the wrong type, is
+    // still refused: that is real corruption or an unknown schema, not an
+    // ordinary not-yet-scheduled partition.
+    let Some(object) = parsed.as_object() else {
         anyhow::bail!(
-            "cron schedule partition {} has no jobs array",
+            "cron schedule partition {} is not a JSON object",
             path.display()
         );
+    };
+    let jobs = match object.get("jobs") {
+        None => return Ok(Vec::new()),
+        Some(value) => match value.as_array() {
+            Some(array) => array,
+            None => anyhow::bail!(
+                "cron schedule partition {} has a non-array \"jobs\" field",
+                path.display()
+            ),
+        },
     };
     let mut result = Vec::with_capacity(jobs.len());
     for job in jobs {
@@ -352,5 +368,38 @@ mod tests {
             .unwrap();
         // Both jobs share the session file (the rebind moved both), so both cancel.
         assert_eq!(cancelled.len(), 2);
+    }
+
+    #[test]
+    fn strict_read_treats_a_well_formed_object_with_no_jobs_key_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("scheduled-jobs.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(
+            read_scheduled_jobs_artifact_strict(&path).unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn strict_read_refuses_a_non_array_jobs_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("scheduled-jobs.json");
+        std::fs::write(&path, r#"{"jobs": "not-an-array"}"#).unwrap();
+        let error = read_scheduled_jobs_artifact_strict(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-array"), "{error}");
+    }
+
+    #[test]
+    fn strict_read_refuses_a_non_object_top_level() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("scheduled-jobs.json");
+        std::fs::write(&path, "[]").unwrap();
+        let error = read_scheduled_jobs_artifact_strict(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a JSON object"), "{error}");
     }
 }
