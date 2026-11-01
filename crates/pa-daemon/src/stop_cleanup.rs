@@ -516,17 +516,40 @@ impl Supervisor {
     /// The tombstoned edges' child id at one session path (the adoption
     /// finalize's ledger consult): `None` when nothing is tombstoned
     /// there - a plain kill, an untouched subagent, a top-level session.
+    /// #42/#37 follow-up: the crash-recovery sweep's own discovery read stays
+    /// best-effort (a plain lookup, tolerant of a torn/malformed line
+    /// elsewhere), but a FOUND candidate is never trusted on that read
+    /// alone before this destructive sweep runs (it captures usage and
+    /// removes session artifacts). `check_committed_deletion` re-verifies
+    /// the SAME candidate through the strict authority read
+    /// (`strict_edges`/`checked_session_path`) - an unrecognized record
+    /// anywhere in this scope (a newer binary's future op, say) makes the
+    /// WHOLE scope unverifiable for authority purposes, not just that one
+    /// line, so the best-effort read's tolerant "skip it and carry on"
+    /// must not be the final word before acting destructively on what it
+    /// found. A refused verification answers `None` here, exactly like
+    /// "nothing tombstoned" - the normal retry/backoff path already
+    /// covers that case; this never panics or escalates beyond declining.
     async fn tombstoned_child_at(self: &Arc<Self>, session_file: &str) -> Option<String> {
         let ledger = self.rlm_spawn_ledger_for(None).await.ok()?;
         let path = crate::lease::canonical_session_path(Path::new(session_file));
         let edges = ledger.edges(true).ok()?;
-        edges
+        let candidate = edges
             .iter()
             .find(|edge| {
                 edge.deleted.is_some()
                     && crate::lease::canonical_session_path(Path::new(&edge.child)) == path
             })
-            .map(|edge| edge.child_id.clone())
+            .map(|edge| edge.child_id.clone())?;
+        let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
+            &self.options.agent_dir,
+            &self.options.socket_path,
+        )
+        .ok()?;
+        authority
+            .check_committed_deletion(Path::new(session_file), &candidate)
+            .ok()?;
+        Some(candidate)
     }
 
     /// The deleted child's durable usage capture: read the frozen transcript's own usage
@@ -665,6 +688,63 @@ mod tests {
         )
         .unwrap();
         serde_json::from_value(raw["jobs"][0].clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tombstoned_child_at_trusts_a_best_effort_read_an_unknown_op_line_should_refuse() {
+        let root = temp_dir();
+        let agent_dir = root.join("agent");
+        let sessions_dir = agent_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(crate::supervisor::SupervisorOptions {
+                socket_path: root.join("daemon.sock"),
+                agent_dir: agent_dir.clone(),
+            })
+            .expect("supervisor"),
+        );
+        let (_, parent_file) = write_session(&sessions_dir, Some("orchestrator"));
+        let (_, child_file) = write_session(&sessions_dir, Some("lane"));
+        let ledger = RlmSpawnLedger::new(&agent_dir, &sessions_dir, |_| {});
+        ledger
+            .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "sub-1".to_string(),
+                parent: parent_file.to_string_lossy().to_string(),
+                child: child_file.to_string_lossy().to_string(),
+                depth: 1,
+                name: "lane".to_string(),
+            })
+            .unwrap();
+        ledger
+            .append_delete(
+                "sub-1",
+                &child_file.to_string_lossy(),
+                crate::rlm_ledger::RlmLedgerDeleteReason::User,
+            )
+            .unwrap();
+        // A future binary's record this reader does not recognize - present and
+        // well-formed otherwise, so the authority/strict read must refuse the
+        // whole scope rather than silently drop it.
+        let mut bytes = std::fs::read(ledger.ledger_path()).unwrap();
+        bytes.extend_from_slice(
+            b"{\"v\":1,\"op\":\"future-operation\",\"at\":\"2026-01-01T00:00:00Z\"}\n",
+        );
+        std::fs::write(ledger.ledger_path(), &bytes).unwrap();
+
+        // RED: the best-effort read `tombstoned_child_at` uses today silently
+        // tolerates the unknown-op line and still reports the tombstone - the
+        // crash-recovery sweep would act on a deletion the authority/strict
+        // read (`check_committed_deletion`) would refuse to confirm, because
+        // an unrecognized record anywhere in scope makes the WHOLE scope
+        // unverifiable, not just that one line.
+        let found = supervisor
+            .tombstoned_child_at(&child_file.to_string_lossy())
+            .await;
+        assert_eq!(
+            found, None,
+            "an unknown-op line anywhere in scope must refuse the tombstone finding, \
+             not silently tolerate it and report the deletion as committed anyway"
+        );
     }
 
     #[test]
