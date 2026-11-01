@@ -1257,17 +1257,61 @@ mod tests {
         );
     }
 
+    /// `chmod` cannot deny root (a root-run `cargo test`, common in Docker
+    /// CI, would write right through the 0o555 fault below and the save
+    /// would genuinely succeed) - this crate's own established pattern
+    /// (`pa-core`'s `kernel/bootstrap/venv/tests.rs::skip_when_root`) skips
+    /// a chmod-fault test under root rather than let it flake by
+    /// environment. `nix`'s `user` feature was added to this crate's
+    /// `Cargo.toml` to resolve the effective uid the same way.
+    #[cfg(unix)]
+    fn skip_when_root() -> bool {
+        if nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipped: run as a non-root user (chmod cannot deny root)");
+            return true;
+        }
+        false
+    }
+
+    // #42: a chmod-based write fault is load-bearing for this whole test,
+    // not just the one set_permissions call - gating only that line (not
+    // the function) would leave the test universal on a non-unix target,
+    // where the fault never injects and `assert!(!response.success)` fails
+    // unconditionally. Matches this crate's own established pattern
+    // (`rlm_ledger/tests.rs`, `venv/tests.rs`) of gating the whole fn.
+    #[cfg(unix)]
     #[tokio::test]
     async fn set_auto_compaction_fails_without_flipping_on_a_failed_save() {
+        if skip_when_root() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("pa-worker-acf-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        // A file where the agent dir would be: the settings save cannot create agent/settings.json.
-        std::fs::write(dir.join("agent"), b"not a directory").unwrap();
+        // `agent_dir` itself must stay a real, resolvable directory -
+        // `Worker::new` resolves `RuntimeSessionAuthority::for_agent_dir`
+        // at construction (`checked_session_path` needs to walk agent_dir's
+        // ancestry), which a bare-file `agent_dir` broke before reaching
+        // the settings-save step this test actually targets ("create"
+        // itself failed with an unrelated authority-resolution error).
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
         let worker = Arc::new(Worker::new(worker_config(&dir), None));
         let created = worker
             .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
             .await;
         assert!(created.success);
+        // Block the WRITE specifically, after "create" (and any settings
+        // read it does) has already run - a directory at the settings.json
+        // path itself was tried first and did not reproduce the intended
+        // fault (confirmed via a temporary, reverted debug trace that
+        // `with_lock`'s write path was never reached at all for that
+        // shape). Making `agent/` itself read-only blocks the real write
+        // path (`atomic_write_with`'s temp-file creation inside the
+        // directory) without disturbing the read side.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("agent"), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+        }
         let response = worker
             .dispatch(
                 "set_auto_compaction",

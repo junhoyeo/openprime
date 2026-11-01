@@ -134,15 +134,14 @@ fn daemon_acp_create(
     } else {
         let (cwd, session_path) = match select_headless_session(options)? {
             HeadlessSession::Fork(source) => {
-                let fork = pa_core::session::manager::SessionManager::fork_from(
-                    &source,
-                    &config.cwd,
-                    &session_dir,
-                )?;
-                (
-                    config.cwd.clone(),
-                    fork.get_session_file().map(std::path::Path::to_path_buf),
+                let authority = pa_daemon::lease::RuntimeSessionAuthority::for_supervisor(
+                    &config.agent_dir,
+                    &crate::interactive_mode::resolve_socket_path(options.daemon_socket.as_deref()),
                 )
+                .map_err(|error| format!("{error:#}"))?;
+                let target =
+                    materialize_startup_fork(&source, &config.cwd, &session_dir, &authority)?;
+                (config.cwd.clone(), Some(target))
             }
             HeadlessSession::Open(path) => (
                 stored_session_cwd(&path, &config.cwd, explicit_cwd_override(options))?,
@@ -248,7 +247,7 @@ async fn rpc_mode_main(options: &RunOptions) -> Result<i32, String> {
     }
     let factory = rpc_engine_factory(options);
     let mut engine_handle = pa_daemon::rpc::session::RpcEngineHandle::from(parts);
-    engine_handle.session_lease = initial_lease;
+    engine_handle.session_lease = initial_lease.map(Arc::new);
     let exit_code = pa_daemon::rpc::run_rpc_mode(pa_daemon::rpc::RpcOptions {
         engine: engine_handle,
         engine_factory: Some(factory),
@@ -268,8 +267,10 @@ async fn rpc_mode_main(options: &RunOptions) -> Result<i32, String> {
 /// The engine-replacement seam the RPC mode's `new_session`/`switch_session`/
 /// `fork` commands drive: pa-cli owns the assembly, the mode owns the swap.
 fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngineFactory {
+    let authority = runtime_session_authority(options);
     let options = options.clone();
     std::sync::Arc::new(move |request| {
+        let authority = authority.clone();
         let mut options = options.clone();
         // The replacement sessions ignore the CLI's session-selection flags.
         options.session.resume = None;
@@ -277,6 +278,7 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
         options.session.continue_recent = false;
         options.session.fork = None;
         Box::pin(async move {
+            let authority = authority?;
             let (manager, opened_lease) = match &request {
                 pa_daemon::rpc::session::RpcEngineRequest::New {
                     parent_session,
@@ -303,13 +305,13 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
                         }
                     };
                     // The fresh session's file is leased BEFORE the replacement can write it.
-                    let lease = pa_daemon::lease::acquire_runtime_session_lease(
-                        manager
-                            .get_session_file()
-                            .expect("a fresh session knows its file"),
-                        &options.config.agent_dir,
-                    )
-                    .map_err(|error| format!("{error:#}"))?;
+                    let lease = authority
+                        .acquire(
+                            manager
+                                .get_session_file()
+                                .expect("a fresh session knows its file"),
+                        )
+                        .map_err(|error| format!("{error:#}"))?;
                     (manager, Some(lease))
                 }
                 pa_daemon::rpc::session::RpcEngineRequest::Open {
@@ -325,6 +327,7 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
                         Some(session_open_guard(
                             options.daemon_socket.as_deref(),
                             session_path,
+                            &authority,
                         )?)
                     };
                     let manager = open_session_file(session_path, &session_dir, &cwd, None)?;
@@ -343,10 +346,23 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
             )
             .await?;
             let mut handle = pa_daemon::rpc::session::RpcEngineHandle::from(engine);
-            handle.session_lease = opened_lease;
+            handle.session_lease = opened_lease.map(Arc::new);
             Ok(handle)
         })
     })
+}
+
+pub(crate) fn runtime_session_authority(
+    options: &RunOptions,
+) -> Result<pa_daemon::lease::RuntimeSessionAuthority, String> {
+    match options.daemon_socket.as_deref() {
+        Some(socket) => pa_daemon::lease::RuntimeSessionAuthority::for_supervisor(
+            &options.config.agent_dir,
+            &crate::interactive_mode::resolve_socket_path(Some(socket)),
+        ),
+        None => pa_daemon::lease::RuntimeSessionAuthority::for_agent_dir(&options.config.agent_dir),
+    }
+    .map_err(|error| format!("Could not resolve session authority: {error:#}"))
 }
 
 fn replacement_session_dir(options: &RunOptions) -> std::path::PathBuf {
@@ -638,7 +654,7 @@ fn select_session_manager_with_lease(
         return Ok((None, None));
     }
     let (manager, lease) = build_session_manager_with_lease(options)?;
-    Ok((Some(manager), lease))
+    Ok((Some(manager), Some(lease)))
 }
 
 /// The real-provider engine assembly over one session-manager selection:
@@ -1277,31 +1293,33 @@ fn build_session_manager_with_lease(
 ) -> Result<
     (
         pa_core::session::manager::SessionManager,
-        Option<pa_daemon::lease::SessionLease>,
+        pa_daemon::lease::SessionLease,
     ),
     String,
 > {
+    let authority = runtime_session_authority(options)?;
     let cwd = options.config.cwd.clone();
     let session_dir = replacement_session_dir(options);
     match select_headless_session(options)? {
         HeadlessSession::Fork(source) => {
-            let manager =
-                pa_core::session::manager::SessionManager::fork_from(&source, &cwd, &session_dir)?;
-            // The materialized fork leases its own file before the engine
-            // writes it (the fresh-session rule): another process resuming
-            // the new file can never become a second writer while this
-            // engine appends — the source was only read, never leased.
-            Ok(lease_fresh_manager(manager))
+            let manager = pa_core::session::manager::SessionManager::prepare_fork_from(
+                &source,
+                &cwd,
+                &session_dir,
+            )?;
+            let (mut manager, lease) = lease_fresh_manager(manager, &authority)?;
+            manager.flush_now().map_err(|error| error.to_string())?;
+            Ok((manager, lease))
         }
         HeadlessSession::Open(path) => {
-            let lease = session_open_guard(options.daemon_socket.as_deref(), &path)?;
+            let lease = session_open_guard(options.daemon_socket.as_deref(), &path, &authority)?;
             // A failed open's early return drops the lease (released),
             // never leaving an orphaned hold behind.
             let manager =
                 open_session_file(&path, &session_dir, &cwd, explicit_cwd_override(options))?;
-            Ok((manager, Some(lease)))
+            Ok((manager, lease))
         }
-        HeadlessSession::Fresh => Ok(fresh_session_with_lease(&cwd, &session_dir)),
+        HeadlessSession::Fresh => fresh_session_with_lease(&cwd, &session_dir, &authority),
     }
 }
 
@@ -1310,38 +1328,63 @@ fn build_session_manager_with_lease(
 fn fresh_session_with_lease(
     cwd: &std::path::Path,
     session_dir: &std::path::Path,
-) -> (
-    pa_core::session::manager::SessionManager,
-    Option<pa_daemon::lease::SessionLease>,
-) {
+    authority: &pa_daemon::lease::RuntimeSessionAuthority,
+) -> Result<
+    (
+        pa_core::session::manager::SessionManager,
+        pa_daemon::lease::SessionLease,
+    ),
+    String,
+> {
     let manager = pa_core::session::manager::SessionManager::persisted(cwd, session_dir);
-    lease_fresh_manager(manager)
+    lease_fresh_manager(manager, authority)
 }
 
-/// Lease a freshly materialized session file before the engine can write it: the
-/// ungated runtime acquire (`Ok(None)` whenever the env gate is unset).
+/// A file-backed runtime never continues after acquisition failure. In-memory
+/// sessions are handled separately before selecting a persisted manager.
 fn lease_fresh_manager(
     manager: pa_core::session::manager::SessionManager,
-) -> (
-    pa_core::session::manager::SessionManager,
-    Option<pa_daemon::lease::SessionLease>,
-) {
-    let lease = match manager.get_session_file() {
-        Some(path) => {
-            match pa_daemon::lease::acquire_runtime_session_lease(
-                path,
-                &crate::config::get_agent_dir(),
-            ) {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    eprintln!("prime-agent: could not lease the fresh session file: {error:#}");
-                    None
-                }
-            }
+    authority: &pa_daemon::lease::RuntimeSessionAuthority,
+) -> Result<
+    (
+        pa_core::session::manager::SessionManager,
+        pa_daemon::lease::SessionLease,
+    ),
+    String,
+> {
+    let path = manager
+        .get_session_file()
+        .ok_or_else(|| "A file-backed session has no target path".to_string())?;
+    let lease = authority
+        .acquire(path)
+        .map_err(|error| format!("Could not lease the fresh session file: {error:#}"))?;
+    Ok((manager, lease))
+}
+
+/// Materialize a startup fork under checked ownership, then retire this
+/// owner's lease before handing the file to a daemon worker. Release is not
+/// proof that nobody acquired a successor lease; the worker acquires again.
+pub(crate) fn materialize_startup_fork(
+    source: &std::path::Path,
+    cwd: &std::path::Path,
+    session_dir: &std::path::Path,
+    authority: &pa_daemon::lease::RuntimeSessionAuthority,
+) -> Result<std::path::PathBuf, String> {
+    let prepared =
+        pa_core::session::manager::SessionManager::prepare_fork_from(source, cwd, session_dir)?;
+    let (mut manager, lease) = lease_fresh_manager(prepared, authority)?;
+    manager.flush_now().map_err(|error| error.to_string())?;
+    let target = manager
+        .get_session_file()
+        .ok_or_else(|| "Prepared fork has no target path".to_string())?
+        .to_path_buf();
+    drop(manager);
+    match lease.try_release() {
+        pa_daemon::lease::LeaseReleaseOutcome::Released => Ok(target),
+        pa_daemon::lease::LeaseReleaseOutcome::Deferred => {
+            Err("Fork ownership is still settling; handoff deferred".to_string())
         }
-        None => None,
-    };
-    (manager, lease)
+    }
 }
 
 /// Guard an in-process open: probe the daemon's live roster, then acquire the
@@ -1349,6 +1392,7 @@ fn lease_fresh_manager(
 fn session_open_guard(
     socket_path: Option<&str>,
     session_path: &std::path::Path,
+    authority: &pa_daemon::lease::RuntimeSessionAuthority,
 ) -> Result<pa_daemon::lease::SessionLease, String> {
     let socket = crate::interactive_mode::resolve_socket_path(socket_path);
     if let Ok(mut client) = crate::daemon_client::DaemonClient::connect(&socket) {
@@ -1401,10 +1445,9 @@ fn session_open_guard(
     }
     // The daemon's roster covers only its own sessions; the session store is
     // shared, so the lease table is the one cross-daemon ownership record.
-    let agent_dir = crate::config::get_agent_dir();
     // Acquire, not observe: a probe leaves a window where another process acquires
     // between the check and this open — two writers on one file.
-    match pa_daemon::lease::acquire_runtime_session_lease(session_path, &agent_dir) {
+    match authority.acquire(session_path) {
         Ok(lease) => Ok(lease),
         Err(error) => {
             let Some(active) = error.downcast_ref::<pa_daemon::lease::SessionAlreadyActiveError>()
@@ -2104,6 +2147,126 @@ mod tests {
                 .any(|service| service.service_id == "my-local"),
             "the dropped source no longer resolves"
         );
+    }
+    fn lifecycle_options(root: &std::path::Path) -> crate::mode::RunOptions {
+        crate::mode::RunOptions {
+            app_mode: crate::mode::AppMode::Print,
+            config: crate::mode::RuntimeConfig {
+                cwd: root.to_path_buf(),
+                agent_dir: root.join("agent"),
+                ..Default::default()
+            },
+            session: crate::mode::SessionOptions::default(),
+            messages: Vec::new(),
+            file_args: Vec::new(),
+            daemon_socket: None,
+            list_models: None,
+            initial_message: None,
+            initial_images: Vec::new(),
+            verbose: false,
+            offline: true,
+            agents_view_requested: false,
+            attach_agent: None,
+        }
+    }
+
+    #[test]
+    fn issue_42_fresh_headless_acquisition_failure_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = lifecycle_options(dir.path());
+        std::fs::create_dir_all(&options.config.agent_dir).unwrap();
+        let blocker = options.config.agent_dir.join("session-leases");
+        std::fs::write(&blocker, b"preserved blocker").unwrap();
+        let result = super::build_session_manager_with_lease(&options);
+        assert!(
+            result.is_err(),
+            "a file-backed engine must not receive an unleased manager"
+        );
+        assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
+    }
+
+    #[test]
+    fn issue_42_headless_fork_does_not_flush_before_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = lifecycle_options(dir.path());
+        let mut source = pa_core::session::manager::SessionManager::persisted(
+            dir.path(),
+            &dir.path().join("source"),
+        );
+        source.flush_now().unwrap();
+        let source_path = source.get_session_file().unwrap().to_path_buf();
+        let before = std::fs::read(&source_path).unwrap();
+        options.session.fork = Some(source_path.to_string_lossy().into_owned());
+        std::fs::create_dir_all(&options.config.agent_dir).unwrap();
+        let blocker = options.config.agent_dir.join("session-leases");
+        std::fs::write(&blocker, b"preserved blocker").unwrap();
+        let result = super::build_session_manager_with_lease(&options);
+        let materialized: Vec<_> = std::fs::read_dir(options.config.agent_dir.join("sessions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            materialized.is_empty(),
+            "no target may be flushed before acquisition succeeds: {materialized:?}"
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(source_path).unwrap(), before);
+        assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
+    }
+
+    #[test]
+    fn issue_42_valid_headless_fresh_session_uses_the_configured_agent_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = lifecycle_options(dir.path());
+        let (manager, held) = super::build_session_manager_with_lease(&options).unwrap();
+        let target = manager.get_session_file().unwrap();
+        assert!(
+            pa_daemon::lease::acquire_runtime_session_lease(target, &options.config.agent_dir)
+                .is_err(),
+            "the runtime must own the configured agent root, not a global fallback root"
+        );
+        drop(held);
+        drop(
+            pa_daemon::lease::acquire_runtime_session_lease(target, &options.config.agent_dir)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn issue_42_acp_fork_does_not_flush_before_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = lifecycle_options(dir.path());
+        options.app_mode = crate::mode::AppMode::Acp;
+        let socket = dir.path().join("supervisor.sock");
+        options.daemon_socket = Some(socket.to_string_lossy().into_owned());
+        let _supervisor =
+            pa_daemon::supervisor::Supervisor::new(pa_daemon::supervisor::SupervisorOptions {
+                socket_path: socket,
+                agent_dir: options.config.agent_dir.clone(),
+            })
+            .unwrap();
+        let mut source = pa_core::session::manager::SessionManager::persisted(
+            dir.path(),
+            &dir.path().join("source"),
+        );
+        source.flush_now().unwrap();
+        let source_path = source.get_session_file().unwrap().to_path_buf();
+        let before = std::fs::read(&source_path).unwrap();
+        options.session.fork = Some(source_path.to_string_lossy().into_owned());
+        let blocker = options.config.agent_dir.join("session-leases");
+        std::fs::write(&blocker, b"preserved blocker").unwrap();
+        let result = super::daemon_acp_create(&options);
+        let materialized: Vec<_> = std::fs::read_dir(options.config.agent_dir.join("sessions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            materialized.is_empty(),
+            "ACP must own the target before first flush: {materialized:?}"
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(source_path).unwrap(), before);
+        assert_eq!(std::fs::read(blocker).unwrap(), b"preserved blocker");
     }
 }
 

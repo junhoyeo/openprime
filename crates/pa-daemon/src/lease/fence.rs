@@ -1,12 +1,6 @@
 //! The one permanent metadata fence for a canonical runtime-session lease.
 //! No network/await/destructor that acquires a lease may run in a held closure.
 
-// Cross-lane shared API (#37/#38 M-fence + identity): consumed by sibling lanes'
-// call sites (record-lifecycle/namespace's rpc/session.rs, session_navigation.rs,
-// worker/create.rs) that land via composition, not by anything in pa-daemon's own
-// --lib/--tests on this branch alone. Remove this once those call sites are merged.
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
@@ -45,6 +39,7 @@ fn mutex_path(directory: &Path) -> Result<PathBuf> {
     Ok(directory.with_extension("fence"))
 }
 
+#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
 pub(super) fn held_on_this_thread(directory: &Path) -> bool {
     mutex_path(directory).is_ok_and(|path| HELD.with(|held| held.borrow().contains(&path)))
 }
@@ -172,6 +167,7 @@ impl HeldRuntimeSessionFence<'_> {
     pub(crate) fn canonical_path(&self) -> &Path {
         &self.target.canonical
     }
+    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn agent_dir(&self) -> &Path {
         &self.target.agent_dir
     }

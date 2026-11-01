@@ -43,14 +43,21 @@ async fn supervisor_with_registered_worker(dir: &Path) -> Supervisor {
         last_error: None,
         rest: Map::default(),
     };
-    supervisor
-        .registry
-        .insert(ResidentWorker::new(
-            "w-delta".to_string(),
-            descriptor,
-            dir.join("descriptor.json"),
-        ))
-        .await;
+    let resident = ResidentWorker::new(
+        "w-delta".to_string(),
+        descriptor,
+        dir.join("descriptor.json"),
+    );
+    // #42 Kind-3-adjacent fix: `handle_worker_roster_delta`'s own early
+    // guard (`!route_state().session_ready && !identity_quarantined()`)
+    // returns success without ever reaching `publish_verified_summary` -
+    // confirmed via an empirical debug trace (no publish-error, no
+    // publish-success side effect, 0 roster pushes) - so a freshly
+    // registered resident this fixture never marks ready/quarantined
+    // silently no-ops every delta these tests drive. A real worker marks
+    // itself ready at create/recovery; mirror that here.
+    resident.note_session_ready();
+    supervisor.registry.insert(resident).await;
     supervisor
 }
 
@@ -133,7 +140,7 @@ async fn worker_roster_delta_drops_stale_sequences() {
     let descriptor: pa_types::daemon::DaemonWorkerDescriptor =
         serde_json::from_value(serde_json::json!({
             "version": 2,
-            "workerId": "seq-worker",
+            "workerId": "s1",
             "pid": 0,
             "socketPath": "/tmp/none.sock",
             "recoveryJournalPath": "/tmp/none.jsonl",
@@ -144,14 +151,14 @@ async fn worker_roster_delta_drops_stale_sequences() {
             "createdAt": "2026-09-23T00:00:00Z",
             "updatedAt": "2026-09-23T00:00:00Z",
             "lifecycle": "ready",
-            "createCommand": {},
+            "createCommand": { "noSession": true },
             "consecutiveFailures": 0,
         }))
         .expect("descriptor");
     supervisor
         .registry
         .insert(ResidentWorker::new(
-            "seq-worker".to_string(),
+            "s1".to_string(),
             descriptor,
             dir.join("descriptor.json"),
         ))
@@ -169,11 +176,7 @@ async fn worker_roster_delta_drops_stale_sequences() {
     // counter (the worker has pushed nothing yet): it starts the
     // slot and applies — the create path's first authoritative
     // write.
-    let resident = supervisor
-        .registry
-        .get("seq-worker")
-        .await
-        .expect("resident");
+    let resident = supervisor.registry.get("s1").await.expect("resident");
     let mut fresh_pull = summary("off");
     fresh_pull["rosterDeltaSequence"] = serde_json::json!(0);
     fresh_pull["workerInstanceId"] = serde_json::json!("i1");
@@ -289,11 +292,23 @@ async fn worker_roster_delta_drops_stale_sequences() {
     // A replacement process registers (the registration notes the
     // new generation) and its counter-restarted sequences apply —
     // never compared against the predecessor's watermark.
+    //
+    // #42: production's own registration flow (`adoption.rs`'s
+    // `register_worker`) updates `descriptor.worker_instance_id` to the
+    // replacement's id in the SAME step it calls `note_worker_
+    // generation` (both happen while the descriptor lock is held) -
+    // `publish_verified_summary`'s generation-match check
+    // (`descriptor.worker_instance_id == instance`) compares against
+    // the descriptor's field specifically, never the roster's
+    // bookkeeping alone. This test called only the roster half; mirror
+    // the descriptor half too, or every delta after the swap refuses
+    // with "Worker generation changed before publication".
+    resident.descriptor.lock().await.worker_instance_id = Some("i2".to_string());
     supervisor
         .roster
         .lock()
         .unwrap()
-        .note_worker_generation("seq-worker", "i2");
+        .note_worker_generation("s1", "i2");
     let replacement = delta(&supervisor, "seq-token", "medium", Some(1), "i2").await;
     assert!(
         replacement.success,
@@ -415,11 +430,19 @@ async fn worker_roster_delta_batches_removals_into_the_same_push() {
 
     // A child agent the delta will remove: a subagent summary keyed
     // parent session path + child id.
+    // #42: `publish_verified_summary`'s "fileless" exemption only ever
+    // applies to a root publish (`is_root`) - a non-root (child) summary
+    // with no `sessionFile` always refuses ("Missing final session file
+    // is not verified fileless state"), confirmed via `session_
+    // publication.rs`'s owner-absent branch. A real subagent always
+    // carries its own session file (every other child summary in this
+    // crate's tests does too); add the field this fixture was missing.
     let child_summary = json!({
         "activity": "idle",
         "isSessionActive": false,
         "activeSessionId": "a-child",
         "sessionId": "s-child",
+        "sessionFile": dir.path().join("child.jsonl").to_string_lossy(),
         "rlmChildId": "c-1",
         "parentSessionPath": dir
             .path()

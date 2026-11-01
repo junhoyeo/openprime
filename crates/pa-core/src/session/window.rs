@@ -204,12 +204,22 @@ impl WindowedSessionStore {
     ///
     /// The two internal `expect`s cannot fire (rows parse first; the header is proven).
     pub fn open(path: &Path) -> io::Result<Option<Self>> {
+        let mut file = std::fs::File::open(path)?;
+        let privacy = super::privacy::scan_opened_container(
+            &mut file,
+            super::privacy::PrivacyScanLimits::default(),
+        )?;
+        if privacy.restriction.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Private session recovery requires a capable owned admission receiver",
+            ));
+        }
         // The generation certificate anchors on unix inode identity; a
         // same-length replace is indistinguishable under weak non-unix metadata.
         if !cfg!(unix) {
             return Ok(None);
         }
-        let mut file = std::fs::File::open(path)?;
         let generation = Generation::of(&file.metadata()?);
         let size = file.metadata()?.len();
         let mut reads = WindowReadStats::default();

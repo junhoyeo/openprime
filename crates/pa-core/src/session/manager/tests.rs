@@ -462,3 +462,31 @@ fn replay_admitted_user_rows_stays_windowed_and_reuses_only_registered_ids() {
         "the worker-owned durable file is untouched by mirrored replay"
     );
 }
+
+/// #42: runtime composition can own the selected target before first flush.
+#[test]
+fn issue_42_prepared_fork_keeps_source_and_target_unmodified_until_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    let mut source = SessionManager::persisted(dir.path(), &source_dir);
+    source
+        .append_custom_entry("kept", Some(serde_json::json!({"value":1})))
+        .unwrap();
+    source.flush_now().unwrap();
+    let source_path = source.get_session_file().unwrap().to_path_buf();
+    let before = std::fs::read(&source_path).unwrap();
+    let mut prepared =
+        SessionManager::prepare_fork_from(&source_path, dir.path(), &target_dir).unwrap();
+    let target = prepared.get_session_file().unwrap().to_path_buf();
+    assert!(
+        !target.exists(),
+        "allocation must not perform the first write"
+    );
+    assert_eq!(std::fs::read(&source_path).unwrap(), before);
+    prepared.flush_now().unwrap();
+    assert!(target.is_file());
+    assert_eq!(std::fs::read(source_path).unwrap(), before);
+    let reopened = SessionManager::open(dir.path(), &target_dir, &target);
+    assert_eq!(reopened.get_all_entries(), prepared.get_all_entries());
+}

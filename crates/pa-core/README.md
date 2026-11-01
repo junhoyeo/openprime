@@ -134,3 +134,8 @@ revocation/errors; bytes already sent cannot be recalled. Recovery belongs to al
 live hosts sharing the agent directory and cancels when the last host disappears.
 Catch-up uses at most three delivery cycles per pending entry, honors Retry-After,
 and releases upload capacity during retry waits; exhaustion retains durable intent.
+
+Runtime fork ownership: `SessionManager::prepare_fork_from` prepares a fresh
+target without materializing its transcript. Composition roots acquire their
+runtime lease before the first `flush_now`. The existing `fork_from` convenience
+method retains its prepare-and-flush behavior for non-runtime callers.

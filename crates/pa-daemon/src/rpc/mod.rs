@@ -63,6 +63,26 @@ impl LineWriter {
         Self { tx, pending }
     }
 
+    /// #42 RECURRENCE SWEEP test enablement (2026-11-01): a minimal,
+    /// test-only constructor so `RpcSession` can be built outside this
+    /// module for the `replace_locked`/`RpcEngineRequest::Open` same-path-
+    /// reuse harness. Mirrors `spawn()`'s exact pending-count bookkeeping
+    /// (so `drain`/`drain_bounded` behave correctly in tests too) but
+    /// discards the frame instead of writing it to the real stdout - no
+    /// new production API surface, compiled out of release builds.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let task_pending = Arc::clone(&pending);
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                task_pending.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        Self { tx, pending }
+    }
+
     /// Queue one frame (serializeJsonLine: LF-only framing).
     pub fn write(&self, frame: Value) {
         self.pending.fetch_add(1, Ordering::SeqCst);

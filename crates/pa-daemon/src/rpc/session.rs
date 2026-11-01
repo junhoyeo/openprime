@@ -28,8 +28,8 @@ pub struct RpcEngineHandle {
     /// settle seams fire it, and the pump listener parks on it.
     pub bash_wake: Arc<tokio::sync::Notify>,
     /// The cross-process ownership lease on the opened session file
-    /// (`None` for fresh/in-memory sessions the factory created itself).
-    pub session_lease: Option<crate::lease::SessionLease>,
+    /// (`None` only for genuinely in-memory sessions).
+    pub session_lease: Option<Arc<crate::lease::SessionLease>>,
 }
 
 /// A whole-session replacement request: a fresh session (optionally under
@@ -70,6 +70,7 @@ pub struct RpcSession {
     pending_outputs: Arc<tokio::sync::Mutex<Option<Vec<serde_json::Value>>>>,
     /// One replacement at a time: a fork racing a `switch_session` must not interleave.
     replacement: tokio::sync::Mutex<()>,
+    mutation_admission: tokio::sync::RwLock<()>,
     /// Bumped on every whole-session replacement: pumps spawned against
     /// the replaced engine retire instead of delivering.
     pump_epoch: Arc<AtomicU64>,
@@ -96,6 +97,7 @@ impl RpcSession {
             subscription: tokio::sync::Mutex::new(None),
             pending_outputs: Arc::new(tokio::sync::Mutex::new(None)),
             replacement: tokio::sync::Mutex::new(()),
+            mutation_admission: tokio::sync::RwLock::new(()),
             pump_epoch: Arc::new(AtomicU64::new(0)),
             replacing: Arc::new(AtomicBool::new(false)),
             signal_shutdown: std::sync::Arc::new(tokio_util::sync::CancellationToken::new()),
@@ -144,6 +146,19 @@ impl RpcSession {
 
     pub fn pump_generation(&self) -> u64 {
         self.pump_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn try_mutation_admission(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, String> {
+        let guard = self
+            .mutation_admission
+            .try_read()
+            .map_err(|_| "Session replacement is in progress; retry the command".to_string())?;
+        if self.is_replacing() {
+            return Err("Session replacement is in progress; retry the command".to_string());
+        }
+        Ok(guard)
     }
 
     pub fn is_replacing(&self) -> bool {
@@ -246,6 +261,14 @@ impl RpcSession {
         // settle: a queued pump waking during the wait sees the moved epoch;
         // the in-flight gate retires a pump KICKED mid-settle.
         let _replacing = self.replacing_gate();
+        // This is an operation admission gate, not the engine/registry data
+        // mutex. Abort remains served while older mutations settle.
+        let _mutations = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.mutation_admission.write(),
+        )
+        .await
+        .map_err(|_| "Session mutations are still settling; replacement deferred".to_string())?;
         self.pump_epoch.fetch_add(1, Ordering::SeqCst);
         // Settle the running turn BEFORE the factory opens the file: the
         // turn's final rows land in the history the replacement hydrates
@@ -265,52 +288,44 @@ impl RpcSession {
                 return Err("A signal exit is in progress".to_string());
             }
         }
-        let mut handle = tokio::select! {
-            guard = self.handle.write() => guard,
-            () = self.signal_shutdown.cancelled() => {
-                return Err("A signal exit is in progress".to_string());
-            }
+        let (old_engine, current_lease) = {
+            let handle = self.handle.read().await;
+            (Arc::clone(&handle.engine), handle.session_lease.clone())
         };
-        // A prompt or steer admitted onto the old engine inside the
-        // guard-free settle window: the re-acquired write guard blocks every
-        // new admission. Deliberate divergence from TS (open before teardown).
-        //
-        // Reopening the currently-owned file: ADOPT the current lease HERE
-        // under the write guard (no refusal path re-acquires it).
         if let RpcEngineRequest::Open {
             session_path,
             reuse_lease,
         } = &mut request
         {
-            let canonical = crate::lease::canonical_session_path(session_path);
-            let same_path = handle
-                .session_lease
-                .as_ref()
-                .is_some_and(|lease| lease.session_path == canonical);
-            if same_path {
-                adopted_lease = handle.session_lease.take();
+            let canonical = crate::lease::checked_session_path(session_path)
+                .map_err(|error| error.to_string())?;
+            if let Some(lease) = current_lease.filter(|lease| lease.session_path == canonical) {
+                // #42 fix (RECURRENCE SWEEP, site 3 of 3): this is the exact
+                // scenario the lock-contract review named verbatim ("RPC
+                // same-path replacement transfers the existing lease and
+                // sets reuse_lease"). `revalidate()` alone never re-reads
+                // the deletion ledger - a tombstone committed while this
+                // session held the lease must still be caught before this
+                // reuse is allowed.
+                lease
+                    .revalidate_and_check_admission()
+                    .map_err(|error| format!("{error:#}"))?;
+                adopted_lease = Some(lease);
                 *reuse_lease = true;
             }
         }
         // Build the replacement after the settle: a failed assembly
-        // leaves the live session serving; the adopted lease goes back
-        // onto the held handle.
+        // leaves the live session serving; its lease never left the old handle.
         let mut replacement = {
             let built = tokio::select! {
                 built = factory(request) => built,
                 () = self.signal_shutdown.cancelled() => {
-                    if adopted_lease.is_some() {
-                        handle.session_lease = adopted_lease;
-                    }
                     return Err("A signal exit is in progress".to_string());
                 }
             };
             match built {
                 Ok(replacement) => replacement,
                 Err(error) => {
-                    if adopted_lease.is_some() {
-                        handle.session_lease = adopted_lease;
-                    }
                     return Err(error);
                 }
             }
@@ -318,9 +333,9 @@ impl RpcSession {
         // The teardown aborts only now that the replacement exists; the
         // check re-samples the LIVE streaming state, catching a turn
         // admitted after the re-acquire.
-        if handle.engine.session.agent().state().await.is_streaming {
-            handle.engine.session.agent().abort();
-            handle.engine.session.agent().wait_for_idle().await;
+        if old_engine.session.agent().state().await.is_streaming {
+            old_engine.session.agent().abort();
+            old_engine.session.agent().wait_for_idle().await;
         }
         // Subscribe the replacement BEFORE publishing the handle: a prompt
         // dispatched the instant the handle lands never drops its first events.
@@ -331,15 +346,12 @@ impl RpcSession {
             subscription.unsubscribe().await;
         }
         // The teardown races the shutdown broadcast: a signal during the
-        // disposal cancels the swap; the adopted lease returns with it.
+        // disposal cancels the swap; the old handle still retains its lease.
         let disposed = tokio::select! {
-            () = handle.engine.dispose_kernel() => true,
+            () = old_engine.dispose_kernel() => true,
             () = self.signal_shutdown.cancelled() => false,
         };
         if !disposed {
-            if adopted_lease.is_some() {
-                handle.session_lease = adopted_lease;
-            }
             return Err("A signal exit is in progress".to_string());
         }
         // The adopted same-path lease rides the replacement; a fresh-open
@@ -347,12 +359,31 @@ impl RpcSession {
         if adopted_lease.is_some() {
             replacement.session_lease = adopted_lease;
         }
+        if let Some(lease) = replacement.session_lease.as_ref() {
+            // #42 fix (RECURRENCE SWEEP, reviewer-recommended 4th fix,
+            // same day/same package): closes the narrower, bounded
+            // same-shape window between the reuse-lease decision and this
+            // post-factory-build publication point. Uses the same shared
+            // revalidate_and_check_admission() as site 3's primary fix -
+            // harmless-redundant for a freshly-acquired lease (admission
+            // was already checked moments earlier), closes the gap for
+            // the adopted-lease case.
+            lease
+                .revalidate_and_check_admission()
+                .map_err(|error| format!("Replacement ownership changed: {error:#}"))?;
+        }
+        let mut handle = self.handle.write().await;
+        if !Arc::ptr_eq(&handle.engine, &old_engine) {
+            return Err("Session generation changed before replacement publication".to_string());
+        }
         // The background-bash listener parks on the retired handle's wake:
         // fire it so the listener re-reads the LIVE handle (a stored
         // permit, because it may not be parked yet). Its kick against the
         // retired engine is dropped by the pump's liveness checks.
         let retired_bash_wake = Arc::clone(&handle.bash_wake);
-        *handle = replacement;
+        let retired = std::mem::replace(&mut *handle, replacement);
+        drop(handle);
+        drop(retired);
         retired_bash_wake.notify_one();
         *self.subscription.lock().await = Some(subscription);
         Ok(())
@@ -394,5 +425,289 @@ struct ReplacingGate<'a>(&'a AtomicBool);
 impl Drop for ReplacingGate<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// #42 RECURRENCE SWEEP (parent/coordinator priority item, 2026-11-01): a
+/// minimal harness for `replace_locked`'s `RpcEngineRequest::Open` same-
+/// path-reuse branch - the exact scenario the lock-contract review named
+/// verbatim ("RPC same-path replacement transfers the existing lease and
+/// sets `reuse_lease`"). Uses `LineWriter::for_test()` (a new, minimal,
+/// `#[cfg(test)]`-gated constructor added alongside this test, reviewed
+/// together as one unit) since the production constructor writes to the
+/// real stdout and is private to this crate's own module.
+#[cfg(test)]
+mod same_path_reuse_tests {
+    use super::*;
+
+    /// `RpcEngineHandle.model`'s type (`pa_types::ai::Model`, the catalog/wire shape).
+    fn test_model() -> pa_types::ai::Model {
+        pa_types::ai::Model {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "test".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: pa_types::ai::ModelCost {
+                input: 0.0.into(),
+                output: 0.0.into(),
+                cache_read: 0.0.into(),
+                cache_write: 0.0.into(),
+            },
+            context_window: 100_000,
+            max_tokens: 8_000,
+            max_tokens_explicit: false,
+            featured: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// `SessionEngineConfig.model`'s DIFFERENT type (`pa_agent::types::Model`,
+    /// the provider-runtime shape - a distinct, similarly-named type).
+    fn test_engine_model() -> pa_agent::types::Model {
+        pa_agent::types::Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            cost: pa_agent::types::UsageCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+            max_tokens_explicit: false,
+        }
+    }
+
+    async fn minimal_handle(
+        cwd: &std::path::Path,
+        agent_dir: &std::path::Path,
+        lease: Option<Arc<crate::lease::SessionLease>>,
+    ) -> RpcEngineHandle {
+        let engine_model = test_engine_model();
+        let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(
+            engine_model.clone(),
+        ));
+        provider.push_text_turn("ok");
+        let engine = pa_core::session_engine::engine::create_session(
+            pa_core::session_engine::engine::SessionEngineConfig {
+                cwd: cwd.to_path_buf(),
+                agent_dir: agent_dir.to_path_buf(),
+                daemonless: true,
+                model: Some(engine_model),
+                stream_fn: Some(provider.stream_fn()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("minimal session engine assembles");
+        RpcEngineHandle {
+            engine: Arc::new(engine),
+            model: test_model(),
+            api_key: None,
+            provider_target: Arc::new(std::sync::RwLock::new(None)),
+            bash_wake: Arc::new(tokio::sync::Notify::new()),
+            session_lease: lease,
+        }
+    }
+
+    /// RED: demonstrates the bypass under the CURRENT, unfixed code - the
+    /// same gap confirmed for `switch_session` (`worker/replacement_gate_tests.rs`)
+    /// and the idempotent re-create path (`worker/create_collapse_tests.rs`).
+    /// `lease.revalidate()` alone proves the lease is unreleased and
+    /// identity-matched; it never re-reads the deletion ledger.
+    #[tokio::test]
+    async fn issue_42_rpc_same_path_open_revalidates_a_committed_tombstone() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let sessions = agent_dir.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let child = sessions.join("child.jsonl");
+            let parent = sessions.join("parent.jsonl");
+            for (path, depth) in [(&parent, 0), (&child, 1)] {
+                let mut file = crate::session_store::SessionFile::create(
+                    &dir.path().to_string_lossy(), None, depth,
+                );
+                file.set_path(path.clone());
+                file.rewrite().unwrap();
+            }
+            let ledger = crate::rlm_ledger::RlmSpawnLedger::new(&agent_dir, &sessions, |_| {});
+            ledger
+                .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                    child_id: "sub-child".into(),
+                    parent: parent.to_string_lossy().into_owned(),
+                    child: child.to_string_lossy().into_owned(),
+                    depth: 1,
+                    name: "child".into(),
+                })
+                .unwrap();
+            let authority = crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap();
+            let lease = Arc::new(authority.acquire(&child).unwrap());
+
+            let handle = minimal_handle(dir.path(), &agent_dir, Some(Arc::clone(&lease))).await;
+            let writer = LineWriter::for_test();
+            // The factory ignores the request's specifics - `replace_locked`
+            // overwrites a fresh handle's `session_lease` with the adopted
+            // lease when the same-path branch sets `reuse_lease`, so the
+            // factory's own returned lease never matters for this scenario.
+            let factory_cwd = dir.path().to_path_buf();
+            let factory_agent_dir = agent_dir.clone();
+            let factory: RpcEngineFactory = Arc::new(move |_request: RpcEngineRequest| {
+                let cwd = factory_cwd.clone();
+                let agent_dir = factory_agent_dir.clone();
+                Box::pin(async move {
+                    let engine_model = test_engine_model();
+                    let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(engine_model.clone()));
+                    provider.push_text_turn("ok");
+                    let engine = pa_core::session_engine::engine::create_session(
+                        pa_core::session_engine::engine::SessionEngineConfig {
+                            cwd,
+                            agent_dir,
+                            daemonless: true,
+                            model: Some(engine_model),
+                            stream_fn: Some(provider.stream_fn()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(RpcEngineHandle {
+                        engine: Arc::new(engine),
+                        model: test_model(),
+                        api_key: None,
+                        provider_target: Arc::new(std::sync::RwLock::new(None)),
+                        bash_wake: Arc::new(tokio::sync::Notify::new()),
+                        session_lease: None,
+                    })
+                })
+            });
+            let session = RpcSession::adopt(handle, Some(factory), writer).await;
+
+            // An interrupted prior stop can leave this exact RPC session
+            // holding a lease the ledger now says is deleted - the same
+            // simulated scenario the other 2 RED tests use, outside the
+            // common-fence admission protocol on purpose.
+            ledger
+                .append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User)
+                .unwrap();
+            let before = std::fs::read(&child).unwrap();
+
+            let result = session
+                .replace_locked(RpcEngineRequest::Open { session_path: child.clone(), reuse_lease: false })
+                .await;
+            assert!(
+                result.is_err(),
+                "same-path RPC open must revalidate deletion authority, not just lease release/identity: {result:?}"
+            );
+            assert_eq!(std::fs::read(&child).unwrap(), before);
+        })
+        .await
+        .expect("bounded rpc same-path reuse test");
+    }
+
+    /// RED (pre-fix)/GREEN (post-fix) for the reviewer-identified second
+    /// window: a narrower, bounded-to-one-`replace_locked`-invocation race
+    /// between the reuse-lease decision (fixed above) and this function's
+    /// POST-factory-build publication check. A tombstone that lands while
+    /// the factory is building the replacement (not before `replace_locked`
+    /// is even called) must still be caught here, using the same shared
+    /// `revalidate_and_check_admission()`.
+    #[tokio::test]
+    async fn issue_42_rpc_replacement_publication_revalidates_a_tombstone_committed_during_the_build(
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let sessions = agent_dir.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let child = sessions.join("child.jsonl");
+            let parent = sessions.join("parent.jsonl");
+            for (path, depth) in [(&parent, 0), (&child, 1)] {
+                let mut file = crate::session_store::SessionFile::create(
+                    &dir.path().to_string_lossy(), None, depth,
+                );
+                file.set_path(path.clone());
+                file.rewrite().unwrap();
+            }
+            let ledger = std::sync::Arc::new(crate::rlm_ledger::RlmSpawnLedger::new(&agent_dir, &sessions, |_| {}));
+            ledger
+                .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                    child_id: "sub-child".into(),
+                    parent: parent.to_string_lossy().into_owned(),
+                    child: child.to_string_lossy().into_owned(),
+                    depth: 1,
+                    name: "child".into(),
+                })
+                .unwrap();
+            let authority = crate::lease::RuntimeSessionAuthority::for_agent_dir(&agent_dir).unwrap();
+            let lease = Arc::new(authority.acquire(&child).unwrap());
+
+            let handle = minimal_handle(dir.path(), &agent_dir, Some(Arc::clone(&lease))).await;
+            let writer = LineWriter::for_test();
+            let factory_cwd = dir.path().to_path_buf();
+            let factory_agent_dir = agent_dir.clone();
+            // The factory itself commits the tombstone - simulating a
+            // delete landing WHILE the replacement is being built, strictly
+            // AFTER the reuse-lease decision already passed (the ledger was
+            // still clean at that point) but BEFORE this function's later
+            // publication check runs.
+            let factory_ledger = std::sync::Arc::clone(&ledger);
+            let factory_child = child.clone();
+            let factory: RpcEngineFactory = Arc::new(move |_request: RpcEngineRequest| {
+                let cwd = factory_cwd.clone();
+                let agent_dir = factory_agent_dir.clone();
+                let ledger = std::sync::Arc::clone(&factory_ledger);
+                let child = factory_child.clone();
+                Box::pin(async move {
+                    ledger
+                        .append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User)
+                        .map_err(|error| error.to_string())?;
+                    let engine_model = test_engine_model();
+                    let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(engine_model.clone()));
+                    provider.push_text_turn("ok");
+                    let engine = pa_core::session_engine::engine::create_session(
+                        pa_core::session_engine::engine::SessionEngineConfig {
+                            cwd,
+                            agent_dir,
+                            daemonless: true,
+                            model: Some(engine_model),
+                            stream_fn: Some(provider.stream_fn()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(RpcEngineHandle {
+                        engine: Arc::new(engine),
+                        model: test_model(),
+                        api_key: None,
+                        provider_target: Arc::new(std::sync::RwLock::new(None)),
+                        bash_wake: Arc::new(tokio::sync::Notify::new()),
+                        session_lease: None,
+                    })
+                })
+            });
+            let session = RpcSession::adopt(handle, Some(factory), writer).await;
+            let before = std::fs::read(&child).unwrap();
+
+            // The ledger is still clean when this call starts - the reuse-
+            // lease decision (already fixed) correctly adopts the lease;
+            // the factory then commits the tombstone DURING the build.
+            let result = session
+                .replace_locked(RpcEngineRequest::Open { session_path: child.clone(), reuse_lease: false })
+                .await;
+            assert!(
+                result.is_err(),
+                "a tombstone committed during the replacement build must still refuse publication: {result:?}"
+            );
+            assert_eq!(std::fs::read(&child).unwrap(), before);
+        })
+        .await
+        .expect("bounded rpc mid-build tombstone test");
     }
 }

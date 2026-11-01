@@ -3,7 +3,6 @@
 //! `list_agent_peers`; the worker arms the selector forms forward to.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -15,6 +14,9 @@ use crate::protocol::{response_failure, response_line, response_success, DaemonR
 use crate::session_store::{read_session_info, SessionFile};
 use crate::supervisor::Supervisor;
 use crate::worker::Worker;
+
+mod file_delete;
+pub(crate) use file_delete::delete_session_file_after_file_removed;
 
 pub(crate) fn name_unavailable_error(name: &str, depth: u32) -> String {
     format!(
@@ -101,36 +103,80 @@ pub(crate) fn append_saved_session_name(path: &Path, name: &str) -> anyhow::Resu
     session.rewrite()
 }
 
-/// Delete a session file: try the `trash` CLI first, fall back to unlink,
-/// then the hook and the artifact partition removal.
-pub(crate) fn delete_session_file(path: &Path) -> Value {
-    delete_session_file_after_file_removed(path, &|_| {})
+/// How a saved-session delete removes the file. It is chosen when the
+/// receiver is built, never by an environment variable or setting.
+/// Production always uses `TrashThenUnlink`. Test builds default to an
+/// explicit unlink, so no test can move a real file to the user's Trash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionFileRemoval {
+    /// The shared #41 Trash helper: the installed `trash` tool, or an
+    /// explicit unlink only when no tool is installed.
+    TrashThenUnlink,
+    /// Test only: unlink without looking for the trash tool.
+    #[cfg(test)]
+    Unlink,
+    /// Test only: the physical removal fails and the file stays.
+    #[cfg(test)]
+    Fail,
 }
 
-/// `deleteSessionFile` with its `afterFileRemoved` hook: the hook runs
-/// once the file is gone but BEFORE the artifact partition's removal (the
-/// job-cancel hook needs the partition registered on the store).
-pub(crate) fn delete_session_file_after_file_removed(
+// Not derivable: the default VARIES by build config (test vs production) -
+// a #[derive(Default)] + #[default] attribute cannot express that split.
+#[allow(clippy::derivable_impls)]
+impl Default for SessionFileRemoval {
+    fn default() -> Self {
+        #[cfg(test)]
+        {
+            Self::Unlink
+        }
+        #[cfg(not(test))]
+        {
+            Self::TrashThenUnlink
+        }
+    }
+}
+
+/// `deleteSessionFile` with the construction-time removal strategy. The
+/// production strategy is the shared #41 Trash helper (`file_delete`): an
+/// installed tool failure keeps the file and errors, an absent tool unlinks
+/// explicitly (reported as `unlink`), and a missing entry is never reported
+/// as trashed. Test strategies never resolve or run the real tool.
+pub(crate) fn delete_session_file_with(
     path: &Path,
     after_file_removed: &dyn Fn(&Path),
+    removal: SessionFileRemoval,
 ) -> Value {
-    let trash = StdCommand::new("trash").arg("--").arg(path).output();
-    let removed_by_trash = match trash {
-        Ok(output) => output.status.success() || !path.exists(),
-        Err(_) => false,
-    };
-    if removed_by_trash {
-        after_file_removed(path);
-        remove_session_artifacts(path);
-        return json!({ "ok": true, "method": "trash" });
-    }
-    match std::fs::remove_file(path) {
-        Ok(()) => {
-            after_file_removed(path);
-            remove_session_artifacts(path);
-            json!({ "ok": true, "method": "unlink" })
+    match removal {
+        SessionFileRemoval::TrashThenUnlink => {
+            // Hermetic deny guard: a unit test must never reach the user's
+            // Trash - a RUNTIME check deliberately, not a const block: this
+            // must only fire if this branch is actually reached during a
+            // test build, never unconditionally at compile time (a const
+            // block evaluates immediately regardless of whether
+            // TrashThenUnlink is ever matched, which would make every test
+            // build fail to compile at all, not just refuse this branch).
+            #[allow(clippy::assertions_on_constants)]
+            {
+                assert!(
+                    !cfg!(test),
+                    "tests must never invoke the real trash tool; use SessionFileRemoval::Unlink"
+                );
+            }
+            delete_session_file_after_file_removed(path, after_file_removed)
         }
-        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+        #[cfg(test)]
+        SessionFileRemoval::Unlink => match std::fs::remove_file(path) {
+            Ok(()) => {
+                after_file_removed(path);
+                remove_session_artifacts(path);
+                json!({ "ok": true, "method": "unlink" })
+            }
+            Err(error) => json!({ "ok": false, "error": error.to_string() }),
+        },
+        #[cfg(test)]
+        SessionFileRemoval::Fail => {
+            json!({ "ok": false, "error": "injected physical removal failure" })
+        }
     }
 }
 
@@ -212,35 +258,101 @@ pub(crate) fn capture_saved_session_delete(
     }
 }
 
-/// The post-delete tombstone append (phase 2 — only a SUCCESSFUL removal
-/// tombstones, or a failed delete would bill a live transcript as deleted spend).
-pub(crate) fn tombstone_saved_session_delete_captured(
-    agent_dir: &Path,
-    sessions_dir: &Path,
+/// What one saved-delete tombstone commit wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SavedTombstone {
+    /// Ledger edges at the path that now carry a tombstone.
+    pub(crate) edges: usize,
+    /// Edges that also received the captured usage snapshot.
+    pub(crate) captured: usize,
+}
+
+/// Append the captured child's tombstone to one ledger.
+fn append_saved_session_tombstone(
+    ledger: &crate::rlm_ledger::RlmSpawnLedger,
     capture: &SavedDeleteCapture,
-) -> usize {
+) -> anyhow::Result<SavedTombstone> {
     let SavedDeleteCapture::Child {
         usage,
         canonical_path,
     } = capture
     else {
-        return 0;
+        return Ok(SavedTombstone::default());
     };
-    let ledger = crate::rlm_ledger::RlmSpawnLedger::new(agent_dir, sessions_dir, |_| {});
-    match ledger.tombstone_child_path_with_usage(
+    let edges = ledger.tombstone_child_path_with_usage(
         canonical_path,
         crate::rlm_ledger::RlmLedgerDeleteReason::User,
         usage.as_ref(),
-    ) {
-        // The returned edges are the pre-append replay state: every
-        // matching edge received the snapshot when one was captured.
-        Ok(edges) => {
-            if usage.is_some() {
-                edges.len()
-            } else {
-                0
+    )?;
+    // The returned edges are the pre-append replay state: every
+    // matching edge received the snapshot when one was captured.
+    Ok(SavedTombstone {
+        edges: edges.len(),
+        captured: if usage.is_some() { edges.len() } else { 0 },
+    })
+}
+
+/// #42 saved-delete commit: under the target's common fence M, prove the
+/// ledger reads strictly and no live runtime owns the file, then append the
+/// tombstone. Only an Ok proves the tombstone committed. The physical
+/// removal runs after M is released, so a failure there leaves a committed
+/// logical deletion (a partial result), never a removed file without a
+/// tombstone.
+pub(crate) fn commit_saved_session_tombstone(
+    authority: &crate::lease::RuntimeSessionAuthority,
+    capture: &SavedDeleteCapture,
+) -> anyhow::Result<SavedTombstone> {
+    let SavedDeleteCapture::Child { canonical_path, .. } = capture else {
+        return Ok(SavedTombstone::default());
+    };
+    let ledger = std::sync::Arc::clone(authority.ledger());
+    crate::lease::with_runtime_session_fence(
+        authority.agent_dir(),
+        Path::new(canonical_path),
+        |held| {
+            ledger.strict_edges()?;
+            match held.inspect_ownership()? {
+                crate::lease::RuntimeLeaseOwnership::Absent
+                | crate::lease::RuntimeLeaseOwnership::Stale => {}
+                crate::lease::RuntimeLeaseOwnership::Unknown => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Runtime ownership is unknown; deletion deferred",
+                    )
+                    .into());
+                }
+                crate::lease::RuntimeLeaseOwnership::Held(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Another runtime owns this session; deletion deferred",
+                    )
+                    .into());
+                }
             }
-        }
+            append_saved_session_tombstone(&ledger, capture)
+        },
+    )
+}
+
+/// The saved delete's answer when the tombstone committed but the physical
+/// removal failed: the TS failure object plus the committed logical deletion.
+fn partial_saved_delete_result(mut result: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        object.insert("logicalDeletion".to_string(), json!("committed"));
+    }
+    result
+}
+
+/// Best-effort tombstone append for the capture unit tests.
+#[cfg(test)]
+pub(crate) fn tombstone_saved_session_delete_captured(
+    agent_dir: &Path,
+    sessions_dir: &Path,
+    capture: &SavedDeleteCapture,
+) -> usize {
+    let ledger = crate::rlm_ledger::RlmSpawnLedger::new(agent_dir, sessions_dir, |_| {});
+    match append_saved_session_tombstone(&ledger, capture) {
+        Ok(tombstone) => tombstone.captured,
         Err(error) => {
             eprintln!("failed to append RLM ledger delete tombstone: {error:#}");
             0
@@ -561,6 +673,20 @@ impl Supervisor {
                 false,
             );
         };
+        let _child_lifecycle = match self.child_lifecycles.lock(session_path).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return (
+                    vec![response_line(&response_failure(
+                        Some(command_id),
+                        type_name,
+                        &format!("Session delete could not acquire lifecycle ownership: {error:#}"),
+                        None,
+                    ))],
+                    false,
+                )
+            }
+        };
         let canonical = canonical_session_path(Path::new(session_path))
             .to_string_lossy()
             .to_string();
@@ -589,9 +715,6 @@ impl Supervisor {
                 );
             }
         }
-        // The session is going away: its passivation launch record goes first,
-        // so no later wake can recreate a deleted transcript's context.
-        self.passivated_launches.forget(session_path);
         // A worker still hosting the file owns the delete; another
         // client's worker is invisible (the unknown-target error).
         if let Some(owner) = self.registry.find_by_session_file(session_path).await {
@@ -625,6 +748,19 @@ impl Supervisor {
                     == Some(true)
                 {
                     self.session_bindings.forget_file(&canonical);
+                    if let Err(error) = self.passivated_launches.forget_deleted(session_path) {
+                        self.log_line(&format!(
+                            "deleted session launch record retained: {error:#}"
+                        ));
+                        response = response_failure(
+                            Some(command_id),
+                            type_name,
+                            &format!(
+                                "Session deleted, but launch record cleanup failed: {error:#}"
+                            ),
+                            None,
+                        );
+                    }
                 }
                 return (vec![response_line(&response)], false);
             }
@@ -638,9 +774,7 @@ impl Supervisor {
                 false,
             );
         }
-        let sessions_dir = self.sessions_dir_path();
-        // Phase 1 while the file is alive; the tombstone waits for the
-        // removal to SUCCEED (see `capture_saved_session_delete`).
+        // Phase 1 while the file is alive: the capture reads the transcript.
         let capture = capture_saved_session_delete(
             session_path,
             roster_entry
@@ -648,19 +782,40 @@ impl Supervisor {
                 .and_then(|entry| entry.summary.get("runtimeKind"))
                 .and_then(Value::as_str),
         );
-        let result = delete_session_file(Path::new(session_path));
+        // #42: the tombstone commits under M BEFORE any physical removal. A
+        // failed commit removes nothing, so the transcript and its ledger
+        // edge stay consistent and the delete can be retried.
+        let committed = match crate::lease::RuntimeSessionAuthority::for_supervisor(
+            &self.options.agent_dir,
+            &self.options.socket_path,
+        )
+        .and_then(|authority| commit_saved_session_tombstone(&authority, &capture))
+        {
+            Ok(tombstone) => tombstone,
+            Err(error) => {
+                return (
+                    vec![response_line(&response_failure(
+                        Some(command_id),
+                        type_name,
+                        &format!(
+                            "Session delete was not committed; nothing was removed: {error:#}"
+                        ),
+                        None,
+                    ))],
+                    false,
+                );
+            }
+        };
+        if committed.captured > 0 {
+            self.note_deleted_child_usage_captured("saved_delete", committed.captured);
+        }
+        let logical = committed.edges > 0;
+        let result =
+            delete_session_file_with(Path::new(session_path), &|_| {}, self.session_file_removal);
         let removed = result.get("ok").and_then(Value::as_bool) == Some(true);
         if removed {
             // A deleted session file can carry passive scheduled rows: the catalog must rescan.
             self.invalidate_passive_catalog();
-            let captured = tombstone_saved_session_delete_captured(
-                &self.options.agent_dir,
-                sessions_dir.as_deref().unwrap_or(&self.options.agent_dir),
-                &capture,
-            );
-            if captured > 0 {
-                self.note_deleted_child_usage_captured("saved_delete", captured);
-            }
             // The deleted file's binding dies with it: a stale id for the
             // session can never rebind again. `canonical` was resolved while
             // the file still existed - the same key the table stores.
@@ -684,7 +839,33 @@ impl Supervisor {
                 None => Vec::new(),
             };
             self.push_roster_update(changed, removed_ids);
+            if let Err(error) = self.passivated_launches.forget_deleted(session_path) {
+                self.log_line(&format!(
+                    "deleted session launch record retained: {error:#}"
+                ));
+                return (
+                    vec![response_line(&response_failure(
+                        Some(command_id),
+                        type_name,
+                        &format!("Session deleted, but launch record cleanup failed: {error:#}"),
+                        None,
+                    ))],
+                    false,
+                );
+            }
         }
+        let result = if !removed && logical {
+            // Committed tombstone, failed physical removal: the child is
+            // deleted (no revival) and the transcript is retained for a retry.
+            if let Err(error) = self.passivated_launches.forget_deleted(session_path) {
+                self.log_line(&format!(
+                    "deleted session launch record retained: {error:#}"
+                ));
+            }
+            partial_saved_delete_result(result)
+        } else {
+            result
+        };
         (
             vec![response_line(&response_success(
                 Some(command_id),
@@ -925,24 +1106,50 @@ impl Worker {
                 None,
             );
         }
-        let sessions_dir = crate::paths::sessions_dir(&self.config.agent_dir)
-            .unwrap_or_else(|_| self.config.agent_dir.join("sessions"));
-        // Phase 1 while the file is alive; the tombstone waits for a
-        // successful removal (see `capture_saved_session_delete`).
+        // Phase 1 while the file is alive: the capture reads the transcript.
         let capture = capture_saved_session_delete(session_path, None);
+        // #42: the tombstone commits under M before any physical removal; a
+        // failed commit removes nothing (same order as the supervisor arm).
+        let authority = match &self.authority {
+            Ok(authority) => authority,
+            Err(error) => {
+                return response_failure(
+                    None,
+                    "delete_saved_session",
+                    &format!("Session delete was not committed; nothing was removed: {error}"),
+                    None,
+                );
+            }
+        };
+        let committed = match commit_saved_session_tombstone(authority, &capture) {
+            Ok(tombstone) => tombstone,
+            Err(error) => {
+                return response_failure(
+                    None,
+                    "delete_saved_session",
+                    &format!("Session delete was not committed; nothing was removed: {error:#}"),
+                    None,
+                );
+            }
+        };
         // The hook runs between the file's removal and the partition's
         // removal — the durable job cancel (needs the partition registered).
-        let result = delete_session_file_after_file_removed(path, &|deleted| {
-            self.cancel_deleted_session_jobs(deleted);
-        });
-        if result.get("ok").and_then(Value::as_bool) == Some(true) {
-            let _captured = tombstone_saved_session_delete_captured(
-                &self.config.agent_dir,
-                &sessions_dir,
-                &capture,
-            );
+        let result = delete_session_file_with(
+            path,
+            &|deleted| {
+                self.cancel_deleted_session_jobs(deleted);
+            },
+            SessionFileRemoval::default(),
+        );
+        let removed = result.get("ok").and_then(Value::as_bool) == Some(true);
+        if removed {
             self.scheduled.wake().await;
         }
+        let result = if !removed && committed.edges > 0 {
+            partial_saved_delete_result(result)
+        } else {
+            result
+        };
         response_success(None, "delete_saved_session", Some(result))
     }
 }

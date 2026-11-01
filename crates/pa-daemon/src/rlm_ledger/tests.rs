@@ -237,9 +237,8 @@ fn edge_is_live_revalidates_paths_without_a_ledger_append() {
     assert!(!ledger.edge_is_live("sub-1", &target_path));
 }
 
-/// A respawned child id: the tombstoned edge at the old path stays dead,
-/// the new path's edge is live, and a later respawn on the old path's key
-/// re-lives that edge in place (the fold keeps one edge per key).
+/// #42: one durable child identity at one transcript path cannot revive
+/// after deletion. A distinct path is a different child transcript.
 #[test]
 fn a_respawned_child_id_on_a_new_path_is_live_and_the_old_one_is_not() {
     let dir = temp_dir("respawn");
@@ -251,25 +250,31 @@ fn a_respawned_child_id_on_a_new_path_is_live_and_the_old_one_is_not() {
     fs::write(&a, "{}").unwrap();
     fs::write(&b, "{}").unwrap();
     let spawn = |child: &Path, name: &str| {
-        ledger
-            .append_spawn(&RlmSpawnInput {
-                child_id: "sub-1".into(),
-                parent: parent.to_string_lossy().into_owned(),
-                child: child.to_string_lossy().into_owned(),
-                depth: 1,
-                name: name.into(),
-            })
-            .unwrap();
+        ledger.append_spawn(&RlmSpawnInput {
+            child_id: "sub-1".into(),
+            parent: parent.to_string_lossy().into_owned(),
+            child: child.to_string_lossy().into_owned(),
+            depth: 1,
+            name: name.into(),
+        })
     };
-    spawn(&a, "first");
+    spawn(&a, "first").unwrap();
     ledger
         .append_delete("sub-1", &a.to_string_lossy(), RlmLedgerDeleteReason::User)
         .unwrap();
-    spawn(&b, "second");
+    spawn(&b, "second").unwrap();
     assert!(!ledger.edge_is_live("sub-1", &a.to_string_lossy()));
     assert!(ledger.edge_is_live("sub-1", &b.to_string_lossy()));
-    spawn(&a, "third");
-    assert!(ledger.edge_is_live("sub-1", &a.to_string_lossy()));
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "{}",
+        "a new path never copies the deleted transcript"
+    );
+    assert!(
+        spawn(&a, "third").is_err(),
+        "#42 forbids reviving the same child id at its tombstoned path"
+    );
+    assert!(!ledger.edge_is_live("sub-1", &a.to_string_lossy()));
     assert!(ledger.edge_is_live("sub-1", &b.to_string_lossy()));
 }
 
@@ -1519,4 +1524,531 @@ fn artifact_misses_stay_cached_until_a_directory_changes() {
     assert_eq!(ledger.live_edges().unwrap(), expected);
     assert_eq!(ledger.live_edges().unwrap(), expected);
     assert_eq!(replay::ARTIFACT_SCANS.with(std::cell::Cell::get), scans + 2);
+}
+
+/// A legacy root with a claimed registry: `live` is a running child and
+/// `gone` was deleted before the ledger existed (TS v0.3.2-v0.7.2).
+fn legacy_root_with_deleted_child(dir: &Path, deleted_row: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let sessions = dir.join("sessions");
+    let artifacts = dir.join("session-artifacts").join("p1");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&artifacts).unwrap();
+    let parent = sessions.join("p1.jsonl");
+    fs::write(&parent, "{\"type\":\"session\",\"id\":\"p1\"}\n").unwrap();
+    let live = dir.join("live.jsonl");
+    let gone = dir.join("gone.jsonl");
+    fs::write(&live, "{}").unwrap();
+    fs::write(&gone, "{}").unwrap();
+    let row = |id: &str, file: &Path, status: &str| {
+        format!(
+            "{{\"type\":\"rlm_subagent\",\"childId\":\"{id}\",\"sessionName\":\"{id}\",\"sessionFile\":\"{}\",\"rlmDepth\":1,\"status\":\"{status}\",\"createdAt\":1}}\n",
+            file.to_string_lossy()
+        )
+    };
+    let mut registry = row("sub-live", &live, "running");
+    registry.push_str(&row("sub-gone", &gone, "running"));
+    registry.push_str(&deleted_row.replace("{gone}", &gone.to_string_lossy()));
+    fs::write(artifacts.join("rlm-subagents.jsonl"), registry).unwrap();
+    (parent, live, gone)
+}
+
+const DELETED_GONE_ROW: &str = "{\"type\":\"rlm_subagent\",\"childId\":\"sub-gone\",\"sessionName\":\"sub-gone\",\"sessionFile\":\"{gone}\",\"rlmDepth\":1,\"status\":\"deleted\",\"createdAt\":1}\n";
+
+fn spawn_input(child_id: &str, parent: &Path, child: &Path) -> RlmSpawnInput {
+    RlmSpawnInput {
+        child_id: child_id.into(),
+        parent: parent.to_string_lossy().into_owned(),
+        child: child.to_string_lossy().into_owned(),
+        depth: 1,
+        name: child_id.into(),
+    }
+}
+
+/// #42: a registry-only legacy deletion becomes a ledger tombstone on its
+/// (childId, path) key. Non-session and header-less roots own no registry.
+#[test]
+fn claimed_legacy_deletion_seeds_a_tombstone_beside_non_session_roots() {
+    let dir = temp_dir("seed-legacy-deleted");
+    let (parent, live, gone) = legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+    let sessions = dir.join("sessions");
+    fs::write(sessions.join("notes.jsonl"), "not json\n").unwrap();
+    fs::write(sessions.join("headerless.jsonl"), "{}\n").unwrap();
+    let ledger = ledger_for(&dir);
+    let edges = ledger.strict_edges().unwrap();
+    let gone_text = canonical_session_path(&gone).to_string_lossy().into_owned();
+    let tombstone = edges
+        .iter()
+        .find(|edge| edge.child_id == "sub-gone")
+        .unwrap();
+    assert_eq!(tombstone.child, gone_text);
+    assert_eq!(tombstone.deleted, Some(RlmLedgerDeleteReason::User));
+    assert!(
+        tombstone.deleted_usage.is_none(),
+        "no usage is invented for an imported tombstone"
+    );
+    assert!(ledger.edge_is_live("sub-live", &live.to_string_lossy()));
+    let content = fs::read_to_string(ledger.ledger_path()).unwrap();
+    let delete_lines: Vec<&str> = content
+        .lines()
+        .filter(|line| line.contains("\"op\":\"delete\""))
+        .collect();
+    assert_eq!(delete_lines.len(), 1);
+    assert!(
+        delete_lines[0].contains("\"reason\":\"user\"")
+            && delete_lines[0].contains("\"source\":\"legacy-registry\"")
+    );
+    // The base grammar (unchanged since dcc) accepts the extra field.
+    assert!(matches!(
+        parse_ledger_line(delete_lines[0], 0).unwrap(),
+        Some(LedgerRecord::Delete {
+            reason: RlmLedgerDeleteReason::User,
+            usage: None,
+            ..
+        })
+    ));
+    // The gone transcript is never opened or rewritten by the import.
+    assert_eq!(fs::read_to_string(&gone).unwrap(), "{}");
+
+    let other = dir.join("other.jsonl");
+    fs::write(&other, "{}").unwrap();
+    ledger
+        .append_spawn(&spawn_input("sub-new", &parent, &other))
+        .unwrap();
+    let error = ledger
+        .append_spawn(&spawn_input("sub-gone", &parent, &gone))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Cannot revive deleted RLM child"));
+    ledger
+        .append_spawn(&spawn_input("sub-reuse", &parent, &gone))
+        .unwrap();
+}
+
+#[test]
+fn a_malformed_deleted_legacy_row_refuses_the_seed_naming_the_registry() {
+    let dir = temp_dir("seed-legacy-malformed");
+    let (parent, _, _) = legacy_root_with_deleted_child(
+        &dir,
+        "{\"type\":\"rlm_subagent\",\"childId\":\"sub-gone\",\"sessionName\":\"x\",\"status\":\"deleted\"}\n",
+    );
+    let ledger = ledger_for(&dir);
+    let other = dir.join("other.jsonl");
+    fs::write(&other, "{}").unwrap();
+    let error = format!(
+        "{:#}",
+        ledger
+            .append_spawn(&spawn_input("sub-new", &parent, &other))
+            .unwrap_err()
+    );
+    assert!(error.contains("rlm-subagents.jsonl"), "{error}");
+    assert!(!ledger.ledger_path().exists());
+    // Display reads degrade instead of failing closed.
+    assert!(ledger.edges(false).is_ok());
+}
+
+#[test]
+fn a_display_read_over_a_malformed_registry_retries_the_seed_after_repair() {
+    let dir = temp_dir("seed-legacy-repair");
+    legacy_root_with_deleted_child(
+        &dir,
+        "{\"type\":\"rlm_subagent\",\"childId\":\"sub-gone\",\"sessionName\":\"x\",\"status\":\"deleted\"}\n",
+    );
+    let ledger = ledger_for(&dir);
+    assert!(
+        ledger.edges(true).unwrap().is_empty(),
+        "display shows no seeded legacy edge"
+    );
+    assert!(!ledger.ledger_path().exists());
+    // Operator remedy: move the bad registry aside.
+    let registry = dir
+        .join("session-artifacts")
+        .join("p1")
+        .join("rlm-subagents.jsonl");
+    fs::rename(&registry, registry.with_extension("jsonl.bad")).unwrap();
+    legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+    let edges = ledger.edges(true).unwrap();
+    assert!(
+        ledger.ledger_path().exists(),
+        "the display-path failure was not memoized"
+    );
+    assert!(edges
+        .iter()
+        .any(|edge| edge.child_id == "sub-live" && edge.deleted.is_none()));
+    assert!(edges.iter().any(
+        |edge| edge.child_id == "sub-gone" && edge.deleted == Some(RlmLedgerDeleteReason::User)
+    ));
+}
+
+#[test]
+fn conflicting_legacy_paths_for_one_child_refuse_the_seed() {
+    let dir = temp_dir("seed-legacy-conflict");
+    let (_, _, _) = legacy_root_with_deleted_child(
+        &dir,
+        "{\"type\":\"rlm_subagent\",\"childId\":\"sub-gone\",\"sessionName\":\"x\",\"sessionFile\":\"/elsewhere/gone.jsonl\",\"status\":\"deleted\"}\n",
+    );
+    let error = format!("{:#}", ledger_for(&dir).strict_edges().unwrap_err());
+    assert!(
+        error.contains("ambiguous paths") && error.contains("rlm-subagents.jsonl"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_failed_legacy_seed_publication_leaves_no_ledger_and_retries_once() {
+    let dir = temp_dir("seed-legacy-retry");
+    legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+    let ledger = ledger_for(&dir);
+    SEED_PUBLISH_FAULT.with(|fault| fault.set(true));
+    assert!(ledger.strict_edges().is_err());
+    assert!(
+        !ledger.ledger_path().exists(),
+        "no partial ledger is visible"
+    );
+    // The scratch is retained evidence and is never deleted. Without the
+    // namespace guard it does not block a fresh no-clobber publication.
+    let ledger_dir = ledger.ledger_path().parent().unwrap().to_path_buf();
+    let scratch_count = || {
+        fs::read_dir(&ledger_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.to_string_lossy().starts_with("seed-"))
+            })
+            .count()
+    };
+    assert_eq!(scratch_count(), 1);
+    ledger.strict_edges().unwrap();
+    let content = fs::read_to_string(ledger.ledger_path()).unwrap();
+    let count = |op: &str, id: &str| {
+        content
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("\"op\":\"{op}\""))
+                    && line.contains(&format!("\"childId\":\"{id}\""))
+            })
+            .count()
+    };
+    assert_eq!(
+        (count("spawn", "sub-gone"), count("delete", "sub-gone")),
+        (1, 1)
+    );
+    assert_eq!(
+        (count("spawn", "sub-live"), count("delete", "sub-live")),
+        (1, 0)
+    );
+    // Under the namespace guard the dead scratch is moved aside, never deleted.
+    let retained = fs::read_dir(dir.join("rlm-ledger-retained")).map_or(0, Iterator::count);
+    assert!(
+        scratch_count() + retained >= 1,
+        "the dead attempt's scratch is retained"
+    );
+}
+
+// Namespace crash recovery (storage_path.rs). Dead seed scratch is moved
+// aside or, when it is an extra name of the published ledger, its name is
+// retired. Bytes are never deleted.
+
+fn seed_scratch(ledger: &RlmSpawnLedger) -> Vec<PathBuf> {
+    let stem = ledger
+        .ledger_path()
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    fs::read_dir(ledger.ledger_path().parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{stem}.seed-"))
+        })
+        .collect()
+}
+
+#[test]
+fn a_crashed_seed_scratch_is_retained_aside_and_the_next_strict_call_publishes() {
+    let dir = temp_dir("seed-crash-recover");
+    legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+    let ledger = ledger_for(&dir);
+    SEED_PUBLISH_FAULT.with(|fault| fault.set(true));
+    assert!(ledger.strict_edges().is_err());
+    assert!(!ledger.ledger_path().exists());
+    let scratch = seed_scratch(&ledger);
+    assert_eq!(scratch.len(), 1);
+    let scratch_bytes = fs::read(&scratch[0]).unwrap();
+    ledger.strict_edges().unwrap();
+    assert!(!scratch[0].exists());
+    let retained: Vec<PathBuf> = fs::read_dir(dir.join("rlm-ledger-retained"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        fs::read(&retained[0]).unwrap(),
+        scratch_bytes,
+        "retained, never deleted"
+    );
+    let content = fs::read_to_string(ledger.ledger_path()).unwrap();
+    let count = |op: &str| {
+        content
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("\"op\":\"{op}\""))
+                    && line.contains("\"childId\":\"sub-gone\"")
+            })
+            .count()
+    };
+    assert_eq!((count("spawn"), count("delete")), (1, 1));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_published_seed_with_a_leftover_link_retires_only_that_name() {
+    let dir = temp_dir("seed-leftover-link");
+    legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+    let ledger = ledger_for(&dir);
+    ledger.strict_edges().unwrap();
+    let stem = ledger
+        .ledger_path()
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ledger_dir = ledger.ledger_path().parent().unwrap().to_path_buf();
+    let leftover = ledger_dir.join(format!("{stem}.seed-7-7"));
+    fs::hard_link(ledger.ledger_path(), &leftover).unwrap();
+    let before = fs::read(ledger.ledger_path()).unwrap();
+    ledger.strict_edges().unwrap();
+    assert!(!leftover.exists());
+    assert_eq!(fs::read(ledger.ledger_path()).unwrap(), before);
+    assert!(!dir.join("rlm-ledger-retained").exists());
+    // A different inode beside an existing ledger is not ours to retire.
+    let foreign_inode = ledger_dir.join(format!("{stem}.seed-7-8"));
+    fs::write(&foreign_inode, &before).unwrap();
+    let error = format!("{:#}", ledger.strict_edges().unwrap_err());
+    assert!(error.contains("retained seed candidate"), "{error}");
+    assert_eq!(fs::read(&foreign_inode).unwrap(), before);
+}
+
+#[test]
+fn a_foreign_namespace_seed_scratch_does_not_block_this_namespace() {
+    let dir = temp_dir("seed-foreign-scratch");
+    let (parent, _, _) = legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+    let ledger = ledger_for(&dir);
+    let ledger_dir = ledger.ledger_path().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&ledger_dir).unwrap();
+    let foreign = ledger_dir.join("0123456789abcdef.seed-1-1");
+    fs::write(&foreign, b"another namespace's evidence").unwrap();
+    let other = dir.join("other.jsonl");
+    fs::write(&other, "{}").unwrap();
+    ledger
+        .append_spawn(&spawn_input("sub-new", &parent, &other))
+        .unwrap();
+    assert_eq!(fs::read(&foreign).unwrap(), b"another namespace's evidence");
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_seed_directory_must_be_private() {
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["symlink", "writable"] {
+        let dir = temp_dir(&format!("seed-retained-{case}"));
+        legacy_root_with_deleted_child(&dir, DELETED_GONE_ROW);
+        let retained = dir.join("rlm-ledger-retained");
+        if case == "symlink" {
+            let target = dir.join("elsewhere");
+            fs::create_dir(&target).unwrap();
+            std::os::unix::fs::symlink(&target, &retained).unwrap();
+        } else {
+            fs::create_dir(&retained).unwrap();
+            fs::set_permissions(&retained, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let ledger = ledger_for(&dir);
+        SEED_PUBLISH_FAULT.with(|fault| fault.set(true));
+        assert!(ledger.strict_edges().is_err());
+        let scratch = seed_scratch(&ledger);
+        assert_eq!(scratch.len(), 1);
+        let error = format!("{:#}", ledger.strict_edges().unwrap_err());
+        assert!(error.contains("not private"), "{case}: {error}");
+        assert!(scratch[0].exists(), "{case}: the scratch stays in place");
+        assert!(!ledger.ledger_path().exists());
+    }
+    // A foreign-owner retained directory is refused by checked_directory's uid
+    // check; a test cannot create one without privileges.
+}
+
+/// A crash mid-append leaves the delete line torn. The delete never returned
+/// Ok and no cleanup ran, so the child was never deleted. The next append
+/// copies the torn bytes into `rlm-ledger-retained/`, truncates them, and
+/// appends; the ledger then holds only complete lines, as TS-format readers
+/// require, and the same child may respawn.
+#[test]
+fn a_delete_torn_mid_write_never_committed_and_the_child_may_respawn() {
+    use std::io::Write;
+    let dir = temp_dir("torn-delete");
+    let ledger = ledger_for(&dir);
+    let parent = dir.join("p.jsonl");
+    let child = dir.join("c.jsonl");
+    fs::write(&parent, "{}").unwrap();
+    fs::write(&child, "{}").unwrap();
+    ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .unwrap();
+    let delete = json!({"v":1,"op":"delete","at":"t","childId":"sub-1","child":canonical_session_path(&child),"reason":"user"}).to_string();
+    let torn = &delete.as_bytes()[..delete.len() / 2];
+    fs::OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(torn)
+        .unwrap();
+    // Both readers treat the unterminated final segment as torn.
+    assert!(ledger
+        .edges(true)
+        .unwrap()
+        .iter()
+        .all(|edge| edge.deleted.is_none()));
+    ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .unwrap();
+    let content = fs::read(ledger.ledger_path()).unwrap();
+    assert!(
+        !content.windows(torn.len()).any(|window| window == torn),
+        "the torn tail was truncated"
+    );
+    assert!(content.ends_with(b"\n"));
+    for line in content
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        serde_json::from_slice::<serde_json::Value>(line).expect("only complete lines remain");
+    }
+    let retained: Vec<Vec<u8>> = fs::read_dir(dir.join("rlm-ledger-retained"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(
+        retained,
+        vec![torn.to_vec()],
+        "the torn bytes are retained, never deleted"
+    );
+    assert!(ledger.edge_is_live("sub-1", &child.to_string_lossy()));
+}
+
+/// A complete-JSON tail missing only its newline (a crash on the final byte or
+/// a failed sync) is still torn for both readers, and the next append retains
+/// and truncates it instead of committing it.
+#[test]
+fn a_complete_json_tail_without_newline_never_becomes_committed() {
+    use std::io::Write;
+    let dir = temp_dir("complete-tail");
+    let ledger = ledger_for(&dir);
+    let parent = dir.join("p.jsonl");
+    let child = dir.join("c.jsonl");
+    fs::write(&parent, "{}").unwrap();
+    fs::write(&child, "{}").unwrap();
+    ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .unwrap();
+    let delete = json!({"v":1,"op":"delete","at":"t","childId":"sub-1","child":canonical_session_path(&child),"reason":"user"}).to_string();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(delete.as_bytes())
+        .unwrap();
+    assert!(ledger
+        .edges(true)
+        .unwrap()
+        .iter()
+        .all(|edge| edge.deleted.is_none()));
+    assert!(ledger
+        .strict_edges()
+        .unwrap()
+        .iter()
+        .all(|edge| edge.deleted.is_none()));
+    let other = dir.join("o.jsonl");
+    fs::write(&other, "{}").unwrap();
+    ledger
+        .append_spawn(&spawn_input("sub-2", &parent, &other))
+        .unwrap();
+    assert!(ledger
+        .strict_edges()
+        .unwrap()
+        .iter()
+        .all(|edge| edge.deleted.is_none()));
+    ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .unwrap();
+    assert!(ledger.edge_is_live("sub-1", &child.to_string_lossy()));
+}
+
+/// A retained-directory failure refuses the append and leaves the torn tail
+/// untouched: copy first, truncate only after the copy is synced.
+#[cfg(unix)]
+#[test]
+fn a_torn_tail_is_not_truncated_when_it_cannot_be_retained() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("torn-unretained");
+    let ledger = ledger_for(&dir);
+    let parent = dir.join("p.jsonl");
+    let child = dir.join("c.jsonl");
+    fs::write(&parent, "{}").unwrap();
+    fs::write(&child, "{}").unwrap();
+    ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(ledger.ledger_path())
+        .unwrap()
+        .write_all(b"{\"v\":1,\"op\":\"de")
+        .unwrap();
+    let retained = dir.join("rlm-ledger-retained");
+    fs::create_dir(&retained).unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o777)).unwrap();
+    let before = fs::read(ledger.ledger_path()).unwrap();
+    let other = dir.join("o.jsonl");
+    fs::write(&other, "{}").unwrap();
+    let error = format!(
+        "{:#}",
+        ledger
+            .append_spawn(&spawn_input("sub-2", &parent, &other))
+            .unwrap_err()
+    );
+    assert!(error.contains("torn tail not retained"), "{error}");
+    assert_eq!(fs::read(ledger.ledger_path()).unwrap(), before);
+}
+
+/// A new ledger is published whole (header plus first record) through the
+/// seed scratch, so no file ever holds only a header.
+#[test]
+fn a_new_ledger_is_published_with_its_first_record() {
+    let dir = temp_dir("new-ledger-whole");
+    let ledger = ledger_for(&dir);
+    let parent = dir.join("p.jsonl");
+    let child = dir.join("c.jsonl");
+    fs::write(&parent, "{}").unwrap();
+    fs::write(&child, "{}").unwrap();
+    SEED_PUBLISH_FAULT.with(|fault| fault.set(true));
+    assert!(ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .is_err());
+    assert!(
+        !ledger.ledger_path().exists(),
+        "a failed first append leaves no ledger"
+    );
+    ledger
+        .append_spawn(&spawn_input("sub-1", &parent, &child))
+        .unwrap();
+    let content = fs::read_to_string(ledger.ledger_path()).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("\"op\":\"meta\"") && lines[1].contains("\"op\":\"spawn\""));
 }

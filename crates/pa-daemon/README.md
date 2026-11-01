@@ -245,6 +245,31 @@ attached UIs daemon-wide).
 
 Side-question lifecycle (`side_question` + `side_question_store`): `/btw` runs stream through the worker, settle before close, and persist each pane as a depth-zero linked transcript under the parent artifact directory. One immutable `side_question` pointer in the parent keeps the side messages out of main context while preserving their complete paid usage. Negotiated `side_question_pane_id` groups follow-ups across reconnects; legacy pointer/transcript files resume in place.
 
+RLM ledger namespace compatibility (#41): stable aliases converge to one
+history. This includes existing symlinked sessions roots and missing macOS
+`/var` roots that are later created. A validated existing legacy bucket keeps
+its filename; no history is moved, copied, linked, or rehashed. Dangling or
+unreadable path components refuse ledger authority. A configured sessions path
+with `..` after a symlink also refuses, because its lexical and physical roots
+can name different histories. Configure that path without `..` after a symlink. When an agent directory
+contains RLM ledgers for multiple sessions roots, the daemon checks whether any
+other ledger may contain authority for this root. A malformed, unresolved, or
+over-limit other ledger does not hide the healthy selected history from display
+reads, but it blocks authority reads and writes for this root. The error names
+the blocking ledger. Repair it, or retire it only after verifying that it is
+unrelated; the daemon never merges or deletes it automatically. Relation checks
+have limits: each history read is capped at 32 MiB and 100,000 records; each
+relation check is capped at 32 MiB + 400,000 work units; all checks in one
+namespace operation share a cap of 4x that amount. Exceeding a cap refuses
+authority and names the blocking ledger. A successful "unrelated" verdict is
+cached by path, device, inode, size and modification time. No file handle is
+kept between calls; each operation reopens the files and compares these values.
+Writers that change a ledger within the same modification-time granularity
+without changing its size are covered only for cooperating writers, which take
+the namespace lock. Display reads of a healthy selected history continue while
+a blocker exists. With no selected history and a blocker, display reads return
+empty without an error, and authority, admission, and append refuse.
+
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
@@ -260,3 +285,130 @@ The composition root initializes the packaged product version with
 `protocol::app_version` supplies that identity to both hello frames and update
 checkpoints; library embedders fall back to the compiled version. Release
 manifest restamping therefore remains consistent with CLI `--version`.
+
+### Deleted-child revival boundary
+
+An explicit RLM ledger deletion is irreversible for that child transcript path.
+Launch, recovery, and adoption consult the ledger even when a stale launch record
+or roster row survives. File-bound launch and deletion share a lifecycle gate.
+A tombstone is keyed by `(childId, canonical child path)`. A late spawn of the
+same child id at that path is refused (#42). A different child id may reuse the
+path, and the same child id may start a new transcript at a new path. The
+ledger itself never opens a transcript. Gates are layered: the ledger admits a
+different child id at a tombstoned path, but launching or opening a worker over
+any tombstoned path is still refused by the lifecycle gate, which is keyed by
+the path alone. The deleted transcript is therefore not read through the reuse.
+An ordinary archive keeps its non-secret launch context for user-driven revival.
+Only committed deletion retires a matching launch record. Unknown or foreign
+records are retained and cleanup failures are reported; no transcript is removed
+by launch-record cleanup.
+
+### Legacy registry import
+
+Released TS v0.3.2-v0.7.2 recorded deletions only in the per-parent
+`session-artifacts/<root id>/rlm-subagents.jsonl` registry. The first ledger
+seed imports each deleted latest row from a claimed registry as a spawn plus a
+delete record with `reason: "user"` and `source: "legacy-registry"`. The
+registry has no cause field; v0.6.0-v0.7.2 cancelled releases (now `revoked`)
+cannot be told apart and are approximated as `user`. Both readers treat every
+reason the same for authority, and they ignore the extra field. No usage is
+invented, and the deleted transcript is not opened. As in dcc and final TS, a
+deleted child's own registry is not descended. Its legacy grandchildren get no
+seeded edge (neither live nor tombstoned) unless another walked registry or a
+sessions-root file names them; no grandchild tombstone is inferred.
+
+A root whose first line is not JSON, or has no nonempty string `id`, claims no
+registry and is skipped, as in shipped readers. A root that is not a regular
+file, a root header longer than the bounded header read (shipped readers
+treated it as absent; this import refuses conservatively), a path-unsafe id, a
+malformed row, one child id with two paths, an I/O error or a budget overrun
+refuses the seed and names the root or registry file. Until the first ledger exists, strict reads and
+spawns in that namespace refuse; display reads still work through the tolerant
+reader. Remedy: inspect the named registry, fix it or move it out of
+`session-artifacts/`, then retry. A failed display-path seed is not memoized,
+so the next read seeds after the repair. Known narrowing: dcc skipped a
+malformed row and still showed that registry's other children; now display
+shows no seeded legacy edges for the namespace until the registry is fixed.
+
+The seed builds its whole payload in memory, writes a synced `seed-<pid>-<ms>`
+scratch, and publishes it with a no-clobber hard link. A crash before the link
+leaves only that scratch. Under the namespace lock, when no ledger exists, a
+regular self-owned scratch with exactly that name comes from a dead attempt.
+It is moved aside to `rlm-ledger-retained/`, never deleted, and the seed is
+rebuilt. If a ledger exists and the scratch is an extra name of the same
+file (a crash after publication but before cleanup), only that extra name is
+unlinked; the bytes remain as the ledger. Any other entry for this ledger, a
+symlink, a foreign owner, or a different file beside an existing ledger still
+refuses. Scratch files of other namespaces are left for their own guard. The
+retained directory is created with mode 0700 and must be owned by this user,
+not a symlink, and not group- or other-writable; otherwise recovery refuses, and
+retained names never overwrite each other.
+
+### Saved-session delete
+
+`delete_saved_session` commits the logical deletion before it removes any
+file (#42). For a child session, the tombstone is appended under the
+session's common fence after a strict ledger read; only an Ok append counts.
+- If the commit fails, the answer is `Session delete was not committed;
+  nothing was removed: <reason>` and the transcript is kept.
+- If another live runtime holds the file's lease, the reason is `Another
+  runtime owns this session; deletion deferred` (`Runtime ownership is
+  unknown; deletion deferred` when ownership cannot be read). Earlier builds
+  deleted a file that another worker still held when the request was routed
+  to a different worker; this is now refused. Stop that session first. This
+  differs from `Session worker is recovering; retry the delete once it is
+  reachable`, which means the owning worker is temporarily unreachable.
+- The file is removed after the commit, through the Trash helper: the
+  installed `trash` tool, never followed by a permanent unlink if it fails;
+  an explicit unlink only when no tool is installed (reported as `unlink`);
+  a missing entry is never reported as trashed.
+- If removal fails after the commit, the answer is the failure object plus
+  `logicalDeletion: "committed"`. The child stays deleted (it cannot be
+  revived) and the transcript is kept for a retry.
+A top-level session has no ledger edge and keeps the plain result.
+Integration tests under `crates/pa-daemon/tests/` run a production daemon, so
+they must run with a fake `trash` first on PATH and the real tool denied.
+
+A child deletion follows the same order: the tombstone commits before the
+resident worker's stop is persisted. After a crash between the two, boot
+adoption and registration find the tombstone and finish the stop.
+
+### Torn ledger lines
+
+Every ledger record is appended as one complete line, ending in a newline, and
+synced while the namespace lock is held. Delete and rename callers act only
+after that append returns Ok. Only Ok proves that a record committed. An error
+can still follow a complete line (for example a failed sync); that errs on the
+safe side, because the tombstone is present while cleanup did not run, and a
+retry takes the already-deleted path. A new ledger is never created by a bare
+append: its header and first record are written to a synced scratch file and
+published with a no-clobber hard link, so a crash cannot leave a header-only
+ledger.
+
+A crash can leave a torn final segment after the last newline. Both readers
+treat it as an unacknowledged record and skip it. Before the next append, the
+writer copies those exact bytes into `rlm-ledger-retained/` (same private-
+directory checks and no-clobber names as seed scratch) and syncs the copy,
+then truncates the ledger to just after the last newline. If the copy fails,
+the append refuses and nothing is truncated. Complete lines are never
+truncated. This matches the final TS writer, so dcc, final TS and this reader
+all read the result.
+
+Authority reads apply one rule per line and keep reading, so a later line is
+never hidden by an earlier bad one:
+- skipped and logged with the ledger file name and line number (never the
+  content): torn, non-UTF-8 or non-JSON lines, and lines with an absent
+  required field;
+- refused: duplicate keys, an unknown op or version, or a required field that
+  is present with the wrong type or an unknown value (for example an unknown
+  delete reason or an invalid usage block), because a newer binary may have
+  written it.
+Display reads skip all of these lines and log the file and line number.
+
+Known limitations:
+- A committed line that is corrupted later (disk damage or manual editing)
+  cannot be told apart from a torn line and is also skipped.
+- Ledgers written by earlier Rust builds may already contain torn fragments in
+  the middle, because those builds started the next record on a new line
+  instead of truncating. The skip rule still handles them, but the final TS
+  reader cannot read such a ledger. That damage predates this change.

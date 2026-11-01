@@ -43,6 +43,7 @@ use crate::print_runtime::{ChildEngineOverrides, ChildLane, FauxChildQueue, Head
 pub(crate) struct PrintRecipe {
     pub options: crate::mode::RunOptions,
     pub faux: Option<Value>,
+    authority: Result<pa_daemon::lease::RuntimeSessionAuthority, String>,
 }
 
 /// One inline session in the print process: the root print session or a
@@ -150,6 +151,7 @@ pub(crate) struct InlineChild {
     model: Model,
     api_key: Option<String>,
     driver: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    session_lease: Mutex<Option<pa_daemon::lease::SessionLease>>,
     state: Mutex<InlineChildState>,
 }
 
@@ -205,6 +207,7 @@ pub(crate) fn root_node(
         recipe: Arc::new(PrintRecipe {
             options: options.clone(),
             faux,
+            authority: crate::print_runtime::runtime_session_authority(options),
         }),
         disposed: std::sync::atomic::AtomicBool::new(false),
     })
@@ -599,6 +602,19 @@ async fn dispose_child(child: &Arc<InlineChild>) {
         if let Some(driver) = current.driver.lock().await.take() {
             let _ = driver.await;
         }
+        current.engine.session.agent().wait_for_idle().await;
+        // A settled driver/kernel does not grant permission to remove an
+        // unknown lease. Keep deferred ownership tracked on the child.
+        let lease = current.session_lease.lock().await.take();
+        if let Some(lease) = lease {
+            match lease.try_release() {
+                pa_daemon::lease::LeaseReleaseOutcome::Released => {}
+                pa_daemon::lease::LeaseReleaseOutcome::Deferred => {
+                    eprintln!("inline child ownership is still settling; lease retained");
+                    *current.session_lease.lock().await = Some(lease);
+                }
+            }
+        }
         pending.extend(std::mem::take(&mut *current.node.children.lock().await));
     }
 }
@@ -765,6 +781,16 @@ impl RlmSubagentHost for InlineHost {
                     &child_dir,
                 )
             };
+            let child_lease = match child_manager.get_session_file() {
+                Some(path) => Some(
+                    recipe
+                        .authority
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("{error}"))?
+                        .acquire(path)?,
+                ),
+                None => None,
+            };
             child_manager
                 .append_session_info(&name)
                 .map_err(anyhow::Error::from)?;
@@ -815,6 +841,7 @@ impl RlmSubagentHost for InlineHost {
                 model: headless.model,
                 api_key: headless.api_key,
                 driver: Mutex::new(None),
+                session_lease: Mutex::new(child_lease),
                 state: Mutex::new(InlineChildState {
                     status: "running",
                     settled: false,

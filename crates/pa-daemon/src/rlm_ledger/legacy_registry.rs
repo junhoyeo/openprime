@@ -1,6 +1,6 @@
 //! The legacy subagent topology surfaces: the pre-ledger per-parent registry reader with its
 //! bounded header-line probe, and the per-child display sidecar entry with its atomic writer.
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 
 use anyhow::Context as _;
 
@@ -160,16 +160,167 @@ pub(crate) fn read_legacy_registry(session_file: &Path) -> Vec<LegacyRlmSubagent
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<LegacyRlmSubagentEntry>(trimmed) else {
+        let Ok(entry) = parse_legacy_entry(trimmed) else {
             continue;
         };
-        if entry.child_id.is_empty()
-            || entry.session_file.is_empty()
-            || !matches!(entry.status.as_str(), "running" | "completed" | "deleted")
-        {
-            continue;
-        }
         latest.insert(entry.child_id.clone(), entry);
     }
     latest.into_values().collect()
+}
+
+fn parse_legacy_entry(line: &str) -> Result<LegacyRlmSubagentEntry> {
+    let entry: LegacyRlmSubagentEntry = serde_json::from_str(line)?;
+    anyhow::ensure!(
+        !entry.child_id.is_empty()
+            && !entry.session_file.is_empty()
+            && matches!(entry.status.as_str(), "running" | "completed" | "deleted"),
+        "invalid legacy child identity or status"
+    );
+    Ok(entry)
+}
+
+pub(super) struct LegacySeedBudget {
+    pub(super) bytes: usize,
+    pub(super) files: usize,
+    pub(super) records: usize,
+}
+
+impl Default for LegacySeedBudget {
+    fn default() -> Self {
+        Self {
+            bytes: super::RLM_LEDGER_MAX_BYTES as usize,
+            files: super::RLM_LEDGER_MAX_RECORDS,
+            records: super::RLM_LEDGER_MAX_RECORDS,
+        }
+    }
+}
+
+/// Authority import uses the same row parser without display degradation.
+/// A root header owns a registry only through a nonempty string id, matching
+/// shipped readers. Non-JSON and id-less roots contribute nothing. I/O errors,
+/// path-unsafe ids and every present registry error remain fatal.
+pub(super) fn read_legacy_registry_checked(
+    session_file: &Path,
+    budget: &mut LegacySeedBudget,
+) -> Result<Vec<LegacyRlmSubagentEntry>> {
+    anyhow::ensure!(budget.files > 0, "legacy seed exceeds aggregate file limit");
+    budget.files -= 1;
+    match fs::symlink_metadata(session_file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error).context("inspect legacy parent"),
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "legacy parent is not a regular file"
+        ),
+    }
+    let limit = LEGACY_REGISTRY_HEADER_READ_MAX_BYTES.min(budget.bytes);
+    let mut line = Vec::new();
+    std::io::BufRead::read_until(
+        &mut std::io::BufReader::new(fs::File::open(session_file)?.take(limit as u64 + 1)),
+        b'\n',
+        &mut line,
+    )?;
+    anyhow::ensure!(
+        line.len() <= limit,
+        "legacy root header exceeds aggregate authority limit"
+    );
+    budget.bytes -= line.len();
+    let Ok(header) = serde_json::from_slice::<Value>(&line) else {
+        return Ok(Vec::new());
+    };
+    let Some(id) = header
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    anyhow::ensure!(
+        Path::new(id).components().count() == 1
+            && !matches!(id, "." | "..")
+            && !id.contains(['/', '\\']),
+        "legacy parent {} has a path-unsafe durable identity",
+        session_file.display()
+    );
+    let registry = session_file
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("legacy parent has no artifact root"))?
+        .join("session-artifacts")
+        .join(id)
+        .join("rlm-subagents.jsonl");
+    // Orphan registries are ignored: the path is keyed by a root id, legacy
+    // registries never carried enforced tombstones, and the ledger is the
+    // tombstone authority.
+    read_checked_registry(&registry, budget)
+}
+
+/// Strictly read one present registry. Shipped readers keep the latest row
+/// per child id; deleted rows are returned so the seed can import them as
+/// ledger tombstones. A child id whose rows name different paths is ambiguous.
+fn read_checked_registry(
+    registry: &Path,
+    budget: &mut LegacySeedBudget,
+) -> Result<Vec<LegacyRlmSubagentEntry>> {
+    match fs::symlink_metadata(registry) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect legacy registry {}", registry.display()))
+        }
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "legacy registry {} is not a regular file",
+            registry.display()
+        ),
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(registry)?
+        .take(budget.bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= budget.bytes,
+        "legacy seed exceeds aggregate byte limit"
+    );
+    budget.bytes -= bytes.len();
+    let mut checked = || -> Result<Vec<LegacyRlmSubagentEntry>> {
+        anyhow::ensure!(
+            bytes.is_empty() || bytes.ends_with(b"\n"),
+            "unterminated record"
+        );
+        let content = std::str::from_utf8(&bytes).context("not UTF-8")?;
+        let mut latest: Vec<(LegacyRlmSubagentEntry, PathBuf)> = Vec::new();
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            anyhow::ensure!(
+                budget.records > 0,
+                "legacy seed exceeds aggregate record limit"
+            );
+            budget.records -= 1;
+            let entry = parse_legacy_entry(line)?;
+            anyhow::ensure!(
+                Path::new(&entry.session_file).is_absolute(),
+                "child path is not absolute"
+            );
+            crate::lease::checked_session_path(Path::new(&entry.session_file))?;
+            let path = super::canonical_session_path(Path::new(&entry.session_file));
+            match latest
+                .iter_mut()
+                .find(|(prior, _)| prior.child_id == entry.child_id)
+            {
+                Some((prior, prior_path)) => {
+                    anyhow::ensure!(
+                        *prior_path == path,
+                        "child {} has ambiguous paths",
+                        entry.child_id
+                    );
+                    *prior = entry;
+                }
+                None => latest.push((entry, path)),
+            }
+        }
+        Ok(latest.into_iter().map(|(entry, _)| entry).collect())
+    };
+    checked().with_context(|| format!("legacy registry {} refused", registry.display()))
 }

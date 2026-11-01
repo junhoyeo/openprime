@@ -210,6 +210,17 @@ pub async fn handle_command(state: &Arc<RpcState>, command: protocol::RpcCommand
     let id = command.id.clone();
     let payload = command.payload.clone();
     let name = command.command.as_str();
+    let _mutation = if matches!(
+        name,
+        "abort" | "abort_retry" | "new_session" | "switch_session" | "fork" | "clone"
+    ) {
+        None
+    } else {
+        match state.session.try_mutation_admission() {
+            Ok(guard) => Some(guard),
+            Err(error) => return protocol::error(id.as_ref(), name, &error),
+        }
+    };
     let outcome: Result<ResponseData, String> = match name {
         "prompt" => prompt_commands::prompt(state, &payload).await,
         "steer" | "follow_up" => prompt_commands::steer_or_follow_up(state, &payload, name).await,

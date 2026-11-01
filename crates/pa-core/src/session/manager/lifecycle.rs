@@ -188,6 +188,22 @@ impl SessionManager {
         target_cwd: &Path,
         session_dir: &Path,
     ) -> Result<Self, String> {
+        let mut forked = Self::prepare_fork_from(source_path, target_cwd, session_dir)?;
+        forked.flush_now().map_err(|error| error.to_string())?;
+        Ok(forked)
+    }
+
+    /// Prepare a fork with a fresh target path, without writing its transcript.
+    /// Runtime callers acquire ownership of that path before calling `flush_now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is not a regular, valid session file.
+    pub fn prepare_fork_from(
+        source_path: &Path,
+        target_cwd: &Path,
+        session_dir: &Path,
+    ) -> Result<Self, String> {
         // A non-regular source (a FIFO or a device) would block the copy's
         // read until a writer appears; a missing path falls through to the
         // empty-or-invalid contract.
@@ -236,7 +252,6 @@ impl SessionManager {
         // from the first new entry: one predicate for the durable-append rule.
         forked.refresh_has_assistant_entry(&branch);
         forked.adopt_entries(branch);
-        forked.flush_now().map_err(|error| error.to_string())?;
         Ok(forked)
     }
 

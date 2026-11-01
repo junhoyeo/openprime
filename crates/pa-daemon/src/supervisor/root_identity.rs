@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use pa_types::daemon::DaemonWorkerDescriptor;
 use serde_json::Value;
-use tokio::sync::MutexGuard;
 
 use crate::registry::ResidentWorker;
 
@@ -120,135 +118,6 @@ impl Supervisor {
             }
         });
     }
-
-    /// Follow the roster's root row for one worker's address, idempotent, under the
-    /// caller's descriptor guard: when the row names a different durable session, the
-    /// descriptor, persisted record, durable create command, and binding table all move
-    /// onto it. `false` means the write was NOT the root's own, so the quarantine stays.
-    pub(crate) fn sync_root_identity_from_roster(
-        &self,
-        resident: &Arc<ResidentWorker>,
-        descriptor: &mut MutexGuard<'_, DaemonWorkerDescriptor>,
-    ) -> bool {
-        let summary = {
-            let roster = self.roster.lock().unwrap();
-            roster
-                .by_active_session_id(&resident.worker_id)
-                .map(|entry| entry.summary.clone())
-        };
-        let Some(summary) = summary else {
-            // The roster holds no root row for this worker's address yet; the next
-            // write triggers the follow.
-            return false;
-        };
-        let (session_id, session_file) = match (
-            summary.get("sessionId").and_then(Value::as_str),
-            summary.get("sessionFile").and_then(Value::as_str),
-        ) {
-            (Some(session_id), Some(session_file))
-                if !session_id.is_empty() && !session_file.is_empty() =>
-            {
-                (session_id.to_string(), session_file.to_string())
-            }
-            // A row without a durable identity (an in-memory `no_session` session) names no
-            // file to follow, but it IS the root's own live word, so the quarantine lifts.
-            _ => return true,
-        };
-        if descriptor.root_session_id.as_deref() == Some(session_id.as_str())
-            && descriptor.session_file.as_deref() == Some(session_file.as_str())
-            && !resident.identity_persist_pending()
-        {
-            return true;
-        }
-        descriptor.root_session_id = Some(session_id.clone());
-        descriptor.session_file = Some(session_file.clone());
-        // The durable create command must reopen the moved-to session on relaunch. A
-        // worker that started `noSession` and switched onto a real file drops the in-memory
-        // flag with the path (the create refuses `noSession`+`sessionPath`).
-        descriptor.create_command.session_path = Some(session_file.clone());
-        descriptor.create_command.no_session = None;
-        // The relaunch cwd follows the moved-to session too: the replacement rebound
-        // the worker onto that transcript's own directory (or the fallback the switch
-        // selected for a missing one). Replaying the launch cwd would run the
-        // switched-in transcript in a directory that belongs to another session.
-        let moved_cwd = summary
-            .get("cwd")
-            .and_then(Value::as_str)
-            .filter(|cwd| !cwd.is_empty())
-            .map(str::to_string);
-        if let Some(cwd) = &moved_cwd {
-            descriptor
-                .create_command
-                .rest
-                .insert("cwd".to_string(), Value::from(cwd.as_str()));
-        }
-        // The durable record is the restart edge: a failed persist leaves the LIVE routing
-        // correct while the record lags — keep the transition marked pending so the next
-        // roster write repairs it.
-        let persisted = crate::descriptor::persist_worker(&resident.descriptor_path, descriptor)
-            .or_else(|error| {
-                let retry =
-                    crate::descriptor::persist_worker(&resident.descriptor_path, descriptor);
-                match retry {
-                    Ok(()) => Ok(()),
-                    Err(_retry_failed) => Err(error),
-                }
-            });
-        match persisted {
-            Ok(()) => {
-                resident.clear_identity_persist_pending();
-                // The repair landed; a failed removal leaves a stale record a later boot
-                // could roll back onto — surface it (the next repair retries).
-                if let Err(clear_error) =
-                    crate::descriptor::clear_identity_pending(&resident.descriptor_path)
-                {
-                    self.log_line(&format!(
-                        "the identity-pending record for worker {} did not clear after the repair (retrying on the next roster write): {clear_error:#}",
-                        resident.worker_id
-                    ));
-                }
-            }
-            Err(error) => {
-                resident.mark_identity_persist_pending();
-                // The durable pending: record the moved-to identity beside the descriptor so a
-                // restart applies it before any routing or relaunch (the in-memory marker dies
-                // with the process; the stale record would serve the superseded session).
-                if let Err(pending_error) = crate::descriptor::write_identity_pending(
-                    &resident.descriptor_path,
-                    &session_id,
-                    &session_file,
-                    moved_cwd.as_deref(),
-                    &crate::util::now_iso(),
-                ) {
-                    // The last resort: the side record could not land either. The boot's live
-                    // reconciliation or the death verdict remain the safety nets — surface both.
-                    self.log_line(&format!(
-                        "session identity move for {} persisted neither record nor pending side record: {pending_error:#}",
-                        resident.worker_id
-                    ));
-                }
-                self.log_line(&format!(
-                    "session identity move for {} did not persist (the pending side record carries it; repairing on the next roster write): {error:#}",
-                    resident.worker_id
-                ));
-                self.note_daemon_event("root_identity_persist_failed", None);
-            }
-        }
-        // The binding table learns the moved-to identity here (under the same guard as
-        // the move): a stale-id rebind never resolves a superseded binding.
-        self.record_session_binding(
-            &resident.worker_id,
-            Some(session_id.as_str()),
-            Some(session_file.as_str()),
-        );
-        // The durable ids never ride the log (the logging discipline); the worker's
-        // address identifies the move.
-        self.log_line(&format!(
-            "session identity moved: worker {} now serves its current session (the root-identity follow ran)",
-            resident.worker_id
-        ));
-        true
-    }
 }
 
 #[cfg(test)]
@@ -264,6 +133,15 @@ mod tests {
 
     /// A supervisor with one registered resident whose address matches its
     /// roster row, carrying a persisted root identity the deltas can move.
+    /// #42 Kind-1 fix: `descriptor.pid`/`process_start_id`/`worker_instance_id`
+    /// are set to match what a REAL `authority.acquire()` call (made later,
+    /// per-delta, by `ensure_session_leased` below, against the delta's OWN
+    /// `sessionFile` - never this descriptor's initial one) will actually
+    /// publish as the owner/generation. A bare `pid: 0` (the original setup)
+    /// can never match a real acquiring process's identity, so every later
+    /// root-targeted publication correctly refused. Every test's original
+    /// assertions/intent are unchanged; only the identity fields this new
+    /// model's checks compare against are set to match THIS TEST PROCESS.
     async fn supervisor_with_movable_worker(dir: &std::path::Path) -> Arc<Supervisor> {
         let supervisor = Arc::new(
             Supervisor::new(crate::supervisor::SupervisorOptions {
@@ -272,14 +150,18 @@ mod tests {
             })
             .expect("supervisor"),
         );
+        let pid = std::process::id();
+        let process_start_id = crate::lease::get_process_start_id(pid);
         let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
             "version": 2,
             "workerId": "w-a",
-            "pid": 0,
+            "pid": pid,
+            "processStartId": process_start_id,
             "socketPath": "/tmp/none.sock",
             "recoveryJournalPath": "/tmp/none.jsonl",
             "supervisorSocketPath": "/tmp/none.sock",
             "authenticationToken": "token-a",
+            "workerInstanceId": "i1",
             "rootActiveSessionId": "w-a",
             "rootSessionId": "s0",
             "sessionFile": dir.join("s0.jsonl").to_string_lossy(),
@@ -291,8 +173,90 @@ mod tests {
         }))
         .expect("descriptor");
         let resident = ResidentWorker::new("w-a".to_string(), descriptor, dir.join("w-a.json"));
+        resident.note_session_ready();
         supervisor.registry.insert(resident).await;
         supervisor
+    }
+
+    /// #42 Kind-1 fix: `publish_verified_summary`'s M-fence ownership check
+    /// targets the DELTA's own `summary.sessionFile` (confirmed via
+    /// `with_runtime_session_fence(authority.agent_dir(), Path::new(file), ...)`
+    /// in `session_publication.rs`), never a resident's session file at setup
+    /// time - so every root-targeted delta this test suite drives needs a
+    /// REAL, fence-acquired lease on that exact file before the delta is
+    /// sent, or the `is_root` ownership check sees `Absent` and refuses.
+    ///
+    /// Tolerates being called more than once for the SAME file within one
+    /// test (several tests swap back onto a session they already visited,
+    /// e.g. `successive_swaps_land_the_identity_on_the_final_row`'s second
+    /// `"a.jsonl"` delta): a fresh `acquire()` on a file this same process
+    /// already holds fails with `SessionAlreadyActiveError` (the lease is
+    /// intentionally never released - see below); that specific, provably-
+    /// self-held case is treated as already-satisfied, not an error.
+    ///
+    /// The owner record's `active_session_id` is read from the process-wide
+    /// `SESSION_LEASE_OWNER_ID_ENV` var by `acquire()` internally; set here
+    /// for the narrow span of the call only, under the crate's shared
+    /// `test_support::TELEMETRY_ENV_MUTEX` (already used by 2 other test
+    /// modules for exactly this "serialize process-env mutation across
+    /// concurrent test threads" purpose, despite its telemetry-flavored
+    /// name - its own doc comment: "one lock across the crate's test
+    /// modules"). The owner record is fully durable the moment `acquire()`
+    /// returns, so the env var and the lock are released immediately after.
+    // Kept async for caller consistency (every call site already
+    // `.await`s it); its body happens to be synchronous today, not a
+    // reason to churn callers for a style-only clippy preference.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn ensure_session_leased(supervisor: &Arc<Supervisor>, summary: &serde_json::Value) {
+        let Some(file) = summary
+            .get("sessionFile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|f| !f.is_empty())
+        else {
+            return;
+        };
+        let active = summary
+            .get("activeSessionId")
+            .or_else(|| summary.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let session_path = std::path::PathBuf::from(file);
+        if !session_path.exists() {
+            let mut sf = crate::session_store::SessionFile::create(
+                &session_path.parent().unwrap().to_string_lossy(),
+                None,
+                0,
+            );
+            sf.set_path(session_path.clone());
+            sf.rewrite().unwrap();
+        }
+        let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
+            &supervisor.options.agent_dir,
+            &supervisor.options.socket_path,
+        )
+        .expect("supervisor authority resolves");
+        let outcome = {
+            let _env_lock = crate::test_support::TELEMETRY_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os(crate::lease::SESSION_LEASE_OWNER_ID_ENV);
+            std::env::set_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV, active);
+            let acquired = authority.acquire(&session_path);
+            match previous {
+                Some(value) => std::env::set_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV, value),
+                None => std::env::remove_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV),
+            }
+            acquired
+        };
+        match outcome {
+            Ok(lease) => std::mem::forget(lease),
+            Err(error) => {
+                let already_mine = error
+                    .downcast_ref::<crate::lease::SessionAlreadyActiveError>()
+                    .is_some_and(|held| held.holder_pid == Some(std::process::id()));
+                assert!(already_mine, "the session file leases for real: {error:#}");
+            }
+        }
     }
 
     fn swap_summary(dir: &std::path::Path, session: &str, file: &str) -> serde_json::Value {
@@ -318,6 +282,7 @@ mod tests {
     /// Drive one accepted roster delta for the worker (a sequenced
     /// generation, the real handler path).
     async fn drive_delta(supervisor: &Arc<Supervisor>, summary: serde_json::Value, sequence: u64) {
+        ensure_session_leased(supervisor, &summary).await;
         let response = supervisor
             .handle_worker_roster_delta(
                 "d",
@@ -791,14 +756,27 @@ mod tests {
             })
             .expect("supervisor"),
         );
+        // #42 Kind-1 fix: this test's own inline descriptor needs the same
+        // identity-matching `supervisor_with_movable_worker` already carries
+        // (review-record-lifecycle-kind1-root-identity flagged this test as
+        // "same mechanism, different fixture, out of scope" - applying the
+        // identical fix here now). The delta's own `drive_delta` call below
+        // targets `sessionFile: "a.jsonl"` - `publish_verified_summary`'s
+        // ownership check runs against THAT file (not this descriptor's own,
+        // initially-fileless, `createCommand.noSession` state), so it still
+        // needs a real, fence-acquired lease via `ensure_session_leased`.
+        let pid = std::process::id();
+        let process_start_id = crate::lease::get_process_start_id(pid);
         let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
             "version": 2,
             "workerId": "w-a",
-            "pid": 0,
+            "pid": pid,
+            "processStartId": process_start_id,
             "socketPath": "/tmp/none.sock",
             "recoveryJournalPath": "/tmp/none.jsonl",
             "supervisorSocketPath": "/tmp/none.sock",
             "authenticationToken": "token-a",
+            "workerInstanceId": "i1",
             "rootActiveSessionId": "w-a",
             "createdAt": "2026-09-30T00:00:00Z",
             "updatedAt": "2026-09-30T00:00:00Z",
@@ -807,14 +785,9 @@ mod tests {
             "consecutiveFailures": 0,
         }))
         .expect("descriptor");
-        supervisor
-            .registry
-            .insert(ResidentWorker::new(
-                "w-a".to_string(),
-                descriptor,
-                dir.join("w-a.json"),
-            ))
-            .await;
+        let resident = ResidentWorker::new("w-a".to_string(), descriptor, dir.join("w-a.json"));
+        resident.note_session_ready();
+        supervisor.registry.insert(resident).await;
 
         drive_delta(&supervisor, swap_summary(&dir, "sA", "a.jsonl"), 1).await;
         let resident = supervisor.registry.get("w-a").await.expect("resident");

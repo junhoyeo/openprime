@@ -3,12 +3,6 @@
 //! Storage overrides never select a different ledger. Supervised workers use
 //! their supervisor's persisted default scope, including when initially fileless.
 
-// Cross-lane shared API (#37/#38 M-fence + identity): consumed by sibling lanes'
-// call sites (record-lifecycle/namespace's rpc/session.rs, session_navigation.rs,
-// worker/create.rs) that land via composition, not by anything in pa-daemon's own
-// --lib/--tests on this branch alone. Remove this once those call sites are merged.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -141,6 +135,7 @@ impl RuntimeSessionAuthority {
 
     /// Cleanup proof for one already-committed child deletion, called under M.
     /// This is not admission permission or authorization to discard private data.
+    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn check_committed_deletion(&self, target: &Path, child_id: &str) -> Result<()> {
         anyhow::ensure!(
             !child_id.is_empty() && !target.as_os_str().is_empty(),
@@ -171,6 +166,12 @@ impl RuntimeSessionAuthority {
 
     pub(crate) fn is_deleted_refusal(error: &anyhow::Error) -> bool {
         error.downcast_ref::<DeletedSessionError>().is_some()
+    }
+
+    pub(crate) fn deleted_target(error: &anyhow::Error) -> Option<&str> {
+        error
+            .downcast_ref::<DeletedSessionError>()
+            .map(|error| error.path.as_str())
     }
 
     /// Called only while the canonical target's common lease fence is held.
@@ -209,7 +210,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs namespace legacy-key selection, lands with PR56 (#41/#42); PR56 removes this ignore"]
     fn issue_42_authority_keeps_a_missing_default_roots_legacy_alias_bucket() {
         let root = tempfile::tempdir().unwrap();
         let real = root.path().join("real");

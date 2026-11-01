@@ -92,7 +92,8 @@ fn recording_worker(dir: &Path, events: std::sync::Arc<std::sync::Mutex<Vec<Stri
     let engine: std::sync::Arc<dyn SessionEngine> = std::sync::Arc::new(RecordingEngine { events });
     let core = std::sync::Arc::clone(&worker.core);
     worker.engine = std::sync::Arc::clone(&engine);
-    worker.navigation = crate::session_navigation::SessionNavigation::new(engine, core);
+    worker.navigation =
+        crate::session_navigation::SessionNavigation::new(engine, core, worker.authority.clone());
     worker
 }
 
@@ -485,4 +486,271 @@ async fn an_unleased_switch_never_rewrites_another_workers_damaged_file() {
     assert!(killed.success, "owner kill failed: {killed:?}");
     drop(visitor);
     drop(owner);
+}
+
+/// #42: fileless storage is not an exemption from runtime ownership.
+#[tokio::test]
+async fn issue_42_fileless_switch_refuses_deleted_and_held_targets() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for occupied in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = dir.path().join("agent");
+            let sessions = agent.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let child = sessions.join("child.jsonl");
+            let parent = sessions.join("parent.jsonl");
+            for path in [&parent, &child] {
+                let mut file = crate::session_store::SessionFile::create(
+                    &dir.path().to_string_lossy(), None, 1,
+                );
+                file.set_path(path.clone());
+                file.rewrite().unwrap();
+            }
+            let ledger = crate::rlm_ledger::RlmSpawnLedger::new(&agent, &sessions, |_| {});
+            ledger.append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "sub-child".into(), parent: parent.to_string_lossy().into_owned(),
+                child: child.to_string_lossy().into_owned(), depth: 1, name: "child".into(),
+            }).unwrap();
+            let held = if occupied {
+                Some(crate::lease::acquire_runtime_session_lease(&child, &agent).unwrap())
+            } else {
+                ledger.append_delete("sub-child", child.to_str().unwrap(),
+                    crate::rlm_ledger::RlmLedgerDeleteReason::User).unwrap();
+                None
+            };
+            let worker = Worker::new(WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: PathBuf::new(), token: "synthetic-token".into(),
+                worker_instance_id: "synthetic-instance".into(), active_session_id: "fileless".into(),
+                agent_dir: agent, recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true), script: Some(json!({"responses":["ack"]})),
+            }, None);
+            let created = worker.dispatch("create", &json!({
+                "noSession": true, "cwd": dir.path(), "sessionDir": sessions,
+            })).await;
+            assert!(created.success, "{created:?}");
+            let before = std::fs::read(&child).unwrap();
+            let switched = worker.dispatch("switch_session", &json!({
+                "sessionPath": child, "cwdOverride": dir.path(),
+            })).await;
+            assert!(!switched.success, "a fileless worker must not bypass target ownership (occupied={occupied}): {switched:?}");
+            assert_eq!(std::fs::read(&child).unwrap(), before);
+            assert!(worker.core.lock().unwrap().store.as_ref().unwrap().path.as_os_str().is_empty());
+            drop(worker);
+            drop(held);
+        }
+    }).await.expect("bounded fileless receiver");
+}
+
+/// #42 positive pairing: a valid fileless-to-file transition owns its target.
+#[tokio::test]
+async fn issue_42_fileless_switch_to_valid_target_acquires_a_real_lease() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("valid.jsonl");
+        let mut file =
+            crate::session_store::SessionFile::create(&dir.path().to_string_lossy(), None, 0);
+        file.set_path(path.clone());
+        file.rewrite().unwrap();
+        let worker = Worker::new(
+            WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: PathBuf::new(),
+                token: "synthetic-token".into(),
+                worker_instance_id: "synthetic-instance".into(),
+                active_session_id: "fileless".into(),
+                agent_dir: agent.clone(),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(json!({"responses":["ack"]})),
+            },
+            None,
+        );
+        assert!(
+            worker
+                .dispatch(
+                    "create",
+                    &json!({
+                        "noSession": true, "cwd": dir.path(), "sessionDir": sessions,
+                    })
+                )
+                .await
+                .success
+        );
+        let switched = worker
+            .dispatch(
+                "switch_session",
+                &json!({
+                    "sessionPath": path, "cwdOverride": dir.path(),
+                }),
+            )
+            .await;
+        assert!(switched.success, "{switched:?}");
+        assert!(
+            crate::lease::acquire_runtime_session_lease(&path, &agent).is_err(),
+            "the actual receiver must hold an exclusive runtime lease after publication"
+        );
+        assert!(worker.dispatch("kill", &json!({})).await.success);
+        drop(worker);
+        drop(crate::lease::acquire_runtime_session_lease(&path, &agent).unwrap());
+    })
+    .await
+    .expect("bounded fileless receiver");
+}
+
+/// #42: retaining the same lease is not permission to bypass renewed authority.
+#[tokio::test]
+async fn issue_42_same_path_switch_revalidates_a_committed_tombstone() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let child = sessions.join("child.jsonl");
+        let parent = sessions.join("parent.jsonl");
+        for (path, depth) in [(&parent, 0), (&child, 1)] {
+            let mut file = crate::session_store::SessionFile::create(
+                &dir.path().to_string_lossy(),
+                None,
+                depth,
+            );
+            file.set_path(path.clone());
+            file.rewrite().unwrap();
+        }
+        let ledger = crate::rlm_ledger::RlmSpawnLedger::new(&agent, &sessions, |_| {});
+        ledger
+            .append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+                child_id: "sub-child".into(),
+                parent: parent.to_string_lossy().into_owned(),
+                child: child.to_string_lossy().into_owned(),
+                depth: 1,
+                name: "child".into(),
+            })
+            .unwrap();
+        let worker = Worker::new(
+            WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: PathBuf::new(),
+                token: "synthetic-token".into(),
+                worker_instance_id: "synthetic-instance".into(),
+                active_session_id: "same-path".into(),
+                agent_dir: agent,
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(json!({"responses":["ack"]})),
+            },
+            None,
+        );
+        assert!(
+            worker
+                .dispatch("create", &json!({"sessionPath":child,"cwd":dir.path()}))
+                .await
+                .success
+        );
+        // An interrupted prior stop can leave a live holder with a durable
+        // tombstone. This tests the real receiver, not permission to append
+        // tombstones outside the new common-fence admission protocol.
+        ledger
+            .append_delete(
+                "sub-child",
+                child.to_str().unwrap(),
+                crate::rlm_ledger::RlmLedgerDeleteReason::User,
+            )
+            .unwrap();
+        let before = std::fs::read(&child).unwrap();
+        let result = worker
+            .dispatch(
+                "switch_session",
+                &json!({"sessionPath":child,"cwdOverride":dir.path()}),
+            )
+            .await;
+        assert!(
+            !result.success,
+            "same-path reuse must revalidate deletion authority: {result:?}"
+        );
+        assert_eq!(std::fs::read(&child).unwrap(), before);
+        drop(worker);
+    })
+    .await
+    .expect("bounded same-path receiver");
+}
+
+/// #42: a same-object read alias never changes writable destination authority.
+#[cfg(unix)]
+#[tokio::test]
+async fn issue_42_import_read_alias_keeps_the_original_target_lease() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let target = sessions.join("current.jsonl");
+        let mut file =
+            crate::session_store::SessionFile::create(&dir.path().to_string_lossy(), None, 0);
+        file.set_path(target.clone());
+        file.rewrite().unwrap();
+        let worker = Worker::new(
+            WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: PathBuf::new(),
+                token: "synthetic-token".into(),
+                worker_instance_id: "synthetic-instance".into(),
+                active_session_id: "alias-reader".into(),
+                agent_dir: agent,
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(json!({"responses":["ack"]})),
+            },
+            None,
+        );
+        assert!(
+            worker
+                .dispatch("create", &json!({"sessionPath":target,"cwd":dir.path()}))
+                .await
+                .success
+        );
+        let before_lease = worker
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .lease
+            .clone()
+            .unwrap();
+        let before = std::fs::read(&target).unwrap();
+        let alias_dir = dir.path().join("read-alias");
+        std::fs::create_dir(&alias_dir).unwrap();
+        let alias = alias_dir.join("current.jsonl");
+        std::fs::hard_link(&target, &alias).unwrap();
+        let imported = worker
+            .dispatch(
+                "import_jsonl",
+                &json!({"inputPath":alias,"cwdOverride":dir.path()}),
+            )
+            .await;
+        assert!(imported.success, "{imported:?}");
+        let (after_path, after_lease) = {
+            let core = worker.core.lock().unwrap();
+            let store = core.store.as_ref().unwrap();
+            (store.path.clone(), store.lease.clone().unwrap())
+        };
+        assert_eq!(after_path, target);
+        assert!(
+            Arc::ptr_eq(&before_lease, &after_lease),
+            "read alias must not transfer or reacquire writable ownership"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(std::fs::read(alias).unwrap(), before);
+        drop(before_lease);
+        drop(after_lease);
+        assert!(worker.dispatch("kill", &json!({})).await.success);
+        drop(worker);
+    })
+    .await
+    .expect("bounded read-alias import");
 }

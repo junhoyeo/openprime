@@ -224,6 +224,21 @@ impl SessionFile {
     /// Returns an error when the leaf does not exist, the lease cannot be acquired, or
     /// the forked file cannot be written.
     pub fn create_branched_file(&self, leaf_id: &str, session_dir: &Path) -> Result<SessionFile> {
+        let mut forked = self.prepare_branched_file(leaf_id, session_dir)?;
+        if let Some(lease) = &self.lease {
+            forked.lease = Some(lease.acquire_target(&forked.path)?);
+        }
+        forked.rewrite().context("write forked session file")?;
+        Ok(forked)
+    }
+
+    /// Prepare a branch without materializing its target. Runtime callers must
+    /// acquire target ownership before the first rewrite.
+    pub(crate) fn prepare_branched_file(
+        &self,
+        leaf_id: &str,
+        session_dir: &Path,
+    ) -> Result<SessionFile> {
         let path = self
             .branch_path_entries(leaf_id)
             .ok_or_else(|| anyhow!("Entry {leaf_id} not found"))?;
@@ -249,9 +264,6 @@ impl SessionFile {
             .trace_upload
             .as_ref()
             .and_then(|traces| traces.forked(&forked.path));
-        if let Some(lease) = &self.lease {
-            forked.lease = Some(lease.acquire_target(&forked.path)?);
-        }
 
         for entry in &path_without_labels {
             forked.index_entry((*entry).clone());
@@ -277,7 +289,6 @@ impl SessionFile {
             }
         }
         forked.hydrate_anthropic_warning_flag();
-        forked.rewrite().context("write forked session file")?;
         Ok(forked)
     }
 

@@ -295,6 +295,15 @@ mod tests {
 
     /// One supervisor with one registered resident whose persisted identity
     /// (`s0` / `s0.jsonl`) the quarantine fence must never serve.
+    /// #42 Kind-1 fix: `descriptor.pid`/`process_start_id`/`worker_instance_id`
+    /// match this test process's own identity - what a REAL `authority.
+    /// acquire()` call (made later, per-delta, by `ensure_delta_session_
+    /// leased` below, against the delta's own `sessionFile`) will actually
+    /// publish as the owner/generation. Mirrors `root_identity.rs`'s
+    /// identically-shaped fix (review-record-lifecycle-kind1-root-identity,
+    /// `ACCEPTed`) - duplicated here rather than shared across files for now;
+    /// worth consolidating into a shared test-support helper as a follow-up
+    /// if a 3rd module needs the identical pattern.
     async fn supervisor_with_stale_identity(dir: &std::path::Path) -> Arc<Supervisor> {
         let supervisor = Arc::new(
             Supervisor::new(crate::supervisor::SupervisorOptions {
@@ -303,14 +312,18 @@ mod tests {
             })
             .expect("supervisor"),
         );
+        let pid = std::process::id();
+        let process_start_id = crate::lease::get_process_start_id(pid);
         let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
             "version": 2,
             "workerId": "w-a",
-            "pid": 0,
+            "pid": pid,
+            "processStartId": process_start_id,
             "socketPath": "/tmp/none.sock",
             "recoveryJournalPath": "/tmp/none.jsonl",
             "supervisorSocketPath": "/tmp/none.sock",
             "authenticationToken": "token-a",
+            "workerInstanceId": "i1",
             "rootActiveSessionId": "w-a",
             "rootSessionId": "s0",
             "sessionFile": dir.join("s0.jsonl").to_string_lossy(),
@@ -330,6 +343,71 @@ mod tests {
             ))
             .await;
         supervisor
+    }
+
+    /// #42 Kind-1 fix: same pattern as `root_identity.rs`'s
+    /// `ensure_session_leased` (review-record-lifecycle-kind1-root-identity,
+    /// `ACCEPTed`) - `publish_verified_summary`'s `is_root` ownership check
+    /// targets the DELTA's own `summary.sessionFile`, never a resident's
+    /// session file at setup time, so a root-targeted delta needs a real,
+    /// fence-acquired lease on that exact file before it is sent.
+    // Kept async for caller consistency (every call site already
+    // `.await`s it); its body happens to be synchronous today, not a
+    // reason to churn callers for a style-only clippy preference.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn ensure_delta_session_leased(
+        supervisor: &Arc<Supervisor>,
+        summary: &serde_json::Value,
+    ) {
+        let Some(file) = summary
+            .get("sessionFile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|f| !f.is_empty())
+        else {
+            return;
+        };
+        let active = summary
+            .get("activeSessionId")
+            .or_else(|| summary.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let session_path = std::path::PathBuf::from(file);
+        if !session_path.exists() {
+            let mut sf = crate::session_store::SessionFile::create(
+                &session_path.parent().unwrap().to_string_lossy(),
+                None,
+                0,
+            );
+            sf.set_path(session_path.clone());
+            sf.rewrite().unwrap();
+        }
+        let authority = crate::lease::RuntimeSessionAuthority::for_supervisor(
+            &supervisor.options.agent_dir,
+            &supervisor.options.socket_path,
+        )
+        .expect("supervisor authority resolves");
+        let outcome = {
+            let _env_lock = crate::test_support::TELEMETRY_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os(crate::lease::SESSION_LEASE_OWNER_ID_ENV);
+            std::env::set_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV, active);
+            let acquired = authority.acquire(&session_path);
+            match previous {
+                Some(value) => std::env::set_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV, value),
+                None => std::env::remove_var(crate::lease::SESSION_LEASE_OWNER_ID_ENV),
+            }
+            acquired
+        };
+        match outcome {
+            Ok(lease) => std::mem::forget(lease),
+            Err(error) => {
+                let already_mine = error
+                    .downcast_ref::<crate::lease::SessionAlreadyActiveError>()
+                    .is_some_and(|held| held.holder_pid == Some(std::process::id()));
+                assert!(already_mine, "the session file leases for real: {error:#}");
+            }
+        }
     }
 
     /// The boot-reconciliation quarantine fences the owned-session scan:
@@ -373,6 +451,7 @@ mod tests {
             "thinkingLevel": "default",
             "workerState": "ready",
         });
+        ensure_delta_session_leased(&supervisor, &summary).await;
         let response = supervisor
             .handle_worker_roster_delta(
                 "d",

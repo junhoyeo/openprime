@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 mod authority;
 mod fence;
 
-pub(crate) use authority::RuntimeSessionAuthority;
-#[allow(unused_imports)] // Cross-lane API (#37/#38): consumed via composition.
+pub use authority::RuntimeSessionAuthority;
 pub(crate) use fence::{with_runtime_session_fence, HeldRuntimeSessionFence};
 
 pub const SESSION_LEASES_ENABLED_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
@@ -85,14 +84,12 @@ pub fn canonical_session_path(path: &Path) -> PathBuf {
 /// Destructive cleanup needs a proven path, not a best-effort spelling after an
 /// I/O error. Only genuinely missing suffixes may use the shared ancestor walk;
 /// dangling symlinks, permission failures and unresolvable components refuse.
-#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
 pub(crate) fn checked_session_path(path: &Path) -> std::io::Result<PathBuf> {
     let absolute = std::path::absolute(path)?;
     resolve_session_path(&absolute, PathResolutionPolicy::Checked)
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Checked: cross-lane API (#37/#38), consumed via composition.
 enum PathResolutionPolicy {
     BestEffort,
     Checked,
@@ -285,7 +282,6 @@ fn lease_reclaimable(owner: Option<&LeaseOwner>) -> bool {
 /// held: `Unknown` must never be treated as `Absent` by a caller deciding
 /// whether admission/revival may proceed (the v3 common-fence contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
 pub(crate) enum RuntimeLeaseOwnership {
     /// No owner record exists for this canonical target (never published,
     /// or a prior holder's cleanup fully removed it).
@@ -301,7 +297,6 @@ pub(crate) enum RuntimeLeaseOwnership {
 
 /// Called only while the canonical target's M fence is held
 /// ([`HeldRuntimeSessionFence::inspect_ownership`]).
-#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
 fn inspect_runtime_ownership_at(
     target: &fence::RuntimeSessionTarget,
 ) -> Result<RuntimeLeaseOwnership> {
@@ -323,7 +318,6 @@ fn inspect_runtime_ownership_at(
 /// `coordinate()`'s existing non-blocking legacy-`.guard` existence
 /// check, which refuses if a live legacy holder is found) is what
 /// serializes this path instead.
-#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
 fn publish_runtime_owner(
     target: &fence::RuntimeSessionTarget,
     authority: &RuntimeSessionAuthority,
@@ -342,7 +336,6 @@ fn publish_runtime_owner(
 /// Called only while the canonical target's M fence is held
 /// ([`HeldRuntimeSessionFence::revalidate_lease`]): strict identity/path
 /// checks against the on-disk owner record, no recursive owner acquisition.
-#[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
 fn revalidate_owned_lease(
     target: &fence::RuntimeSessionTarget,
     lease: &SessionLease,
@@ -573,8 +566,7 @@ impl SessionLease {
     /// A caller that needs to know synchronously whether a fresh lease is
     /// actually free before handing its target off (e.g. a fork-replace
     /// RPC deciding whether to proceed) uses this instead of `release()`.
-    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
-    pub(crate) fn try_release(&self) -> LeaseReleaseOutcome {
+    pub fn try_release(&self) -> LeaseReleaseOutcome {
         self.release_attempt()
     }
 
@@ -641,7 +633,7 @@ impl SessionLease {
 /// was still unsettled past the drain deadline (#37) - never silently
 /// treat a deferred release as a freed target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LeaseReleaseOutcome {
+pub enum LeaseReleaseOutcome {
     /// Ownership was actually released by this call.
     Released,
     /// This call did not release ownership (an admitted mutation was
@@ -694,10 +686,31 @@ impl SessionLease {
     /// be resolved, or ownership can no longer be confirmed (released,
     /// superseded, or the on-disk owner record no longer matches this
     /// process).
-    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn revalidate(&self) -> Result<()> {
         with_runtime_session_fence(self.agent_dir(), &self.session_path, |held| {
             held.revalidate_lease(self)
+        })
+    }
+
+    /// #42 fix (RECURRENCE SWEEP, site 3 of 3): `revalidate()` alone only
+    /// proves the lease is still unreleased and identity-matched; it never
+    /// re-reads the deletion ledger. A same-path-reuse receiver that has no
+    /// ambient, already-correctly-scoped [`RuntimeSessionAuthority`] of its
+    /// own (unlike the daemon's supervised `Worker`, which already holds
+    /// one) needs both checks bundled under ONE held M. Resolves a strict,
+    /// standalone authority scope for this lease's own agent root - the
+    /// matching scope for an unsupervised caller (e.g. the CLI's direct RPC
+    /// session), not a substitute for a supervised caller's own authority.
+    ///
+    /// # Errors
+    /// Returns an error when this lease's canonical identity can no longer
+    /// be resolved, ownership can no longer be confirmed, or the deletion
+    /// ledger now names this target as deleted.
+    pub(crate) fn revalidate_and_check_admission(&self) -> Result<()> {
+        let authority = RuntimeSessionAuthority::for_agent_dir(self.agent_dir())?;
+        with_runtime_session_fence(self.agent_dir(), &self.session_path, |held| {
+            held.revalidate_lease(self)?;
+            authority.check_admission(held.canonical_path())
         })
     }
 

@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use super::{
     anyhow, json, load_descriptors, response_failure, response_success, socket,
-    worker_connect_deadline, Context, DaemonCommand, DaemonResponse, DaemonWorkerLifecycle,
-    Duration, Ordering, Path, PathBuf, ResidentWorker, Result, Supervisor, Value,
-    WorkerRegistration,
+    worker_connect_deadline, Context, DaemonCommand, DaemonResponse, Duration, Ordering, Path,
+    PathBuf, ResidentWorker, Result, Supervisor, Value, WorkerRegistration,
 };
 
 /// An unobservable start identity does not prove that a live pid was recycled.
@@ -124,7 +123,7 @@ pub(super) enum AdoptionBoot {
 
 /// One descriptor's boot-adoption decision, reported as a count in the
 /// pass's `worker_adoption` event (counts only, never session payload).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AdoptionOutcome {
     /// Live socket adopted (incl. a worker that re-registered before the
     /// descriptor scan reached it).
@@ -273,6 +272,17 @@ impl Supervisor {
         .unwrap_or(false)
     }
 
+    /// Test-only entry to one descriptor's boot-adoption decision.
+    #[cfg(test)]
+    pub(super) async fn adopt_persisted_worker_for_tests(
+        self: &Arc<Self>,
+        path: PathBuf,
+        descriptor: crate::descriptor::WorkerDescriptor,
+        boot: AdoptionBoot,
+    ) -> AdoptionOutcome {
+        self.adopt_persisted_worker(path, descriptor, boot).await
+    }
+
     /// Adopt one persisted worker descriptor. Serialized against worker
     /// self-registration by the per-worker adoption gate: whichever path
     /// arrives first builds the roster entry; the other finds it present.
@@ -334,6 +344,25 @@ impl Supervisor {
         // The durable pending FIRST: a failed identity persist left a side record carrying the
         // moved-to identity — apply it before any routing or revival acts on the stale record.
         self.apply_identity_pending(&resident).await;
+        let file = resident.descriptor.lock().await.session_file.clone();
+        let _child_lifecycle = match file.as_deref() {
+            Some(file) => match self.child_lifecycles.lock(file).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.log_line(&format!("could not adopt worker {worker_id}: {error:#}"));
+                    return AdoptionOutcome::Failed;
+                }
+            },
+            None => None,
+        };
+        match self.stop_ledger_deleted_worker(&resident).await {
+            Ok(true) => return AdoptionOutcome::Stopped,
+            Ok(false) => {}
+            Err(error) => {
+                self.log_line(&format!("could not verify worker {worker_id}: {error:#}"));
+                return AdoptionOutcome::Failed;
+            }
+        }
         // The stop tombstone outranks liveness (TS's stop ownership: the stop was durable intent
         // BEFORE the worker was told): a supervisor that died between the tombstone and the
         // shutdown finishes the stop on the next boot — never adopts it as healthy.
@@ -345,6 +374,7 @@ impl Supervisor {
         // descriptor's stale pre-restart pid (a revived worker was once left
         // orphaned behind a phantom-exit loop while serving live).
         let (result, revived_child) = if alive {
+            resident.mark_identity_quarantined();
             let adopted = self
                 .connect_worker(&resident, worker_connect_deadline())
                 .await;
@@ -363,9 +393,8 @@ impl Supervisor {
                         "session worker {worker_id}: the boot reconciliation pull failed; the resident is quarantined from routing until the live state lands"
                     ));
                 }
-                // The adopted worker's session already exists (its create ran before the
-                // supervisor restart): routed client commands may reach it immediately.
-                resident.note_session_ready();
+                // Only publish_verified_summary may clear quarantine or mark
+                // readiness after validating the final live path.
             }
             (adopted, None)
         } else {
@@ -415,14 +444,13 @@ impl Supervisor {
             // worker's lease, or stale evidence vetoes.
             let busy_recorded_at =
                 crate::journal::WorkerRecoveryJournal::latest_busy_recorded_at(&journal_path);
-            let gated = resident.descriptor.lock().await;
+            let gated = resident.descriptor.lock().await.clone();
             let veto = crate::revival_gate::revival_veto(
                 &self.options.agent_dir,
                 &gated,
                 kept,
                 busy_recorded_at.as_deref(),
             );
-            drop(gated);
             if let Some(veto) = veto {
                 self.log_line(&format!(
                     "session worker {worker_id} not revived: {}",
@@ -433,7 +461,7 @@ impl Supervisor {
             // Dead worker with journal-proven live work (or a kept worker): relaunch from
             // the durable create command. The spawned child rides out to the monitor arming
             // below — the descriptor's pid is the DEAD pre-restart holder.
-            match self.relaunch_worker(&resident).await {
+            match self.relaunch_worker_under_lifecycle(&resident).await {
                 Ok(child) => (Ok(()), Some(child)),
                 Err(error) => (Err(error), None),
             }
@@ -552,6 +580,56 @@ impl Supervisor {
                 }
             },
         };
+        let (file, stopping) = {
+            let descriptor = resident.descriptor.lock().await;
+            if token.as_str() != descriptor.authentication_token {
+                return fail("Session worker authentication failed");
+            }
+            (
+                descriptor.session_file.clone(),
+                descriptor.stop_requested_at.is_some(),
+            )
+        };
+        if stopping {
+            resident.mark_identity_quarantined();
+            resident.note_retired();
+            return fail(&crate::registration::tombstoned_registration_refusal(
+                active_session_id,
+            ));
+        }
+        if let Some(file) = file {
+            let authority = match crate::lease::RuntimeSessionAuthority::for_supervisor(
+                &self.options.agent_dir,
+                &self.options.socket_path,
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return fail(&format!("{error:#}")),
+            };
+            let checked = crate::lease::with_runtime_session_fence(
+                authority.agent_dir(),
+                Path::new(&file),
+                |held| authority.check_admission(held.canonical_path()),
+            );
+            if let Err(error) = checked {
+                match self
+                    .reject_failed_publication(&resident, None, &error)
+                    .await
+                {
+                    Ok(true) => {
+                        return fail(&crate::registration::tombstoned_registration_refusal(
+                            active_session_id,
+                        ))
+                    }
+                    Ok(false) => return fail(&format!("{error:#}")),
+                    Err(persist_error) => {
+                        return fail(&format!(
+                            "Registration quarantined; stop intent not durable: {persist_error:#}"
+                        ))
+                    }
+                }
+            }
+        }
+        let starting = !resident.route_state().session_ready && !resident.identity_quarantined();
         // The registration's durable id is optional on the wire: a re-registering worker
         // that does not report it still owns its persisted descriptor. Both reads share
         // this one lock acquisition — a second one let the create path race into a stall.
@@ -602,14 +680,8 @@ impl Supervisor {
             if let Some(session_id) = &registration.session_id {
                 descriptor.root_session_id = Some(session_id.clone());
             }
-            descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
-            // A (re-)registered worker refreshes its binding: the id stays addressable
-            // with its current durable identity; a newly owned session file supersedes.
-            self.record_session_binding(
-                active_session_id,
-                descriptor.root_session_id.as_deref(),
-                descriptor.session_file.as_deref(),
-            );
+            // Registration authenticates transport only. Final-path guarded
+            // publication, never this callback, establishes ready bindings.
             // The registration refreshes the resident in memory only — no
             // persist here. The spawn record already carries the
             // launch-time identity (pid, socket), and the create-completion
@@ -640,8 +712,10 @@ impl Supervisor {
         // A restore pass that owns this session's roster row can settle it now (spec §10.4).
         // The settle lands after the registration is recorded, so a woken waiter's
         // re-resolve cannot miss it.
-        if let Some(session_id) = durable_session_id {
-            self.restore.settle_adopted(&session_id);
+        if !starting {
+            if let Some(session_id) = durable_session_id {
+                self.restore.settle_adopted(&session_id);
+            }
         }
         let verb = if record.epoch > 1 {
             "re-registered"
@@ -655,7 +729,14 @@ impl Supervisor {
         drop(guard);
         // Registration rebuilt the resident: refresh its roster entry from
         // the live worker so the roster reflects the re-registered state.
-        self.refresh_roster_entry(&resident).await;
+        if !starting {
+            self.refresh_roster_entry(&resident).await;
+        }
+        if resident.descriptor.lock().await.stop_requested_at.is_some() {
+            return fail(&crate::registration::tombstoned_registration_refusal(
+                active_session_id,
+            ));
+        }
         // A worker that registers after the boot seed publishes its passive ledger family in
         // the background: TS reseeds on the worker's first roster snapshot, and this port's
         // workers push only their own summary, so the daemon walks the family here.
@@ -733,6 +814,18 @@ impl Supervisor {
         // The durable pending (the same repair the descriptor adoption runs): apply the failed
         // follow's side record before the routing opens, so the moved-to session is served.
         self.apply_identity_pending(&resident).await;
+        let file = resident.descriptor.lock().await.session_file.clone();
+        let _child_lifecycle = match file.as_deref() {
+            Some(file) => Some(self.child_lifecycles.lock(file).await?),
+            None => None,
+        };
+        if self.stop_ledger_deleted_worker(&resident).await? {
+            return Err(anyhow!(
+                crate::registration::tombstoned_registration_refusal(
+                    &registration.active_session_id
+                )
+            ));
+        }
         // A tombstoned identity is mid-stop (TS `adoptOrRecoverWorker`'s stopRequestedAt
         // branch): adoption finishes the stop and never adopts the worker as healthy.
         // The refusal is definitive: the registrant is the process the stop must
@@ -771,6 +864,7 @@ impl Supervisor {
                 )
             ));
         }
+        resident.mark_identity_quarantined();
         self.connect_worker(&resident, worker_connect_deadline())
             .await?;
         // The boot reconciliation: registration rebuilt the resident from the PERSISTED record;
@@ -785,9 +879,8 @@ impl Supervisor {
                 "session worker {worker_id}: the registration reconciliation pull failed; the resident is quarantined from routing until the live state lands"
             ));
         }
-        // The self-registered worker's session already exists: routed
-        // client commands may reach it immediately.
-        resident.note_session_ready();
+        // The successful guarded pull owns readiness. A failed pull keeps
+        // the tracked resident quarantined while its retry resolves identity.
         self.registry.insert(Arc::clone(&resident)).await;
         self.spawn_monitor(
             Arc::clone(&resident),
@@ -860,6 +953,8 @@ impl Supervisor {
                 },
                 str::to_string,
             );
+        let _child_lifecycle = self.child_lifecycles.lock(child).await?;
+        self.ensure_child_not_deleted(child).await?;
         let ledger = self.rlm_spawn_ledger_for(None).await?;
         ledger
             .append_spawn(&crate::rlm_ledger::RlmSpawnInput {

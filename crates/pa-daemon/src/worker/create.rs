@@ -17,11 +17,72 @@ impl Worker {
         // One create in flight at a time: a concurrent create joins this open and
         // answers with the created summary instead of racing a second init.
         let _create_gate = self.create_gate.lock().await;
+        let authority = match &self.authority {
+            Ok(authority) => authority.clone(),
+            Err(error) => return response_failure(None, "create", error, None),
+        };
         let existing_summary = {
             let (core, inputs) = self.summary_inputs();
             core.created.then(|| self.summary_locked(&core, inputs))
         };
         if let Some(summary) = existing_summary {
+            let stored = {
+                let core = self.core.lock().unwrap();
+                core.store
+                    .as_ref()
+                    .map(|store| (store.path.clone(), store.lease.clone()))
+            };
+            let Some((path, lease)) = stored else {
+                return response_failure(
+                    None,
+                    "create",
+                    "Created session has no store identity",
+                    None,
+                );
+            };
+            if !path.as_os_str().is_empty() {
+                let Some(lease) = lease else {
+                    return response_failure(
+                        None,
+                        "create",
+                        "File-backed session has no runtime ownership",
+                        None,
+                    );
+                };
+                // #42 fix (RECURRENCE SWEEP, site 2 of 3): the idempotent
+                // re-create path reuses a lease that may have been held
+                // across an arbitrary window (a full supervisor restart or
+                // respawn, wider than a single command gap). `revalidate()`
+                // alone never re-reads the deletion ledger - a tombstone
+                // committed during that window must still be caught before
+                // this reuse is allowed, same mandate and same fence-held
+                // pairing as target_lease's fix (site 1).
+                let checked = {
+                    let authority = authority.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let target = lease.session_path.clone();
+                        crate::lease::with_runtime_session_fence(
+                            authority.agent_dir(),
+                            &target,
+                            |held| {
+                                held.revalidate_lease(&lease)?;
+                                authority.check_admission(held.canonical_path())
+                            },
+                        )
+                    })
+                }
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+                if let Err(error) = checked {
+                    return response_failure(
+                        None,
+                        "create",
+                        &format!("Cannot reuse {}: {error:#}", path.display()),
+                        None,
+                    );
+                }
+            }
             // Idempotent re-create after a supervisor restart or respawn.
             // A respawned worker's re-create re-binds the pane reporter
             // (the session may carry a fresh client env on the payload)
@@ -35,6 +96,9 @@ impl Worker {
             );
         }
         let session_path = match payload.get("sessionPath").and_then(Value::as_str) {
+            Some(path) if path.trim().is_empty() => {
+                return response_failure(None, "create", "Session path is empty", None);
+            }
             Some(path) => match paths::expand_tilde(path) {
                 Ok(expanded) => Some(expanded),
                 Err(error) => return response_failure(None, "create", &error.to_string(), None),
@@ -216,10 +280,12 @@ impl Worker {
             (Some(path), false) if path.exists() => {
                 let loaded = {
                     let path = path.clone();
-                    let agent_dir = self.config.agent_dir.clone();
+                    let authority = authority.clone();
                     tokio::task::spawn_blocking(move || {
-                        let lease = crate::lease::acquire_runtime_session_lease(&path, &agent_dir)?;
-                        pa_core::session::manager::repair_jsonl_damage(&path);
+                        let lease = authority.acquire(&path)?;
+                        // The loader's strict privacy preflight runs before
+                        // any mutation. Ambiguous/torn input is retained and
+                        // refused, never repaired before provenance is known.
                         let mut store = SessionFile::open_windowed(&path)?;
                         store.lease = Some(Arc::new(lease));
                         Ok(store)
@@ -318,13 +384,11 @@ impl Worker {
                 created.trace_upload = traces(&created.path);
                 let acquired = {
                     let path = path.clone();
-                    let agent_dir = self.config.agent_dir.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::lease::acquire_runtime_session_lease(&path, &agent_dir)
-                    })
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|lease| lease)
+                    let authority = authority.clone();
+                    tokio::task::spawn_blocking(move || authority.acquire(&path))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|lease| lease)
                 };
                 match acquired {
                     Ok(lease) => created.lease = Some(Arc::new(lease)),
@@ -357,13 +421,11 @@ impl Worker {
                 created.trace_upload = traces(&created.path);
                 let acquired = {
                     let path = path.clone();
-                    let agent_dir = self.config.agent_dir.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::lease::acquire_runtime_session_lease(&path, &agent_dir)
-                    })
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|lease| lease)
+                    let authority = authority.clone();
+                    tokio::task::spawn_blocking(move || authority.acquire(&path))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|lease| lease)
                 };
                 match acquired {
                     Ok(lease) => created.lease = Some(Arc::new(lease)),

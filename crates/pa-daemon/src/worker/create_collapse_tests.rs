@@ -339,3 +339,68 @@ async fn a_resume_is_append_only_and_never_deletes_rows() {
     let killed = worker.dispatch("kill", &json!({})).await;
     assert!(killed.success, "{killed:?}");
 }
+
+/// #42 RECURRENCE SWEEP (parent/coordinator priority item, 2026-11-01): the
+/// idempotent re-create branch (`handle_create`'s `existing_summary` path)
+/// only calls `lease.revalidate()` before allowing reuse - the SAME gap
+/// confirmed for `switch_session`'s same-path reuse
+/// (`issue_42_same_path_switch_revalidates_a_committed_tombstone`,
+/// `worker/replacement_gate_tests.rs`). `revalidate()` proves the lease is
+/// still unreleased and identity-matched; it never re-reads the deletion
+/// ledger. A tombstone committed while the worker holds this lease (e.g.
+/// across a supervisor restart/respawn, an even wider window than a single
+/// command gap) must still be caught before a re-create is allowed to
+/// reuse it. RED: demonstrates the bypass under the CURRENT, unfixed code.
+#[tokio::test]
+async fn issue_42_idempotent_recreate_revalidates_a_committed_tombstone() {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let sessions = agent.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let child = sessions.join("child.jsonl");
+        let parent = sessions.join("parent.jsonl");
+        for (path, depth) in [(&parent, 0), (&child, 1)] {
+            let mut file = crate::session_store::SessionFile::create(&dir.path().to_string_lossy(), None, depth);
+            file.set_path(path.clone());
+            file.rewrite().unwrap();
+        }
+        let ledger = crate::rlm_ledger::RlmSpawnLedger::new(&agent, &sessions, |_| {});
+        ledger.append_spawn(&crate::rlm_ledger::RlmSpawnInput {
+            child_id: "sub-child".into(), parent: parent.to_string_lossy().into_owned(),
+            child: child.to_string_lossy().into_owned(), depth: 1, name: "child".into(),
+        }).unwrap();
+        let worker = Worker::new(WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "synthetic-token".into(),
+            worker_instance_id: "synthetic-instance".into(),
+            active_session_id: "idempotent-recreate".into(),
+            agent_dir: agent,
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(json!({ "responses": ["ack"] })),
+        }, None);
+        // First create: establishes core.created == true and a real,
+        // fence-acquired held lease (this acquisition does check admission).
+        let created = worker.dispatch("create", &json!({ "sessionPath": child, "cwd": dir.path() })).await;
+        assert!(created.success, "create failed: {created:?}");
+        // An interrupted prior stop can leave this exact worker holding a
+        // lease the ledger now says is deleted - the same simulated
+        // scenario the switch_session RED test uses, outside the common-
+        // fence admission protocol on purpose (a real tombstone commit
+        // elsewhere, not permission to append one here).
+        ledger.append_delete("sub-child", child.to_str().unwrap(), crate::rlm_ledger::RlmLedgerDeleteReason::User).unwrap();
+        let before = std::fs::read(&child).unwrap();
+        // The idempotent re-create path (core.created is already true):
+        // must revalidate deletion authority, not just the lease's own
+        // release/identity state, before letting this reuse proceed.
+        let recreated = worker.dispatch("create", &json!({ "sessionPath": child, "cwd": dir.path() })).await;
+        assert!(
+            !recreated.success,
+            "idempotent re-create must revalidate deletion authority, not just lease release/identity: {recreated:?}"
+        );
+        assert_eq!(std::fs::read(&child).unwrap(), before);
+        drop(worker);
+    }).await.expect("bounded idempotent re-create test");
+}

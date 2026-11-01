@@ -35,6 +35,16 @@ mod tests;
 /// Run the interactive TUI attached to the daemon. Returns the exit code.
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the interactive runtime")?;
+    // Fork materialization must use the selected supervisor's persisted
+    // authority, not guess its namespace before the supervisor exists.
+    let daemon_prepared_for_fork = options.session.fork.is_some();
+    if daemon_prepared_for_fork {
+        runtime.block_on(ensure_daemon_running(&socket_path, &options.config.cwd))?;
+    }
     let configuration_load_started = std::time::Instant::now();
     let (tui_options, pending_onboarding_stages) = build_tui_options(
         options,
@@ -49,10 +59,6 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     // attach pushes the info row once per installation, deferred behind
     // onboarding — a pre-TUI stderr print would be hidden by the alt
     // screen.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build the interactive runtime")?;
     let startup_started = std::time::Instant::now();
     runtime.block_on(async {
         // The `agent startup stage` telemetry: the configuration-load and
@@ -94,7 +100,9 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             .track(client);
         }
         let attach_started = std::time::Instant::now();
-        ensure_daemon_running(&tui_options.socket_path, &tui_options.cwd).await?;
+        if !daemon_prepared_for_fork {
+            ensure_daemon_running(&tui_options.socket_path, &tui_options.cwd).await?;
+        }
         if let Some(client) = startup_telemetry.as_ref() {
             pa_telemetry::AgentStartupStage {
                 stage: "session_attach",
@@ -418,7 +426,16 @@ fn build_tui_options(
     // Flag order (fork -> resume -> create): the daemon opens the fork —
     // never the source — through the create `sessionPath`.
     let mut session = match &options.session.fork {
-        Some(selector) => fork_startup_selection(selector, &config.cwd, session_dir.as_deref())?,
+        Some(selector) => {
+            let authority = pa_daemon::lease::RuntimeSessionAuthority::for_supervisor(
+                &config.agent_dir,
+                &socket_path,
+            )?;
+            let storage = session_dir
+                .as_deref()
+                .ok_or_else(|| anyhow!("Fork storage directory is unavailable"))?;
+            fork_startup_selection(selector, &config.cwd, storage, &authority)?
+        }
         None => session_selection(&options.session, session_dir.as_deref()),
     };
     // A plain resume follows the saved project. Resolve its file before
@@ -567,10 +584,10 @@ fn session_selection(
 fn fork_startup_selection(
     selector: &str,
     cwd: &Path,
-    session_dir: Option<&Path>,
+    session_dir: &Path,
+    authority: &pa_daemon::lease::RuntimeSessionAuthority,
 ) -> Result<SessionSelection> {
-    let default_dir = config::get_agent_dir().join("sessions");
-    let dir = session_dir.unwrap_or(&default_dir);
+    let dir = session_dir;
     let expanded = config::expand_tilde_path(selector);
     let selector = expanded.to_string_lossy();
     let resolved = resolve_session_path(&selector, cwd, dir)
@@ -580,17 +597,8 @@ fn fork_startup_selection(
         | ResolvedSession::Local(path)
         | ResolvedSession::Global { path, .. } => path,
     };
-    let forked = pa_core::session::manager::SessionManager::fork_from(&source, cwd, dir)
+    let fork_file = crate::print_runtime::materialize_startup_fork(&source, cwd, dir, authority)
         .map_err(anyhow::Error::msg)?;
-    let fork_file = forked
-        .get_session_file()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            anyhow!(
-                "Cannot fork: the forked session file is missing: {}",
-                source.display()
-            )
-        })?;
     Ok(SessionSelection::Resume(fork_file))
 }
 

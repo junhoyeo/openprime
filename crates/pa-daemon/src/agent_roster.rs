@@ -70,6 +70,25 @@ impl AgentRoster {
         }
     }
 
+    pub(crate) fn delta_is_current(&self, worker_id: &str, instance: &str, sequence: u64) -> bool {
+        self.delta_watermarks.get(worker_id).is_none_or(|slot| {
+            slot.instance == instance && (sequence == 0 || sequence > slot.watermark)
+        })
+    }
+
+    pub(crate) fn pull_is_current(
+        &self,
+        worker_id: &str,
+        instance: &str,
+        counter: Option<u64>,
+    ) -> bool {
+        counter.is_none_or(|counter| {
+            self.delta_watermarks
+                .get(worker_id)
+                .is_none_or(|slot| slot.instance == instance && counter >= slot.watermark)
+        })
+    }
+
     /// The stale-delta gate for one worker's `worker_roster_delta`: a sequence at or below
     /// the newest applied one must not write; a frame from a generation the slot no longer
     /// names is stale (the answer is still success). `0` means unsequenced and always applies.

@@ -48,7 +48,9 @@ const PERSISTED_LAUNCH_KEYS: [&str; 18] = [
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PassivatedLaunch {
     create_command: DurableDaemonCreateCommand,
-    telemetry_disabled: Option<bool>,
+    pub(crate) telemetry_disabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 impl PassivatedLaunch {
@@ -70,6 +72,7 @@ impl PassivatedLaunch {
                 rest,
             },
             telemetry_disabled,
+            session_id: None,
         }
     }
 
@@ -140,22 +143,98 @@ impl PassivatedLaunches {
         session_file: &str,
         launch: &PassivatedLaunch,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Path::new(session_file).is_absolute(),
+            "launch record requires an absolute session path"
+        );
+        let canonical = crate::lease::canonical_session_path(Path::new(session_file));
+        if let Some(recorded) = launch.create_command.session_path.as_deref() {
+            anyhow::ensure!(
+                Path::new(recorded).is_absolute()
+                    && crate::lease::canonical_session_path(Path::new(recorded)) == canonical,
+                "launch record belongs to a different session"
+            );
+        }
+        self.get_checked(session_file)?;
         crate::paths::ensure_dir(&self.dir)?;
-        let content = serde_json::to_string_pretty(launch)?;
+        let mut stored = PassivatedLaunch::new(&launch.create_command, launch.telemetry_disabled);
+        stored.create_command.session_path = Some(canonical.to_string_lossy().into_owned());
+        stored.session_id =
+            pa_core::session::manager::read_session_header(&canonical).map(|header| header.id);
+        let content = serde_json::to_string_pretty(&stored)?;
         crate::descriptor::write_file_atomic(&self.record_path(session_file), &content)
     }
 
     /// The recorded context for `session_file`, if its worker passivated.
     pub(crate) fn get(&self, session_file: &str) -> Option<PassivatedLaunch> {
-        let content = std::fs::read_to_string(self.record_path(session_file)).ok()?;
-        serde_json::from_str(&content).ok()
+        self.get_checked(session_file).ok().flatten()
     }
 
     /// Drop the record once a worker hosts the session again (any launch
     /// over the file: the new resident's descriptor owns the context), when
     /// a passivation stop fails, or when the session is deleted.
     pub(crate) fn forget(&self, session_file: &str) {
-        let _ = std::fs::remove_file(self.record_path(session_file));
+        let _ = self.forget_deleted(session_file);
+    }
+
+    /// Only app-owned records with the addressed durable identity may retire.
+    /// Unknown, malformed, replaced, and foreign metadata stays for inspection.
+    pub(crate) fn forget_deleted(&self, session_file: &str) -> anyhow::Result<()> {
+        if self.get_checked(session_file)?.is_some() {
+            match std::fs::remove_file(self.record_path(session_file)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// A wake must distinguish genuine absence from unreadable or foreign context.
+    pub(crate) fn get_checked(
+        &self,
+        session_file: &str,
+    ) -> anyhow::Result<Option<PassivatedLaunch>> {
+        anyhow::ensure!(
+            Path::new(session_file).is_absolute(),
+            "launch record requires an absolute session path"
+        );
+        let path = self.record_path(session_file);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "launch record is not a regular file: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let launch: PassivatedLaunch = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let canonical = crate::lease::canonical_session_path(Path::new(session_file));
+        anyhow::ensure!(
+            launch
+                .create_command
+                .session_path
+                .as_deref()
+                .is_some_and(|recorded| {
+                    Path::new(recorded).is_absolute()
+                        && crate::lease::canonical_session_path(Path::new(recorded)) == canonical
+                }),
+            "launch record belongs to a different session"
+        );
+        if let Some(expected) = launch.session_id.as_deref() {
+            match pa_core::session::manager::read_session_header(&canonical) {
+                Some(header) => anyhow::ensure!(
+                    header.id == expected,
+                    "launch record session identity changed"
+                ),
+                None => anyhow::ensure!(
+                    !canonical.try_exists()?,
+                    "launch record session identity cannot be verified"
+                ),
+            }
+        }
+        Ok(Some(launch))
     }
 }
 
@@ -224,8 +303,53 @@ mod tests {
             .unwrap();
         let restarted = PassivatedLaunches::new(records);
         let spelled = dir.path().join(".").join("session.jsonl");
-        assert_eq!(restarted.get(&spelled.to_string_lossy()), Some(launch));
+        assert_eq!(
+            restarted
+                .get(&spelled.to_string_lossy())
+                .unwrap()
+                .wake_create("/wake.jsonl", 0, None),
+            launch.wake_create("/wake.jsonl", 0, None),
+        );
         restarted.forget(&session_file.to_string_lossy());
         assert_eq!(restarted.get(&session_file.to_string_lossy()), None);
+    }
+    #[test]
+    fn issue_42_old_records_filter_secrets_and_unknown_identity_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("child.jsonl");
+        let other = dir.path().join("sibling.jsonl");
+        std::fs::write(&file, "{\"type\":\"session\",\"id\":\"child-id\",\"version\":3,\"cwd\":\"/missing\",\"timestamp\":\"t\"}\n").unwrap();
+        let records = PassivatedLaunches::new(dir.path().join("records"));
+        let old = json!({
+            "createCommand": {"sessionPath": file, "cwd": "/fallback", "apiKey": "synthetic-secret", "env": {"TOKEN": "synthetic-secret"}},
+            "telemetryDisabled": true,
+        });
+        std::fs::create_dir_all(&records.dir).unwrap();
+        let path = records.record_path(file.to_str().unwrap());
+        std::fs::write(&path, old.to_string()).unwrap();
+        let legacy = records.get(file.to_str().unwrap()).unwrap();
+        let wake =
+            serde_json::to_value(legacy.wake_create(file.to_str().unwrap(), 1, None)).unwrap();
+        assert!(!wake.to_string().contains("synthetic-secret"));
+        records.remember(file.to_str().unwrap(), &legacy).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("synthetic-secret"));
+        for recorded in [json!(other), json!("../child.jsonl"), Value::Null] {
+            let mut foreign = old.clone();
+            foreign["createCommand"]["sessionPath"] = recorded;
+            let bytes = foreign.to_string();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(records.get(file.to_str().unwrap()).is_none());
+            assert!(records.forget_deleted(file.to_str().unwrap()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, old.to_string()).unwrap();
+        records.remember(file.to_str().unwrap(), &legacy).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(&file, "{\"type\":\"session\",\"id\":\"replaced-id\",\"version\":3,\"cwd\":\"/missing\",\"timestamp\":\"t\"}\n").unwrap();
+        assert!(records.get(file.to_str().unwrap()).is_none());
+        assert!(records.forget_deleted(file.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }

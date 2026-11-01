@@ -100,11 +100,26 @@ async fn a_known_resident_registration_writes_nothing_to_disk() {
         "the registration must not write the descriptor"
     );
 
-    // MEMORY: the resident's live identity still refreshes (the routing
-    // surfaces read it) — the registration is not a no-op, only its
-    // durable write is gone.
+    // MEMORY: the resident's transport identity still refreshes (the
+    // routing surfaces read it) — the registration is not a no-op, only
+    // its durable write is gone. Lifecycle is deliberately NOT among the
+    // fields registration refreshes: `handle_worker_register`
+    // "authenticates transport only" (its own doc comment) - only the
+    // later create-completion persist (`publish_verified_summary`) or a
+    // recovery-retry path (`ownership.rs`) ever sets `Ready`. Confirmed
+    // intentional via git history (a prior version did flip lifecycle at
+    // registration; that line was deliberately removed) and via 3 real
+    // production call sites that gate routing on lifecycle==Ready
+    // (`peer_tickets.rs`, `create_reuse.rs`, `agent_message_broadcast.rs`)
+    // - flipping it this early, before a session file exists, would make
+    // an unready worker look routable (review-spawn-record-lifecycle-
+    // mismatch: TEST BUG, not an implementation gap).
     let descriptor = resident.descriptor.lock().await;
-    assert_eq!(descriptor.lifecycle, DaemonWorkerLifecycle::Ready);
+    assert_eq!(
+        descriptor.lifecycle,
+        DaemonWorkerLifecycle::Starting,
+        "registration alone never establishes readiness"
+    );
     assert_eq!(
         descriptor.socket_path, "/tmp/w-regskip-live.sock",
         "the live socket refreshes in memory"

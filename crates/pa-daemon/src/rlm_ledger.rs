@@ -30,9 +30,9 @@ use crate::lease::canonical_session_path;
 use crate::util::now_iso;
 
 mod replay;
+mod storage_path;
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Authority: cross-lane API (#37/#38), consumed via composition.
 enum LedgerReadPolicy {
     BestEffort,
     Authority,
@@ -116,19 +116,37 @@ pub struct RlmSpawnInput {
     pub name: String,
 }
 
+/// How a guarded seed failure surfaces: display degrades, authority refuses.
+#[derive(Clone, Copy)]
+enum SeedFailure {
+    Degrade,
+    Refuse,
+}
+
+pub(super) enum SeedPublication {
+    Absent,
+    Existing,
+    Published { file: File, temp_path: PathBuf },
+}
+
 /// The per-sessions-dir spawn ledger. Reads are guarded by a file stat snapshot; a missing ledger
 /// is seeded from the legacy registries (seed failure degrades to empty, never fail-closed).
 pub struct RlmSpawnLedger {
     path: PathBuf,
+    selected_path: OnceLock<PathBuf>,
+    had_history: AtomicBool,
+    configured_agent_dir: PathBuf,
+    configured_sessions_dir: PathBuf,
     agent_dir: PathBuf,
     canonical_sessions_dir: PathBuf,
-    seed_attempted: AtomicBool,
+    session_storage_dir: PathBuf,
     cache: Mutex<Option<ReplaySnapshot>>,
     log: Box<dyn Fn(&str) + Send + Sync>,
 }
 
-/// Ledger path for one sessions dir: a 16-hex sha256 of the canonical
-/// sessions dir under `<agent-dir>/rlm-ledger/`.
+/// Proposed path for a NEW ledger. This pure naming helper does not select
+/// legacy history. All production I/O must use `RlmSpawnLedger`; its
+/// `ledger_path()` returns the selected actual pathname after resolution.
 #[must_use]
 pub fn rlm_ledger_path(agent_dir: &Path, sessions_dir: &Path) -> PathBuf {
     let canonical = canonicalize_dir(sessions_dir);
@@ -179,6 +197,11 @@ fn fold_records(records: Vec<LedgerRecord>, keep: impl Fn(&str) -> bool) -> Repl
             } if keep(&child_id) => {
                 let key = edge_key(&child_id, &child);
                 if let Some(at) = state.index.get(&key).copied() {
+                    // A late admission/re-registration cannot undo deletion.
+                    // A new child has a new durable transcript identity.
+                    if state.edges[at].deleted.is_some() {
+                        continue;
+                    }
                     state.edges[at] = RlmLedgerEdge {
                         child_id,
                         parent,
@@ -247,20 +270,84 @@ impl RlmSpawnLedger {
         sessions_dir: &Path,
         log: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
+        // Storage is a filesystem target; the sessions-dir namespace keeps
+        // shipping lexical resolution BEFORE stable ancestor canonicalization.
+        let configured_agent_dir =
+            std::path::absolute(agent_dir).unwrap_or_else(|_| agent_dir.to_path_buf());
+        let configured_sessions_dir =
+            std::path::absolute(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf());
+        let agent_dir = canonical_session_path(&configured_agent_dir);
+        let canonical_sessions_dir = replay::checked_scope(&configured_sessions_dir)
+            .unwrap_or_else(|_| canonicalize_dir(&configured_sessions_dir));
+        let session_storage_dir = canonical_session_path(&configured_sessions_dir);
         Self {
-            path: rlm_ledger_path(agent_dir, sessions_dir),
-            // Canonical agent dir: the resolver's tree anchor takes the
-            // same realpath form as the sessions dir (one path form).
-            agent_dir: canonicalize_dir(agent_dir),
-            canonical_sessions_dir: canonicalize_dir(sessions_dir),
-            seed_attempted: AtomicBool::new(false),
+            path: rlm_ledger_path(&agent_dir, &canonical_sessions_dir),
+            selected_path: OnceLock::new(),
+            had_history: AtomicBool::new(false),
+            configured_agent_dir,
+            configured_sessions_dir,
+            agent_dir,
+            canonical_sessions_dir,
+            session_storage_dir,
             cache: Mutex::new(None),
             log: Box::new(log),
         }
     }
 
+    /// The selected actual filename after resolution; before that, only the
+    /// proposed new path. Construction may read canonical paths, but takes no
+    /// namespace lock and writes no files. It never caches a transient busy error.
     pub fn ledger_path(&self) -> &Path {
-        &self.path
+        self.selected_path.get().unwrap_or(&self.path)
+    }
+
+    fn storage_guard(&self) -> Result<storage_path::StorageGuard> {
+        let agent = crate::lease::checked_session_path(&self.configured_agent_dir)?;
+        let scope = replay::checked_scope(&self.configured_sessions_dir)?;
+        let storage = crate::lease::checked_session_path(&self.configured_sessions_dir)?;
+        if agent != self.agent_dir
+            || scope != self.canonical_sessions_dir
+            || storage != self.session_storage_dir
+        {
+            bail!("RLM ledger authority paths changed; reopen with a validated authority context");
+        }
+        let guard = storage_path::StorageGuard::acquire(&agent, &scope)?;
+        for recovery in &guard.recovered {
+            match recovery {
+                storage_path::SeedScratchRecovery::Retained { from, to } => self.log(&format!(
+                    "RLM ledger: retained dead seed scratch {} as {}",
+                    from.display(),
+                    to.display()
+                )),
+                storage_path::SeedScratchRecovery::RetiredPublishedName { name } => {
+                    self.log(&format!(
+                        "RLM ledger: retired extra published seed name {}",
+                        name.display()
+                    ));
+                }
+            }
+        }
+        self.pin_selection(&guard)?;
+        Ok(guard)
+    }
+
+    fn pin_selection(&self, guard: &storage_path::StorageGuard) -> Result<()> {
+        if guard.has_file() {
+            self.had_history.store(true, Ordering::SeqCst);
+        } else if self.had_history.load(Ordering::SeqCst) {
+            bail!("known RLM ledger disappeared; refusing empty authority");
+        }
+        let selected = guard.path();
+        let pinned = self.selected_path.get_or_init(|| selected.to_path_buf());
+        if pinned != selected {
+            bail!("RLM ledger selection changed; refusing a second history");
+        }
+        Ok(())
+    }
+
+    fn refresh_storage(&self, guard: &mut storage_path::StorageGuard) -> Result<()> {
+        guard.refresh(&self.agent_dir, &self.canonical_sessions_dir)?;
+        self.pin_selection(guard)
     }
 
     fn log(&self, message: &str) {
@@ -295,9 +382,21 @@ impl RlmSpawnLedger {
         }
         let child_path = canonical_session_path(Path::new(&input.child));
         let child_path_text = child_path.to_string_lossy().to_string();
-        let state = self.replay_cached()?;
+        let mut guard = self.storage_guard()?;
+        self.seed_once_guarded(&mut guard)?;
+        // Only an Ok append proves a record committed: append_record_guarded
+        // writes one whole line and syncs before returning Ok, and callers
+        // act only after Ok. A torn line was never acknowledged, so it never
+        // committed a tombstone; it is skipped and logged by file and line.
+        let state = self.replay_cached_guarded(&guard)?;
         for edge in &state.edges {
             let edge_child = canonical_session_path(Path::new(&edge.child));
+            // #42 forbids the same durable child identity at the same path.
+            // A different child id may reuse a path after a tombstone.
+            if edge.deleted.is_some() && edge_child == child_path && edge.child_id == input.child_id
+            {
+                bail!("Cannot revive deleted RLM child: {child_path_text}");
+            }
             if edge.deleted.is_none() && edge_child == child_path && edge.child_id != input.child_id
             {
                 bail!(
@@ -306,16 +405,19 @@ impl RlmSpawnLedger {
                 );
             }
         }
-        self.append_record(&json!({
-            "v": 1,
-            "op": "spawn",
-            "at": now_iso(),
-            "childId": input.child_id,
-            "parent": canonical_session_path(Path::new(&input.parent)).to_string_lossy(),
-            "child": child_path_text,
-            "depth": input.depth,
-            "name": input.name,
-        }))
+        self.append_record_guarded(
+            &mut guard,
+            &json!({
+                "v": 1,
+                "op": "spawn",
+                "at": now_iso(),
+                "childId": input.child_id,
+                "parent": canonical_session_path(Path::new(&input.parent)).to_string_lossy(),
+                "child": child_path_text,
+                "depth": input.depth,
+                "name": input.name,
+            }),
+        )
     }
 
     /// Record a rename for a known child edge.
@@ -672,12 +774,14 @@ impl RlmSpawnLedger {
     /// Authority reads must not interpret unreadable or partially understood
     /// topology as an empty tree. Keep ordinary display reads best-effort; this
     /// uncached path propagates seeding, I/O, malformed and unknown-op errors.
-    #[allow(dead_code)] // Cross-lane API (#37/#38): consumed via composition.
     pub(crate) fn strict_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
-        self.seed()?;
-        let state = fold_records(self.read_records_with(LedgerReadPolicy::Authority)?, |_| {
-            true
-        });
+        let mut guard = self.storage_guard()?;
+        guard.require_authority()?;
+        self.seed_once_guarded(&mut guard)?;
+        let state = fold_records(
+            self.read_records_with(&guard, LedgerReadPolicy::Authority)?,
+            |_| true,
+        );
         Ok(state.edges)
     }
 
@@ -694,7 +798,7 @@ impl RlmSpawnLedger {
         let state = self.replay_cached()?;
         let mut resolver = LivePathResolver::new(
             self.agent_dir.clone(),
-            self.canonical_sessions_dir.clone(),
+            self.session_storage_dir.clone(),
             &state.artifact_index,
         );
         resolve_live_edges(&state, &mut resolver)
@@ -717,7 +821,7 @@ impl RlmSpawnLedger {
         let state = self.replay_of_parent(&parent_file)?;
         let mut resolver = LivePathResolver::new(
             self.agent_dir.clone(),
-            self.canonical_sessions_dir.clone(),
+            self.session_storage_dir.clone(),
             &state.artifact_index,
         );
         let mut edges = resolve_live_edges(&state, &mut resolver)?;
@@ -733,7 +837,9 @@ impl RlmSpawnLedger {
     /// matched together with the child path: ids can be shared by
     /// edges with different paths, and only the exact edge a seed
     /// snapshotted counts as live. An unreadable (oversized) ledger reads
-    /// as not-live.
+    /// as not-live. `false` means "not proven live", never "proven deleted":
+    /// it is display-only (roster seed revalidation) and must not authorize
+    /// admission or deletion. Authority callers use `strict_edges`.
     pub fn edge_is_live(&self, child_id: &str, child: &str) -> bool {
         let canonical_child = canonical_session_path(Path::new(child));
         self.seed_once().is_ok()
@@ -758,43 +864,105 @@ impl RlmSpawnLedger {
             })
     }
 
+    /// Display reads: a failed legacy seed degrades to no seeded edges and is
+    /// logged. It is not memoized; the next read seeds again after a repair.
     fn seed_once(&self) -> Result<()> {
-        if self.seed_attempted.swap(true, Ordering::SeqCst) {
+        let mut guard = self.storage_guard()?;
+        self.seed_once_with(&mut guard, SeedFailure::Degrade)
+    }
+
+    /// Authority, admission and append: a failed legacy seed refuses.
+    fn seed_once_guarded(&self, guard: &mut storage_path::StorageGuard) -> Result<()> {
+        self.seed_once_with(guard, SeedFailure::Refuse)
+    }
+
+    fn seed_once_with(
+        &self,
+        guard: &mut storage_path::StorageGuard,
+        failure: SeedFailure,
+    ) -> Result<()> {
+        if guard.has_file() {
             return Ok(());
         }
-        match self.seed() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // A broken seed degrades to an empty ledger; it never
-                // fail-closes the read path.
+        // No selected history plus a mixed-history blocker: never publish a
+        // seed. Display then reads this namespace as empty without an error;
+        // authority, admission and append still refuse via require_authority.
+        if guard.authority_blocked() {
+            return Ok(());
+        }
+        // Empty/missing and failed seeds are never memoized: new or repaired
+        // legacy inputs may appear later.
+        let publication = match (self.seed(), failure) {
+            (Ok(publication), _) => publication,
+            (Err(error), SeedFailure::Refuse) => return Err(error),
+            (Err(error), SeedFailure::Degrade) => {
                 self.log(&format!("RLM ledger seeding failed: {error:#}"));
-                Ok(())
+                return Ok(());
+            }
+        };
+        match publication {
+            SeedPublication::Absent => {
+                self.refresh_storage(guard)?;
+                if guard.has_file() {
+                    bail!("RLM ledger appeared without this operation's publication receipt");
+                }
+            }
+            SeedPublication::Existing => {
+                bail!("RLM ledger appeared during guarded seed; refusing unknown publication")
+            }
+            SeedPublication::Published { file, temp_path } => {
+                guard.refresh_with_seed(
+                    &self.agent_dir,
+                    &self.canonical_sessions_dir,
+                    Some(&temp_path),
+                )?;
+                self.pin_selection(guard)?;
+                guard.retire_published_seed(&file, &temp_path)?;
+                self.refresh_storage(guard)?;
             }
         }
+        Ok(())
     }
 
     /// Replay behind the stat guard: a file whose identity snapshot is
     /// unchanged reuses the cached edges. A missing file replays empty.
     fn replay_cached(&self) -> Result<Arc<ReplayState>> {
-        let identity = file_identity(&self.path)?;
+        let guard = self.storage_guard()?;
+        self.replay_cached_guarded(&guard)
+    }
+
+    fn replay_cached_guarded(
+        &self,
+        guard: &storage_path::StorageGuard,
+    ) -> Result<Arc<ReplayState>> {
+        let identity = guard.file().map(replay::opened_file_stat).transpose()?;
         let mut cache = self.cache.lock().expect("ledger cache lock");
         if let (Some(identity), Some(cached)) = (&identity, cache.as_ref()) {
-            if *identity == cached.identity {
+            if *identity == cached.identity
+                && storage_path::same_open_file(
+                    &cached.file,
+                    guard.file().expect("stat implies retained file"),
+                )?
+            {
                 return Ok(Arc::clone(&cached.state));
             }
         }
-        let state = Arc::new(self.replay()?);
+        let state = Arc::new(self.replay(guard)?);
         if let Some(identity) = identity {
             *cache = Some(ReplaySnapshot {
                 identity,
+                file: guard
+                    .file()
+                    .expect("stat implies retained file")
+                    .try_clone()?,
                 state: Arc::clone(&state),
             });
         }
         Ok(state)
     }
 
-    fn replay(&self) -> Result<ReplayState> {
-        Ok(fold_records(self.read_records()?, |_| true))
+    fn replay(&self, guard: &storage_path::StorageGuard) -> Result<ReplayState> {
+        Ok(fold_records(self.read_records(guard)?, |_| true))
     }
 
     /// The opened parent file's subset of the replayed ledger: fold only
@@ -804,7 +972,8 @@ impl RlmSpawnLedger {
     /// subset fold equals the full fold restricted to that parent's
     /// children.
     fn replay_of_parent(&self, parent_file: &Path) -> Result<ReplayState> {
-        let records = self.read_records()?;
+        let guard = self.storage_guard()?;
+        let records = self.read_records(&guard)?;
         let own: HashSet<String> = records
             .iter()
             .filter_map(|record| match record {
@@ -823,44 +992,36 @@ impl RlmSpawnLedger {
     /// byte and record-count caps apply to the whole file; a missing
     /// ledger reads empty, and one torn or unknown line skips that
     /// record only.
-    fn read_records(&self) -> Result<Vec<LedgerRecord>> {
-        self.read_records_with(LedgerReadPolicy::BestEffort)
+    fn read_records(&self, guard: &storage_path::StorageGuard) -> Result<Vec<LedgerRecord>> {
+        self.read_records_with(guard, LedgerReadPolicy::BestEffort)
     }
 
-    fn read_records_with(&self, policy: LedgerReadPolicy) -> Result<Vec<LedgerRecord>> {
-        if matches!(policy, LedgerReadPolicy::Authority) {
-            match fs::symlink_metadata(&self.path) {
-                Ok(metadata) if !metadata.is_file() => {
-                    bail!("authority ledger is not a regular file")
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(error) => return Err(error).context("inspect authority ledger"),
-            }
-        }
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read RLM ledger {}", self.path.display()));
-            }
+    fn read_records_with(
+        &self,
+        guard: &storage_path::StorageGuard,
+        policy: LedgerReadPolicy,
+    ) -> Result<Vec<LedgerRecord>> {
+        let Some(bytes) = guard.read_bytes(RLM_LEDGER_MAX_BYTES)? else {
+            return Ok(Vec::new());
         };
         if bytes.len() as u64 > RLM_LEDGER_MAX_BYTES {
             bail!(
                 "RLM ledger {} exceeds {RLM_LEDGER_MAX_BYTES} bytes; refusing to read",
-                self.path.display()
+                self.ledger_path().display()
             );
         }
         if matches!(policy, LedgerReadPolicy::Authority) {
             return self.read_authority_records(&bytes);
         }
         // A torn write inside a multibyte name must spoil one line, not
-        // the whole file for ordinary display reads.
+        // the whole file for ordinary display reads. Like the authority
+        // reader, an unterminated final segment is an unacknowledged record.
+        let terminated = bytes.is_empty() || bytes.ends_with(b"\n");
         let content = String::from_utf8_lossy(&bytes);
         let mut records = Vec::new();
         let mut lines = 0usize;
-        for (index, line) in content.lines().enumerate() {
+        let mut segments = content.lines().enumerate().peekable();
+        while let Some((index, line)) = segments.next() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -868,21 +1029,33 @@ impl RlmSpawnLedger {
             if lines > RLM_LEDGER_MAX_RECORDS {
                 bail!(
                     "RLM ledger {} exceeds {RLM_LEDGER_MAX_RECORDS} records; refusing to read",
-                    self.path.display()
+                    self.ledger_path().display()
                 );
+            }
+            if !terminated && segments.peek().is_none() {
+                self.log(&format!(
+                    "RLM ledger {}: skipped torn record on line {}",
+                    self.ledger_path().display(),
+                    index + 1
+                ));
+                continue;
             }
             match parse_ledger_line(line, index) {
                 Ok(Some(record)) => records.push(record),
                 Ok(None) => {
                     self.log(&format!(
-                        "RLM ledger: skipped record with unknown op on line {}",
+                        "RLM ledger {}: skipped record with unknown op on line {}",
+                        self.ledger_path().display(),
                         index + 1
                     ));
                 }
                 Err(error) => {
+                    // File name and line number only: record content is never logged.
+                    let _ = error;
                     self.log(&format!(
-                        "RLM ledger {}: skipped {error:#}",
-                        self.path.display()
+                        "RLM ledger {}: skipped malformed or torn record on line {}",
+                        self.ledger_path().display(),
+                        index + 1
                     ));
                 }
             }
@@ -900,7 +1073,7 @@ impl RlmSpawnLedger {
     /// replacement, or hard-fail everything): it splits raw bytes and
     /// decodes per segment instead.
     fn read_authority_records(&self, bytes: &[u8]) -> Result<Vec<LedgerRecord>> {
-        let path = self.path.display().to_string();
+        let path = self.ledger_path().display().to_string();
         let mut lines = bytes.split(|byte| *byte == b'\n').enumerate().peekable();
         let terminated = bytes.is_empty() || bytes.ends_with(b"\n");
         let header = loop {
@@ -967,82 +1140,177 @@ impl RlmSpawnLedger {
     /// One durable append; the first record in a fresh file is the meta
     /// header (the same line `seed` publishes).
     fn append_record(&self, record: &Value) -> Result<()> {
-        self.seed_once()?;
-        if let Some(parent) = self.path.parent() {
+        let mut guard = self.storage_guard()?;
+        self.seed_once_guarded(&mut guard)?;
+        self.append_record_guarded(&mut guard, record)
+    }
+
+    fn append_record_guarded(
+        &self,
+        guard: &mut storage_path::StorageGuard,
+        record: &Value,
+    ) -> Result<()> {
+        guard.require_authority()?;
+        if let Some(parent) = self.ledger_path().parent() {
             crate::paths::ensure_dir(parent)?;
         }
         let mut line = serde_json::to_string(&record)?;
         line.push('\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("open RLM ledger {}", self.path.display()))?;
-        if file.metadata()?.len() == 0 {
-            let meta = json!({
-                "v": 1,
-                "op": "meta",
-                "at": now_iso(),
-                "sessionsDir": self.canonical_sessions_dir.to_string_lossy(),
-            });
-            let mut header = serde_json::to_string(&meta)?;
-            header.push('\n');
-            file.write_all(header.as_bytes())?;
-        } else {
-            // A crash can leave the final record torn short of its
-            // newline: start on a fresh line so this record never glues
-            // onto it.
+        if !guard.has_file() {
+            // A new ledger is published whole: header plus this first record
+            // through the seed scratch and no-clobber link, never a bare
+            // header that a crash could leave torn.
+            return match self.publish_new_ledger(&line)? {
+                SeedPublication::Published { file, temp_path } => {
+                    guard.refresh_with_seed(
+                        &self.agent_dir,
+                        &self.canonical_sessions_dir,
+                        Some(&temp_path),
+                    )?;
+                    self.pin_selection(guard)?;
+                    guard.retire_published_seed(&file, &temp_path)?;
+                    self.finish_append();
+                    Ok(())
+                }
+                SeedPublication::Existing => {
+                    bail!("RLM ledger appeared during append; refusing unknown publication")
+                }
+                SeedPublication::Absent => unreachable!("publication always carries the record"),
+            };
+        }
+        let mut file = guard
+            .open_append()
+            .with_context(|| format!("open RLM ledger {}", self.ledger_path().display()))?;
+        let length = file.metadata()?.len();
+        if length > 0 {
             let mut last = [0u8; 1];
             file.seek(SeekFrom::End(-1))?;
             file.read_exact(&mut last)?;
             if last[0] != b'\n' {
-                line.insert(0, '\n');
+                self.retain_and_truncate_torn_tail(&mut file, length)?;
             }
+        }
+        #[cfg(test)]
+        if let Some(prefix) = APPEND_WRITE_FAULT.with(std::cell::Cell::take) {
+            file.write_all(&line.as_bytes()[..prefix.min(line.len())])?;
+            bail!("injected ledger append fault after {prefix} bytes");
         }
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
+        self.finish_append();
+        Ok(())
+    }
+
+    fn finish_append(&self) {
+        self.had_history.store(true, Ordering::SeqCst);
         // Our own writes must not be served stale from the stat guard.
         self.cache.lock().expect("ledger cache lock").take();
+    }
+
+    /// A tail after the last newline is an unacknowledged, torn record. Like
+    /// the final TS writer (event-log.ts repairTailSync), truncate it before
+    /// appending, so every reader sees only complete lines. Its bytes are first
+    /// copied and synced into the private retained directory; if that copy
+    /// fails, the append refuses and nothing is truncated. Complete lines are
+    /// never truncated.
+    fn retain_and_truncate_torn_tail(&self, file: &mut File, length: u64) -> Result<()> {
+        let mut reader = file.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        reader
+            .take(RLM_LEDGER_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 == length,
+            "RLM ledger {} changed while repairing a torn tail",
+            self.ledger_path().display()
+        );
+        let keep = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        let retained =
+            storage_path::retain_torn_tail(&self.agent_dir, self.ledger_path(), &bytes[keep..])
+                .with_context(|| {
+                    format!(
+                        "RLM ledger {}: torn tail not retained; append refused",
+                        self.ledger_path().display()
+                    )
+                })?;
+        // The append handle cannot truncate; reopen the same selected object.
+        let writer = OpenOptions::new().write(true).open(self.ledger_path())?;
+        anyhow::ensure!(
+            storage_path::same_open_file(file, &writer)?,
+            "RLM ledger {} changed before truncating its torn tail",
+            self.ledger_path().display()
+        );
+        writer.set_len(keep as u64)?;
+        writer.sync_all()?;
+        self.log(&format!(
+            "RLM ledger {}: retained torn tail as {} and truncated it before appending",
+            self.ledger_path().display(),
+            retained.display()
+        ));
         Ok(())
     }
 
     /// Seed a missing ledger from the legacy per-parent registries, then publish atomically (an
     /// interrupted seed leaves nothing to mis-read; a concurrent append wins).
-    fn seed(&self) -> Result<()> {
-        if self.path.exists() {
-            return Ok(());
+    fn seed(&self) -> Result<SeedPublication> {
+        match fs::symlink_metadata(self.ledger_path()) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_file(),
+                    "existing ledger is not a regular authority file"
+                );
+                return Ok(SeedPublication::Existing);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect ledger before legacy seed"),
         }
-        let Ok(root_entries) = fs::read_dir(&self.canonical_sessions_dir) else {
-            return Ok(());
+        let root_entries = match fs::read_dir(&self.configured_sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SeedPublication::Absent)
+            }
+            Err(error) => return Err(error).context("read legacy seed roots"),
         };
-        let mut queue: Vec<(PathBuf, u32)> = root_entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .map(|path| (path, 0))
-            .collect();
+        let mut queue = Vec::new();
+        for (index, entry) in root_entries.enumerate() {
+            anyhow::ensure!(
+                index < RLM_LEDGER_MAX_RECORDS,
+                "legacy seed exceeds root enumeration limit"
+            );
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                queue.push((path, 0u32));
+            }
+        }
         queue.sort();
         let mut visited: Vec<PathBuf> = queue
             .iter()
             .map(|(path, _)| canonical_session_path(path))
             .collect();
+        let mut tombstoned: Vec<(String, PathBuf)> = Vec::new();
         let mut records = String::new();
         let mut record_count = 0usize;
+        let mut push_record = |records: &mut String, record: Value| -> Result<()> {
+            records.push_str(&serde_json::to_string(&record)?);
+            records.push('\n');
+            record_count += 1;
+            anyhow::ensure!(
+                records.len() as u64 <= RLM_LEDGER_MAX_BYTES
+                    && record_count < RLM_LEDGER_MAX_RECORDS,
+                "legacy seed exceeds authority limits; refusing partial history"
+            );
+            Ok(())
+        };
+        let mut budget = legacy_registry::LegacySeedBudget::default();
         while let Some((session_file, depth)) = queue.pop() {
-            for entry in read_legacy_registry(&session_file) {
-                if entry.status == "deleted" {
-                    continue;
-                }
-                if entry.child_id.is_empty() {
-                    self.log("RLM ledger: skipped seeding a registry entry without a childId");
-                    continue;
-                }
+            let entries = legacy_registry::read_legacy_registry_checked(&session_file, &mut budget)
+                .with_context(|| format!("legacy root {}", session_file.display()))?;
+            for entry in entries {
                 let child_path = canonical_session_path(Path::new(&entry.session_file));
-                if visited.contains(&child_path) {
-                    continue;
-                }
-                visited.push(child_path.clone());
                 // A registry depth < 1 (legacy 0-depth entries exist in real
                 // data) is unwritable; derive parent depth + 1 instead of
                 // skipping the edge.
@@ -1051,7 +1319,7 @@ impl RlmSpawnLedger {
                 } else {
                     depth + 1
                 };
-                records.push_str(&serde_json::to_string(&json!({
+                let spawn = json!({
                     "v": 1,
                     "op": "spawn",
                     "at": now_iso(),
@@ -1060,23 +1328,61 @@ impl RlmSpawnLedger {
                     "child": child_path.to_string_lossy(),
                     "depth": child_depth,
                     "name": entry.session_name,
-                }))?);
-                records.push('\n');
-                record_count += 1;
+                });
+                if entry.status == "deleted" {
+                    // Pre-ledger TS (v0.3.2-v0.7.2) recorded deletions only in
+                    // this registry. Import the tombstone on its own edge key.
+                    // The edge only carries the tombstone: the deleted child's
+                    // transcript is never opened, copied or walked, and no
+                    // usage is invented. The row has no cause field; "user" is
+                    // the shipped user-delete reason (see README).
+                    // Like dcc and final TS, a deleted row does not mark the
+                    // path visited and its registry is not descended; no
+                    // grandchild tombstone is inferred from it.
+                    let key = (entry.child_id.clone(), child_path.clone());
+                    if tombstoned.contains(&key) {
+                        continue;
+                    }
+                    tombstoned.push(key);
+                    push_record(&mut records, spawn)?;
+                    push_record(
+                        &mut records,
+                        json!({
+                            "v": 1,
+                            "op": "delete",
+                            "at": now_iso(),
+                            "childId": entry.child_id,
+                            "child": child_path.to_string_lossy(),
+                            "reason": RlmLedgerDeleteReason::User.wire_name(),
+                            "source": "legacy-registry",
+                        }),
+                    )?;
+                    continue;
+                }
+                if visited.contains(&child_path) {
+                    continue;
+                }
+                visited.push(child_path.clone());
+                push_record(&mut records, spawn)?;
                 queue.push((PathBuf::from(&entry.session_file), child_depth));
             }
         }
         if records.is_empty() {
-            return Ok(());
+            return Ok(SeedPublication::Absent);
         }
         if records.len() as u64 > RLM_LEDGER_MAX_BYTES || record_count + 1 > RLM_LEDGER_MAX_RECORDS
         {
-            self.log(&format!(
-                "RLM ledger: seed exceeds read bounds ({record_count} records, {} bytes); skipping seeding",
-                records.len()
-            ));
-            return Ok(());
+            bail!("legacy seed exceeds authority limits; refusing partial history");
         }
+        self.publish_new_ledger(&records)
+    }
+
+    /// The one writer that creates a ledger: the meta header plus `records`
+    /// go to a synced `seed-<pid>-<ms>` scratch, published with a no-clobber
+    /// hard link. A crash can therefore never leave a ledger with only a
+    /// header. The namespace caller retires only this exact temp link after
+    /// proving the selected final object is the retained candidate.
+    fn publish_new_ledger(&self, records: &str) -> Result<SeedPublication> {
         let mut payload = serde_json::to_string(&json!({
             "v": 1,
             "op": "meta",
@@ -1084,35 +1390,58 @@ impl RlmSpawnLedger {
             "sessionsDir": self.canonical_sessions_dir.to_string_lossy(),
         }))?;
         payload.push('\n');
-        payload.push_str(&records);
-        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        payload.push_str(records);
+        let dir = self
+            .ledger_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(dir)?;
-        let temp_path = self.path.with_extension(format!(
+        let temp_path = self.ledger_path().with_extension(format!(
             "seed-{}-{}",
             std::process::id(),
             crate::util::now_ms()
         ));
-        {
-            let mut file = File::create(&temp_path)?;
-            file.write_all(payload.as_bytes())?;
-            file.sync_all()?;
+        // A retained temporary name is evidence, never a truncation target.
+        let mut candidate = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temp_path)?;
+        candidate.write_all(payload.as_bytes())?;
+        candidate.sync_all()?;
+        #[cfg(test)]
+        if SEED_PUBLISH_FAULT.with(|fault| fault.replace(false)) {
+            bail!("injected legacy seed publication fault");
         }
         // Atomic no-clobber publish via a hard link: EEXIST means a live
         // append created the real file meanwhile and wins.
-        match fs::hard_link(&temp_path, &self.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                self.log(&format!(
-                    "RLM ledger: link publish unavailable ({error}); skipping seeding"
-                ));
+        match fs::hard_link(&temp_path, self.ledger_path()) {
+            Ok(()) => Ok(SeedPublication::Published {
+                file: candidate,
+                temp_path,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(SeedPublication::Existing)
             }
+            Err(error) => Err(error).context("publish validated legacy seed"),
         }
-        let _ = fs::remove_file(&temp_path);
-        Ok(())
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Writes only this many bytes of the next appended line, then fails.
+    pub(crate) static APPEND_WRITE_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails the next seed publication after its scratch is durable.
+    pub(crate) static SEED_PUBLISH_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod path_tests;
 #[cfg(test)]
 mod strict_tests;
 #[cfg(test)]
