@@ -686,7 +686,6 @@ async fn worker_finalize_completes_a_fully_stopped_tree() {
 }
 
 #[test]
-#[ignore = "needs strict_edges() from PR56 (#41/#42); PR56 removes this ignore"]
 fn malformed_ledger_topology_refuses_cleanup_but_display_reads_stay_lenient() {
     use std::io::Write;
     let temp = tempfile::tempdir().unwrap();
@@ -711,11 +710,19 @@ fn malformed_ledger_topology_refuses_cleanup_but_display_reads_stay_lenient() {
         .unwrap()
         .join("scheduled-jobs.json");
     let job_bytes = std::fs::read(&jobs).unwrap();
+    // A well-formed JSON line with an unrecognized `op` is "present but unknown",
+    // not "never committed" (unlike torn/non-JSON/non-UTF-8 input, which the
+    // authority reader treats as an unacknowledged write and skips the same way
+    // the lenient reader does). The lenient reader still skips an unknown op
+    // gracefully (`parse_ledger_line`'s catch-all `_ => Ok(None)`); only the
+    // authority reader refuses it (`classify_authority_line`'s catch-all
+    // `_ => bail!("unknown operation...")`), which is the asymmetry this test
+    // exercises.
     std::fs::OpenOptions::new()
         .append(true)
         .open(ledger.ledger_path())
         .unwrap()
-        .write_all(b"{unknown-broken-topology}\n")
+        .write_all(b"{\"v\":1,\"op\":\"unknown-topology\",\"at\":\"2026-01-01T00:00:00Z\"}\n")
         .unwrap();
     let ledger_before = std::fs::read(ledger.ledger_path()).unwrap();
     let (count, error) = finalize_archived_stop(&agent, &sessions, &file, &HashSet::new());

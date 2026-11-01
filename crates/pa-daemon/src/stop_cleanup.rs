@@ -74,14 +74,18 @@ fn strict_session_identity(path: &Path) -> Result<PathBuf> {
 }
 
 /// The ledger's parent→child map: non-deleted edges keyed by canonical parent path.
+///
+/// Uses the ledger's authority-grade `strict_edges()`, not the lenient `edges(false)`:
+/// this map drives cleanup/cancellation decisions, which must refuse on a torn or
+/// unreadable ledger line rather than silently reading a truncated topology as complete.
 fn children_by_parent(
     agent_dir: &Path,
     sessions_dir: &Path,
 ) -> Result<HashMap<String, Vec<(String, PathBuf)>>> {
     let ledger = RlmSpawnLedger::new(agent_dir, sessions_dir, |_| {});
     let mut map: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-    let edges = ledger.edges(false)?;
-    for edge in edges {
+    let edges = ledger.strict_edges()?;
+    for edge in edges.into_iter().filter(|edge| edge.deleted.is_none()) {
         let child = PathBuf::from(&edge.child);
         let parent = canonical_session_path(Path::new(&edge.parent));
         map.entry(parent.to_string_lossy().to_string())
