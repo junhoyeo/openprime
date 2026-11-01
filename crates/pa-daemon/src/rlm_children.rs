@@ -100,6 +100,11 @@ pub struct ParentIdentity {
     pub thinking: Option<String>,
     /// Verification seam: create children with a scripted engine file.
     pub child_script: Option<String>,
+    /// The calling worker's own invocation opt-out (#35/#36): monotone,
+    /// `Some(true)` only. A child never turns a parent's recorded opt-out
+    /// off; an absent/false parent stance is the daemon default, not an
+    /// explicit on.
+    pub telemetry_disabled: Option<bool>,
 }
 
 impl ParentIdentity {

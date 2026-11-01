@@ -416,6 +416,7 @@ async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
         session_file: Some(parent_file.to_string_lossy().to_string()),
         thinking: None,
         child_script: Some(script.to_string_lossy().to_string()),
+        telemetry_disabled: None,
     });
 
     let handle = children

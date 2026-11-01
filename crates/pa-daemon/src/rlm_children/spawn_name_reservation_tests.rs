@@ -464,3 +464,79 @@ async fn concurrent_parent_renames_keep_the_last_applied_name() {
     let rows = sessions.list_subagents().await.expect("roster");
     assert_eq!(rows[0].session_name, "second");
 }
+
+/// #36: a depth-0 `rlm.create_session` root must carry the calling worker's
+/// own opt-out into the created session -- the exact scenario the issue
+/// names, not just the recursive `rlm.spawn` path (which shares the same
+/// underlying `create_child`, but is covered separately in messaging.rs's
+/// `WakeTelemetry::of_source` tests for #35's distinct wake path).
+#[tokio::test]
+async fn depth_zero_create_session_inherits_the_parents_opt_out() {
+    let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (rename_seen_tx, _rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions =
+        sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx, None).await;
+    // Override just the telemetry stance the depth-0 caller carries;
+    // everything else keeps the harness's default identity.
+    sessions.set_identity(ParentIdentity {
+        model: Some("mock/mock-1".to_string()),
+        cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+        telemetry_disabled: Some(true),
+        ..ParentIdentity::with_default_depth()
+    });
+    // The gated supervisor admits immediately; this test never parks.
+    verdict_tx.send(true).expect("admit the create");
+    let created = sessions
+        .create_session(pa_core::session_engine::rlm_host::RlmCreateSessionRequest {
+            prompt: "a depth-0 root".to_string(),
+            name: Some("opted-out-root".to_string()),
+            model: None,
+            thinking: None,
+            cwd: None,
+        })
+        .await
+        .expect("create_session admission");
+    assert_eq!(created.name, "opted-out-root");
+    let seen = create_seen_rx
+        .recv()
+        .await
+        .expect("the create must reach the gated supervisor");
+    assert_eq!(
+        seen["telemetryDisabled"],
+        Value::Bool(true),
+        "a depth-0 create_session root must carry the parent's opt-out: {seen:?}"
+    );
+}
+
+/// The companion green control: an identity with no opt-out never forces
+/// one on -- `Create.telemetry_disabled` stays the daemon default (`null`
+/// on the wire, not `false`), matching the existing monotone contract
+/// elsewhere (only `Some(true)` is ever a real signal).
+#[tokio::test]
+async fn depth_zero_create_session_without_an_opt_out_sets_no_telemetry_flag() {
+    let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (rename_seen_tx, _rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions =
+        sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx, None).await;
+    verdict_tx.send(true).expect("admit the create");
+    let _created = sessions
+        .create_session(pa_core::session_engine::rlm_host::RlmCreateSessionRequest {
+            prompt: "a plain depth-0 root".to_string(),
+            name: Some("plain-root".to_string()),
+            model: None,
+            thinking: None,
+            cwd: None,
+        })
+        .await
+        .expect("create_session admission");
+    let seen = create_seen_rx
+        .recv()
+        .await
+        .expect("the create must reach the gated supervisor");
+    assert!(
+        seen.get("telemetryDisabled").is_none_or(Value::is_null),
+        "a plain identity must not force telemetryDisabled: {seen:?}"
+    );
+}
